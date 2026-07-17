@@ -42,77 +42,8 @@ async def _run_async(args, log):
     deserialization for the ~800 legacy records on disk.
     """
     server = build_server(library_path=args.library_path)
-    library = server._paper_library  # type: ignore[attr-defined]
-    download_queue = server._paper_download_queue  # type: ignore[attr-defined]
-    extract_queue = server._paper_extract_queue  # type: ignore[attr-defined]
-
-    # D7 one-time status migration — normalize every legacy download_status
-    # ("ok:<src>", "text-only:firecrawl", "extract_low_quality") to the clean
-    # routing enum BEFORE the queues' recovery scans (which route on
-    # classify()/the enum) ever read a record. Idempotent: a no-op once the
-    # index is already in canonical shape.
-    from ..services.migrate_status import (
-        STUB_DELETION_RULE, migrate_status, should_persist)
-    report = migrate_status(library)
-    # R2/redrill: the save-guard predicate lives in exactly ONE place
-    # (``should_persist`` in services.migrate_status) so it can't drift from the
-    # regression test, which calls the SAME helper. The save must fire when the
-    # migration normalized any download_status VALUE (``report["migrated"]``) OR
-    # when the ONLY mutation was a Pass A stub deletion: Pass A clears md_path /
-    # md_engine / extract_attempts in memory and deletes the on-disk stub but
-    # does NOT bump ``migrated`` (that counter tracks download_status value
-    # migrations). A boot whose sole mutation is a stub deletion (e.g. a row
-    # already canonical ``ok`` carrying an un-gated stub) would otherwise skip
-    # save() → md_path=None never persists → index.json still points at the
-    # now-deleted file.
-    if should_persist(report):
-        library.save()
-        stub_deletions = report.get("by_rule", {}).get(STUB_DELETION_RULE, 0)
-        log.info("download_status migration: normalized %d/%d records "
-                 "(%d stub deletions) %s",
-                 report["migrated"], report["total"], stub_deletions,
-                 report["by_rule"])
-
-    await extract_queue.start()
-    log.info("paper-extract queue started")
-    await download_queue.start()
-    log.info("paper-download queue started")
-
-    # D8 reconcile sweep — the automatic safety net for papers that fell
-    # between the two conveyor belts (esp. the ~48 firecrawl-md papers the
-    # download queue's pending-only recovery scan forgets). ``reconcile_loop``
-    # runs ``reconcile_once`` immediately at the top of its first iteration
-    # (before its first sleep), so we do NOT call it explicitly here — doing
-    # so would run an identical full-library scan (one pdf_probe subprocess per
-    # EXTRACT paper) twice back-to-back at boot for no benefit (low fix #2).
-    # The queues are already up, so the loop's first sweep's add()s land.
-    from ..services.reconcile import reconcile_loop
-    reconcile_task = asyncio.create_task(
-        reconcile_loop(library, download_queue, extract_queue),
-        name="paper-reconcile-loop",
-    )
-    log.info("paper-reconcile loop started")
-
-    # On-demand MinerU server lifecycle (no-op unless PAPER_LIBRARY_MINERU_ONDEMAND=1):
-    # stop the vLLM server after the extract queue is idle for IDLE_TIMEOUT,
-    # freeing the GPU; ensure_ready (on the extract worker path) starts it back.
-    from ..services.mineru_server import get_server_controller
-    mineru_monitor_task = asyncio.create_task(
-        get_server_controller().monitor_loop(extract_queue),
-        name="mineru-idle-monitor",
-    )
-    log.info("mineru on-demand monitor task created (active only when on-demand ON)")
-
-    async def _shutdown_queues():
-        reconcile_task.cancel()
-        mineru_monitor_task.cancel()
-        for _t in (reconcile_task, mineru_monitor_task):
-            try:
-                await _t
-            except (asyncio.CancelledError, Exception):
-                pass
-        await download_queue.stop()
-        await extract_queue.stop()
+    from .boot import start_background as _start_library_bg
+    _shutdown_queues = await _start_library_bg(server, log)
 
     if args.stdio:
         log.info("MCP stdio server ready")

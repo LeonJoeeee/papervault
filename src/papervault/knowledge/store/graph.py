@@ -179,6 +179,14 @@ async def get_graph() -> LightRAG:
         # V1 (SDD §6.9.1): wire the bge-reranker-v2-m3 rerank path. Without rerank_model_func,
         # LightRAG's enable_rerank=True default (base.py:160) silently no-ops (F18). lazy-loaded.
         rerank_model_func=_bge_rerank,
+        # LightRAG 1.5.x wraps rerank_model_func in its own worker pool with a per-call
+        # timeout (upstream default 30s, worker cap 2x=60s). On a co-rented GPU a facet
+        # rerank of a 200-320-chunk pool under 5-way facet concurrency legitimately runs
+        # 40-120s+ — at the upstream default 3/5 facets TIME OUT and LightRAG silently
+        # fail-opens to UNRERANKED order ("using original chunks"), which cost -6.8pp
+        # distinct-paper recall in the 2026-07-17 equivalence eval (issue #4 root cause).
+        # 480s mirrors the extraction-worker patience; env-overridable via upstream's name.
+        default_rerank_timeout=int(os.getenv("RERANK_TIMEOUT", "480")),
         # Pin 0.0 explicitly: rerank only REORDERS chunks, never drops by absolute score
         # (process_chunks_unified filters only when min_rerank_score > 0.0; F20). Default is
         # already 0.0 but the env MIN_RERANK_SCORE could drift it → kill niche-query chunks.

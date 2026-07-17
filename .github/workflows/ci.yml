@@ -20,10 +20,8 @@ jobs:
         with:
           enable-cache: true
       - name: Ruff
-        run: |
-          uv venv
-          uv pip install ruff
-          uv run ruff check src tests
+        # --no-project / uvx: lint without syncing the heavy runtime tree (torch, lightrag, …).
+        run: uvx ruff check src tests
 
   test:
     runs-on: ubuntu-latest

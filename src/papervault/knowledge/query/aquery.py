@@ -73,10 +73,16 @@ def _cited_papers(data: dict[str, Any]) -> list[str]:
     keys = set()
     for r in refs:
         fp = r.get("file_path") or ""
-        if fp.startswith("paper/"):
-            key = fp.split("/", 1)[1]
-            if key:
-                keys.add(key)
+        if not fp or fp == "unknown_source":
+            continue
+        # Two coexisting formats: 1.4-built data stores 'paper/<key>' (the distill-side
+        # prefix), while LightRAG 1.5.x normalizes file_path to its BASENAME at enqueue
+        # (pipeline 'canonical stored basename'), so fresh docs carry the bare key. The
+        # probe caught fresh-built docs vanishing from cited_papers under the old
+        # prefix-only rule — accept both, forever (mixed-era graphs are the normal state).
+        key = fp.split("/", 1)[1] if fp.startswith("paper/") else fp.rsplit("/", 1)[-1]
+        if key:
+            keys.add(key)
     return sorted(keys)
 
 

@@ -32,13 +32,12 @@ dependencies = [
     "mcp>=1.27.1",
     "uvicorn>=0.30",           # the streamable-http `papervault serve` path imports it directly
     # --- knowledge (graph-RAG) ---
-    # Framework spine. PINNED to the 1.4.x line the ported logic was proven against: the
-    # graph-build ontology (addon_params entity_types) and the extraction-prompt monkeypatch
-    # anchor on 1.4.x internals that 1.5.x restructured — on 1.5.x both silently no-op, so the
-    # space-physics noise-suppression + closed ontology vanish. apply_ks_extraction_prompt now
-    # fails loud if the anchors are missing, but the pin is the real guard. Re-validate before
-    # widening the ceiling. (retro-review 2026-07-17)
-    "lightrag-hku>=1.4,<1.5",
+    # Framework spine, ported to the 1.5.x line (2026-07-17 port map): ontology + exclusions
+    # travel via addon_params['entity_types_guidance']; examples via PROMPTS (text mode);
+    # one monkeypatch (kill the `Other` escape hatch) anchored on 1.5.x internals with a
+    # fail-loud guard; PARSING/ANALYZING doc phases handled in the scheduler. The ceiling is
+    # load-bearing: bump it only with a fresh port map + probe build + FAST recall gate.
+    "lightrag-hku>=1.5,<1.6",
     "openai>=1.50",            # raw OpenAI-compatible SDK (knowledge LLM path)
     "asyncpg>=0.29",
     "psycopg[binary]>=3.2",

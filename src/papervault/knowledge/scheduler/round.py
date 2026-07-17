@@ -84,8 +84,12 @@ async def reconcile_terminal(
             counters["error"] += 1
             seen_terminal.add(rec.source_id)
             log.info("reconcile_terminal: %s doc_status FAILED → ledger error", rec.source_id)
-        elif ds in (DocStatus.PROCESSING, DocStatus.PENDING):
-            counters["pending"] += 1            # 中途态:不写终态,留下轮(本轮末 process 会推进)
+        elif ds in (DocStatus.PROCESSING, DocStatus.PENDING,
+                    DocStatus.PARSING, DocStatus.ANALYZING):
+            # 中途态:不写终态,留下轮(本轮末 process 会推进)。PARSING/ANALYZING 是
+            # LightRAG 1.5.x 新增的管线相位 — 不列入这里会落进 stuck_guard,3 轮后把
+            # 慢文档误判成 error(1.5 移植面 #6)。
+            counters["pending"] += 1
         else:
             # st is None(doc_status 无此行 — enqueue 早返/F16 内容去重孤儿)或非预期态(PREPROCESSED, F10)。
             # 记日志不静默跳过(§8 TOTAL);计 stuck_guard。

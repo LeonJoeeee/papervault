@@ -51,13 +51,29 @@ _CLOSED_ONTOLOGY = (
 
 
 def apply_ks_extraction_prompt(examples: bool = True, exclusions: bool = True) -> None:
-    """Mutate lightrag.prompt.PROMPTS in place. Idempotent. Call before extraction."""
+    """Mutate lightrag.prompt.PROMPTS in place. Idempotent. Call before extraction.
+
+    This monkeypatch anchors on LightRAG 1.4.x internals (the ``\\n---Examples---`` marker and
+    the `Other` catch-all in the entity-extraction system prompt). A LightRAG version that
+    restructures that prompt makes the patch a silent no-op — the space-physics noise-suppression
+    and closed ontology would vanish with no error, degrading every graph build. So we FAIL LOUD
+    if neither anchor is found (the pin is `lightrag-hku>=1.4,<1.5`; this backs it up)."""
     if exclusions:
         sysp = lr_prompt.PROMPTS["entity_extraction_system_prompt"]
-        if "Exclusions (do NOT extract" not in sysp and "\n---Examples---" in sysp:
+        already = "Exclusions (do NOT extract" in sysp
+        has_examples_anchor = "\n---Examples---" in sysp
+        has_other = _OTHER_CATCHALL in sysp
+        if not already and not has_examples_anchor and not has_other:
+            raise RuntimeError(
+                "apply_ks_extraction_prompt: neither the '---Examples---' anchor nor the "
+                "'Other' catch-all was found in LightRAG's entity_extraction_system_prompt. "
+                "The extraction-prompt monkeypatch would silently no-op — this usually means an "
+                "unsupported LightRAG version (pin is >=1.4,<1.5). Refusing to build a degraded graph."
+            )
+        if not already and has_examples_anchor:
             sysp = sysp.replace("\n---Examples---", "\n" + _EXCLUSIONS, 1)
         # Drop the `Other` catch-all: close the ontology so off-ontology candidates are omitted.
-        if _OTHER_CATCHALL in sysp:
+        if has_other:
             sysp = sysp.replace(_OTHER_CATCHALL, _CLOSED_ONTOLOGY, 1)
         lr_prompt.PROMPTS["entity_extraction_system_prompt"] = sysp
     if examples:

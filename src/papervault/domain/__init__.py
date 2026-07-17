@@ -49,6 +49,25 @@ class DomainPack:
     search_gate: str
     """Ingest domain-gate rubric (markdown text)."""
 
+    @property
+    def entity_types_guidance(self) -> str:
+        """The closed-ontology guidance string for LightRAG >= 1.5.
+
+        1.5.x replaced ``addon_params['entity_types']`` (a list) with
+        ``addon_params['entity_types_guidance']`` (one free-text string rendered into the
+        extraction system prompt's ``---Entity Types---`` section). This renders the pack's
+        ontology as a CLOSED list plus the negative-exclusion rules, so the whole domain
+        layer travels through the one supported channel.
+        """
+        types = ", ".join(f"`{t}`" for t in self.entity_types)
+        return (
+            f"Allowed entity types (a CLOSED list): {types}.\n"
+            "This list is CLOSED — never invent a new type and never use `Other`/`Unknown`. "
+            "If a candidate entity does not clearly fit one of these types, DO NOT extract "
+            "it at all (omit it entirely rather than forcing a catch-all).\n\n"
+            + self.extraction_exclusions
+        )
+
 
 _CACHE: DomainPack | None = None
 

@@ -21,7 +21,7 @@ KW_EXAMPLES_1416 = ["Example 1:\n\nQuery: \"How does international trade influen
 
 def apply_kw_prompt_compat() -> None:
     """Restore the 1.4.16 keyword-extraction prompt + rich few-shots. Idempotent."""
-    if os.getenv("KS_KW_PROMPT_COMPAT", "1").strip().lower() in ("0", "false", "no"):
+    if os.getenv("KS_KW_PROMPT_COMPAT", "0").strip().lower() in ("0", "false", "no"):
         return
     lr_prompt.PROMPTS["keywords_extraction"] = KW_PROMPT_1416
     if KW_EXAMPLES_1416 is not None:

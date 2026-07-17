@@ -128,7 +128,11 @@ async def get_graph() -> LightRAG:
     #       recall A/B can arbitrate before any flip (issue #3).
     async def _build_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
         kwargs.setdefault("model", os.getenv("KS_BUILD_MODEL") or _pv.BUILD_MODEL)
-        if kwargs.get("keyword_extraction") and os.getenv("KS_KW_THINKING", "1") == "0":
+        # LightRAG 1.5.x no longer tags the query-path keyword-extraction call with
+        # keyword_extraction=True; it now passes response_format={"type":"json_object"}
+        # (operate.py query kw path) — and in papervault's text-mode config that is the ONLY
+        # call carrying response_format, so it uniquely marks keyword extraction.
+        if kwargs.get("response_format") and os.getenv("KS_KW_THINKING", "1") == "0":
             kwargs.setdefault("enable_thinking", False)
         elif os.getenv("KS_BUILD_THINKING", "1") == "1":
             kwargs.setdefault("enable_thinking", True)
@@ -162,7 +166,11 @@ async def get_graph() -> LightRAG:
         default_llm_timeout=int(os.getenv("KS_LLM_TIMEOUT", "240")),
         enable_llm_cache_for_entity_extract=True,
         force_llm_summary_on_merge=8,
-        addon_params={"language": "English", "entity_types": ENTITY_TYPES},
+        # LightRAG 1.5.x: 'entity_types' (a list) is DEAD — the ontology travels as ONE
+        # guidance string ('entity_types_guidance') rendered into the ---Entity Types---
+        # section. The domain pack renders the closed 11-type list + negative exclusions.
+        addon_params={"language": "English",
+                      "entity_types_guidance": get_domain().entity_types_guidance},
         graph_storage="Neo4JStorage",
         kv_storage="PGKVStorage",
         vector_storage="PGVectorStorage",

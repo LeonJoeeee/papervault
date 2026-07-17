@@ -20,6 +20,8 @@ import logging
 import re
 from typing import Optional, TypedDict
 
+from papervault.domain import get_domain
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,7 +41,7 @@ class SearchPlan(TypedDict):
 
 
 _SYSTEM_PROMPT = """You are a search planner for a research librarian working on
-**space physics + AI4Science**. Your job: turn a natural-language research
+**__DOMAIN_LABEL__**. Your job: turn a natural-language research
 intent into a structured search plan.
 
 First THINK (briefly, in the "reasoning" field): what would a paper that is a
@@ -225,6 +227,10 @@ Output: {
 
 ==== End few-shots ====
 """
+# Domain label from the active domain pack (ADR-0003, papervault.domain), substituted at
+# import (loader-cached). The facet-taxonomy examples below the label stay space-physics-
+# specific (no domain-pack field covers them).
+_SYSTEM_PROMPT = _SYSTEM_PROMPT.replace("__DOMAIN_LABEL__", get_domain().label)
 
 
 def parse_intent(query: str, llm=None) -> SearchPlan:

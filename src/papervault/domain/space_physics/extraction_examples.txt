@@ -1,0 +1,68 @@
+<Entity_types>
+["concept","method","phenomenon","dataset","instrument","mission","quantity","material","model","finding","application"]
+
+<Input Text>
+```
+Solar energetic particles (SEPs) accelerated during coronal mass ejections propagate through the heliosphere, where their transport is governed by the parallel diffusion coefficient. Observations from the Parker Solar Probe show that the particle mean free path increases with radial distance, consistent with quasi-linear theory; the parallel diffusion coefficient $\kappa_\parallel$ scales roughly as $\kappa_\parallel \propto r^1.17$ in this regime. Cane et al. (2003) reported a correlation between the onset delay and the ambient solar wind density, later refined using SOHO measurements. The focused transport equation, which balances streaming and pitch-angle scattering, reproduces the observed intensity-time profiles for most gradual events.
+```
+
+<Output>
+entity{tuple_delimiter}Solar Energetic Particles{tuple_delimiter}phenomenon{tuple_delimiter}Energetic charged particles (abbreviated SEPs) accelerated during solar eruptions that propagate through the heliosphere.
+entity{tuple_delimiter}Coronal Mass Ejection{tuple_delimiter}phenomenon{tuple_delimiter}A large eruption of plasma and magnetic field from the Sun that can accelerate solar energetic particles.
+entity{tuple_delimiter}Heliosphere{tuple_delimiter}phenomenon{tuple_delimiter}The region of space dominated by the solar wind through which solar energetic particles propagate.
+entity{tuple_delimiter}Parallel Diffusion Coefficient{tuple_delimiter}quantity{tuple_delimiter}A transport parameter governing particle diffusion along the magnetic field; observed to increase with radial distance.
+entity{tuple_delimiter}Parker Solar Probe{tuple_delimiter}mission{tuple_delimiter}A spacecraft whose observations show the particle mean free path increasing with radial distance.
+entity{tuple_delimiter}Quasi-Linear Theory{tuple_delimiter}method{tuple_delimiter}A theoretical framework for particle scattering, consistent with the observed radial trend of the mean free path.
+entity{tuple_delimiter}SOHO{tuple_delimiter}mission{tuple_delimiter}A solar observatory whose measurements refined the onset-delay versus solar-wind-density correlation.
+entity{tuple_delimiter}Focused Transport Equation{tuple_delimiter}model{tuple_delimiter}A transport model balancing streaming and pitch-angle scattering that reproduces SEP intensity-time profiles for gradual events.
+entity{tuple_delimiter}Onset Delay{tuple_delimiter}quantity{tuple_delimiter}The delay in solar-energetic-particle arrival, observed to correlate with ambient solar wind density.
+relation{tuple_delimiter}Solar Energetic Particles{tuple_delimiter}Coronal Mass Ejection{tuple_delimiter}acceleration, source{tuple_delimiter}Solar energetic particles are accelerated during coronal mass ejections.
+relation{tuple_delimiter}Parallel Diffusion Coefficient{tuple_delimiter}Solar Energetic Particles{tuple_delimiter}transport, governing parameter{tuple_delimiter}The parallel diffusion coefficient governs the transport of solar energetic particles.
+relation{tuple_delimiter}Focused Transport Equation{tuple_delimiter}Solar Energetic Particles{tuple_delimiter}modeling, intensity profiles{tuple_delimiter}The focused transport equation reproduces observed solar-energetic-particle intensity-time profiles.
+relation{tuple_delimiter}Parker Solar Probe{tuple_delimiter}Parallel Diffusion Coefficient{tuple_delimiter}observation, radial dependence{tuple_delimiter}Parker Solar Probe observations bear on the radial increase of the parallel diffusion coefficient.
+{completion_delimiter}
+===EXAMPLE===
+<Entity_types>
+["concept","method","phenomenon","dataset","instrument","mission","quantity","material","model","finding","application"]
+
+<Input Text>
+```
+Physics-Informed Neural Networks (PINNs) solve partial differential equations by embedding the governing equations into the loss function. The total loss combines a data term and a residual term evaluated at collocation points. Raissi et al. (2019) introduced the framework, and later work showed that the gradient of the loss with respect to the network parameters can become ill-conditioned for stiff problems. Domain-decomposition variants such as XPINNs partition the domain to improve scalability. The approach has been applied to the heat equation and to inverse problems in fluid dynamics.
+```
+
+<Output>
+entity{tuple_delimiter}Physics-Informed Neural Network{tuple_delimiter}method{tuple_delimiter}A neural-network method (abbreviated PINN) that solves partial differential equations by embedding the governing equations into the training loss.
+entity{tuple_delimiter}Partial Differential Equation{tuple_delimiter}concept{tuple_delimiter}The governing equations that physics-informed neural networks are designed to solve.
+entity{tuple_delimiter}Residual Loss{tuple_delimiter}quantity{tuple_delimiter}The loss component evaluated at collocation points that enforces the governing equations during training.
+entity{tuple_delimiter}Collocation Points{tuple_delimiter}concept{tuple_delimiter}Sampling points in the domain where the residual loss of a physics-informed neural network is evaluated.
+entity{tuple_delimiter}XPINNs{tuple_delimiter}method{tuple_delimiter}A domain-decomposition variant of physics-informed neural networks that partitions the domain to improve scalability.
+entity{tuple_delimiter}Domain Decomposition{tuple_delimiter}method{tuple_delimiter}A strategy that partitions the computational domain to improve the scalability of neural-network PDE solvers.
+entity{tuple_delimiter}Inverse Problem{tuple_delimiter}application{tuple_delimiter}A class of fluid-dynamics problems to which physics-informed neural networks have been applied.
+entity{tuple_delimiter}Stiff Problem{tuple_delimiter}concept{tuple_delimiter}A class of problems for which the loss gradient with respect to network parameters can become ill-conditioned.
+relation{tuple_delimiter}Physics-Informed Neural Network{tuple_delimiter}Partial Differential Equation{tuple_delimiter}solving, governing equations{tuple_delimiter}Physics-informed neural networks solve partial differential equations by embedding them in the loss.
+relation{tuple_delimiter}Physics-Informed Neural Network{tuple_delimiter}Residual Loss{tuple_delimiter}training, loss component{tuple_delimiter}The residual loss enforces the governing equations during training of a physics-informed neural network.
+relation{tuple_delimiter}XPINNs{tuple_delimiter}Domain Decomposition{tuple_delimiter}method, scalability{tuple_delimiter}XPINNs apply domain decomposition to improve the scalability of physics-informed neural networks.
+relation{tuple_delimiter}Residual Loss{tuple_delimiter}Collocation Points{tuple_delimiter}evaluation, sampling{tuple_delimiter}The residual loss is evaluated at collocation points.
+{completion_delimiter}
+===EXAMPLE===
+<Entity_types>
+["concept","method","phenomenon","dataset","instrument","mission","quantity","material","model","finding","application"]
+
+<Input Text>
+```
+Galactic cosmic rays are modulated by the solar wind as they propagate into the inner heliosphere, producing an anti-correlation between cosmic-ray intensity and solar activity. The AMS-02 detector aboard the International Space Station has measured the proton and helium spectra with high precision, while the PAMELA experiment provided earlier measurements of the positron fraction. These data constrain the local interstellar spectrum used in solar modulation models. The force-field approximation offers a single-parameter description of modulation, although it breaks down at low rigidities.
+```
+
+<Output>
+entity{tuple_delimiter}Galactic Cosmic Rays{tuple_delimiter}phenomenon{tuple_delimiter}High-energy charged particles from outside the solar system, modulated by the solar wind in the inner heliosphere.
+entity{tuple_delimiter}Solar Modulation{tuple_delimiter}phenomenon{tuple_delimiter}The suppression of galactic cosmic-ray intensity by the solar wind, anti-correlated with solar activity.
+entity{tuple_delimiter}AMS-02{tuple_delimiter}instrument{tuple_delimiter}A particle detector aboard the International Space Station that measures cosmic-ray proton and helium spectra with high precision.
+entity{tuple_delimiter}PAMELA{tuple_delimiter}instrument{tuple_delimiter}A space experiment that provided early measurements of the cosmic-ray positron fraction.
+entity{tuple_delimiter}Positron Fraction{tuple_delimiter}quantity{tuple_delimiter}The ratio of positrons to total electrons-plus-positrons in cosmic rays, measured by PAMELA.
+entity{tuple_delimiter}Local Interstellar Spectrum{tuple_delimiter}quantity{tuple_delimiter}The cosmic-ray spectrum outside the heliosphere, constrained by detector data and used in modulation models.
+entity{tuple_delimiter}Force-Field Approximation{tuple_delimiter}model{tuple_delimiter}A single-parameter description of solar modulation that breaks down at low rigidities.
+relation{tuple_delimiter}Galactic Cosmic Rays{tuple_delimiter}Solar Modulation{tuple_delimiter}modulation, anti-correlation{tuple_delimiter}Galactic cosmic rays undergo solar modulation, anti-correlated with solar activity.
+relation{tuple_delimiter}AMS-02{tuple_delimiter}Galactic Cosmic Rays{tuple_delimiter}measurement, spectra{tuple_delimiter}AMS-02 measures the proton and helium spectra of galactic cosmic rays.
+relation{tuple_delimiter}Force-Field Approximation{tuple_delimiter}Solar Modulation{tuple_delimiter}modeling, single-parameter{tuple_delimiter}The force-field approximation describes solar modulation with a single parameter.
+relation{tuple_delimiter}Local Interstellar Spectrum{tuple_delimiter}Solar Modulation{tuple_delimiter}input, modeling constraint{tuple_delimiter}The local interstellar spectrum constrains solar modulation models.
+{completion_delimiter}

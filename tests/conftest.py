@@ -40,8 +40,10 @@ _INTEGRATION_MODULES = {
 # collaborators run — so any test that drives it with a NON-empty query raises "No LLM
 # credentials" and needs a key. The empty-query / docstring cases short-circuit before the
 # preflight and are hermetic, so they were UN-marked (moved back into the CI set). The
-# firecrawl re-entry quality-gate tests ALL passed with no creds (the gate fails open /
-# their LLM is stubbed) — the previous exact-name set was over-broad, so it is dropped.
+# firecrawl re-entry quality-gate tests LOOKED hermetic in a local "no-creds" run, but that
+# was ambient-credential leakage (real keys reachable on the dev box -> the gate silently ran a
+# REAL judge LLM). On CI (guaranteed no creds) all 7 fail — CI is the ground truth for this
+# classification, so they are marked integration by exact name.
 _INTEGRATION_NAMES = {
     # test_mcp_server.py — search_papers get_llm() preflight (non-empty query).
     "test_search_malformed_intent_returns_error",
@@ -54,6 +56,14 @@ _INTEGRATION_NAMES = {
     "test_search_sort_secondary_by_importance",
     "test_search_judge_batches_dropped_zero_when_healthy",
     "test_search_ingest_upsert_passes_no_llm",
+    # test_firecrawl_quality_gate.py — the re-entry gate drives a live judge LLM.
+    "test_firecrawl_reentry_historical_md_passes_gate_stays_ok",
+    "test_firecrawl_reentry_historical_stub_fails_gate_is_deleted_terminal",
+    "test_firecrawl_reentry_historical_stub_no_abstract_to_failed",
+    "test_firecrawl_reentry_gates_body_not_frontmatter",
+    "test_firecrawl_reentry_gate_failopen_keeps_md",
+    "test_firecrawl_reentry_pass_stamps_pdf_hunt_exhausted",
+    "test_firecrawl_reentry_failopen_stamps_exhausted_no_reloop",
 }
 
 

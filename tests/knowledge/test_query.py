@@ -41,6 +41,19 @@ def test_cited_papers_strips_paper_prefix_only():
     assert _cited_papers({"references": refs}) == ["Jokipii1966", "Reames2023"]  # sorted, paper/ only
 
 
+def test_cited_papers_accepts_15_era_basenames():
+    # LightRAG 1.5.x basenames file_path at enqueue: fresh docs carry the bare key.
+    # Mixed-era graphs are the permanent normal — both forms must resolve to keys.
+    refs = [
+        {"reference_id": "1", "file_path": "paper/Xu2025e"},     # 1.4-era prefixed
+        {"reference_id": "2", "file_path": "Bonomi2020"},         # 1.5-era basename
+        {"reference_id": "3", "file_path": "unknown_source"},     # LightRAG default junk
+        {"reference_id": "4", "file_path": ""},                   # blank
+        {"reference_id": "5", "file_path": "web/https://x/y"},    # defensive exclusion holds
+    ]
+    assert _cited_papers({"references": refs}) == ["Bonomi2020", "Xu2025e"]
+
+
 def test_cited_papers_dedup_and_sort():
     refs = [
         {"reference_id": "1", "file_path": "paper/Bbb2020"},

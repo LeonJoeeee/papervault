@@ -29,13 +29,34 @@ _INTEGRATION_MODULES = {
     "test_server_lifespan",  # scheduler + graph/DB lifecycle
     "test_background",       # background queue timing / daemons
 }
-# Per-module test-name prefixes that need live infra inside an otherwise-unit module.
-_INTEGRATION_NAME_PREFIXES = {
-    "test_mcp_server": ("test_search_",),   # search_papers → live intent-parser LLM
-}
-# Exact test names that invoke a live LLM (the firecrawl re-entry quality gate) inside an
-# otherwise-unit module. These pass locally only when ambient LLM creds happen to be present.
+# Exact test names (matched on the base function name, so parametrization is covered) that
+# genuinely fail WITHOUT LLM credentials. Derived EMPIRICALLY (2026-07-17): every
+# currently-marked candidate was run individually in a no-credentials env (PAPERVAULT_LLM_API_KEY
+# unset, PAPERVAULT_LLM_KEYS/LLM_KEYS_FILE pointing at an absent file, a fresh empty
+# PAPERVAULT_DATA so the default llm_keys.json is absent). Kept ONLY the ones that failed.
+#
+# The search_papers tool calls get_llm() as an upfront credential preflight
+# (library/mcp/server.py) AFTER its empty-query Stage-0 guard but BEFORE the mocked
+# collaborators run — so any test that drives it with a NON-empty query raises "No LLM
+# credentials" and needs a key. The empty-query / docstring cases short-circuit before the
+# preflight and are hermetic, so they were UN-marked (moved back into the CI set). The
+# firecrawl re-entry quality-gate tests LOOKED hermetic in a local "no-creds" run, but that
+# was ambient-credential leakage (real keys reachable on the dev box -> the gate silently ran a
+# REAL judge LLM). On CI (guaranteed no creds) all 7 fail — CI is the ground truth for this
+# classification, so they are marked integration by exact name.
 _INTEGRATION_NAMES = {
+    # test_mcp_server.py — search_papers get_llm() preflight (non-empty query).
+    "test_search_malformed_intent_returns_error",
+    "test_search_ingest_gate_and_minimal_records",
+    "test_search_ingest_plugs_reject_egu_abstract_and_contentless_stub",
+    "test_search_fair_share_no_term_starved",
+    "test_search_rrf_consensus_floats_up_niche_still_surfaces",
+    "test_search_judge_drop_is_not_fail_open",
+    "test_search_sort_secondary_by_recency",
+    "test_search_sort_secondary_by_importance",
+    "test_search_judge_batches_dropped_zero_when_healthy",
+    "test_search_ingest_upsert_passes_no_llm",
+    # test_firecrawl_quality_gate.py — the re-entry gate drives a live judge LLM.
     "test_firecrawl_reentry_historical_md_passes_gate_stays_ok",
     "test_firecrawl_reentry_historical_stub_fails_gate_is_deleted_terminal",
     "test_firecrawl_reentry_historical_stub_no_abstract_to_failed",
@@ -58,10 +79,7 @@ def pytest_collection_modifyitems(config, items):
         if mod in _INTEGRATION_MODULES:
             item.add_marker(pytest.mark.integration)
             continue
-        if item.name in _INTEGRATION_NAMES:
+        # Match on the base function name so a future @parametrize can't silently unmark.
+        base_name = getattr(item, "originalname", None) or item.name
+        if base_name in _INTEGRATION_NAMES:
             item.add_marker(pytest.mark.integration)
-            continue
-        for prefix in _INTEGRATION_NAME_PREFIXES.get(mod, ()):
-            if item.name.startswith(prefix):
-                item.add_marker(pytest.mark.integration)
-                break

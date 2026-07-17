@@ -571,6 +571,7 @@ async def _ensure_paper_in_lib(identifier: str,
 
 def build_server(library_path: Optional[str] = None,
                  *,
+                 mcp: Optional[FastMCP] = None,
                  library: Optional[Library] = None,
                  download_queue: Optional[DownloadQueue] = None,
                  extract_queue: Optional[ExtractQueue] = None,
@@ -624,7 +625,10 @@ def build_server(library_path: Optional[str] = None,
     resolver_svc = ResolverService(library)
     search_svc = SearchService(library)
 
-    mcp = FastMCP("paper-library", instructions="""
+    # When composed into the unified papervault server, tools register onto the passed-in
+    # instance (which owns the combined instructions); standalone, build our own.
+    if mcp is None:
+        mcp = FastMCP("paper-library", instructions="""
 paper-library is your literature library — the raw papers themselves. (Sister service:
 knowledge-system / KS gives you DIGESTED knowledge; paper-library gives you the PAPERS.)
 Find papers and read their full text. Adding papers to the library happens for you
@@ -657,10 +661,7 @@ will NOT progress — ``"extract_failed"`` (a PDF is on disk but extraction gave
 full text, but citable DOI/title/authors/year/abstract). ``abstract`` rides in the record either
 way — only ``pending`` is worth re-polling.
 
-BibTeX rendering and \\cite validation are NOT MCP tools — run the ``paper-library`` CLI for
-those (e.g. wired into your manuscript build / ship gate).
-
-Design: services/paper-library/PAPER_LIBRARY_SDD.md
+BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervault`` CLI for those.
 """.strip())
 
     # Stash references on the server so __main__ / tests can manage lifecycle

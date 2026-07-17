@@ -113,6 +113,12 @@ async def get_graph() -> LightRAG:
     # sentinel) and build-time-only (takes effect only on the next BUILD, not queries).
     apply_ks_extraction_prompt(examples=True, exclusions=True)
 
+    # 1.4.16-parity keyword-extraction prompt (issue #4 residual): restore the rich
+    # 3-example few-shot set 1.5.x gutted. KS_KW_PROMPT_COMPAT=0 reverts to stock.
+    from papervault.knowledge.store.kw_prompt_compat import apply_kw_prompt_compat
+
+    apply_kw_prompt_compat()
+
     # Build-plane LLM (2026-07-16, user call): LightRAG-internal calls — entity/relation
     # extraction at ainsert (the token sink: 2 calls/chunk × ~10-13k tok) plus its small
     # query-path keyword extraction — run on the CHEAP deployment with thinking ON; pro
@@ -179,6 +185,14 @@ async def get_graph() -> LightRAG:
         # V1 (SDD §6.9.1): wire the bge-reranker-v2-m3 rerank path. Without rerank_model_func,
         # LightRAG's enable_rerank=True default (base.py:160) silently no-ops (F18). lazy-loaded.
         rerank_model_func=_bge_rerank,
+        # LightRAG 1.5.x wraps rerank_model_func in its own worker pool with a per-call
+        # timeout (upstream default 30s, worker cap 2x=60s). On a co-rented GPU a facet
+        # rerank of a 200-320-chunk pool under 5-way facet concurrency legitimately runs
+        # 40-120s+ — at the upstream default 3/5 facets TIME OUT and LightRAG silently
+        # fail-opens to UNRERANKED order ("using original chunks"), which cost -6.8pp
+        # distinct-paper recall in the 2026-07-17 equivalence eval (issue #4 root cause).
+        # 480s mirrors the extraction-worker patience; env-overridable via upstream's name.
+        default_rerank_timeout=int(os.getenv("RERANK_TIMEOUT", "480")),
         # Pin 0.0 explicitly: rerank only REORDERS chunks, never drops by absolute score
         # (process_chunks_unified filters only when min_rerank_score > 0.0; F20). Default is
         # already 0.0 but the env MIN_RERANK_SCORE could drift it → kill niche-query chunks.

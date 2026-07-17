@@ -6,8 +6,10 @@ demonstration of keyword count/richness, thinning the base-arm hl/ll keywords th
 KG (entity/relation) retrieval arms. This module restores the 1.4.16 strings VERBATIM
 (extracted programmatically from lightrag 1.4.16, never hand-typed).
 
-Applied by get_graph() when KS_KW_PROMPT_COMPAT=1 (default 1; set 0 to fall back to the
-1.5.x stock prompt)."""
+Applied by get_graph() when KS_KW_PROMPT_COMPAT=1 — DEFAULT 0 (OFF): the frozen-window
+arbitration (2026-07-18, issue #4) showed the 1.5.4 stock keyword prompt WINS (frozen arm
+E' 0.8568 with compat off; drift-tainted arm F 0.7798 with it on). Kept as an experiment
+knob only."""
 from __future__ import annotations
 
 import os

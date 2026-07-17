@@ -44,5 +44,5 @@ An industrial-grade, self-hosted literature + knowledge layer for coding agents 
 - Grey-zone download tiers (Sci-Hub, Anna's Archive, anti-bot scraping) ship flag-gated and disabled by default (ADR-0004).
 
 ## Release plan
-- **v1 = closed beta** for the originating research group (all space physics); repo stays private, group members install from it directly.
-- **Open testing** follows: the repo flips public. The flip is gated by the secrets/legal/PII audit in DoD #7 — it is a release step, not a formality.
+- **v1 = closed beta** for the originating research group (all space physics); repo stays private, group members install from it directly. Beta ships with the grey download tiers enabled in config (ADR-0004 amendment).
+- **Open testing** follows: the repo flips public. The flip is gated by the secrets/legal/PII audit in DoD #7 **and** by reverting the beta's grey-tier shipped config to disabled-by-default (ADR-0004) — release steps, not formalities.

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from papervault.library import Library, Paper, base_key
+from papervault.library import Library, base_key
 from papervault.library.cite_check import check, extract_cite_keys
 
 

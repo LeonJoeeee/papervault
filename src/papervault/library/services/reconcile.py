@@ -148,7 +148,6 @@ async def _resolve_one(title: str, authors: list, year) -> tuple[str, str]:
     network/HTTP failure. To keep the miss-vs-transient split (load-bearing for
     the termination guard) we wrap the candidate fetch: a None from a SUCCESSFUL
     query is a miss (stamp), a None from a FAILED query is transient (retry)."""
-    from .. import fetch
     async with _resolve_sem:
         def _call():
             # Re-run the conservative resolver, but split miss vs transient by

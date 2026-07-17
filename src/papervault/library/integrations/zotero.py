@@ -37,9 +37,8 @@ Usage::
 from __future__ import annotations
 
 import logging
-import os
 import re
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 from ..models import Paper
 from ..store import Library

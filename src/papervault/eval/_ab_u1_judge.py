@@ -8,7 +8,7 @@ faithful. Same gateway/model as the downstream judge (judge_mimo); needs KS_VIRT
 Usage:  set -a; . ./.env; set +a
         uv run python experiments/eval/_ab_u1_judge.py /tmp/u1_new.jsonl
 """
-import asyncio, json, os, re, sys
+import asyncio, json, os, sys
 
 GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
 VKEY = os.getenv("KS_VIRTUAL_KEY", "")

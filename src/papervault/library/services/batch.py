@@ -17,7 +17,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Callable, Iterable, Optional
 
 from ..download import download_paper
-from ..models import DOWNLOAD_STATUS_FAILED, DOWNLOAD_STATUS_OK
+from ..models import DOWNLOAD_STATUS_OK
 from ..store import Library
 from .add_service import AddService
 

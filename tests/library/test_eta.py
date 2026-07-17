@@ -1,7 +1,6 @@
 """Unit tests for the ETA estimator (D14)."""
 from __future__ import annotations
 
-import pytest
 
 from papervault.library import Library
 from papervault.library.services.download_queue import DownloadQueue

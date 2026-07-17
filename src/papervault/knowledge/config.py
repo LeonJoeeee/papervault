@@ -9,7 +9,7 @@ Anthropic kept as optional fallback for Phase 3+ idea curator.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from papervault import config as _pv  # importing loads the single .env (side effect)
 

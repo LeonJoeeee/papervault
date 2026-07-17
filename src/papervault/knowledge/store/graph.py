@@ -122,10 +122,10 @@ async def get_graph() -> LightRAG:
     #   KS_BUILD_MODEL=mimo-v2.5-pro  → revert model
     #   KS_BUILD_THINKING=0           → stop forwarding enable_thinking
     #   KS_KW_THINKING=0              → enable_thinking=False for the query-path
-    #       keyword-extraction call ONLY (LightRAG tags it keyword_extraction=True,
-    #       operate.py:3465). It is a mechanical task measured burning ~67s of reasoning
-    #       CoT (2026-07-16). Default 1 = today's behavior; the knob exists so the FAST
-    #       recall A/B can arbitrate before any flip (issue #3).
+    #       keyword-extraction call ONLY (on LightRAG 1.5.x that call is the one carrying
+    #       response_format — see the branch below). It is a mechanical task measured
+    #       burning ~67s of reasoning CoT (2026-07-16). Default 1 = today's behavior; the
+    #       knob exists so a FAST recall A/B can arbitrate before any flip.
     async def _build_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
         kwargs.setdefault("model", os.getenv("KS_BUILD_MODEL") or _pv.BUILD_MODEL)
         # LightRAG 1.5.x no longer tags the query-path keyword-extraction call with

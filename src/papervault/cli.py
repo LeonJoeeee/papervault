@@ -102,6 +102,20 @@ def _check_databases(r: _Report) -> None:
         pg = PostgresConfig.from_env()
         with psycopg.connect(pg.dsn, connect_timeout=5):
             r.ok("postgres", f"{pg.host}:{pg.port}/{pg.db} (user={pg.user})")
+        # LightRAG's PG storage reads POSTGRES_DATABASE (config.py bridges it FROM
+        # POSTGRES_DB when unset). If the two diverge — explicit POSTGRES_DATABASE, or a
+        # bare env with neither set (LightRAG then falls back to 'postgres') — the graph
+        # KV/vector/doc_status store silently targets a DIFFERENT database than the
+        # ledger doctor just verified. Surface it (review F2).
+        store_db = os.environ.get("POSTGRES_DATABASE", "")
+        if not store_db:
+            r.warn("postgres (graph store)",
+                   "POSTGRES_DATABASE unset and POSTGRES_DB missing → LightRAG will use "
+                   "db 'postgres', splitting the graph store from the ledger db")
+        elif store_db != pg.db:
+            r.warn("postgres (graph store)",
+                   f"POSTGRES_DATABASE={store_db!r} != POSTGRES_DB={pg.db!r} — graph "
+                   "store and ledger live in DIFFERENT databases (ok only if intentional)")
     except Exception as e:  # noqa: BLE001
         r.fail("postgres", str(e).splitlines()[0] if str(e) else type(e).__name__)
     # Neo4j
@@ -317,6 +331,12 @@ async def _smoke_server_phase(full: bool) -> list[tuple[bool, str]]:
             child_env["PAPERVAULT_VAULT"] = vault
             child_env["PAPERVAULT_STORAGE"] = str(Path(tmp) / "knowledge_store")
             child_env.pop("PAPER_LIBRARY_PATH", None)   # legacy real-vault fallback
+            # Isolate the GRAPH STORE too, not just the filesystem vault (review F1): the
+            # smoke child must never run a second scheduler against the host's live
+            # Neo4j/PG workspace. The tool phase needs no scheduler and no graph.
+            child_env["KS_AUTO_INGEST_ENABLED"] = "false"
+            child_env["NEO4J_WORKSPACE"] = "papervault_smoke"
+            child_env["POSTGRES_WORKSPACE"] = "papervault_smoke"
             params = StdioServerParameters(
                 command=sys.executable,
                 args=["-m", "papervault.mcp", "--stdio", "--library-path", vault],

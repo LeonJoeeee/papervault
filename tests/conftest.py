@@ -33,6 +33,17 @@ _INTEGRATION_MODULES = {
 _INTEGRATION_NAME_PREFIXES = {
     "test_mcp_server": ("test_search_",),   # search_papers → live intent-parser LLM
 }
+# Exact test names that invoke a live LLM (the firecrawl re-entry quality gate) inside an
+# otherwise-unit module. These pass locally only when ambient LLM creds happen to be present.
+_INTEGRATION_NAMES = {
+    "test_firecrawl_reentry_historical_md_passes_gate_stays_ok",
+    "test_firecrawl_reentry_historical_stub_fails_gate_is_deleted_terminal",
+    "test_firecrawl_reentry_historical_stub_no_abstract_to_failed",
+    "test_firecrawl_reentry_gates_body_not_frontmatter",
+    "test_firecrawl_reentry_gate_failopen_keeps_md",
+    "test_firecrawl_reentry_pass_stamps_pdf_hunt_exhausted",
+    "test_firecrawl_reentry_failopen_stamps_exhausted_no_reloop",
+}
 
 
 def pytest_configure(config):
@@ -45,6 +56,9 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         mod = item.module.__name__.rsplit(".", 1)[-1]
         if mod in _INTEGRATION_MODULES:
+            item.add_marker(pytest.mark.integration)
+            continue
+        if item.name in _INTEGRATION_NAMES:
             item.add_marker(pytest.mark.integration)
             continue
         for prefix in _INTEGRATION_NAME_PREFIXES.get(mod, ()):

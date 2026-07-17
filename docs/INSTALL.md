@@ -25,10 +25,9 @@ $EDITOR .env          # set PAPERVAULT_LLM_*, PAPERVAULT_MODEL, POSTGRES/NEO4J p
 # 3. Backing stores (Postgres + Neo4j)
 docker compose -f deploy/docker-compose.yml up -d
 
-# 4. Install papervault (add extras as needed)
-uv venv && uv pip install -e .          # core
-#   uv pip install -e ".[mineru]"       # + local OCR (heavy; recommended)
-#   uv pip install -e ".[grey]"         # + shadow-library / anti-bot download tiers (see ADR-0004)
+# 4. Install papervault (beta-standard: core + local OCR + grey download tiers)
+uv venv && uv pip install -e ".[mineru,grey]"
+#   uv pip install -e .                 # minimal core (no OCR, OA-only downloads)
 
 # 5. Preflight — verify GPU, databases, LLM config, domain pack
 papervault doctor
@@ -67,6 +66,10 @@ is your responsibility.
 
 ## Grey-zone download tiers
 
-Shadow libraries (Sci-Hub, Anna's Archive) and anti-bot scraping tiers are **off
-by default** and not installed unless you add the `grey` extra. Enabling them is
-your own legal decision — see [ADR-0004](adr/0004-grey-download-tiers-flag-gated.md).
+Shadow libraries (Sci-Hub, Anna's Archive) and anti-bot scraping tiers are
+**enabled in the beta posture**: the standard install includes the `grey` extra and
+`.env.example` ships `PAPER_PIPELINE_USE_SCIHUB=1`. Running them is still your own
+legal decision — comment the flag out (and skip the extra) to opt out. Anna's
+Archive additionally requires a personal member key (`ANNAS_ARCHIVE_API_KEY`).
+Before the repo flips public, this shipped default reverts to OFF — see
+[ADR-0004](adr/0004-grey-download-tiers-flag-gated.md) and its amendment.

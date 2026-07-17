@@ -82,6 +82,9 @@ packages = ["src/papervault"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: requires GPU / Postgres / Neo4j / network / a live LLM (excluded from CI)",
+]
 
 [tool.ruff]
 line-length = 100

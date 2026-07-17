@@ -44,6 +44,7 @@ from typing import Any
 from lightrag import QueryParam
 
 from papervault import config as _pv_config
+from papervault.domain import get_domain
 from papervault.knowledge.query import aquery as aq
 from papervault.knowledge.store.llm import mimo_complete
 
@@ -138,7 +139,8 @@ retrieval (no further extraction), so make them precise and discriminating."""
 # search_terms to KS's {query, hl, ll} shape so each retrieval skips its own LLM keyword extraction.
 _STD_DECOMPOSE_SYSTEM = (
     "You decompose a researcher's information need into focused retrieval facets for a graph + "
-    "vector literature knowledge base, working in **space physics + AI4Science**. You output ONLY "
+    # domain label from the active domain pack (ADR-0003, papervault.domain)
+    f"vector literature knowledge base, working in **{get_domain().label}**. You output ONLY "
     "a JSON array, nothing else."
 )
 _STD_DECOMPOSE_PROMPT = """Information need:

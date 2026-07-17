@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Ruff
+        run: |
+          uv venv
+          uv pip install ruff
+          uv run ruff check src tests
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - name: Install (CPU torch — CI has no GPU)
+        env:
+          # Pull the CPU-only torch build so CI stays lean and GPU-free.
+          UV_TORCH_BACKEND: cpu
+        run: |
+          uv venv --python 3.12
+          uv pip install -e ".[dev]"
+          uv pip install pytest-timeout
+      - name: Unit tests (no GPU / DB / network)
+        run: |
+          uv run pytest -m "not integration" -p no:cacheprovider \
+            --timeout=60 --timeout-method=thread -q
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+      - name: Build sdist + wheel
+        run: |
+          uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/*

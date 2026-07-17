@@ -15,6 +15,9 @@ corpus, so the harness splits into what CI can prove and what only reference har
 - **Reference machine (manual gate):** the end-to-end recall run against a real corpus:
 
   ```bash
+  # The harness runs only against the reserved eval workspace 'l0_probe' (a prod-safety
+  # gate). Point BOTH workspace envs at it for the run, or run_eval aborts.
+  export NEO4J_WORKSPACE=l0_probe POSTGRES_WORKSPACE=l0_probe
   python -m papervault.eval.run_eval --gold src/papervault/eval/gold_fast.jsonl \
       --tag mytag --variant multiquery --concurrency 4
   ```
@@ -22,6 +25,12 @@ corpus, so the harness splits into what CI can prove and what only reference har
   This needs the full stack up (`papervault serve` + GPU + databases + a populated vault) and
   an LLM endpoint. It is the gate you run before shipping a change that could move retrieval
   quality (reranker dtype, chunking, decompose prompts, model routing).
+
+  **Workspace gate.** `run_eval` hard-aborts unless `NEO4J_WORKSPACE == POSTGRES_WORKSPACE ==
+  'l0_probe'` (or `'l0'` with `KS_ALLOW_PROD_WORKSPACE=1`, a read-only baseline against a
+  production graph). These names are fixed in the harness — your serving workspace (e.g. the
+  `main` shipped in `.env.example`) is **not** accepted, so set the eval workspace explicitly as
+  above and populate it with the corpus you want scored.
 
 ## Gold sets
 
@@ -35,3 +44,31 @@ Retrieval-affecting changes are flag-gated and benchmark-arbitrated: run the sam
 before and after, same day (the corpus drifts as auto-ingest runs), and only flip the default
 if the recall delta clears the measured noise floor. This is how the reranker fp16 flip and the
 build-model switch were decided upstream.
+
+## Retrieval tuning knobs (benchmark-arbitrated)
+
+The query path is tuned by a family of environment variables — exactly the levers the
+arbitration discipline above governs. Change one, re-run the same gold + config before and
+after, and keep it only if the recall delta clears the measured noise floor. Defaults below are
+the shipped values.
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `KS_QUERY_VARIANT` | `multiquery` | Retrieval variant selector (the shipped path). |
+| `KS_TOP_K` | `100` | Entity/relation top-k pulled from the graph. |
+| `KS_CHUNK_TOP_K` | `60` | Chunk top-k pulled for context. |
+| `KS_MAX_TOTAL_TOKENS` | `300000` | Hard context-token budget for the assembled prompt. |
+| `KS_MQ_N_SUBQ` | `5` | Sub-queries the decomposer fans a question into. |
+| `KS_MQ_RRF_K` | `60` | Reciprocal-rank-fusion constant when merging sub-query hits. |
+| `KS_MQ_SUB_CHUNK_TOP_K` | `60` | Chunk top-k per sub-query before fusion. |
+| `KS_MQ_ENABLE_RERANK` | `true` | Rerank the fused chunk set on the GPU. |
+| `KS_MQ_MAX_CHUNKS_PER_PAPER` | `0` | Per-paper chunk cap (`0` = no cap; raise to diversify served papers). |
+| `KS_MQ_MIN_COVERAGE` | `thin` | Coverage-gate floor before synthesis. |
+| `KS_MQ_CITATION_PRIOR` | `0` | Citation-count prior on fused ranking (`0` = off). |
+| `KS_MQ_CITATION_LAMBDA` | `0.5` | Weight of the citation prior when it is on. |
+| `KS_MQ_FANOUT` | `1` | Adaptive fan-out on/off (`KS_MQ_FANOUT_MAX`=100, `KS_MQ_FANOUT_SLOPE`=7 shape it). |
+| `KS_SYNTH_STRICT_REFUSAL` | `1` | Refuse to answer on thin/absent evidence (`0` = permissive). |
+| `KS_SYNTH_COVERAGE` | `0` | Coverage-oriented synthesis variant (`1` = on). |
+
+Changing any of these is a retrieval-affecting change: it must clear the eval noise floor before
+you flip the default.

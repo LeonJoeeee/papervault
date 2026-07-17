@@ -1,4 +1,4 @@
-"""paper-library CLI.
+"""papervault library operator CLI (``python -m papervault.library.cli``).
 
 Subcommands are thin wrappers around the services + Library API. Keep each
 handler focused (≤30 lines); business logic stays in the modules they call.
@@ -36,7 +36,7 @@ def _json(obj) -> None:
 
 
 def cmd_add(args) -> int:
-    """`paper-library add <ident>` — enqueue one paper for background ingest.
+    """`python -m papervault.library.cli add <ident>` — enqueue one paper for background ingest.
 
     D11: this only resolves + caches the metadata card and drops it onto the
     daemon's download queue (status ``queued``); the PDF download + OCR happen
@@ -65,7 +65,7 @@ def cmd_add(args) -> int:
 
 
 def cmd_add_batch(args) -> int:
-    """`paper-library add-batch <file>` — one identifier per line, concurrent."""
+    """`python -m papervault.library.cli add-batch <file>` — one identifier per line, concurrent."""
     from .services.batch import BatchAddService
 
     if args.file == "-":
@@ -93,7 +93,7 @@ def cmd_add_batch(args) -> int:
 
 
 def cmd_list(args) -> int:
-    """`paper-library list [filters]` — tabular library view."""
+    """`python -m papervault.library.cli list [filters]` — tabular library view."""
     lib = Library()
 
     def keep(p) -> bool:
@@ -128,7 +128,7 @@ def cmd_list(args) -> int:
 
 
 def cmd_search(args) -> int:
-    """`paper-library search <query>` — in-library search with optional LLM rerank."""
+    """`python -m papervault.library.cli search <query>` — in-library search with optional LLM rerank."""
     from .services.search_service import SearchService
 
     lib = Library()
@@ -149,7 +149,7 @@ def cmd_search(args) -> int:
 
 
 def cmd_show(args) -> int:
-    """`paper-library show <key>` — full metadata for one paper."""
+    """`python -m papervault.library.cli show <key>` — full metadata for one paper."""
     lib = Library()
     p = lib.get(args.key)
     if p is None:
@@ -165,7 +165,7 @@ def cmd_show(args) -> int:
 
 
 def cmd_read(args) -> int:
-    """`paper-library read <key>` — print extracted text."""
+    """`python -m papervault.library.cli read <key>` — print extracted text."""
     lib = Library()
     if lib.get(args.key) is None:
         _err(f"no paper with key {args.key!r}")
@@ -186,7 +186,7 @@ def cmd_read(args) -> int:
 
 
 def cmd_bibtex(args) -> int:
-    """`paper-library bibtex` — export BibTeX (full library or subset)."""
+    """`python -m papervault.library.cli bibtex` — export BibTeX (full library or subset)."""
     lib = Library()
     keys = None
     if args.keys:
@@ -205,7 +205,7 @@ def cmd_bibtex(args) -> int:
 
 
 def cmd_cite_check(args) -> int:
-    """`paper-library cite-check <file.tex>` — validate \\cite keys."""
+    """`python -m papervault.library.cli cite-check <file.tex>` — validate \\cite keys."""
     from . import cite_check
 
     tex_path = Path(args.tex_file)
@@ -415,7 +415,7 @@ def _stub_filter_match(p, spec: str) -> bool:
 
 
 def cmd_audit(args) -> int:
-    """`paper-library audit [--fix] [--queue] [--retry-failed] [--retry-low-quality] [--retry-metadata-only]` — index/disk + BG queue.
+    """`python -m papervault.library.cli audit [--fix] [--queue] [--retry-failed] [--retry-low-quality] [--retry-metadata-only]` — index/disk + BG queue.
 
     Default (no action flag) runs the drift/dangling/orphan scan. Each of the
     action flags (``--fix``, ``--queue``, ``--retry-failed``,
@@ -448,7 +448,7 @@ def cmd_audit(args) -> int:
         payload["reset_count"] = reset_count
         if not args.json:
             print(f"reset {reset_count} papers from failed → pending")
-            print("they will be retried at next paper-library-mcp startup")
+            print("they will be retried at next papervault-mcp startup")
 
     # ---- retry-low-quality (D7/D9): reset extract_failed → ok with
     # extract_attempts cleared, so the extract_queue recovery scan
@@ -474,7 +474,7 @@ def cmd_audit(args) -> int:
             print(f"reset {reset_count} papers from extract_failed → ok "
                   f"(attempts cleared)")
             print("extract_queue recovery will re-run them at next "
-                  "paper-library-mcp startup")
+                  "papervault-mcp startup")
 
     # ---- retry-metadata-only: reset SCOPED metadata_only → pending so a
     # restart re-enqueues them through the (now Sci-Hub-on) download cascade.
@@ -520,7 +520,7 @@ def cmd_audit(args) -> int:
                 print(f"  {key}")
             if len(reset_keys) > 20:
                 print(f"  (+{len(reset_keys) - 20} more)")
-            print("they will be retried at next paper-library-mcp startup")
+            print("they will be retried at next papervault-mcp startup")
 
     # ---- resolve-stub-dois: give no-DOI in-domain stubs a DOI by title.
     # SAFETY: --dry-run is the DEFAULT (write only when --no-dry-run is passed).
@@ -628,11 +628,11 @@ def cmd_audit(args) -> int:
 
 
 def cmd_status(args) -> int:
-    """`paper-library status` — single-screen library + queue snapshot.
+    """`python -m papervault.library.cli status` — single-screen library + queue snapshot.
 
     Concise alternative to ``audit --queue``: focuses on "is the system
     healthy, and what just happened" rather than the full state-machine
-    breakdown. Designed for ``watch -n 60 paper-library status`` style use.
+    breakdown. Designed for ``watch -n 60 python -m papervault.library.cli status`` style use.
     """
     lib = Library()
     papers = lib.all_papers()
@@ -743,13 +743,13 @@ def cmd_status(args) -> int:
             ident = p.doi or p.arxiv_id or "?"
             print(f"  ✗ {p.key:<22} {ident}")
         if failed_count > 5:
-            print(f"  (+{failed_count - 5} more — see `paper-library audit --queue`)")
+            print(f"  (+{failed_count - 5} more — see `python -m papervault.library.cli audit --queue`)")
 
     return 0
 
 
 def cmd_topics(args) -> int:
-    """`paper-library topics list|show <slug>` — topic membership inspection."""
+    """`python -m papervault.library.cli topics list|show <slug>` — topic membership inspection."""
     lib = Library()
     if args.topic_command == "list":
         slugs = sorted(p.stem for p in lib.topics_dir.glob("*.json"))
@@ -767,7 +767,7 @@ def cmd_topics(args) -> int:
 
 
 def cmd_config(args) -> int:
-    """`paper-library config` — print effective config."""
+    """`python -m papervault.library.cli config` — print effective config."""
     lib = Library()
     info = {
         "library_root": str(lib.root),
@@ -784,7 +784,7 @@ def cmd_config(args) -> int:
 
 
 def cmd_zotero_sync(args) -> int:
-    """`paper-library zotero-sync` — push metadata to Zotero user library.
+    """`python -m papervault.library.cli zotero-sync` — push metadata to Zotero user library.
 
     Reads ZOTERO_API_KEY + ZOTERO_USER_ID from env (or .env if loaded).
     Metadata-only: no file uploads (300 MB Zotero quota would saturate at
@@ -837,7 +837,7 @@ def _version() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="paper-library",
+        prog="python -m papervault.library.cli",
         description="Personal academic paper library — manage your local store",
     )
     p.add_argument("--library-path", help="override $PAPER_LIBRARY_PATH for this invocation")

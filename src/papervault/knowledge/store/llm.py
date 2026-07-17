@@ -1,7 +1,7 @@
 """MiMo (Xiaomi) LLM wrapper for LightRAG — central hot-reloaded key pool (2026-06-02).
 
-Design: research/docs/llm-key-pool.md ("给 KS 的实现契约"). pl and KS share ONE key
-file (``research/llm_keys.json``, overridable via ``LLM_KEYS_FILE``) — a JSON array of
+pl and KS share ONE central key file (``PAPERVAULT_LLM_KEYS`` / legacy
+``LLM_KEYS_FILE``, default ``<data>/llm_keys.json``) — a JSON array of
 ``{model, api_key, base_url}`` groups, optionally ``disabled``. Each ``mimo_complete``:
   * HOT-READS the file if its mtime changed (edit the file → next call sees it, no
     restart — add a group to add a key, delete/``disabled`` a group to drop one);

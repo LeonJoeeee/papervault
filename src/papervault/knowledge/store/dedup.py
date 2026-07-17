@@ -1,6 +1,6 @@
 """Surface-form entity de-duplication for the KS graph — the corrected, type-aware Route B sweep.
 
-Background (decision doc research/docs/history/2026-06-06-entity-dedup-sweep.md §9-§11): LightRAG keys entities by
+Background (2026-06-06 entity-dedup-sweep decision, §9-§11): LightRAG keys entities by
 the case/whitespace/hyphen-preserving name, so surface variants ("Physics-Informed Neural Network" vs
 "Physics Informed Neural Network" vs "PINN") become distinct nodes. A naive blind merge by normalized key
 is UNSAFE — it fused distinct entities that collide by case (NUCLEON-experiment vs Nucleon-particle,

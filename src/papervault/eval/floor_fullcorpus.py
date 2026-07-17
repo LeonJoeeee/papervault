@@ -5,7 +5,7 @@ The full-corpus analogue of recompute_baseline.py: 3 identical baseline repeats
 tightened contract → per-run headline → run-level noise floor (stats.noise_floor run_mean_sd).
 Pure aggregation over persisted artifacts (no re-run, no LLM).
 
-  uv run python experiments/eval/floor_fullcorpus.py
+  python -m papervault.eval.floor_fullcorpus
 """
 from __future__ import annotations
 

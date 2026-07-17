@@ -1,7 +1,7 @@
 """Zotero Web API sync — push paper-library metadata + abstracts to a
 Zotero user library.
 
-Design choices (see CLAUDE.md "Zotero integration" section):
+Design choices:
 
   * **Metadata + abstract only.** Zotero Web API has no concept of
     linked-file attachments to arbitrary local paths (the JSON schema

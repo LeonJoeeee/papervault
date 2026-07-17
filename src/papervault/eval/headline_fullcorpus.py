@@ -3,7 +3,7 @@
 Single-run (1-seed protocol) analogue of recompute_baseline.py, for tag=fullcorpus_baseline over
 gold_v2.jsonl (39 answerable + 9 traps). No re-run, no LLM — pure aggregation over persisted data.
 
-  uv run python experiments/eval/headline_fullcorpus.py
+  python -m papervault.eval.headline_fullcorpus
 """
 from __future__ import annotations
 

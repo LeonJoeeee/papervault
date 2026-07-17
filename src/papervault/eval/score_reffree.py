@@ -10,7 +10,7 @@ precision_judge.md §7 (via metric_reffree.validate_precision_json), and prints:
     a partial fan-out can NEVER be silently read as "scored everything" (no-silent-caps).
 
 Run (after build_reffree_prompts precision <tag> + the judge fan-out land the seed0.json files):
-  uv run python experiments/eval/score_reffree.py <tag> [--intents intents_v1.jsonl] [--seed 0]
+  python -m papervault.eval.score_reffree <tag> [--intents intents_v1.jsonl] [--seed 0]
 """
 from __future__ import annotations
 

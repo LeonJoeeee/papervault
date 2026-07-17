@@ -6,12 +6,15 @@ service for all consumer projects on this machine. ``--stdio`` is
 retained for clients that spawn the server as a subprocess (Claude
 Desktop / Cursor's MCP integration).
 
+This standalone library server has no console-script entry point; run it as a module.
+The unified 3-tool server is ``papervault-mcp`` / ``papervault serve``.
+
 Usage::
 
-    paper-library-mcp                       # streamable-http on 127.0.0.1:8765
-    paper-library-mcp --port 9999           # streamable-http on a different port
-    paper-library-mcp --host 0.0.0.0        # bind all interfaces (cross-machine)
-    paper-library-mcp --stdio               # subprocess transport for Claude Desktop
+    python -m papervault.library.mcp                 # streamable-http on 127.0.0.1:8765
+    python -m papervault.library.mcp --port 9999     # streamable-http on a different port
+    python -m papervault.library.mcp --host 0.0.0.0  # bind all interfaces (cross-machine)
+    python -m papervault.library.mcp --stdio         # subprocess transport for Claude Desktop
 """
 
 from __future__ import annotations
@@ -37,8 +40,8 @@ async def _run_async(args, log):
     ✦ Phase 28 (2026-05-24, route B): the insight queue (3rd stage) was
     removed. paper-library is now a mechanical fetch/extract/MCP service;
     all 5-Q digest intelligence lives in the research-side ``librarian/``
-    curators. See ``services/paper-library/src/papervault.library/insight/
-    __init__.py`` for the read-side shim that preserves ``Paper.insight``
+    curators. See ``src/papervault/library/insight/__init__.py`` for the
+    read-side shim that preserves ``Paper.insight``
     deserialization for the ~800 legacy records on disk.
     """
     server = build_server(library_path=args.library_path)
@@ -92,7 +95,7 @@ async def _run_async(args, log):
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="paper-library-mcp")
+    parser = argparse.ArgumentParser(prog="python -m papervault.library.mcp")
     parser.add_argument("--stdio", action="store_true",
                         help="serve over stdio instead of streamable-http "
                              "(use for Claude Desktop / subprocess clients)")

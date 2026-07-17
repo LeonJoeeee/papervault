@@ -38,7 +38,7 @@ SYNTH_FAILED_PREFIX = "(synthesis LLM failed"
 # Retrieval still succeeded, so point the caller at cited_papers to pull the sources directly.
 _SYNTH_FAILED_MSG = (
     f"{SYNTH_FAILED_PREFIX}; the knowledge base did return relevant sources — "
-    "see cited_papers and pull them via paper-library get_full_text.)"
+    "see cited_papers and pull them via get_paper.)"
 )
 
 # MiMo is a REASONING model: it spends a large chain-of-thought budget BEFORE the visible

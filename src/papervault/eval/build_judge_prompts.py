@@ -8,7 +8,7 @@ output schema); it does NOT touch the live graph (all inputs are in the prompt).
 Fills ALL gold questions present in the run (incl. traps — the judge scores trap_correct_refusal;
 judge_aggregate drops traps from the quality tables but uses them for trap_correct_refusal_rate).
 
-Run:  uv run python experiments/eval/build_judge_prompts.py <tag>
+Run:  python -m papervault.eval.build_judge_prompts <tag>
 """
 from __future__ import annotations
 

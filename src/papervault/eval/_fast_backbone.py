@@ -6,7 +6,7 @@ recall, hallucinated_rate. These come from the retrieval (data.chunks[].paper_ke
 gold, so they're instant + judge-free. Use to FILTER retrieval levers (fcap/v3) on gold_fast.jsonl;
 the full tier (judge) is still required to PROMOTE (trap/nugget/cit_sp/faith).
 
-Usage:  uv run python experiments/eval/_fast_backbone.py <tag> [gold_fast.jsonl]
+Usage:  python -m papervault.eval._fast_backbone <tag> [gold_fast.jsonl]
         # compare two: ... _fast_backbone.py fast_fcapv2 ; ... _fast_backbone.py fast_fsdef
 """
 import json, statistics, sys

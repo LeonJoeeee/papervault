@@ -6,7 +6,7 @@ directly supported by the source chunk text, not an inferred or fabricated conne
 faithful. Same gateway/model as the downstream judge (judge_mimo); needs KS_VIRTUAL_KEY exported.
 
 Usage:  set -a; . ./.env; set +a
-        uv run python experiments/eval/_ab_u1_judge.py /tmp/u1_new.jsonl
+        python -m papervault.eval._ab_u1_judge /tmp/u1_new.jsonl
 """
 import asyncio, json, os, sys
 

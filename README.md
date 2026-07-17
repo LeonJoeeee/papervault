@@ -38,9 +38,9 @@ See [`docs/INSTALL.md`](docs/INSTALL.md) for the full walkthrough. In brief:
 ```bash
 cp .env.example .env          # then fill in your LLM endpoint + key + data dir
 docker compose -f deploy/docker-compose.yml up -d   # Neo4j + Postgres
-uv venv && uv pip install -e .                      # add [mineru] for local OCR
-papervault doctor             # verify GPU, databases, LLM endpoint
-papervault-mcp                # start the MCP server
+uv venv && uv pip install -e ".[mineru,grey]"       # beta standard: + local OCR + grey download tiers
+papervault doctor             # verify GPU, databases, LLM config
+papervault-mcp                # start the MCP server (== papervault serve)
 ```
 
 Then register the server with your agent (Claude Code: install the bundled plugin; other

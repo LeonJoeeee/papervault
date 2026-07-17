@@ -17,8 +17,8 @@ Two modes:
     B=variant chunks → judge/<variant_tag>__vs__<baseline_tag>/<qid>.prompt.txt.
 
 Run:
-  uv run python experiments/eval/build_reffree_prompts.py precision <tag>
-  uv run python experiments/eval/build_reffree_prompts.py pairwise  <baseline_tag> <variant_tag>
+  python -m papervault.eval.build_reffree_prompts precision <tag>
+  python -m papervault.eval.build_reffree_prompts pairwise  <baseline_tag> <variant_tag>
 
 Then fan out the Claude judge over every *.prompt.txt (one subagent call per file), writing the
 JSON next to it as <same-stem>.seed0.json (replays -> .seed1.json, ...). Score offline with

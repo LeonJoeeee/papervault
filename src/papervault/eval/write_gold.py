@@ -1,6 +1,6 @@
 """Validate `_gold_source.GOLD` against the FIXED test100 corpus, then write gold.jsonl.
 
-Run:  uv run python experiments/eval/write_gold.py
+Run:  python -m papervault.eval.write_gold
       (add --check to validate WITHOUT writing — useful in CI/pre-commit)
 
 Validation (loud failure on any violation — a bad gold file silently poisons every
@@ -21,7 +21,7 @@ a count of directly-answering papers — a single-paper question can legitimatel
 'strong' coverage if that one paper produces many graph entities (e.g. q-mishev-gle66-method).
 The only band rule is the trap rule: band=='empty' iff the question is a trap.
 
-Output: experiments/eval/gold.jsonl — one compact JSON object per line, fields in a
+Output: src/papervault/eval/gold.jsonl — one compact JSON object per line, fields in a
 stable order, qids written in GOLD order (already deduped). Re-running overwrites it.
 """
 from __future__ import annotations

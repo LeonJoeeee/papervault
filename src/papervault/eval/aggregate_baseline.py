@@ -4,7 +4,7 @@ construction) → aggregate the baseline: per-run headline + vector (headline.ru
 baseline = mean over the 3 runs, noise floor = stats.noise_floor over the 3 runs' headline
 tables, + trap_correct_refusal_rate. Prints the baseline report.
 
-Run:  uv run python experiments/eval/aggregate_baseline.py /tmp/.../<judge_workflow>.output
+Run:  python -m papervault.eval.aggregate_baseline /tmp/.../<judge_workflow>.output
 """
 from __future__ import annotations
 

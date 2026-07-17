@@ -4,7 +4,7 @@ judge_aggregate.validate passes) -> MERGE with the persisted existing-25 results
 -> per-run headline+vector over all 49 -> baseline mean + noise floor + trap_correct_refusal over
 all 10 traps. Read-only on the graph (operates on persisted results/judge).
 
-Run:  uv run python experiments/eval/full_baseline.py /tmp/.../<ks-judge-newq>.output
+Run:  python -m papervault.eval.full_baseline /tmp/.../<ks-judge-newq>.output
 """
 from __future__ import annotations
 

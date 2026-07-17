@@ -5,8 +5,8 @@ Reuses upstream_metrics' constants but works on l0 OR l0_probe (the prod sampler
   sample-u1:   write N U1 edges (relationship_description + source chunks) for the MiMo faithfulness judge.
 
 Usage:
-  uv run python experiments/eval/_ab_upstream.py guardrails l0_probe
-  uv run python experiments/eval/_ab_upstream.py sample-u1 l0_probe /tmp/u1_new.jsonl 120
+  python -m papervault.eval._ab_upstream guardrails l0_probe
+  python -m papervault.eval._ab_upstream sample-u1 l0_probe /tmp/u1_new.jsonl 120
 """
 import asyncio, collections, json, re, sys
 

@@ -13,9 +13,10 @@ or from the pl service dir:
 import json
 import os
 
+from papervault import config
 from papervault.library import Library
 
-OUT = os.getenv("KS_CITATION_MAP", "/home/leon/projects/dev/research/citation_map.json")
+OUT = os.getenv("KS_CITATION_MAP") or str(config.CITATION_MAP)
 
 
 def main() -> None:

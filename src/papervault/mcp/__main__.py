@@ -19,11 +19,42 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
 log = logging.getLogger("papervault.mcp")
+
+
+class _BearerAuthMiddleware:
+    """Pure-ASGI gate requiring ``Authorization: Bearer <token>`` on every HTTP request.
+
+    Wraps the streamable-http app ONLY when ``PAPERVAULT_MCP_TOKEN`` is set (non-empty).
+    It inspects the request headers on the incoming scope and short-circuits a 401 JSON
+    before the app runs — it never touches the response stream, so it's safe for the
+    server's SSE/streaming responses. Non-HTTP scopes (lifespan, websocket) pass straight
+    through, so the server-lifetime lifecycle is unaffected. Constant-time compare avoids
+    leaking the token via timing.
+    """
+
+    def __init__(self, app, token: str) -> None:
+        self._app = app
+        self._expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] == "http":
+            provided = dict(scope.get("headers") or {}).get(b"authorization", b"")
+            if not hmac.compare_digest(provided, self._expected):
+                body = (b'{"error":"unauthorized",'
+                        b'"detail":"missing or invalid bearer token"}')
+                await send({"type": "http.response.start", "status": 401,
+                            "headers": [(b"content-type", b"application/json"),
+                                        (b"content-length", str(len(body)).encode())]})
+                await send({"type": "http.response.body", "body": body})
+                return
+        await self._app(scope, receive, send)
 
 
 def main() -> int:
@@ -71,7 +102,17 @@ def main() -> int:
                 await shutdown_library()
 
     app.router.lifespan_context = _server_lifespan
-    config = uvicorn.Config(app, host=args.host, port=args.port, log_level=args.log_level.lower())
+
+    # Optional bearer-token auth (unset ⇒ byte-identical to prior behavior). The unified
+    # server binds loopback with no auth by default; a token lets an operator expose it on
+    # a trusted non-loopback address behind `Authorization: Bearer <token>`.
+    asgi_app = app
+    token = os.environ.get("PAPERVAULT_MCP_TOKEN", "").strip()
+    if token:
+        asgi_app = _BearerAuthMiddleware(app, token)
+        log.info("bearer-token auth ENABLED on the HTTP transport (PAPERVAULT_MCP_TOKEN set)")
+
+    config = uvicorn.Config(asgi_app, host=args.host, port=args.port, log_level=args.log_level.lower())
     uvicorn.Server(config).run()
     return 0
 

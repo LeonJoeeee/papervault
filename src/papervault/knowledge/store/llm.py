@@ -427,7 +427,10 @@ class KeyPool:
         # asked cheap (model="mimo-v2.5" or the legacy alias "mimo-cheap"). Ignore the per-key
         # _sdk_model map — the proxy owns key→deployment selection.
         requested = openai_kwargs.pop("model", None)
-        model = config.BUILD_MODEL if requested in (config.BUILD_MODEL, "cheap") else config.SYNTH_MODEL
+        # Strip any provider prefix (openai/<name>) before hitting the proxy: the gateway's
+        # model GROUP is the bare real name, and PAPERVAULT_MODEL may legitimately carry a
+        # litellm-form prefix (the library plane builds one). Mirrors the direct path's _sdk_model.
+        model = _sdk_model(config.BUILD_MODEL if requested in (config.BUILD_MODEL, "cheap") else config.SYNTH_MODEL)
 
         # Gateway owns retry + timeout (config.yaml request_timeout/num_retries/retry_policy), so
         # send NO per-request retry/timeout to the proxy. synth.py / multiquery.py pass timeout=…

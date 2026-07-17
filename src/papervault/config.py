@@ -33,6 +33,13 @@ def _load_env() -> Path | None:
 
 ENV_FILE = _load_env()
 
+# LightRAG's Postgres storage reads POSTGRES_DATABASE (defaulting to 'postgres'), while the
+# ingest ledger reads POSTGRES_DB — leave them unbridged and the knowledge graph's KV/vector/
+# doc_status store silently targets a DIFFERENT database than the ledger. Bridge them: the graph
+# store follows POSTGRES_DB unless the operator set POSTGRES_DATABASE explicitly.
+if os.environ.get("POSTGRES_DB") and not os.environ.get("POSTGRES_DATABASE"):
+    os.environ["POSTGRES_DATABASE"] = os.environ["POSTGRES_DB"]
+
 
 def _path(env: str, default: str) -> Path:
     return Path(os.path.expanduser(os.environ.get(env, default)))

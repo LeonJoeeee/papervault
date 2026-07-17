@@ -202,7 +202,10 @@ class Library:
         # is the last-resort default (its own env capture happened at import).
         from papervault import config
         env_root = os.environ.get("PAPERVAULT_VAULT") or os.environ.get("PAPER_LIBRARY_PATH")
-        self.root = Path(root or env_root or config.VAULT_PATH)
+        # expanduser the live env value: config.VAULT_PATH is already expanded, but a raw
+        # env read is not — a tilde path (the style .env.example ships) would otherwise
+        # become a literal cwd-relative './~/...' dir, diverging from what doctor reports.
+        self.root = Path(os.path.expanduser(str(root or env_root or config.VAULT_PATH)))
         self.bib_path = self.root / "library.bib"
         self.index_path = self.root / "index.json"
         # D14: the last known-good index, rotated in on every successful save.

@@ -5,8 +5,9 @@ We bypass the MCP HTTP layer for batch operations (massive throughput diff:
 disk read ~ms vs MCP HTTP round-trip ~100ms). Ad-hoc single-paper lookups go
 through paper-library's own MCP server (used by Executor/Reviewer LLMs, not by KS).
 
-KS depends on paper-library ONLY through this on-disk contract: the vault path
-(via $PAPER_LIBRARY_PATH, matching paper-library's own default) and the index.json
+The knowledge plane depends on the library plane ONLY through this on-disk contract:
+the vault path (papervault.config.VAULT_PATH — the SAME source the library plane
+writes through, so the co-hosted reader and writer always agree) and the index.json
 shape (version-checked on load, so a producer-side format change fails loud here
 instead of silently yielding empty records).
 """
@@ -14,7 +15,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,10 +22,14 @@ from typing import Any, Iterator, Optional
 
 logger = logging.getLogger("ks.ingest.paper_library_client")
 
-# Honor paper-library's own env var so the two services derive the same vault
-# root (paper-library is also driven by PAPER_LIBRARY_PATH); fall back to the
-# deployment convention path.
-DEFAULT_VAULT = Path(os.environ.get("PAPER_LIBRARY_PATH", "/data/paper-vault"))
+# Resolve the vault from the SAME source the library plane writes through
+# (papervault.config.VAULT_PATH: PAPERVAULT_VAULT -> legacy PAPER_LIBRARY_PATH ->
+# PAPERVAULT_DATA/vault, expanduser'd). In the unified single process the library
+# writer and this ingest reader MUST agree on the directory, or the scheduler reads
+# an empty/absent vault and the knowledge graph never populates.
+from papervault import config as _pv_config
+
+DEFAULT_VAULT = _pv_config.VAULT_PATH
 
 # paper-library writes index.json as {"version": 1, "papers": {...}}.
 _EXPECTED_INDEX_VERSION = 1

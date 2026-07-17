@@ -77,10 +77,16 @@ def _cited_papers(data: dict[str, Any]) -> list[str]:
             continue
         # Two coexisting formats: 1.4-built data stores 'paper/<key>' (the distill-side
         # prefix), while LightRAG 1.5.x normalizes file_path to its BASENAME at enqueue
-        # (pipeline 'canonical stored basename'), so fresh docs carry the bare key. The
-        # probe caught fresh-built docs vanishing from cited_papers under the old
-        # prefix-only rule — accept both, forever (mixed-era graphs are the normal state).
-        key = fp.split("/", 1)[1] if fp.startswith("paper/") else fp.rsplit("/", 1)[-1]
+        # (pipeline 'canonical stored basename'), so fresh docs carry the bare key — the
+        # probe caught fresh-built docs vanishing from cited_papers under the prefix-only
+        # rule. Accept both eras; any OTHER slash-prefixed source class (hypothetical
+        # textbook/, web/) keeps the old defensive exclusion.
+        if fp.startswith("paper/"):
+            key = fp.split("/", 1)[1]
+        elif "/" not in fp:
+            key = fp  # 1.5-era basename; our distill is the only writer, so this IS a key
+        else:
+            continue
         if key:
             keys.add(key)
     return sorted(keys)

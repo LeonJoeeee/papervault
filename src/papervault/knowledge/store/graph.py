@@ -113,6 +113,12 @@ async def get_graph() -> LightRAG:
     # sentinel) and build-time-only (takes effect only on the next BUILD, not queries).
     apply_ks_extraction_prompt(examples=True, exclusions=True)
 
+    # 1.4.16-parity keyword-extraction prompt (issue #4 residual): restore the rich
+    # 3-example few-shot set 1.5.x gutted. KS_KW_PROMPT_COMPAT=0 reverts to stock.
+    from papervault.knowledge.store.kw_prompt_compat import apply_kw_prompt_compat
+
+    apply_kw_prompt_compat()
+
     # Build-plane LLM (2026-07-16, user call): LightRAG-internal calls — entity/relation
     # extraction at ainsert (the token sink: 2 calls/chunk × ~10-13k tok) plus its small
     # query-path keyword extraction — run on the CHEAP deployment with thinking ON; pro

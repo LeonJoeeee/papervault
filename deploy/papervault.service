@@ -1,0 +1,27 @@
+# papervault unified MCP server — systemd --user unit (deployment #1 / lab posture).
+#
+# Install:
+#   cp deploy/papervault.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now papervault.service
+#
+# The service runs the checkout's venv entrypoint with WorkingDirectory at the repo root
+# so the repo-root .env is loaded (papervault.config loads CWD/.env). Pin discipline
+# (ADR-0001): keep the checkout on a release tag, not a moving branch.
+# Backing services expected: Postgres + Neo4j (deploy/docker-compose.yml) and a MinerU
+# vLLM server on MINERU_URL (deploy/papervault-mineru.service, or an existing legacy unit).
+
+[Unit]
+Description=papervault unified MCP server (library + knowledge, streamable-http :8080)
+After=network-online.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/dev/papervault
+ExecStart=%h/projects/dev/papervault/.venv/bin/papervault-mcp --host 127.0.0.1 --port 8080
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+# GPU pinning etc. come from the repo-root .env, not from this unit.
+
+[Install]
+WantedBy=default.target

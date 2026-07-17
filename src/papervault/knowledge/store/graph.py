@@ -37,6 +37,7 @@ from lightrag import LightRAG
 from lightrag.utils import EmbeddingFunc
 
 from papervault import config as _pv
+from papervault.domain import get_domain
 from papervault.knowledge.config import CONFIG
 from papervault.knowledge.ingest.chunking import chunking_by_sentence_boundary
 from papervault.knowledge.store.extraction_prompt import apply_ks_extraction_prompt
@@ -87,10 +88,9 @@ def assert_safe_workspace() -> str:
     return neo
 
 # 研究本体(SDD §6.0 / run.py:55):丢 Person/Organization,作者/期刊/引文串不进图。
-ENTITY_TYPES = [
-    "Concept", "Method", "Phenomenon", "Dataset", "Instrument",
-    "Mission", "Quantity", "Material", "Model", "Finding", "Application",
-]
+# Externalized to the active domain pack (ADR-0003, papervault.domain); the bundled
+# space_physics factory pack reproduces the 11-type list verbatim.
+ENTITY_TYPES = get_domain().entity_types
 
 _RAG: Optional[LightRAG] = None
 

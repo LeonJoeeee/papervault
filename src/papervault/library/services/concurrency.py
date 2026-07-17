@@ -63,8 +63,11 @@ PRIORITY_LOW = 10
 
 
 def _vault_path() -> str:
+    import os
     from papervault import config
-    return str(config.VAULT_PATH)
+    return (os.environ.get("PAPERVAULT_VAULT")
+            or os.environ.get("PAPER_LIBRARY_PATH")
+            or str(config.VAULT_PATH))
 
 
 def extract_dispatch_enabled() -> bool:

@@ -196,10 +196,13 @@ class Library:
     """A directory holding library.bib + index.json + pdfs/ + extracts/."""
 
     def __init__(self, root: Optional[str | Path] = None):
-        # Vault root = the library's on-disk store. Resolved from papervault.config
-        # (PAPERVAULT_VAULT, legacy PAPER_LIBRARY_PATH honored) unless passed explicitly.
+        # Vault root = the library's on-disk store. Read the env LIVE at construction
+        # (not the import-frozen config value) so a runtime override — e.g. the CLI's
+        # --library-path, which sets PAPER_LIBRARY_PATH — is honored. config.VAULT_PATH
+        # is the last-resort default (its own env capture happened at import).
         from papervault import config
-        self.root = Path(root or config.VAULT_PATH)
+        env_root = os.environ.get("PAPERVAULT_VAULT") or os.environ.get("PAPER_LIBRARY_PATH")
+        self.root = Path(root or env_root or config.VAULT_PATH)
         self.bib_path = self.root / "library.bib"
         self.index_path = self.root / "index.json"
         # D14: the last known-good index, rotated in on every successful save.

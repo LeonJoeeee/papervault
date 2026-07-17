@@ -1,0 +1,11 @@
+9.  **Exclusions (do NOT extract any of these as entities):**
+    *   In-text bibliographic citations / author-year reference strings (e.g. `Cane et al. (2003)`, `Raissi (2019)`). Extract the concept, method, or finding being discussed — never the citation itself.
+    *   Isolated mathematical symbols, variable names, subscripted quantities, or equation/figure/table labels (e.g. `S_m`, `x_0`, `Equation 9`). Extract the named quantity it denotes (e.g. `diffusion coefficient`), not the symbol.
+    *   Generic type-words used with no specific name (a bare `Model`, `Method`, `Study`, `Approach`).
+    *   Individual people, author names, institutions, universities, journals, funding agencies, or scientific collaborations treated as organizations.
+
+10. **Acronym canonicalization:** When a concept is introduced with an acronym in parentheses (e.g. `Physics-Informed Neural Networks (PINNs)`), emit a SINGLE entity using the full canonical name and mention the acronym in its description — do NOT create separate entities for the acronym and its expansion.
+
+11. **Capture the scientific substance in the description:** Each entity_description must preserve the *specific* content the text states about the entity, not a generic gloss. When the text gives them, include: quantitative facts (values, ranges, units, scaling, e.g. 'increases with radial distance'), the conditions or regime in which it holds, the mechanism, and the DIRECTION of any effect (increases/decreases, correlated/anti-correlated, governs/constrains). Prefer 'A transport parameter governing parallel diffusion; observed to increase with radial distance and consistent with quasi-linear theory' over 'A parameter related to particle transport.' Likewise, each relationship_description must state HOW the entities are related (the mechanism or quantitative dependence), not merely that they are related.
+
+---Examples---

@@ -28,8 +28,9 @@ import asyncio
 import json
 import logging
 import re
-from pathlib import Path
 from typing import Any, Callable, Optional
+
+from papervault.domain import get_domain
 
 from . import concurrency
 
@@ -38,7 +39,6 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 30
 MAX_RETRIES = 2          # → up to 3 attempts per batch
 _BACKOFF_BASE = 2.0
-DOMAIN_PATH = Path(__file__).parent.parent / "domain.md"
 
 # Tiers that count as in-domain (keep for ingest); "3" = off-domain reject.
 INGEST_TIERS = {"1A", "1B", "1C", "2A", "2B", "2C"}
@@ -175,17 +175,11 @@ async def _scored_judge(
     return merged, dropped
 
 
-def _read_domain_md() -> str:
-    try:
-        return DOMAIN_PATH.read_text(encoding="utf-8")
-    except OSError as e:
-        logger.error("judge: cannot read domain.md at %s: %s", DOMAIN_PATH, e)
-        return "(domain context unavailable)"
-
-
 # ───────────────────────── LLM2: judge_ingest (domain tier) ─────────────────────────
 
-_INGEST_SYSTEM = """You screen each candidate for INGEST into a **space physics + AI4Science**
+# Domain label + rubric come from the active domain pack (ADR-0003, papervault.domain);
+# __DOMAIN_LABEL__ is substituted at import (loader-cached), {domain_md} at call time.
+_INGEST_SYSTEM = """You screen each candidate for INGEST into a **__DOMAIN_LABEL__**
 research library. Judge each candidate on its OWN merit (absolute), not relative to the others
 in this batch.
 
@@ -209,6 +203,7 @@ Output ONLY one JSON object:
 {{"items": [{{"i": <int>, "reason": "<str>", "is_paper": <bool>, "tier": "<1A|1B|1C|2A|2B|2C|3>"}}, ...]}}
 The ``i`` must match the candidate's ``i``.
 """
+_INGEST_SYSTEM = _INGEST_SYSTEM.replace("__DOMAIN_LABEL__", get_domain().label)
 
 
 def _parse_ingest(raw: str, expected: set[int]) -> dict[int, dict]:
@@ -249,7 +244,7 @@ async def judge_ingest(candidates: list[dict], *, llm: Any = None) -> tuple[dict
     if llm is None:
         from ..llm import get_llm
         llm = get_llm()
-    system = _INGEST_SYSTEM.format(domain_md=_read_domain_md())
+    system = _INGEST_SYSTEM.format(domain_md=get_domain().search_gate)
 
     def build_user(items: list[dict]) -> str:
         return f"Candidates ({len(items)}):\n{json.dumps(items, ensure_ascii=False)}"
@@ -268,7 +263,7 @@ async def judge_ingest(candidates: list[dict], *, llm: Any = None) -> tuple[dict
 # ───────────────────────── LLM3: judge_return (relevance) ─────────────────────────
 
 _RETURN_SYSTEM = """You score how well each candidate paper matches the user's QUERY INTENT for a
-researcher in space physics + AI4Science. Judge each on its OWN merit (ABSOLUTE
+researcher in __DOMAIN_LABEL__. Judge each on its OWN merit (ABSOLUTE
 scale), not relative to the batch.
 
 RELEVANCE = UTILITY-TO-INTENT, not topical or field overlap. Score by whether a
@@ -308,6 +303,7 @@ answers + what it gives the intent, or "no sub-part: same field only") then scor
 Output ONLY: {"items":[{"i":<int>,"reason":"<str>","score":<float>}, ...]}
 The "i" MUST be the candidate's provided "i" (do NOT renumber).
 """
+_RETURN_SYSTEM = _RETURN_SYSTEM.replace("__DOMAIN_LABEL__", get_domain().label)
 
 
 def _parse_score(raw: str, expected: set[int]) -> dict[int, dict]:

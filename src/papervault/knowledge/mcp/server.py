@@ -25,8 +25,8 @@ MCP surface (Executor-facing): a SINGLE natural-language tool —
 - query(intent) — ask the knowledge base a question; get a sourced prose answer.
 
 propose_ideas / idea-engine is SDD【defer】(不进 v1) — NOT exposed here.
-Operator-only ops (diagnostics, by-id chunk inspection, knob-tuning) live in the `ks`
-CLI (papervault.knowledge.cli), NOT on the MCP surface.
+Operator-only ops (diagnostics, by-id chunk inspection, knob-tuning) live in the operator
+CLI (`python -m papervault.knowledge.cli`), NOT on the MCP surface.
 """
 from __future__ import annotations
 
@@ -128,10 +128,10 @@ references, and distilled insights — and digested it so you can just ask.
   briefing a senior colleague (what you're doing + what you want to know), NOT keywords.
   You get a prose answer + a cited_papers list to trace.
 
-(Diagnostics / by-id chunk lookup / knob-tuning are operator ops in the `ks` CLI, not here.)
+(Diagnostics / by-id chunk lookup / knob-tuning are operator ops in the operator CLI
+`python -m papervault.knowledge.cli`, not here.)
 
-Design: services/knowledge-system/KS_SDD.md (live v3 source of truth; the old
-ARCHITECTURE.md describes the retired v2 — do not follow it for v3).
+Design: docs/architecture.md.
 """.strip())
 
 
@@ -217,7 +217,7 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     Returns:
       {
         "answer":       "<prose answer with [paper_key] inline cites>",
-        "cited_papers": ["Reames2023", ...],   # feed these to paper-library get_full_text
+        "cited_papers": ["Reames2023", ...],   # feed these to get_paper
         "kb_coverage":  "strong" | "thin" | "empty",   # honesty signal
       }
     kb_coverage="empty"/"thin" → rephrase more specifically, or fall back to

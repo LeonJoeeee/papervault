@@ -10,7 +10,7 @@ variant side : mq_r{1,2,3} results (backbone) + judge where, per run, FUSED ques
 Per-question value fed to verdict = MEAN over the 3 runs. Noise floor = the pinned baseline
 run_mean_sd (headline.BASELINE_NOISE_FLOOR_RUN_MEAN_SD = 0.0127). Trap refusal rate = mean over runs.
 
-Run (AFTER the variant judge seeds exist):  uv run python experiments/eval/verdict_run.py
+Run (AFTER the variant judge seeds exist):  python -m papervault.eval.verdict_run
 """
 from __future__ import annotations
 

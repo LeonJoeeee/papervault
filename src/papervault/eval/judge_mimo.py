@@ -16,8 +16,8 @@ self-consistency validator — the model only has to make the per-check/per-nugg
 identities are enforced here. Then validate via judge_aggregate.validate_judge_json and write
 <qid>.seed0.json.
 
-  uv run python experiments/eval/judge_mimo.py --all [--concurrency 60] [--force]
-  uv run python experiments/eval/judge_mimo.py vmq_r1 vsr_r3 [--force]
+  python -m papervault.eval.judge_mimo --all [--concurrency 60] [--force]
+  python -m papervault.eval.judge_mimo vmq_r1 vsr_r3 [--force]
 
 --force overwrites existing seeds (the cutover run uses it); without it, a seed that already
 parses+validates is skipped (idempotent resume after a partial run / rate-limit blip).

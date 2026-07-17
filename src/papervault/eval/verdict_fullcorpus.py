@@ -1,6 +1,6 @@
 """Variant-vs-baseline verdict on the FULL-CORPUS frame (gold_v2, 3-run protocol).
 
-  uv run python experiments/eval/verdict_fullcorpus.py <variant_prefix>   # e.g. vmq | vsr
+  python -m papervault.eval.verdict_fullcorpus <variant_prefix>   # e.g. vmq | vsr
 
 baseline side: fullcorpus_baseline / fullcorpus_r2 / fullcorpus_r3 (results + Opus judge seeds).
 variant side : <prefix>_r{1,2,3} results + judge/<prefix>_r{k} seeds (same tightened contract,

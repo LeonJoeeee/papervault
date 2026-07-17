@@ -1,11 +1,11 @@
 """MCP server: 2 executor-facing tools (get_paper, search_papers) + 4 read-only resources.
 
 Executor-facing consumer surface (the library↔executor interface). Writes / ingest are operator
-ops in the `paper-library` CLI, NOT on this MCP surface. (get_full_text / get_bibtex /
+ops in the ``papervault`` CLI, NOT on this MCP surface. (get_full_text / get_bibtex /
 cite_check / get_book_chapter were moved off MCP 2026-05 — full text is read via each
 record's ``text_path``; bibtex + \\cite validation are CLI commands.)
 
-This file is the **frontend** layer (per the architecture in CLAUDE.md):
+This file is the **frontend** layer (per the architecture in docs/architecture.md):
 no business logic lives here, only protocol shaping. Each tool:
 
   - accepts any identifier form (citation key / DOI / arxiv id / fuzzy text)
@@ -66,7 +66,7 @@ logger = logging.getLogger(__name__)
 
 def _paper_dict(paper: Paper, library: Library) -> dict:
     """Minimal Executor-facing paper record — the **library↔executor interface** projection
-    (2026-05; the canonical contract is ``PAPER_LIBRARY_SDD.md`` §5). 9 research fields
+    (2026-05; the canonical contract is ``docs/architecture.md``). 9 research fields
     + a text reference. Internal / ops / legacy fields are intentionally NOT exposed (the
     kernel keeps everything; the MCP view is the minimal projection — store-all,
     expose-minimal). This is the SINGLE caller-facing projection (SDD §5 I-PROJ): get_paper
@@ -629,8 +629,7 @@ def build_server(library_path: Optional[str] = None,
     # instance (which owns the combined instructions); standalone, build our own.
     if mcp is None:
         mcp = FastMCP("paper-library", instructions="""
-paper-library is your literature library — the raw papers themselves. (Sister service:
-knowledge-system / KS gives you DIGESTED knowledge; paper-library gives you the PAPERS.)
+This is the literature-library plane of papervault — the raw papers themselves.
 Find papers and read their full text. Adding papers to the library happens for you
 (search ingests what it discovers) — not something you call. get_paper is read-only:
 a named paper not already in the library returns not_found (it is NOT fetched on lookup).
@@ -1245,9 +1244,8 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         read (a 100-paper batch runs ~20 KB instead of ~130 KB). The
         main thread does mechanical assignment (cluster into per-curator
         batches by title keywords / topic / venue) using these slim
-        fields; each paper-curator sub-agent then calls ``get_paper(key)``
-        / ``get_full_text(key)`` from inside its worktree to pull the
-        full content for its batch — sub-agent context budget absorbs
+        fields; a curator then calls ``get_paper(key)`` to pull the
+        full content for its batch — the curator's context budget absorbs
         the per-paper load, not the main thread.
         """
         return {

@@ -14,7 +14,7 @@ One Python package (`papervault`), one server process, subsystems as modules:
 - **mcp/** — the single endpoint, three tools, progress heartbeat (long queries survive client idle timeouts).
 - **domain pack** (config, not code) — search-gate rubric, entity ontology, extraction few-shots, instruction fragments. Space physics is the factory default and worked sample (ADR-0003).
 - **eval/** — the bundled harness (recall@served, hallucination rate, trap gates) + method notes. Retrieval/pipeline quality changes are benchmark-arbitrated.
-- **plugin shell** — `.claude-plugin/` at repo root: manifest, MCP wiring, skills. Thin by rule; per-agent adapters never hold logic.
+- **plugin shell** — `.claude-plugin/` at repo root (`marketplace.json` + `plugin.json`) plus the repo-root `.mcp.json` MCP wiring; no skills shipped in v1. Thin by rule; per-agent adapters never hold logic.
 
 Boundaries: the library→knowledge hand-off is the on-disk vault — single writer (library), one reader (knowledge scheduler) — with reader and writer versioned together inside the package. External processes: OCR server (HTTP; lifecycle managed by library), Neo4j + Postgres (docker-compose), the operator LLM endpoint (OpenAI-compatible).
 

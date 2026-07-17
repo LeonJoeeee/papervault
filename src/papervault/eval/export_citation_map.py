@@ -2,13 +2,12 @@
 
 Path 1 (recall-ceiling root-cause, 2026-06-18) feeds this into multiquery.py's citation rerank.
 The map is REGENERABLE derived data (citation counts drift slowly) — not committed; refresh
-periodically. KS loads it from KS_CITATION_MAP (default research/citation_map.json), mirroring
-the shared llm_keys.json pattern.
+periodically. The knowledge side reads it from ``PAPERVAULT_CITATION_MAP`` (default
+``citation_map.json`` under the papervault data dir; the legacy ``KS_CITATION_MAP`` is still
+honored).
 
-Run in paper-library's env (it imports papervault.library):
-    uv run --project ../../../paper-library python experiments/eval/export_citation_map.py
-or from the pl service dir:
-    cd services/paper-library && uv run python <path>/export_citation_map.py
+Run:
+    python -m papervault.eval.export_citation_map
 """
 import json
 import os

@@ -20,7 +20,7 @@ with exponential backoff; on persistent failure the batch is **dropped** (contri
 no judgments) — ingest-side that means "not ingested" (stop-the-bleed: never let an unjudged paper
 into the library), return-side "not returned". We never fabricate ``keep=True``.
 
-See ``PAPER_LIBRARY_SDD.md`` §5.
+See ``docs/architecture.md``.
 """
 from __future__ import annotations
 

@@ -22,23 +22,45 @@ cp .env.example .env
 $EDITOR .env          # set PAPERVAULT_LLM_*, PAPERVAULT_MODEL, POSTGRES/NEO4J passwords,
                       # PAPERVAULT_CONTACT_EMAIL
 
-# 3. Backing stores (Postgres + Neo4j)
-docker compose -f deploy/docker-compose.yml up -d
+# 3. Backing stores (Postgres + Neo4j). --env-file is REQUIRED: with `-f
+#    deploy/...`, compose reads deploy/.env, NOT the repo-root .env — pass it
+#    explicitly so your POSTGRES/NEO4J passwords reach the containers.
+docker compose --env-file .env -f deploy/docker-compose.yml up -d
 
 # 4. Install papervault (beta-standard: core + local OCR + grey download tiers)
 uv venv && uv pip install -e ".[mineru,grey]"
 #   uv pip install -e .                 # minimal core (no OCR, OA-only downloads)
 
-# 5. Preflight — verify GPU, databases, LLM config, domain pack
+# 5. Start the MinerU OCR server (ONLY if you installed the [mineru] extra).
+#    extract talks to a MinerU vLLM server over HTTP on :30000; the [mineru]
+#    client libs do NOT start it, and nothing else will — without it every
+#    extract fails and papers sit at text_status="pending" forever. Leave it up:
+mineru-vllm-server --host 127.0.0.1 --port 30000 &
+#    First run pulls the MinerU2.5 weights from ModelScope (MINERU_MODEL_SOURCE,
+#    default `modelscope`). Point papervault at another host/port via MINERU_URL.
+
+# 6. Preflight — verify GPU, databases, LLM config, domain pack
 papervault doctor
 
-# 6. Run the server
+# 7. Run the server
 papervault serve                         # streamable-http on 127.0.0.1:8080
 #   papervault serve --stdio             # subprocess transport
 ```
 
 `papervault doctor` must be green before serving. It checks the .env, data dirs,
-the domain pack, GPU/VRAM, and Postgres + Neo4j connectivity.
+the domain pack, GPU/VRAM, and Postgres + Neo4j connectivity. It does NOT cover
+everything a boot needs: it does not validate the workspace vars
+(`NEO4J_WORKSPACE` / `POSTGRES_WORKSPACE` must both be non-empty AND equal, or
+`papervault serve` aborts at boot), and it does not probe the MinerU endpoint —
+so a green doctor can still fail to serve on empty/mismatched workspace vars, or
+serve but never build a corpus if MinerU is down.
+
+**First ingest/query downloads model weights.** The embed + reranker default to
+`BAAI/bge-m3` + `BAAI/bge-reranker-v2-m3` (~4.5 GB total), pulled lazily from
+Hugging Face on first use — `doctor` does NOT download or probe them, so it can
+be green while the first build/query then blocks on (or, air-gapped, fails at)
+the download. Pre-seed or redirect the HF cache with `HF_HOME`, or point
+`BGE_M3_MODEL_PATH` / `BGE_RERANKER_MODEL_PATH` at local weights.
 
 ## Connecting an agent
 
@@ -54,6 +76,17 @@ MCP server):
 **Any other MCP client** — register the streamable-http endpoint
 `http://127.0.0.1:8080/mcp` (or your host/port) as an MCP server. The three tools
 (`search_papers`, `get_paper`, `query`) appear automatically.
+
+> Note: this endpoint URL is hardcoded (see `.mcp.json` at the repo root), not derived
+> from your `serve` config. If you run `papervault serve --port`/`--host` on a different
+> address, update the URL in `.mcp.json` and in any MCP client registration to match, or
+> clients will point at the wrong address.
+
+> **Bind loopback only.** `papervault serve` binds `127.0.0.1` by default and has
+> NO built-in auth — passing `--host 0.0.0.0` (or any non-loopback host) exposes
+> all three tools unauthenticated. Keep it on loopback, a Tailscale/VPN address,
+> or a trusted private LAN. (`PAPER_LIBRARY_MCP_TOKEN` guards only the *standalone*
+> library HTTP server; the unified `papervault serve` has no token equivalent.)
 
 ## Choosing a domain
 

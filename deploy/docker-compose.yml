@@ -3,8 +3,11 @@
 #
 #   docker compose -f deploy/docker-compose.yml up -d
 #
-# Credentials come from your .env (same file papervault reads). Defaults are
-# dev-only — set POSTGRES_PASSWORD / NEO4J_PASSWORD for anything real.
+# Credentials come from your .env — but with `-f deploy/...` you MUST pass it
+# explicitly (`docker compose --env-file .env -f deploy/docker-compose.yml up -d`),
+# or compose reads deploy/.env instead of the repo-root .env papervault uses and
+# the containers bake the `changeme` default. Defaults are dev-only — set
+# POSTGRES_PASSWORD / NEO4J_PASSWORD for anything real.
 
 services:
   postgres:

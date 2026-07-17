@@ -28,7 +28,7 @@ An industrial-grade, self-hosted literature + knowledge layer for coding agents 
 
 ## Definition of done (v1 release)
 1. A documented clean-machine install (Linux, 1× 24 GB GPU) reaches green on a shipped smoke test — search ingests new papers, full text is readable, knowledge query returns a cited answer — in ≤ 8 operator commands.
-2. The bundled eval harness runs against an operator corpus and emits the full metric set (recall@served, hallucinated_rate, trap gates); CI proves it end-to-end on a small open-access fixture corpus with a pinned floor.
+2. The bundled eval harness runs against an operator corpus and emits the full metric set (recall@served, hallucinated_rate, trap gates); CI proves the scoring/aggregation logic (backbone parsing, metric_reffree, stats, headline, judge_aggregate) on fixed inputs, and the end-to-end recall run with a pinned floor is a reference-machine (GPU) gate — retrieval has a hard GPU dependency, so it cannot run on the GPU-less CI runners (see docs/eval.md).
 3. The domain layer (search-gate rubric, entity ontology, extraction few-shots, instruction text) is externalized to operator-editable config files with the space-physics factory default; swapping domains requires no code edits, and each file's role is documented.
 4. Full co-load (concurrent OCR + concurrent queries) stays inside the published single-GPU VRAM budget with zero OOM on reference hardware; the budget ships as the config defaults.
 5. Queries longer than default MCP client timeouts survive end-to-end (progress heartbeat), covered by the smoke test.

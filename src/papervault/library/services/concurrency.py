@@ -23,7 +23,7 @@ log = logging.getLogger("papervault.library.concurrency")
 
 # ---------- Queue priority constants (D11) ----------
 
-# Foreground MCP-tool calls (get_paper, get_full_text) enqueue at PRIORITY_URGENT
+# Foreground MCP-tool calls (get_paper) enqueue at PRIORITY_URGENT
 # so a single user request jumps past a multi-hundred-paper backlog from a
 # search-paper batch ingest. Background recovery scans and search candidates
 # enqueue at PRIORITY_NORMAL. Lower number = higher priority (asyncio.PriorityQueue

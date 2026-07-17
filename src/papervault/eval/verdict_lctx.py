@@ -1,6 +1,6 @@
 """Variant verdict on the LONG-CONTEXT frame — the NEW baseline is lctx@60 (user, 2026-06-14).
 
-  uv run python experiments/eval/verdict_lctx.py <variant_prefix>   # e.g. somevariant → somevariant_r{1,2,3}
+  python -m papervault.eval.verdict_lctx <variant_prefix>   # e.g. somevariant → somevariant_r{1,2,3}
 
 The #5 loop promoted the long-context config (multiquery + V-SR + MAX_TOTAL_TOKENS=300000 +
 KS_MQ_ENABLE_RERANK=false, serving 60 chunks) to the CURRENT baseline. New variants are judged

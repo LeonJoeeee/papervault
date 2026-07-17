@@ -8,8 +8,8 @@ nugget_recall (from judge seeds, if present): @12 flat + @served & nugget rising
 long-context win the headline structurally under-credits; @served rising + nugget flat = the deep
 chunks are noise. K is FIXED (not =n_served) so the shadow cannot be gamed by merely serving more.
 
-  uv run python experiments/eval/recall_curve.py <prefix>          # 3-run mean over <prefix>_r{1,2,3}
-  uv run python experiments/eval/recall_curve.py <tag1> <tag2> ... # explicit tags, each averaged in
+  python -m papervault.eval.recall_curve <prefix>          # 3-run mean over <prefix>_r{1,2,3}
+  python -m papervault.eval.recall_curve <tag1> <tag2> ... # explicit tags, each averaged in
 """
 from __future__ import annotations
 

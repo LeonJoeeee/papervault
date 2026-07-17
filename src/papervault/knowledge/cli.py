@@ -1,12 +1,12 @@
-"""KS CLI — `ks` entry point = the v1 OPERATOR surface (SDD §6.8).
+"""KS operator CLI (`python -m papervault.knowledge.cli`) = the v1 OPERATOR surface.
 
 The MCP surface is just query(intent) for the executor (mcp/server.py). Operator-only
 ops — diagnostics, ledger/doc_status status views, by-id doc lookup — live here, NOT on
 the MCP surface:
-    uv run ks query "PINN 在 SEP 现状"            # same §6.4 pipeline the MCP tool wraps
-    uv run ks query "STEREO SEPT 能量" --json
-    uv run ks stats                                # §6.5 step5 acceptance + ops truth view
-    uv run ks get paper:Reames2023                 # by-id LightRAG doc_status row
+    python -m papervault.knowledge.cli query "PINN 在 SEP 现状"     # same §6.4 pipeline the MCP tool wraps
+    python -m papervault.knowledge.cli query "STEREO SEPT 能量" --json
+    python -m papervault.knowledge.cli stats                        # §6.5 step5 acceptance + ops truth view
+    python -m papervault.knowledge.cli get paper:Reames2023         # by-id LightRAG doc_status row
 
 All reads are workspace-gated via assert_safe_workspace() (SDD §6.0): hitting prod 'l0'
 without KS_ALLOW_PROD_WORKSPACE=1 refuses to run = explicit failure, never a silent
@@ -192,7 +192,7 @@ def get(doc_id: str, json_out: bool) -> None:
 
 
 def main() -> None:
-    """Entry point for `ks` script."""
+    """Entry point for the operator CLI (`python -m papervault.knowledge.cli`)."""
     cli()
 
 

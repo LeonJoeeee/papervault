@@ -132,8 +132,8 @@ retrieval (no further extraction), so make them precise and discriminating."""
 
 
 # ---- STANDARD variant: anchor + orthogonal-facet decompose ------------------------------------
-# Ported from paper-library's intent_parser._SYSTEM_PROMPT (services/paper-library/src/
-# paper_library/services/intent_parser.py): TERM-0 ANCHOR (the verbatim core concept) + 2-5
+# Ported from the library intent_parser._SYSTEM_PROMPT (papervault/library/services/
+# intent_parser.py): TERM-0 ANCHOR (the verbatim core concept) + 2-5
 # ORTHOGONAL facets over the phenomenon/method/system/regime taxonomy, with the OVER-SPLIT GUARD
 # (no synonym shards; an intent with 2 real facets yields 2, not 5). Adapted from pl's flat
 # search_terms to KS's {query, hl, ll} shape so each retrieval skips its own LLM keyword extraction.

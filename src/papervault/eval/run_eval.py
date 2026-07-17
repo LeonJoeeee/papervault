@@ -7,20 +7,20 @@ judge subagent + judge_aggregate.py). It captures EXACTLY what the deterministic
 (backbone.py) and the judge both need, so a run can be re-scored offline forever without
 re-querying the graph.
 
-PROD-SAFETY (铁律 1): this connects to a LIVE graph. It HARD-REFUSES unless
+PROD-SAFETY (hard rule 1): this connects to a LIVE graph. It HARD-REFUSES unless
 NEO4J_WORKSPACE == POSTGRES_WORKSPACE == 'l0_probe' (the isolated probe workspace). It never
 touches prod 'l0'. The existing ~59-paper partial graph on l0_probe is fine for a SMOKE run;
 this script is read-only against the graph (query only — no ingest, no clear).
 
 Run:
   NEO4J_WORKSPACE=l0_probe POSTGRES_WORKSPACE=l0_probe \
-    uv run python experiments/eval/run_eval.py --gold experiments/eval/gold.jsonl --tag baseline
+    python -m papervault.eval.run_eval --gold src/papervault/eval/gold.jsonl --tag baseline
 
   # smoke against the partial graph with the bundled tiny gold fixture, no real gold needed:
   NEO4J_WORKSPACE=l0_probe POSTGRES_WORKSPACE=l0_probe \
-    uv run python experiments/eval/run_eval.py --gold experiments/eval/gold.sample.jsonl --tag smoke --limit 3
+    python -m papervault.eval.run_eval --gold src/papervault/eval/gold.sample.jsonl --tag smoke --limit 3
 
-Output: experiments/eval/results/<tag>.jsonl — one JSON object per gold question, in the
+Output: src/papervault/eval/results/<tag>.jsonl — one JSON object per gold question, in the
 EXACT shape backbone.py + judge_prompt.md consume (see backbone.py module docstring):
   {
     "qid": "...",

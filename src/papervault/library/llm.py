@@ -1,7 +1,7 @@
 """LLM configuration — central hot-reloaded key pool (2026-06-02).
 
-Design: research/docs/llm-key-pool.md. The XIAOMI/MiMo path reads a CENTRAL key
-file (``research/llm_keys.json``, overridable via ``LLM_KEYS_FILE``) shared with
+The XIAOMI/MiMo path reads a CENTRAL key file (``PAPERVAULT_LLM_KEYS`` / legacy
+``LLM_KEYS_FILE``, default ``<data>/llm_keys.json``) shared with
 KS — a JSON array of ``{model, api_key, base_url}`` groups. Each ``.call()``:
   * HOT-READS the file if its mtime changed (edit the file → next call sees it,
     no restart — add a group to add a key, delete/``disabled`` a group to drop one);
@@ -224,7 +224,7 @@ class KeyPool:
 _pools: dict[tuple, KeyPool] = {}
 _pools_lock = threading.Lock()
 
-# Gateway-mode (PL_USE_GATEWAY=1) cache: one :class:`LLM` per (max_tokens, group) pointed at the
+# Gateway-mode (PAPERVAULT_LLM_GATEWAY=1) cache: one :class:`LLM` per (max_tokens, group) pointed at the
 # LiteLLM proxy — same reuse shape as the direct-path pool cache. Phase 3, docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md.
 _gw_llms: dict[tuple, "LLM"] = {}
 _gw_lock = threading.Lock()
@@ -242,7 +242,7 @@ def _gateway_group(model: str | None) -> str:
 
 
 def _get_llm_via_gateway(mt: int, model: str | None):
-    """PL_USE_GATEWAY=1 path: an :class:`LLM` (litellm under the hood) pointed at the running LiteLLM
+    """PAPERVAULT_LLM_GATEWAY=1 path: an :class:`LLM` (litellm under the hood) pointed at the running LiteLLM
     proxy. The proxy holds the real MiMo keys + does failover/retry/cooldown/401-disable, so pl just
     talks to it with a virtual key. Same :class:`LLM` interface + max_tokens passthrough as the direct
     path, so callers (and their fail-open/closed exception handling) are byte-unchanged. Cached per
@@ -268,9 +268,16 @@ def get_llm(*, max_tokens: int | None = None, model: str | None = None):
     simple judge) while keeping the pool's key failover; default = per-group /
     ``_DEFAULT_MODEL``.
 
-    Gateway mode (``PL_USE_GATEWAY=1``, DEFAULT OFF — Phase 3, docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md):
+    Fallback (no ``PAPERVAULT_LLM_*`` key or pool set): a bare ``OPENAI_API_KEY``
+    in the environment is used with ``OPENAI_MODEL`` (default ``openai/gpt-4o-mini``),
+    then a bare ``ANTHROPIC_API_KEY`` with ``ANTHROPIC_MODEL`` (default
+    ``anthropic/claude-sonnet-4-5``). NOTE: ``papervault doctor`` validates only the
+    ``PAPERVAULT_LLM_*`` surface, NOT these fallbacks — a stray ``OPENAI_API_KEY`` in
+    your shell silently routes library LLM calls to OpenAI while doctor stays green.
+
+    Gateway mode (``PAPERVAULT_LLM_GATEWAY=1``, DEFAULT OFF — Phase 3, docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md):
     when set, return an :class:`LLM` pointed at the running LiteLLM proxy
-    (``PL_GATEWAY_URL`` default ``http://127.0.0.1:4000/v1``, virtual key ``PL_VIRTUAL_KEY``),
+    (``PAPERVAULT_LLM_GATEWAY_URL`` default ``http://127.0.0.1:4000/v1``, virtual key ``PAPERVAULT_LLM_GATEWAY_KEY``),
     with the model mapped to the proxy GROUP (default/None → ``mimo-v2.5-pro``; explicit cheap → ``mimo-v2.5``). The proxy owns the
     real keys + failover. The DEFAULT (OFF) path below is UNCHANGED."""
     mt = max_tokens or _DEFAULT_MAX_TOKENS

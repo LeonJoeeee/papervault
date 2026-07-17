@@ -114,8 +114,8 @@ def retry_failed_with_cooloff(
 
     Empirical: this is the highest-leverage batch-level lever for hit rate
     on the 82-paper bench. Single-pass tops out at ~80%; 4-pass with 5-min
-    cool-off lifts to ~99%. See CLAUDE.md "Cascade evolution" table for the
-    R3→R13 progression that established these defaults.
+    cool-off lifts to ~99% (the R3→R13 cascade-tuning progression that
+    established these defaults).
 
     Args:
         library: Loaded :class:`Library`.

@@ -1,9 +1,8 @@
 """Pydantic models for Paper.insight.
 
-See docs/integration/paper-library-insight-ingest.md §5.1 for the canonical
-schema spec. Output of the LLM ingest call is validated against
-``InsightAnswers``; the surrounding provenance fields (version /
-ingested_at / model / academic_knowledge_hash) are filled by the worker.
+Output of the LLM ingest call is validated against ``InsightAnswers``; the
+surrounding provenance fields (version / ingested_at / model /
+academic_knowledge_hash) are filled by the worker.
 """
 
 from __future__ import annotations

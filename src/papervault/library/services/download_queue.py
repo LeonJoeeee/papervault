@@ -25,8 +25,8 @@ Worker body wraps :func:`download_paper` under ``concurrency.network_sem``
   terminal states and recovery on next startup will NOT re-enqueue them.
 
 ✦ Phase 28 (2026-05-24, route B): the third-stage insight queue was
-removed (see ``services/paper-library/src/papervault.library/insight/
-__init__.py``). The previous ``on_text_only`` callback that bypassed
+removed (see ``src/papervault/library/insight/__init__.py``). The
+previous ``on_text_only`` callback that bypassed
 extract straight into insight is gone; text-only papers now route
 through extract_queue (which short-circuits on already-present md and
 just records the completion).

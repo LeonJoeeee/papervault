@@ -1,10 +1,12 @@
 """Knowledge System config loader.
 
-Env vars come from services/knowledge-system/.env (gitignored).
-See .env.example for template.
+Env vars come from the single repo-root ``.env`` (gitignored), loaded by
+``papervault.config``. See ``.env.example`` for the template.
 
-Phase 1 LLM provider: MiMo (Xiaomi, 6 endpoints, reused from paper-library/.env).
-Anthropic kept as optional fallback for Phase 3+ idea curator.
+The ``MIMO_API_KEY_*`` env path is retained only as legacy back-compat; the
+documented LLM surface is a generic OpenAI-compatible endpoint (see the
+``PAPERVAULT_LLM_*`` vars in ``.env.example``). Anthropic stays an optional
+fallback for the Phase 3+ idea curator.
 """
 from __future__ import annotations
 
@@ -56,7 +58,7 @@ class MimoEndpoint:
 @dataclass(frozen=True)
 class MimoConfig:
     """MiMo pool config — now a thin view over the CENTRAL hot-reloaded key pool
-    (research/llm_keys.json, see store/llm.py + docs/llm-key-pool.md). ``model`` and
+    (the pool file at PAPERVAULT_LLM_KEYS / legacy LLM_KEYS_FILE, see store/llm.py). ``model`` and
     ``valid_endpoint_count`` defer to the pool so they reflect the ACTIVE groups in the
     shared file (hot-reloaded); the ``MIMO_API_KEY_*`` .env path is kept as a fallback
     inside store.llm when the file is missing/broken. ``endpoints`` is retained only for

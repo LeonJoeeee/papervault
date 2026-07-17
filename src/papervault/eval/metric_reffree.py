@@ -36,8 +36,8 @@ aggregation on canned judge JSONs — no judge, no LLM.
 RUNNER (how to fan out the judging — mirror build_judge_prompts.py + the workflow judge pattern):
 
   # 1. build per-(intent,chunk) precision prompts + per-(intent,A,B) pairwise prompts from runs:
-  uv run python experiments/eval/build_reffree_prompts.py precision <tag>
-  uv run python experiments/eval/build_reffree_prompts.py pairwise  <baseline_tag> <variant_tag>
+  python -m papervault.eval.build_reffree_prompts precision <tag>
+  python -m papervault.eval.build_reffree_prompts pairwise  <baseline_tag> <variant_tag>
 
   # 2. fan out the Claude judge over every *.prompt.txt (one subagent call per file), writing the
   #    JSON next to it as <same-stem>.seed0.json (replays -> .seed1.json, ...). This is the SAME
@@ -47,9 +47,9 @@ RUNNER (how to fan out the judging — mirror build_judge_prompts.py + the workf
 
   # 3. score offline (pure, no LLM):
   from papervault.eval import metric_reffree as M
-  pt = M.precision_per_question("experiments/eval/judge", tag=<tag>)      # {qid: precision}
+  pt = M.precision_per_question("src/papervault/eval/judge", tag=<tag>)      # {qid: precision}
   print(M.run_precision(pt))                                             # the run's mean precision
-  tally = M.pairwise_tally("experiments/eval/judge", tag=<pairwise_tag>) # net gains vs losses
+  tally = M.pairwise_tally("src/papervault/eval/judge", tag=<pairwise_tag>) # net gains vs losses
 """
 from __future__ import annotations
 

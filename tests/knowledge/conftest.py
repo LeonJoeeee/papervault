@@ -15,7 +15,7 @@ NOTE: ks_ledger is now workspace-isolated (SDD §4.1: a `workspace` column + per
 filtering on every CRUD entry, workspace sourced from assert_safe_workspace()). So the
 workspace env is BOTH a prod-vs-probe prod-safety signal AND the ledger's filter dimension
 — an l0_probe pool can no longer read/delete prod 'l0' ledger rows even within the single
-shared POSTGRES_DB=papervault.knowledge table. (chunk_metadata is dead v2, removed.)
+shared POSTGRES_DB=papervault table. (chunk_metadata is dead v2, removed.)
 """
 from __future__ import annotations
 

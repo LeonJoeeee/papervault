@@ -26,10 +26,15 @@ class PostgresConfig:
 
     @classmethod
     def from_env(cls) -> "PostgresConfig":
+        # Defaults track deploy/docker-compose.yml (which creates user/db 'papervault')
+        # so a bare install with only POSTGRES_PASSWORD set connects to the container it
+        # ships. A divergent default here would let `papervault doctor` pass against one
+        # database while the runtime (ledger + LightRAG KV/vector store) targets another,
+        # nonexistent one. cli.doctor imports THIS resolver so the two never drift.
         return cls(
-            user=os.getenv("POSTGRES_USER", "ks"),
+            user=os.getenv("POSTGRES_USER", "papervault"),
             password=os.getenv("POSTGRES_PASSWORD", "changeme"),
-            db=os.getenv("POSTGRES_DB", "papervault.knowledge"),
+            db=os.getenv("POSTGRES_DB", "papervault"),
             host=os.getenv("POSTGRES_HOST", "localhost"),
             port=int(os.getenv("POSTGRES_PORT", "5432")),
         )

@@ -34,8 +34,18 @@ uv venv && uv pip install -e ".[mineru,grey]"
 # 5. Start the MinerU OCR server (ONLY if you installed the [mineru] extra).
 #    extract talks to a MinerU vLLM server over HTTP on :30000; the [mineru]
 #    client libs do NOT start it, and nothing else will — without it every
-#    extract fails and papers sit at text_status="pending" forever. Leave it up:
-mineru-vllm-server --host 127.0.0.1 --port 30000 &
+#    extract fails and papers sit at text_status="pending" forever.
+#
+#    RECOMMENDED — run it as a systemd --user service (restarts on failure, and
+#    papervault's on-demand lifecycle can start/stop it by name):
+cp deploy/papervault-mineru.service ~/.config/systemd/user/
+#    Edit the copy if `mineru-vllm-server` isn't on your login PATH or to pick a GPU.
+systemctl --user daemon-reload
+systemctl --user enable --now papervault-mineru.service
+#
+#    ALTERNATIVE — run it in the foreground (no restart-on-failure):
+#    mineru-vllm-server --host 127.0.0.1 --port 30000 &
+#
 #    First run pulls the MinerU2.5 weights from ModelScope (MINERU_MODEL_SOURCE,
 #    default `modelscope`). Point papervault at another host/port via MINERU_URL.
 
@@ -48,19 +58,24 @@ papervault serve                         # streamable-http on 127.0.0.1:8080
 ```
 
 `papervault doctor` must be green before serving. It checks the .env, data dirs,
-the domain pack, GPU/VRAM, and Postgres + Neo4j connectivity. It does NOT cover
-everything a boot needs: it does not validate the workspace vars
-(`NEO4J_WORKSPACE` / `POSTGRES_WORKSPACE` must both be non-empty AND equal, or
-`papervault serve` aborts at boot), and it does not probe the MinerU endpoint —
-so a green doctor can still fail to serve on empty/mismatched workspace vars, or
-serve but never build a corpus if MinerU is down.
+the workspace vars, the domain pack, GPU/VRAM, the OCR endpoint + local model
+weights, and Postgres + Neo4j connectivity:
 
-**First ingest/query downloads model weights.** The embed + reranker default to
-`BAAI/bge-m3` + `BAAI/bge-reranker-v2-m3` (~4.5 GB total), pulled lazily from
-Hugging Face on first use — `doctor` does NOT download or probe them, so it can
-be green while the first build/query then blocks on (or, air-gapped, fails at)
-the download. Pre-seed or redirect the HF cache with `HF_HOME`, or point
-`BGE_M3_MODEL_PATH` / `BGE_RERANKER_MODEL_PATH` at local weights.
+- **workspace (FAIL):** `NEO4J_WORKSPACE` / `POSTGRES_WORKSPACE` must both be
+  non-empty AND equal (or `papervault serve` aborts at boot); the reserved prod
+  name `l0` fails unless `KS_ALLOW_PROD_WORKSPACE=1` is set on purpose.
+- **MinerU (WARN):** probes the configured OCR endpoint; if it's down, extracts
+  just queue until it comes up — not fatal, so a warning, not a failure.
+- **BGE weights (WARN):** the embed + reranker default to `BAAI/bge-m3` +
+  `BAAI/bge-reranker-v2-m3` (~4.5 GB total), pulled lazily from Hugging Face on
+  first use. `doctor` detects whether they're already local (a directory, or the
+  HF cache) WITHOUT downloading; absent ⇒ a warning that the first build/query
+  downloads them. Pre-seed or redirect the HF cache with `HF_HOME`, or point
+  `BGE_M3_MODEL_PATH` / `BGE_RERANKER_MODEL_PATH` at local weights.
+
+For a deeper check, `papervault smoke` runs doctor, boots the MCP server over
+stdio, and round-trips its tools (`list_tools` + a read-only `get_paper`) — no
+LLM required (`papervault smoke --skip-db` skips the DB connectivity checks).
 
 ## Connecting an agent
 
@@ -82,11 +97,13 @@ MCP server):
 > address, update the URL in `.mcp.json` and in any MCP client registration to match, or
 > clients will point at the wrong address.
 
-> **Bind loopback only.** `papervault serve` binds `127.0.0.1` by default and has
-> NO built-in auth — passing `--host 0.0.0.0` (or any non-loopback host) exposes
-> all three tools unauthenticated. Keep it on loopback, a Tailscale/VPN address,
-> or a trusted private LAN. (`PAPER_LIBRARY_MCP_TOKEN` guards only the *standalone*
-> library HTTP server; the unified `papervault serve` has no token equivalent.)
+> **Bind loopback only (or set a token).** `papervault serve` binds `127.0.0.1`
+> by default and has no auth unless you set one — passing `--host 0.0.0.0` (or any
+> non-loopback host) with no token exposes all three tools unauthenticated. Keep it
+> on loopback, a Tailscale/VPN address, or a trusted private LAN. To require auth,
+> set `PAPERVAULT_MCP_TOKEN=<secret>`: the HTTP transport then rejects any request
+> without `Authorization: Bearer <secret>` (401 JSON). Unset ⇒ current behavior,
+> unchanged; the `--stdio` transport is unaffected either way.
 
 ## Choosing a domain
 

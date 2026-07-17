@@ -270,10 +270,12 @@ def _try_url_overrides(paper: Paper) -> Optional[bytes]:
     """
     if not paper.doi and not paper.arxiv_id:
         return None
-    overrides_path = Path(os.environ.get(
-        "PAPER_LIBRARY_PATH",
-        str(Path.home() / "paper-vault"),
-    )).expanduser() / "url_overrides.json"
+    # Resolve the vault dir through the SAME live-env + config path as the rest of the
+    # library (services.concurrency._vault_path: PAPERVAULT_VAULT → PAPER_LIBRARY_PATH →
+    # config.VAULT_PATH, expanduser'd) so a relocated vault's overrides are still read,
+    # instead of a stale ~/paper-vault default that diverges from Library.root.
+    from papervault.library.services.concurrency import _vault_path
+    overrides_path = Path(_vault_path()) / "url_overrides.json"
     try:
         overrides = json.loads(overrides_path.read_text())
     except (FileNotFoundError, ValueError):

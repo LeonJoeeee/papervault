@@ -1,6 +1,7 @@
 """On-demand lifecycle for the persistent MinerU vLLM server unit.
 
-The MinerU server (``paper-library-mineru.service``) holds ~14 GB on the 3090 for
+The MinerU server (``papervault-mineru.service``; legacy ``paper-library-mineru.service``
+still selectable via ``PAPER_LIBRARY_MINERU_UNIT``) holds ~14 GB on the 3090 for
 its whole lifetime (vLLM pre-allocates the KV-cache pool and never releases it
 while running). In steady state the vault is fully extracted and the extract
 queue is idle almost always, so a 24/7-resident server wastes the card. This
@@ -93,7 +94,7 @@ class MineruServerController:
     ) -> None:
         self._ondemand = _env_flag("PAPER_LIBRARY_MINERU_ONDEMAND") if ondemand is None else ondemand
         self._unit = unit or os.environ.get(
-            "PAPER_LIBRARY_MINERU_UNIT", "paper-library-mineru.service")
+            "PAPER_LIBRARY_MINERU_UNIT", "papervault-mineru.service")
         if base_url is None:
             eps = endpoints_from_env()
             base_url = eps[0].url if eps else "http://127.0.0.1:30000"

@@ -1,0 +1,42 @@
+# papervault MinerU OCR server — systemd --user unit (template).
+#
+# papervault's extract path drives OCR over HTTP against a MinerU2.5 vLLM server on
+# :30000 (see docs/INSTALL.md step 5). This unit runs that server as a --user service so
+# it restarts on failure and (optionally) can be started/stopped on demand by papervault's
+# own lifecycle controller (ADR-0005) — which addresses THIS unit by name via
+# PAPER_LIBRARY_MINERU_UNIT (default: papervault-mineru.service).
+#
+# Install:
+#   cp deploy/papervault-mineru.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now papervault-mineru.service
+#
+# Requires the [mineru] extra installed in the venv that provides `mineru-vllm-server`.
+
+[Unit]
+Description=papervault MinerU2.5 vLLM OCR server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ExecStart runs the console script the [mineru] extra installs. We go through
+# `bash -lc` so your LOGIN shell's PATH resolves `mineru-vllm-server` (e.g. a venv
+# activated in ~/.profile / ~/.bashrc). If it is NOT on your login PATH, replace the
+# line below with the absolute venv path, e.g.:
+#   ExecStart=%h/projects/dev/papervault/.venv/bin/mineru-vllm-server --host 127.0.0.1 --port 30000
+ExecStart=/bin/bash -lc 'exec mineru-vllm-server --host 127.0.0.1 --port 30000'
+Restart=on-failure
+RestartSec=5
+# Cold start pulls the MinerU2.5 weights on first run and loads the model into VRAM;
+# these match the timeouts papervault's on-demand controller assumes (mineru_server.py).
+TimeoutStartSec=300
+TimeoutStopSec=60
+# Operator-set: pin the OCR server to ONE GPU. Edit the index to the card MinerU should
+# own (papervault's embed/reranker default to cuda:0 too — see .env). First run pulls the
+# weights from ModelScope by default (MINERU_MODEL_SOURCE).
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=MINERU_MODEL_SOURCE=modelscope
+
+[Install]
+WantedBy=default.target

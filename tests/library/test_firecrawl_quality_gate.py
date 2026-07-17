@@ -17,7 +17,7 @@ import json
 import pytest
 import responses
 
-from papervault.library import Library, Paper, download
+from papervault.library import Library, download
 
 
 @pytest.fixture

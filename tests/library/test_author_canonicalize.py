@@ -5,7 +5,6 @@ consistent "First [Middle] Last" form for cross-paper matching.
 """
 from __future__ import annotations
 
-import pytest
 
 from papervault.library import Paper
 from papervault.library.models import canonicalize_author

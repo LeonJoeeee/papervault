@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 import responses
 
-from papervault.library import Library, Paper, download
+from papervault.library import Library, download
 
 
 PDF_BYTES = b"%PDF-1.4\n%fake-pdf"

@@ -14,7 +14,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-import pytest
 
 from papervault.library.models import DownloadStatus
 from papervault.library.services.migrate_status import migrate_status

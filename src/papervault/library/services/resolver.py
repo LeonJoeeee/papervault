@@ -9,9 +9,8 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Optional
 
-from ..models import Paper, normalize_title
+from ..models import Paper
 from ..store import Library
 
 

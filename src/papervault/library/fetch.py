@@ -30,7 +30,6 @@ import requests
 from papervault import config
 from .models import normalize_title
 from .sources.arxiv import search_arxiv
-from .sources.semantic_scholar import search_semantic_scholar
 
 
 _DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")

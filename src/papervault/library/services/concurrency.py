@@ -16,8 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
-import time
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable
 
 log = logging.getLogger("papervault.library.concurrency")
 

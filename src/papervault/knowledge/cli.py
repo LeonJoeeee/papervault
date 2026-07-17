@@ -20,7 +20,6 @@ import sys
 
 import click
 
-from papervault.knowledge.config import CONFIG
 
 
 async def _count_doc_status(workspace: str) -> dict[str, int]:

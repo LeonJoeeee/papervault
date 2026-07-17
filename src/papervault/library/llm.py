@@ -290,6 +290,6 @@ def get_llm(*, max_tokens: int | None = None, model: str | None = None):
         return LLM(model=os.environ.get("ANTHROPIC_MODEL", "anthropic/claude-sonnet-4-5"),
                    max_tokens=mt)
     raise RuntimeError(
-        "No LLM credentials. Set up llm_keys.json or XIAOMI_API_KEY / OPENAI_API_KEY / "
-        "ANTHROPIC_API_KEY."
+        "No LLM credentials. Set PAPERVAULT_LLM_API_KEY (+ PAPERVAULT_LLM_BASE_URL) or "
+        "provide a key-pool file at PAPERVAULT_LLM_KEYS. See .env.example."
     )

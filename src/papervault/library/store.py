@@ -7,7 +7,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 from .models import DOWNLOAD_STATUS_PENDING, Paper, base_key, normalize_title
 

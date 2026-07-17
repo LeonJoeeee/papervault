@@ -22,11 +22,13 @@ from typing import Optional
 
 import requests
 
-from .sources.arxiv import search_arxiv
-from .sources.semantic_scholar import search_semantic_scholar
-from .sources.inspire import search_inspire
-from .sources.ads import search_ads
-from .sources.core import search_core
+# Resolved by NAME via module globals() in the backend registry (search_<backend>),
+# so they read as "unused" to the linter — keep them imported.
+from .sources.arxiv import search_arxiv  # noqa: F401
+from .sources.semantic_scholar import search_semantic_scholar  # noqa: F401
+from .sources.inspire import search_inspire  # noqa: F401
+from .sources.ads import search_ads  # noqa: F401
+from .sources.core import search_core  # noqa: F401
 from .sources.exceptions import BackendDegraded
 
 logger = logging.getLogger(__name__)

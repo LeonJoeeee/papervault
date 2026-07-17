@@ -5,7 +5,7 @@ The map is REGENERABLE derived data (citation counts drift slowly) — not commi
 periodically. KS loads it from KS_CITATION_MAP (default research/citation_map.json), mirroring
 the shared llm_keys.json pattern.
 
-Run in paper-library's env (it imports paper_library):
+Run in paper-library's env (it imports papervault.library):
     uv run --project ../../../paper-library python experiments/eval/export_citation_map.py
 or from the pl service dir:
     cd services/paper-library && uv run python <path>/export_citation_map.py
@@ -13,7 +13,7 @@ or from the pl service dir:
 import json
 import os
 
-from paper_library import Library
+from papervault.library import Library
 
 OUT = os.getenv("KS_CITATION_MAP", "/home/leon/projects/dev/research/citation_map.json")
 

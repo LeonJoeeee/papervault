@@ -218,7 +218,7 @@ class KeyPool:
         if mtime is None:
             groups = _env_fallback_groups()
             if not groups:
-                logger.error("LLM key file %s missing and no MIMO_API_KEY_* env fallback",
+                logger.error("LLM key file %s missing and no PAPERVAULT_LLM_API_KEY fallback",
                              self._path)
             return groups
         try:
@@ -302,7 +302,7 @@ class KeyPool:
         base_groups = list(self._groups)
         if not base_groups:
             raise RuntimeError(
-                f"No active MiMo keys (file={self._path}; no MIMO_API_KEY_* env fallback)."
+                f"No active LLM keys (file={self._path}; no PAPERVAULT_LLM_API_KEY fallback)."
             )
 
         messages: list[dict[str, str]] = []

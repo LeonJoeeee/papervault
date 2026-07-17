@@ -1,0 +1,286 @@
+"""LightRAG ingest layer (SDD §6.1): paper → graph.
+
+- distill_batch(): ★ two-phase batch enqueue → single process. NOT 逐篇 await
+  ainsert (that pins doc-level concurrency to 1 and defeats max_parallel_insert, §6.1.d).
+  元数据态(fp==META)→ ledger done_meta, 不入图。done/PROCESSED 回写交 reconcile 读
+  doc_status 终态(§6.6),这里只置 processing。
+- remove_one(): adelete_by_doc_id with the 4-way DeletionResult.status handling (§6.1):
+  success|not_found → 收口; not_allowed(403 busy) → pending_remove; fail → error.
+- REDISTILL = remove_one(delete_ledger=False) 先删旧 doc(ainsert 按 doc_id 存在性去重,
+  对已存在 id 直插会写 dup-<hash> FAILED 行,污染 doc_status + 饿池),再进 distill_batch。
+"""
+from __future__ import annotations
+
+import hashlib
+import logging
+import re
+from typing import Optional
+
+from lightrag.utils import sanitize_text_for_encoding
+
+from papervault.knowledge.ingest.fingerprint import META
+from papervault.knowledge.ingest.paper_library_client import _strip_references
+from papervault.knowledge.ingest.vault import PaperRecord, read_extract_raw
+from papervault.knowledge.ledger import store as ledger
+
+log = logging.getLogger("ks.ingest.distill")
+
+
+def doc_id(key: str) -> str:
+    return f"paper:{key}"
+
+
+def file_path(key: str) -> str:
+    return f"paper/{key}"
+
+
+# V7(SDD §6.9.7 / §6.1.c)— KS-side strip of trailing acknowledgements-class sections.
+# These sections (致谢/funding/grant 号/email/利益声明) are the richest source of junk
+# graph entities (person names, institutions, grant ids) that wear legitimate-ontology
+# clothing → noise in the graph; cutting them also trims chunk count (吞吐). Build-time
+# only (composed into clean(), which runs pre-ainsert at extraction time).
+#
+# CONSERVATIVE by design (§6.9.7): markdown-heading based ONLY (never an in-body keyword
+# search, so "this work was funded by..." inside a methods paragraph is NOT a cut point); a
+# bounded narrow cut (ack heading followed by another heading) is honored at any position while
+# an unbounded cut-to-EOF is only honored in the trailing half; a body-marker gate keeps any
+# removable segment that holds a floating table/figure/$$ block (genuine results body the
+# narrow cut would otherwise lose); a char-count guard (_MIN_KEEP_RATIO) aborts the strip
+# entirely if it would remove too much (mis-cut on a short/OCR-mangled doc); a doc with none of
+# these sections is an exact no-op.
+#
+# 大小写不敏感(re.I). \b after the heading keeps "fundingsomething" / "conflictsxyz" from
+# matching but allows "Funding", "Funding Information", "Conflicts of Interest", etc.
+# ★ `(?:[\dIVXLC]{1,6}[.)]?\s+)?` allows an optional leading section number / roman numeral
+# between the `#` markers and the keyword, so '## 5. Acknowledgments', '## VII. ACKNOWLEDGMENTS',
+# '## 6 Acknowledgment' all match (drill fix 2026-06-02, SDD §6.9.7 / §11 F22): without it the
+# regex required the keyword immediately after `#` and silently skipped every numbered ack
+# heading, leaking author/grant/institution junk into the graph.
+# ★ declaration-class variants (drill fix 2026-06-02c, SDD §6.9.7 / §11 F22 b3): two real
+# journal heading styles leaked through — Liu2021 '## Compliance with ethical standard Conflict'
+# (Springer; bare 'Conflict' under a 'Compliance...' heading, not 'conflicts of interest') and
+# Liu2024a '## Disclosure statement' ('disclosure'/'declaration of interest' were absent). Added
+# 'disclosure( statement)?' / 'declaration(s) of (competing )?interest(s)?' / 'compliance with
+# ethical standard(s)?'. NOTE: this keyword list is hand-maintained and NOT exhaustive — a novel
+# labelled declaration heading may still leak (accepted leak: a few ack names/grant ids reach the
+# graph; the miss is conservative-direction, never body loss). Broaden only doc-first (SDD).
+_ACK_HEADINGS = re.compile(
+    r"(?im)^\s{0,3}#{1,4}\s*"
+    r"(?:[\dIVXLC]{1,6}[.)]?\s+)?"  # optional section number / roman numeral prefix
+    r"(?:"
+    r"acknowledge?ments?|acknowledgement|"
+    r"funding|"
+    r"author\s+contributions?|"
+    r"conflicts?\s+of\s+interest|competing\s+interests?|"
+    r"declaration\s+of\s+competing\s+interest|"
+    r"declarations?\s+of(?:\s+competing)?\s+interests?|"  # 'Declaration of interests'
+    r"disclosure(?:\s+statement)?|"                        # Liu2024a '## Disclosure statement'
+    r"compliance\s+with\s+ethical\s+standards?|"           # Liu2021 Springer 'Compliance...'
+    r"data\s+availability(?:\s+statement)?"
+    r")\b"
+)
+# Any markdown heading (used to find where the ack section ENDS — its scope stops at the next
+# heading so a trailing Appendix is preserved).
+_ANY_HEADING = re.compile(r"(?im)^\s{0,3}#{1,4}\s+\S")
+_MIN_KEEP_RATIO = 0.5
+
+# ★ body-marker probe (drill fix 2026-06-02b, SDD §6.9.7 / §11 F22 a/a2). The narrow-cut only
+# protects an appendix that has its OWN markdown heading. OCR/markdown frequently emits a
+# FLOATING data table / figure caption / display-math block between sections (or after the
+# acknowledgements, before EOF) with no heading of its own — narrow-cut/EOF-cut would delete it
+# = genuine results body lost (Adriani2009 lost 'TABLE I: positron fraction summary' + 'FIG. 5'
+# + 13 $$ blocks, -24%; Cholis2020 lost 'TABLE II' 19-row fit constraints, -17%; Dong2020/
+# Maurin2019 lost 'Figure N:' captions). So before removing an ack segment, scan it for these
+# markers; if present the segment is NOT pure ack/ref prose and must be kept (gate ③ in
+# _strip_acks). Conservative on purpose — when a removable segment shows any sign of body, keep
+# it. Line-anchored (re.M) so a TABLE/FIG token must start a line (a caption/heading), not an
+# in-prose mention ('see Table 2'); $$ and <table> are unambiguous block markers.
+_BODY_MARKERS = re.compile(
+    r"(?im)"
+    r"(?:<table\b)"                              # HTML table (OCR'd data table)
+    r"|(?:^\s*\|.*\|.*\|)"                       # markdown table row (>=2 pipes)
+    r"|(?:^\s*TABLE\s+[IVXLC\d]+\b)"             # 'TABLE I' / 'TABLE II' caption at line start
+    r"|(?:^\s*FIG(?:URE)?\.?\s*[IVXLC\d]+\b)"    # 'FIG. 5' / 'Figure 44:' caption at line start
+    r"|(?:\$\$)"                                 # display-math block delimiter
+)
+
+
+def _strip_acks(text: str) -> str:
+    """V7(SDD §6.9.7):剥 Acknowledg(e)ments / Funding / Author Contributions /
+    Conflicts(Competing) Interests / Data Availability / Disclosure / Declaration of
+    Interests / Compliance with Ethical Standards 等清晰标注的**尾部**声明章节
+    (heading 词表人工维护, **非穷尽** —— 残余漏剥 = accepted leak, 方向保守=漏点噪声非丢正文)。
+
+    保守口径(逐个 ack 候选标题从前到后过三道闸,删第一个全过的):
+    ① **位置闸**:窄切(待删段有**下一标题** = 删除有界、只削单段)→ 不论位置一律认;
+       无界 EOF 切(无下一标题)→ 仅当命中点落在后段(> 50%)才认(无界切只在文末安全)。
+       (drill 2026-06-02b:旧"一律须 > 50%"对 appendix-heavy 论文过度限制 → 50% 前的真致谢段
+        漏剥、人名/grant 号漏进图;放宽位置闸=修 Rathore2024@35% / Chen2020@44% 的 ack leak。)
+    ② **markdown-heading based**(`^#{1,4}\\s*(?:编号)?\\s*<h>\\b`),不做正文内关键词搜杀
+       (防 "this work was funded by..." 在正文被误当章节起点)。
+    ③ ★ **body-marker 闸**(drill 2026-06-02b,§11 F22 a/a2):删段前扫 `_BODY_MARKERS`
+       (`<table>` / md 表行 / `TABLE N` / `FIG N` / `$$`)。命中 = 待删段里混着 OCR 甩出的
+       **floating 数据表/图注**(无自己标题,窄切口径保护不到)→ **保段不切**(跳到更靠后的纯
+       ack 段)+ WARN 一行让 build-time 正文丢失可观测。Adriani2009(EOF 切删 TABLE I+FIG.5+
+       13 公式块 -24%)、Cholis2020(窄切删 TABLE II 19 行拟合约束 -17%)即此闸救回。
+    ④ ★ **窄切**:删到下一 markdown 标题为止(无下一标题=切到 EOF,已被闸①限定后段+闸②清过
+       body);连续多个声明段(Acknowledgements 紧跟 Funding 紧跟 Data Availability)由递归收敛
+       逐段剥净;⑤ char-count 护栏 `_MIN_KEEP_RATIO`:剥后 < 原文一半 → 判定误切,整体放弃、
+       原样返回(防短文/OCR 异常把正文当尾巴砍掉);⑥ 无这些章节的论文 = no-op(原样返回)。
+
+    NOT for pl's references — that stays in pl's `_strip_references` (KS 绝不改 pl 命名空间)."""
+    if not text:
+        return text
+    half = len(text) * 0.5
+    chosen: Optional[tuple[re.Match, Optional[re.Match]]] = None
+    for cand in _ACK_HEADINGS.finditer(text):
+        # Narrow cut ends at the NEXT markdown heading after this ack heading (so a heading-anchored
+        # Appendix/Supplement survives); if none follows it is an unbounded cut-to-EOF.
+        nxt = _ANY_HEADING.search(text, cand.end())
+        # 闸①: bounded narrow cut honored at any position; unbounded EOF cut only in trailing half.
+        if nxt is None and cand.start() <= half:
+            continue
+        seg = text[cand.start() : nxt.start()] if nxt is not None else text[cand.start() :]
+        # 闸③: a removable segment that contains body markers is NOT pure ack/ref prose (floating
+        # table/figure with no heading of its own) → keep it; try a later, cleaner ack section.
+        if _BODY_MARKERS.search(seg):
+            log.warning(
+                "V7 _strip_acks: ack segment at %d%% (%d chars%s) holds body markers "
+                "(table/fig/$$) → keep, not pure ack (would lose results body; SDD §6.9.7 F22 a/a2)",
+                round(100 * cand.start() / len(text)),
+                len(seg),
+                ", cut-to-EOF" if nxt is None else "",
+            )
+            continue
+        chosen = (cand, nxt)
+        break  # earliest ack-class match that passes all gates
+    if chosen is None:
+        return text  # ⑥ no-op:无可安全删的尾部致谢段
+
+    cand, nxt = chosen
+    cut_start = cand.start()
+    if nxt is not None:
+        stripped = (text[:cut_start].rstrip() + "\n\n" + text[nxt.start() :].lstrip()).strip()
+    else:
+        stripped = text[:cut_start].rstrip()
+
+    # Consecutive ack-class sections: if the head we kept still ends in an ack heading (or the
+    # tail we re-joined leads with one), re-run until it stops changing (converges; still only
+    # ever cuts ack sections, never an Appendix or a body-marker segment).
+    if stripped != text:
+        stripped = _strip_acks(stripped)
+
+    # ★ 正文截断护栏(SDD §6.9.7 ④):护栏在**每个递归帧**比「本帧 stripped vs 本帧入参 text」。
+    # 递归(line above)在本 guard 之前 return,故**最外层帧**比的是「全剥后结果 vs 原文」——
+    # 用户面承诺(剥后 < 原文×0.5 → 放弃)在顶层成立,真实语料 0 触发。已知 benign false-keep:
+    # 一篇极短且致谢占比 >50% 的合成/退化文档会在某帧触发护栏 → 放弃剥、保留致谢(把"合法的致谢
+    # 主导短文"误判成误切)。真实论文绝不会 50%+ 是致谢,故语料里永不发生;方向保守(留致谢=多点
+    # 噪声,而非砍正文=知识丢失),可接受(SDD §6.9.7 / §11 F22)。
+    if len(stripped) < len(text) * _MIN_KEEP_RATIO:
+        log.warning(
+            "V7 _strip_acks would cut %d%% of doc (len %d → %d) → skip (likely mis-cut)",
+            round(100 * (1 - len(stripped) / len(text))),
+            len(text),
+            len(stripped),
+        )
+        return text
+    return stripped
+
+
+def clean(text: str) -> str:
+    """2a 删尾巴(SDD §6.1.c):`_strip_acks(_strip_references(text))`(组合)。
+    ① `_strip_references`(pl 侧,**KS 不改**)剥 references/bibliography 段;
+    ② V7 `_strip_acks`(KS 侧新增,§6.9.7)剥 acknowledgements/funding/利益声明等尾部章节。"""
+    return _strip_acks(_strip_references(text))
+
+
+def _dedup_key(cleaned_text: str) -> str:
+    """与 LightRAG enqueue 同口径(sanitize_text_for_encoding 后)的内容指纹,用于批内预去重(F16)。
+
+    LightRAG apipeline_enqueue_documents 按 sanitize_text_for_encoding(doc) 去重
+    (lightrag.py:1404-1413):内容相同的第二个 doc_id 被静默丢弃、从不入 doc_status,
+    其 ledger 行会永卡 processing。故 KS 在 enqueue 前用同一规范化口径自查碰撞。"""
+    return hashlib.sha256(sanitize_text_for_encoding(cleaned_text).encode("utf-8")).hexdigest()
+
+
+async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
+    """items = [(rec, fp)]. 两段式:批量 enqueue → 单次 process(§6.1)。"""
+    inputs: list[str] = []
+    ids: list[str] = []
+    fpaths: list[str] = []
+    queued: list[tuple[str, str]] = []     # (key, fp) — 批级异常回写 error 用(保留各自指纹,F17)
+    seen_clean: dict[str, str] = {}        # dedup_key → 已入队的 key(F16 内容去重)
+    counters = {"queued": 0, "meta": 0, "no_text": 0, "dup": 0, "errored": 0}
+
+    for rec, fp in items:
+        if fp == META:
+            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
+            counters["meta"] += 1
+            continue
+        text = read_extract_raw(rec)
+        if not text or not text.strip():
+            # 路径有但文件缺/空 → 当元数据态(待全文就绪)
+            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
+            counters["no_text"] += 1
+            continue
+        cleaned = clean(text)
+        dk = _dedup_key(cleaned)
+        if dk in seen_clean:
+            # F16: 与本批先到的一篇正文(sanitize 后)字节相同 → LightRAG enqueue 会静默丢这个 doc_id。
+            # 不留 processing(否则永卡):标 done_meta(dup),指向同内容已入队那篇。
+            # ★指纹写 *真实 fp*(不是 META):本篇有全文,fingerprint(rec) 下轮恒返真实 hash;
+            #   若这里写 META,下轮 diff(fp != META)会判 to_redistill 永久 churn(SDD §6.1 line 221 口径)。
+            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=fp)
+            counters["dup"] += 1
+            log.info("distill_batch: content-dup %s == %s → done_meta(dup)", rec.key, seen_clean[dk])
+            continue
+        seen_clean[dk] = rec.key
+        inputs.append(cleaned)
+        ids.append(doc_id(rec.key))
+        fpaths.append(file_path(rec.key))
+        await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="processing", fingerprint=fp)
+        queued.append((rec.key, fp))
+        counters["queued"] += 1
+
+    if inputs:
+        try:
+            # 批量入队(按 doc_id 去重),再单次 process —— Semaphore(max_parallel_insert) 在整批铺开。
+            # ★前提: 调用点 pipeline idle(§6.6 删插互斥保证);否则 busy → request_pending 早返,本批仍 PENDING。
+            await rag.apipeline_enqueue_documents(input=inputs, ids=ids, file_paths=fpaths)
+            await rag.apipeline_process_enqueue_documents()
+        except Exception as e:  # noqa: BLE001 — F17 批级兜底:不许击穿整 round
+            # 批级 setup/校验/连接异常(enqueue 校验 ValueError、PG/Neo4j blip、pipeline 未 init):
+            # 异常常发生在写 doc_status 之前,本批 key 会永卡 processing → 回写 error,下轮 diff(status) 重投。
+            for key, fp in queued:
+                await ledger.upsert("paper", key, doc_id=doc_id(key), status="error", fingerprint=fp)
+            counters["errored"] = len(queued)
+            counters["queued"] = 0
+            log.warning("distill_batch enqueue/process failed (%d keys → error): %r", len(queued), e)
+    # done 不在此写(enqueue 只回 track_id);reconcile 读 doc_status 终态回写 done/error(§6.6)
+    return counters
+
+
+def _result_status(r) -> Optional[str]:
+    """DeletionResult.status(对象)或 dict 兜底。"""
+    s = getattr(r, "status", None)
+    if s is None and isinstance(r, dict):
+        s = r.get("status")
+    return s
+
+
+async def remove_one(rag, key: str, *, delete_ledger: bool) -> str:
+    """adelete_by_doc_id;4-way status(§6.1)。返回 removed|pending|error。
+    delete_ledger=True(真删,REMOVE_PHASE)/ False(REDISTILL 先删旧 doc,留 ledger 行重插)。"""
+    did = doc_id(key)
+    r = await rag.adelete_by_doc_id(did)
+    status = _result_status(r)
+    if status in ("success", "not_found"):  # 已不在图 → 收口(404 不当失败,防无限重试)
+        if delete_ledger:
+            await ledger.delete("paper", key)
+        return "removed"
+    if status == "not_allowed":  # 403 pipeline busy
+        await ledger.upsert("paper", key, doc_id=did, status="pending_remove")
+        return "pending"
+    await ledger.upsert("paper", key, doc_id=did, status="error")
+    log.warning("remove %s failed: status=%s result=%r", key, status, r)
+    return "error"

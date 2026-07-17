@@ -1,0 +1,34 @@
+# --- secrets: NEVER commit ---
+.env
+.env.*
+!.env.example
+llm_keys.json
+llm_keys.json.*
+*.key
+*.pem
+
+# --- runtime data ---
+data/
+ks_storage/
+*.log
+*.nohup
+
+# --- python ---
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# --- eval artifacts (regenerable / local) ---
+eval/results/
+eval/judge/
+
+# --- os ---
+.DS_Store

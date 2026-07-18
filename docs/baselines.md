@@ -32,15 +32,16 @@ synthesis layer. The e2e honesty gate lives there, not in retrieval.
 | metric | value | measured |
 | --- | --- | --- |
 | end-to-end latency (incl. ingest triage of new finds) | 319 s mean, 222–525 s range | 2026-07-18, 12-intent baseline run (supersedes the 216–251 s 2-smoke figure) |
-| result relevance (P@served: fraction of served papers a judge scores ≥ 0.7 against the stated need, title+abstract) | **0.9056 (MiMo judge) / 0.9444 (Claude blind judge)** | 2026-07-18, first 12 intents of `intents_v1.jsonl`, 15 served each; `scripts/search_relevance_baseline.py`, results `srb_v1_0718` + `srb_v1_0718_claudejudge.json` |
+| result relevance (P@served: fraction of served papers the canonical judge scores ≥ 0.7 against the stated need, title+abstract) | **0.9111 mean / 0.7333 min** | 2026-07-18; **canonical judge = Claude opus blind panel, reasoning effort MAX** (12 fresh-context agents, one intent each, rubric-only, no access to other judges' scores); results `srb_v1_0718_claudejudge_max.json` |
 
-Honest notes: the family-correlation worry (MiMo judging MiMo-gated results) was TESTED —
-12 blind independent Claude judges re-scored all 180 papers and landed HIGHER (0.9444 vs
-0.9056, verdict agreement 165/180 = 92%), so the MiMo number is conservative, not inflated.
-Disagreements concentrate in adjacent-subtopic boundary calls, and the worst-intent identity
-flips by judge (UHECR 0.60 per MiMo → 1.00 per Claude; SDE-solvers 0.67 per Claude).
-Regime: routine regression runs use the MiMo judge (cheap, harsher); milestone baselines
-re-verify with the Claude blind-judge panel.
+Judge triangulation (all on the same 180 served papers, `srb_v1_0718`): MiMo strong-slot
+0.9056, opus default-effort 0.9444, opus max-effort 0.9111 — spread ±0.03, opus
+default-vs-max self-agreement 170/180. Treat ±0.03 as judge-side measurement noise on this
+instrument. Regime (user decision 2026-07-18): the opus max-effort blind panel is the
+CANONICAL judge for baselines and arbitration; the MiMo judge (in
+`scripts/search_relevance_baseline.py`) remains a cheap dev-time smoke that never decides.
+Known boundary behavior: adjacent-subtopic serving is where judges disagree (UHECR intent:
+0.60 MiMo / 0.73 canonical / 1.00 opus-default).
 
 ## Business: `get_paper` (lookup + full text)
 

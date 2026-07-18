@@ -301,3 +301,38 @@ def test_extraction_prompt_idempotent():
     finally:
         lr_prompt.PROMPTS["entity_extraction_examples"] = saved_examples
         lr_prompt.PROMPTS["entity_extraction_system_prompt"] = saved_sysp
+
+
+# ---- KS_RERANK_POOL_CAP (round-2 latency lever, default OFF) ----------------
+
+def test_pool_cap_scores_only_prefix(_stub_reranker, monkeypatch):
+    monkeypatch.setattr(lightrag_init, "_RERANK_POOL_CAP", 3)
+    docs = ["d0", "d1", "d2", "d3", "d4", "d5"]
+    fake = _stub_reranker([0.1, 0.9, 0.5])  # only 3 pairs may reach the model
+    out = _run(lightrag_init._bge_rerank(query="q", documents=docs, top_n=2))
+
+    (pairs,) = fake.calls
+    assert len(pairs) == 3                      # cross-encoder saw ONLY the capped prefix
+    assert [p[1] for p in pairs] == ["d0", "d1", "d2"]
+    assert [r["index"] for r in out] == [1, 2]  # indices still valid in the ORIGINAL list
+
+
+def test_pool_cap_never_below_top_n(_stub_reranker, monkeypatch):
+    monkeypatch.setattr(lightrag_init, "_RERANK_POOL_CAP", 2)
+    docs = ["d0", "d1", "d2", "d3", "d4", "d5"]
+    fake = _stub_reranker([0.1, 0.9, 0.5, 0.3])
+    out = _run(lightrag_init._bge_rerank(query="q", documents=docs, top_n=4))
+
+    (pairs,) = fake.calls
+    assert len(pairs) == 4  # clamped up to top_n, not the smaller cap
+    assert len(out) == 4
+
+
+def test_pool_cap_zero_is_off(_stub_reranker, monkeypatch):
+    monkeypatch.setattr(lightrag_init, "_RERANK_POOL_CAP", 0)
+    docs = ["d0", "d1", "d2", "d3"]
+    fake = _stub_reranker([0.1, 0.9, 0.5, 0.3])
+    _run(lightrag_init._bge_rerank(query="q", documents=docs, top_n=None))
+
+    (pairs,) = fake.calls
+    assert len(pairs) == 4  # untouched pool — byte-identical default

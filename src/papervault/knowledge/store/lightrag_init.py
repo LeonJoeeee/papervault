@@ -75,6 +75,14 @@ _RERANK_MAX_LENGTH = int(os.getenv("KS_RERANK_MAX_LENGTH", "4096"))
 # is QUALITY-NEUTRAL (still scores full max_length chunks, just in smaller batches → slightly slower);
 # the #28 OOM-retry shrinks further (→2→1). Set lower (e.g. 8) when co-renting the GPU with pl/MinerU.
 _RERANK_BATCH_SIZE = int(os.getenv("KS_RERANK_BATCH_SIZE", "32"))
+# Round-2 latency lever (issue #4, benchmark-arbitrated, default OFF = byte-identical):
+# cap the candidate pool BEFORE the cross-encoder. `documents` arrives in LightRAG's
+# pre-rerank retrieval order (descending vector relevance), so a PREFIX cut keeps the
+# best candidates and index positions stay valid against the original list. The
+# cross-encoder is ~78% of retrieval wall-clock at avg pool 220 (2026-07-18 pair),
+# so cap 120 ≈ halves rerank compute IF recall holds — that arbitration decides the
+# default, never this code. Never caps below the requested top_n.
+_RERANK_POOL_CAP = int(os.getenv("KS_RERANK_POOL_CAP", "0"))
 
 
 def _get_bge_model() -> object:
@@ -243,6 +251,11 @@ async def _bge_rerank(
     global _RERANK_FAILURES
     if not documents:
         return []
+    if _RERANK_POOL_CAP and len(documents) > _RERANK_POOL_CAP:
+        cap = max(_RERANK_POOL_CAP, top_n or 0)
+        if len(documents) > cap:
+            log.debug("rerank pool capped %d -> %d (KS_RERANK_POOL_CAP)", len(documents), cap)
+            documents = documents[:cap]
     model = _get_bge_reranker()
     pairs = [(query, d) for d in documents]
     async with _get_rerank_sem():

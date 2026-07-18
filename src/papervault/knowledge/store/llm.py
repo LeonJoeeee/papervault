@@ -45,6 +45,7 @@ from typing import Any
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from papervault import config
+from papervault.llm_usage import log_usage
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +351,7 @@ class KeyPool:
                     if dt >= _SLOW_CALL_S:
                         # Slow but OK — the call we want to see before an outer worker timeout kills it.
                         logger.info("mimo slow-ok %.0fs endpoint=%s round=%d", dt, ep, round_idx)
+                    log_usage(logger, "ks", model, dt, resp)
                     return resp.choices[0].message.content or ""
                 except asyncio.CancelledError:
                     # Killed from OUTSIDE (e.g. LightRAG's worker timeout cancels this still-running
@@ -454,6 +456,7 @@ class KeyPool:
                 if dt >= _SLOW_CALL_S:
                     # Slow but OK — the call we want to see before an outer worker timeout kills it.
                     logger.info("mimo slow-ok %.0fs endpoint=%s", dt, ep)
+                log_usage(logger, "ks", model, dt, resp)
                 return resp.choices[0].message.content or ""
             except asyncio.CancelledError:
                 # Killed from OUTSIDE (LightRAG worker timeout / synth wait_for / shutdown). Log

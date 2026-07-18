@@ -31,8 +31,13 @@ synthesis layer. The e2e honesty gate lives there, not in retrieval.
 
 | metric | value | measured |
 | --- | --- | --- |
-| end-to-end latency (incl. ingest triage of new finds) | 216–251 s | 2026-07-17/18 live smokes (14–15 results) |
-| result relevance | **not yet instrumented** | pl relevance-judge harness exists; baseline TBD (next MCP round) |
+| end-to-end latency (incl. ingest triage of new finds) | 319 s mean, 222–525 s range | 2026-07-18, 12-intent baseline run (supersedes the 216–251 s 2-smoke figure) |
+| result relevance (P@served: fraction of served papers an independent strong-model judge scores ≥ 0.7 against the stated need, title+abstract) | **0.9056 mean / 0.60 min** | 2026-07-18, first 12 intents of `intents_v1.jsonl`, 15 served each; `scripts/search_relevance_baseline.py`, results tag `srb_v1_0718` |
+
+Honest notes: the measurement judge is the same MiMo family as the live return gate, so
+scores may lean optimistic (family-correlation); treat P@served as a regression ruler, not
+absolute truth. The 0.60 floor (UHECR air-shower intent) is adjacent-topic serving — same
+field, wrong sub-need — the known failure shape to watch.
 
 ## Business: `get_paper` (lookup + full text)
 
@@ -78,3 +83,7 @@ This business is frozen: no optimization budget; regression watch only.
 4. **Component instruments** (the eval harness in `src/papervault/eval/`: gold sets,
    backbone, judges, FULL arm) are the sensitive tools for small-delta arbitration; this
    card is the product-level truth. See `docs/eval.md` for the two-tier regime.
+5. **Paired AND interleaved, ≥ 3 reps/arm** for FAST-gold arbitration: within-arm rep
+   spread (LLM-decompose non-determinism) measured ~3× the historical run-level noise
+   floor (2026-07-18 rerank pair: one arm spanned 0.8169–0.8537 across reps), so a
+   single-shot A/B is not decisive; per-rep paired deltas are.

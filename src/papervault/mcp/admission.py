@@ -1,0 +1,132 @@
+"""Load control for the heavy MCP tools (issue #28, layers 1+2).
+
+Layer 1 — per-session in-flight cap: each MCP session may have at most
+``PAPERVAULT_SESSION_INFLIGHT`` (default 2) heavy calls executing; excess calls
+WAIT on that session's own semaphore (a client queues behind itself, never
+starving other sessions of the shared GPU lanes).
+
+Layer 2 — bounded admission with an honest busy answer: at entry, projected
+wait is estimated as ``max(0, depth - lanes) * rolling_avg_service_time``.
+Above ``PAPERVAULT_ADMISSION_MAX_WAIT_S`` (default 600; ``0`` disables the
+layer) the call is NOT queued — it returns a STRUCTURED normal result::
+
+    {"busy": true, "reason": "...", "queue_depth": 7,
+     "expected_wait_s": 780, "retry_after_s": 840}
+
+An LLM caller reschedules itself well on such an answer; an opaque 20-minute
+stall it handles badly. The rolling average is fed by real completions (last
+20 per tool, seeded conservatively before data exists).
+
+Scope: ``query`` and ``search_papers`` only — ``get_paper`` is sub-second and
+never load-controlled. Installed UNDER the access log (access log wraps this),
+so MCPCALL durations remain the caller-experienced truth (queue wait included)
+and busy answers still produce an MCPCALL line. All knobs env-tunable;
+thresholds are expected to be re-set from MCPCALL production data (issue #28).
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from collections import deque
+from typing import Any
+
+from mcp.server.fastmcp import Context, FastMCP
+
+log = logging.getLogger("papervault.mcp.admission")
+
+HEAVY_TOOLS = ("query", "search_papers")
+
+_SESSION_INFLIGHT = int(os.getenv("PAPERVAULT_SESSION_INFLIGHT", "2"))
+_MAX_WAIT_S = float(os.getenv("PAPERVAULT_ADMISSION_MAX_WAIT_S", "600"))
+_LANES = int(os.getenv("PAPERVAULT_ADMISSION_LANES", "2"))
+# Conservative pre-data seeds (2026-07-18 MCPCALL observations).
+_SEED_AVG_S = {"query": 300.0, "search_papers": 320.0}
+
+_session_sems: dict[int, asyncio.Semaphore] = {}
+_depth: dict[str, int] = {}                      # per-tool in-flight + waiting
+_recent: dict[str, deque] = {}                   # per-tool completed durations
+
+
+def _session_key(kwargs: dict[str, Any]) -> int:
+    for v in kwargs.values():
+        if isinstance(v, Context):
+            try:
+                return id(v.session)
+            except Exception:  # noqa: BLE001 — unbound Context: shared bucket
+                return 0
+    return 0
+
+
+def _avg_service_s(tool: str) -> float:
+    hist = _recent.get(tool)
+    if hist:
+        return sum(hist) / len(hist)
+    return _SEED_AVG_S.get(tool, 300.0)
+
+
+def _record(tool: str, dur_s: float) -> None:
+    _recent.setdefault(tool, deque(maxlen=20)).append(dur_s)
+
+
+def _busy_answer(tool: str, depth: int, expected_wait_s: float) -> dict[str, Any]:
+    retry = int(expected_wait_s) + 60
+    return {
+        "busy": True,
+        "reason": (
+            f"{tool} is load-limited right now: {depth} calls are in line and the "
+            f"projected wait (~{int(expected_wait_s // 60)} min) exceeds the service's "
+            "honest-wait threshold. Nothing is wrong — do other work and retry."
+        ),
+        "queue_depth": depth,
+        "expected_wait_s": int(expected_wait_s),
+        "retry_after_s": retry,
+    }
+
+
+def _wrap(name: str, fn):
+    async def admitted(**kwargs):
+        depth = _depth.get(name, 0) + 1
+        if _MAX_WAIT_S > 0:
+            projected = max(0, depth - _LANES) * _avg_service_s(name)
+            if projected > _MAX_WAIT_S:
+                log.warning("ADMISSION busy tool=%s depth=%d expected_wait=%.0fs",
+                            name, depth, projected)
+                return _busy_answer(name, depth, projected)
+        _depth[name] = depth
+        t_enter = time.monotonic()
+        try:
+            sem = _session_sems.setdefault(_session_key(kwargs),
+                                           asyncio.Semaphore(_SESSION_INFLIGHT))
+            async with sem:
+                waited = time.monotonic() - t_enter
+                if waited > 1.0:
+                    log.info("ADMISSION wait tool=%s waited=%.0fs (session cap)", name, waited)
+                t0 = time.monotonic()
+                result = await fn(**kwargs)
+                _record(name, time.monotonic() - t0)
+                return result
+        finally:
+            _depth[name] = _depth.get(name, 1) - 1
+
+    return admitted
+
+
+def install_admission(mcp: FastMCP) -> None:
+    """Wrap the heavy tools with layers 1+2. Missing internals degrade to a warning."""
+    try:
+        tools = mcp._tool_manager._tools
+    except AttributeError:
+        log.warning("admission NOT installed: FastMCP tool-manager internals changed")
+        return
+    wrapped = []
+    for name in HEAVY_TOOLS:
+        tool = tools.get(name)
+        if tool is None or not getattr(tool, "is_async", True):
+            continue
+        tool.fn = _wrap(name, tool.fn)
+        wrapped.append(name)
+    log.info("admission installed on %s (session cap %d, lanes %d, max wait %.0fs%s)",
+             ", ".join(wrapped) or "NOTHING", _SESSION_INFLIGHT, _LANES, _MAX_WAIT_S,
+             "" if _MAX_WAIT_S > 0 else " — layer 2 DISABLED")

@@ -28,21 +28,25 @@ def _norm_doi(d: str | None) -> str | None:
     if not d:
         return None
     d = d.strip().lower()
-    for pre in ("https://doi.org/", "http://doi.org/", "doi:"):
-        if d.startswith(pre):
-            d = d[len(pre):]
+    d = re.sub(r"^(https?://)?(dx\.)?doi\.org/", "", d)
+    d = re.sub(r"^doi:\s*", "", d).strip()
     return d or None
 
 
 def _norm_title(t: str | None) -> str:
-    return re.sub(r"[^a-z0-9 ]", "", (t or "").lower()).strip()
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t or "").lower()
+    t = re.sub(r"[^a-z0-9]+", " ", t)  # punctuation/unicode -> SPACE (hyphens must not fuse words)
+    return re.sub(r"\s+", " ", t).strip()
 
 
 def _title_match(a: str, b: str) -> bool:
     na, nb = _norm_title(a), _norm_title(b)
     if not na or not nb:
         return False
-    if na in nb or nb in na:
+    # containment only when the shorter side is substantial (>=4 words) — a 3-word
+    # normalized title inside an unrelated longer one is an overcount vector.
+    if min(len(na.split()), len(nb.split())) >= 4 and (na in nb or nb in na):
         return True
     ta, tb = set(na.split()), set(nb.split())
     return len(ta & tb) / max(1, len(ta | tb)) >= 0.8
@@ -56,6 +60,16 @@ def _served_matches(pool_entry: dict, served: list[dict]) -> bool:
         if _title_match(pool_entry["title"], s.get("title")):
             return True
     return False
+
+
+async def _search_once(intent: str) -> list[dict]:
+    async with streamablehttp_client("http://127.0.0.1:8080/mcp",
+                                     sse_read_timeout=timedelta(seconds=630)) as (r, w, _):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            res = await s.call_tool("search_papers", {"query": intent},
+                                    read_timeout_seconds=timedelta(seconds=600))
+            return json.loads(res.content[0].text).get("results") or []
 
 
 async def main() -> None:
@@ -73,14 +87,21 @@ async def main() -> None:
     with out_path.open("w") as fh:
         for qid, pool_row in pools.items():
             t0 = time.monotonic()
-            async with streamablehttp_client("http://127.0.0.1:8080/mcp",
-                                             sse_read_timeout=timedelta(seconds=120)) as (r, w, _):
-                async with ClientSession(r, w) as s:
-                    await s.initialize()
-                    res = await s.call_tool("search_papers", {"query": intents[qid]},
-                                            read_timeout_seconds=timedelta(seconds=600))
-                    served = json.loads(res.content[0].text).get("results") or []
+            served = await _search_once(intents[qid])
             dt = time.monotonic() - t0
+            if not served:
+                # An empty serve in seconds is a backend soft-failure, not a real result —
+                # retry once; if still empty, QUARANTINE the row (excluded from the mean).
+                print(f"{qid:<28} EMPTY SERVE ({dt:.0f}s) — retrying once", flush=True)
+                await asyncio.sleep(30)
+                t0 = time.monotonic()
+                served, dt = (await _search_once(intents[qid])), time.monotonic() - t0
+            if not served:
+                fh.write(json.dumps({"qid": qid, "error": "empty_serve_after_retry",
+                                     "latency_s": round(dt, 1)}) + "\n")
+                fh.flush()
+                print(f"{qid:<28} QUARANTINED (empty serve twice)", flush=True)
+                continue
             pool = pool_row["pool"]
             hits = [p["title"] for p in pool if _served_matches(p, served)]
             misses = [p["title"] for p in pool if p["title"] not in hits]

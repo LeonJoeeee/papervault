@@ -123,6 +123,18 @@ def test_new_var_overrides_synth_with_thinking(monkeypatch):
     assert route("synth") == ("mimo-v2.5-pro", True)
 
 
+def test_synth_nothink_override_beats_thinking_default(monkeypatch):
+    # THE regression guard for the thinking-ON default: an explicit :nothink must
+    # yield False (sent as enable_thinking=False), never fall back to True.
+    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", "mimo-v2.5-pro:nothink")
+    assert route("synth") == ("mimo-v2.5-pro", False)
+
+
+def test_synth_bare_model_override_sends_no_thinking_param(monkeypatch):
+    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", "some-model")
+    assert route("synth") == ("some-model", None)
+
+
 def test_new_var_overrides_decompose_nothink(monkeypatch):
     monkeypatch.setenv("PAPERVAULT_LLM_DECOMPOSE", "mimo-v2.5:nothink")
     assert route("decompose") == ("mimo-v2.5", False)

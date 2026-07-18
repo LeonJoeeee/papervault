@@ -1,0 +1,80 @@
+# papervault — Baselines
+
+The measured floors and envelopes the PRD's definition-of-done points at ("published
+floor", "published budget"). Every number here is a real measurement with a date and
+conditions — never an aspiration. Organized by the caller-facing businesses; component
+instruments and arbitration rules at the end.
+
+**Reference conditions** (all numbers below unless stated): lab deployment #1 — RTX 3090
+24 GB (`CUDA_VISIBLE_DEVICES=1`), fp16 reranker @ max_length 4096, rerank 2×4
+(`KS_RERANK_MAX_ASYNC=2 × KS_RERANK_BATCH_SIZE=4`), `RERANK_TIMEOUT=480`, LightRAG 1.5.4,
+corpus ≈ 5.2k papers (≈ 4.4k full-text distilled), models mimo-v2.5-pro (synth slot) /
+mimo-v2.5 (build slot) via the LiteLLM gateway (12-key pool).
+
+## Business: `query` (ask the knowledge base)
+
+| metric | value | measured |
+| --- | --- | --- |
+| recall@served (distinct papers, FAST gold, --no-synth) | **0.8568** | 2026-07-18, frozen corpus, tag `frozen154_07180011` |
+| — same-window 1.4.16 reference | 0.8046 | same frozen window (papervault **+5.2 pp**) |
+| noise floor (run-level, historical) | 0.0132 | the flip/no-flip bar for retrieval changes |
+| hallucinated citation rate | **0.0** | every eval arm to date |
+| single-query end-to-end latency (with synthesis) | **172 s** | 2026-07-18 cutover smoke (44 cited papers); 207 s at rehearsal |
+| synthesis stage alone | 55–79 s | prompt ≈ 200k tokens |
+| long-call survival | ≥ 485 s proven | S17 progress heartbeat (45 s ticks) kept a deliberately-strict 120 s-SSE client alive |
+
+Honest note: at the *retrieval* level trap questions still serve content
+(trap_violation 1.0 in --no-synth arms, historical constant); refusal is enforced at the
+synthesis layer. The e2e honesty gate lives there, not in retrieval.
+
+## Business: `search_papers` (discover literature)
+
+| metric | value | measured |
+| --- | --- | --- |
+| end-to-end latency (incl. ingest triage of new finds) | 216–251 s | 2026-07-17/18 live smokes (14–15 results) |
+| result relevance | **not yet instrumented** | pl relevance-judge harness exists; baseline TBD (next MCP round) |
+
+## Business: `get_paper` (lookup + full text)
+
+| metric | value | measured |
+| --- | --- | --- |
+| latency (batch of 2, key + DOI forms) | **≈ 0 s** | every smoke |
+| identifier forms | key / DOI / arXiv / fuzzy — all resolve | 2026-07-16 caller test |
+
+This business is frozen: no optimization budget; regression watch only.
+
+## Business: freshness pipeline (search → queryable)
+
+| metric | value | measured |
+| --- | --- | --- |
+| search → full text on disk (download + OCR) | ≈ 10 min | 2026-07-16 live probe (5 papers) |
+| search → queryable knowledge (distilled into graph) | ≈ 20–30 min | scheduler rounds every 60 s; distill on arrival |
+| pipeline health under load | 342 consecutive clean rounds, 0 errors | post-cutover observation window, 2026-07-18 |
+
+## Build plane (not caller-facing; cost envelope)
+
+| metric | value | measured |
+| --- | --- | --- |
+| extraction yield (sample: 218k-char paper) | 25 chunks → 434 entities + 547 relations | 2026-07-18 probe, LightRAG 1.5.4 |
+| ontology purity (fresh 1.5.4 build) | 434/437 in the closed 11-type set, **zero `Other`** | l0_probe; 3 UNKNOWN = framework relation-endpoint placeholders (0.56 % pre-exists in prod) |
+| distill throughput | ≈ 1 paper/min under the 2-key era throttle | 2026-07-17 night; **remeasure with the 12-key pool** |
+
+## Resource envelope
+
+| metric | value | measured |
+| --- | --- | --- |
+| co-active VRAM peak (4-way OCR + concurrent queries) | **18.8 / 24 GB** | 2026-07-16 stress test |
+| held-in-reserve levers | MinerU gmu 0.40→0.30; rerank batch 4→smaller | never needed |
+
+## Arbitration rules (how these numbers may change)
+
+1. **Quality is a hard constraint**: a retrieval-affecting change flips its default only
+   if the paired recall delta stays within the 0.0132 noise floor (or improves).
+2. **Arbitration window = corpus-freeze window**: pause ingestion (stop the service or
+   disable auto-ingest) for the duration of any paired eval — live distills contaminated
+   a verdict once (2026-07-18; see the papervault issue #4 thread).
+3. **Same-day paired, identical knobs both arms** (`KS_RERANK_MAX_LENGTH=4096` explicit —
+   historical drivers defaulted to a wrong 1024).
+4. **Component instruments** (the eval harness in `src/papervault/eval/`: gold sets,
+   backbone, judges, FULL arm) are the sensitive tools for small-delta arbitration; this
+   card is the product-level truth. See `docs/eval.md` for the two-tier regime.

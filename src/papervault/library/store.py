@@ -6,6 +6,7 @@ import datetime as _dt
 import json
 import os
 import re
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -223,6 +224,15 @@ class Library:
         self._by_doi: dict[str, str] = {}
         self._by_arxiv: dict[str, str] = {}
         self._by_title: dict[str, str] = {}
+        # Save-cost controls (issue #34 root cause: per-item full-index writes starved
+        # the event loop during boot sweeps). Debounce is safe because the boot
+        # reconcile re-registers anything a crash loses between flushes.
+        self._rotation_validated = False
+        self._save_min_interval = float(os.environ.get("PAPERVAULT_SAVE_MIN_INTERVAL_S", "0"))  # 0 = off (legacy semantics); deployments opt in
+        self._last_index_save = 0.0
+        self._index_dirty = False
+        self._bib_min_interval = float(os.environ.get("PAPERVAULT_BIB_MIN_INTERVAL_S", "60"))
+        self._last_bib_save = 0.0
         self._load()
 
     # ----- load / save -----
@@ -312,11 +322,24 @@ class Library:
         # it, so a known-good copy survives a crash mid-write of the new index.
         # We only rotate a copy that actually parses — never overwrite a good
         # backup with a freshly-corrupted primary.
-        if self.index_path.exists() and self._read_index_file(self.index_path) is not None:
-            try:
-                _atomic_write(self.index_bak_path, self.index_path.read_text())
-            except OSError:
-                pass  # backup is best-effort; the durable primary write follows
+        if self.index_path.exists():
+            if not self._rotation_validated:
+                # First rotation this process: parse-validate before trusting (D14).
+                if self._read_index_file(self.index_path) is not None:
+                    try:
+                        _atomic_write(self.index_bak_path, self.index_path.read_text())
+                        self._rotation_validated = True
+                    except OSError:
+                        pass  # backup is best-effort; the durable primary write follows
+            else:
+                # Later saves: the primary was OUR OWN atomic write under the save lock —
+                # valid by construction. Rotate by O(1) rename instead of a full-file
+                # parse+copy (the 33 MB-per-item cost behind issue #34). Crash between
+                # this replace and the write below leaves only .bak; _load() recovers.
+                try:
+                    os.replace(self.index_path, self.index_bak_path)
+                except OSError:
+                    pass
         data = {"version": 1, "papers": {k: p.model_dump() for k, p in self._papers.items()}}
         _atomic_write(self.index_path, json.dumps(data, ensure_ascii=False, indent=2))
 
@@ -329,19 +352,36 @@ class Library:
                    if p.domain_status is None]
         _atomic_write(self.bib_path, "\n\n".join(entries) + "\n" if entries else "")
 
-    def save(self, *, lock_timeout: float = 30.0) -> None:
-        """Persist index + BibTeX to disk under a process-level write lock.
+    def save(self, *, force: bool = False, lock_timeout: float = 30.0) -> None:
+        """Persist index (+ BibTeX on its own cadence) under a process write lock.
+
+        Debounced (issue #34): within ``PAPERVAULT_SAVE_MIN_INTERVAL_S`` (default 5 s)
+        a non-forced save only marks the library dirty and returns — burst writers
+        (the boot sweep, multi-paper ingests) do O(1) disk work per interval instead
+        of per item. Callers at drain/shutdown points pass ``force=True``; anything
+        a crash catches unflushed is re-registered by the next boot reconcile.
+        BibTeX is a convenience view and rebuilds at most every
+        ``PAPERVAULT_BIB_MIN_INTERVAL_S`` (default 60 s) or on force.
 
         The lock prevents two MCP server instances (or pipeline + MCP) from
         racing on index.json. Reads are unsynchronized — they always see a
         fully-written file because writes are atomic (.tmp → rename).
         """
+        now = time.monotonic()
+        if (not force and self._save_min_interval > 0
+                and (now - self._last_index_save) < self._save_min_interval):
+            self._index_dirty = True
+            return
         from filelock import FileLock, Timeout
         lock_path = self.root / ".write.lock"
         try:
             with FileLock(str(lock_path), timeout=lock_timeout):
                 self._save_index()
-                self._save_bib()
+                self._last_index_save = time.monotonic()
+                self._index_dirty = False
+                if force or (now - self._last_bib_save) >= self._bib_min_interval:
+                    self._save_bib()
+                    self._last_bib_save = time.monotonic()
         except Timeout as exc:
             raise RuntimeError(f"library write lock timed out after {lock_timeout}s") from exc
 

@@ -83,3 +83,9 @@ def pytest_collection_modifyitems(config, items):
         base_name = getattr(item, "originalname", None) or item.name
         if base_name in _INTEGRATION_NAMES:
             item.add_marker(pytest.mark.integration)
+
+
+# The lab .env (loaded by papervault.config at import) may opt into save debouncing;
+# tests must see the shipped defaults (off) unless a test sets its own value (issue #34).
+os.environ["PAPERVAULT_SAVE_MIN_INTERVAL_S"] = "0"
+os.environ["PAPERVAULT_BIB_MIN_INTERVAL_S"] = "0"

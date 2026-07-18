@@ -32,7 +32,14 @@ synthesis layer. The e2e honesty gate lives there, not in retrieval.
 | metric | value | measured |
 | --- | --- | --- |
 | end-to-end latency (incl. ingest triage of new finds) | 319 s mean, 222–525 s range | 2026-07-18, 12-intent baseline run (supersedes the 216–251 s 2-smoke figure) |
+| must-find recall (coverage: fraction of the frozen landmark pool the search surfaces; `scripts/mustfind_recall.py` vs `gold_search_pools.jsonl`) | **0.1806 mean / 0.00 min** | 2026-07-18 night, single-shot v1 (serving varies run-to-run — treat as ±0.1 until a 3-rep baseline lands); results `mfr_v1_0718b` |
 | result relevance (P@served: fraction of served papers the canonical judge scores ≥ 0.7 against the stated need, title+abstract) | **0.9111 mean / 0.7333 min** | 2026-07-18; **canonical judge = Claude opus blind panel, reasoning effort MAX** (12 fresh-context agents, one intent each, rubric-only, no access to other judges' scores); results `srb_v1_0718_claudejudge_max.json` |
+
+The coverage/precision split is the search business's honest portrait: 91 % of what it
+serves is relevant, but it surfaces fewer than 1 in 5 of the landmark papers a review
+would demand — it serves the topical frontier and misses the canon (validated by hand:
+an intent NAMING PAMELA/AMS got 15 modern analysis papers, zero of the original
+measurement papers). Improvement lever tracked separately.
 
 Judge triangulation (all on the same 180 served papers, `srb_v1_0718`): MiMo strong-slot
 0.9056, opus default-effort 0.9444, opus max-effort 0.9111 — spread ±0.03, opus

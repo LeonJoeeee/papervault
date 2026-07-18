@@ -25,6 +25,7 @@ from mcp.server.fastmcp import FastMCP
 from papervault.knowledge.mcp.server import query as _knowledge_query
 from papervault.knowledge.mcp.server import start_background as _start_knowledge_bg
 from papervault.library.mcp.server import build_server as _build_library
+from papervault.mcp.access_log import install_access_log
 
 INSTRUCTIONS = """
 papervault is your literature + knowledge layer. It gives a research agent two things:
@@ -63,4 +64,6 @@ def build_server(library_path: str | None = None) -> FastMCP:
     _build_library(library_path=library_path, mcp=mcp)
     # Knowledge plane: register the query tool (its module owns the heartbeat + pipeline).
     mcp.tool()(_knowledge_query)
+    # Observability last, so every registered tool gets the MCPCALL line (issue #13).
+    install_access_log(mcp)
     return mcp

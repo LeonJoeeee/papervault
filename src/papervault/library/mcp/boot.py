@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 from typing import Awaitable, Callable
+from papervault.library.services import concurrency
 
 
 async def start_background(server, log) -> Callable[[], Awaitable[None]]:
@@ -58,7 +59,25 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
     )
     log.info("mineru on-demand monitor task created (active only when on-demand ON)")
 
+    async def _dirty_flusher() -> None:
+        # Trailing-edge flush for debounced saves (issue #34 review): a burst that
+        # ends inside the debounce window must not stay dirty until the next writer.
+        while True:
+            await asyncio.sleep(10)
+            try:
+                async with concurrency.lib_write_lock:
+                    library.flush_if_dirty()
+            except Exception:  # noqa: BLE001 — flusher must never die
+                log.exception("dirty-flusher failed (will retry)")
+
+    flusher_task = asyncio.create_task(_dirty_flusher(), name="library-dirty-flusher")
+
     async def shutdown() -> None:
+        flusher_task.cancel()
+        try:
+            await flusher_task
+        except (asyncio.CancelledError, Exception):
+            pass
         reconcile_task.cancel()
         mineru_monitor_task.cancel()
         for _t in (reconcile_task, mineru_monitor_task):
@@ -68,5 +87,9 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
                 pass
         await download_queue.stop()
         await extract_queue.stop()
+        # Graceful-shutdown flush: debounced state must reach disk before exit —
+        # NEW records have no disk artifact and are NOT reconcile-recoverable.
+        async with concurrency.lib_write_lock:
+            library.save(force=True)
 
     return shutdown

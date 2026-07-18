@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -790,7 +791,6 @@ def cmd_zotero_sync(args) -> int:
     Metadata-only: no file uploads (300 MB Zotero quota would saturate at
     scale). For PDFs, import library.bib via Zotero Desktop instead.
     """
-    import os
     from .integrations.zotero import ZoteroSync
 
     api_key = os.environ.get("ZOTERO_API_KEY") or ""
@@ -968,10 +968,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[list[str]] = None) -> int:
+    # CLI processes want legacy save semantics (every save persists): multi-action
+    # commands would otherwise debounce away their later saves and exit dirty
+    # (issue #34 review finding 3). The debounce is a long-lived-server optimization.
+    os.environ["PAPERVAULT_SAVE_MIN_INTERVAL_S"] = "0"
+    os.environ["PAPERVAULT_BIB_MIN_INTERVAL_S"] = "0"
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.library_path:
-        import os
         os.environ["PAPER_LIBRARY_PATH"] = args.library_path
     try:
         return args.func(args)

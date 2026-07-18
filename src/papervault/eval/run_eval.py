@@ -103,7 +103,7 @@ def _require_exclusive_gpu() -> None:
             if r.stdout.strip() in ("active", "activating"):
                 active.append(unit)
         except FileNotFoundError:
-            return  # no systemd at all (CI/container): nothing to guard
+            break  # no systemd at all (CI/container): empty `active` falls through permissively
         except Exception:  # noqa: BLE001 — transient probe failure: keep checking; never
             continue      # discard a positive already in hand (fail-loud philosophy)
     if active:

@@ -192,7 +192,7 @@ async def test_all_transient_raises_after_max_rounds(tmp_path, monkeypatch):
     # speed up: no real backoff sleeps
     monkeypatch.setattr(llm_mod, "_BASE_BACKOFF", 0.0)
     pool = KeyPool(f)
-    with pytest.raises(RuntimeError, match="All active MiMo keys failed"):
+    with pytest.raises(RuntimeError, match="All configured LLM keys failed"):
         await pool.complete("ping")
     data = json.loads(f.read_text())
     assert all("disabled" not in g for g in data)  # 500 is transient → never disabled

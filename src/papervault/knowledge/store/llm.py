@@ -383,7 +383,7 @@ class KeyPool:
                 await asyncio.sleep(_BASE_BACKOFF * (2 ** round_idx) + random.uniform(0, _BACKOFF_JITTER))
 
         raise RuntimeError(
-            f"All active MiMo keys failed after {_MAX_ROUNDS} rounds. "
+            f"All configured LLM keys failed after {_MAX_ROUNDS} rounds. "
             f"Last error: {type(last_error).__name__}: {last_error}"
         )
 

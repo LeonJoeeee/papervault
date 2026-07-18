@@ -58,7 +58,7 @@ operator's responsibility.
 
 papervault is consumed **by pin** (ADR-0001): deployments track an annotated git tag
 (`vX.Y.Z[-stage]`), never `main`. A release IS a tag — CI's build job produces the
-wheel/sdist for every commit, so tagging is the whole ceremony. Current: `v0.1.0-beta`
+wheel/sdist for every commit, so tagging is the whole ceremony, plus one bump: set the version field in BOTH `plugin/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` to the tag (minus the `-beta` suffix) in the release commit. Current: `v0.1.4-beta`
 (closed beta).
 
 ## License

@@ -92,9 +92,9 @@ MCP server):
 `http://127.0.0.1:8080/mcp` (or your host/port) as an MCP server. The three tools
 (`search_papers`, `get_paper`, `query`) appear automatically.
 
-> Note: this endpoint URL is hardcoded (see `.mcp.json` at the repo root), not derived
+> Note: this endpoint URL is hardcoded (see `plugin/.mcp.json`), not derived
 > from your `serve` config. If you run `papervault serve --port`/`--host` on a different
-> address, update the URL in `.mcp.json` and in any MCP client registration to match, or
+> address, update the URL in `plugin/.mcp.json` and in any MCP client registration to match, or
 > clients will point at the wrong address.
 
 > **Bind loopback only (or set a token).** `papervault serve` binds `127.0.0.1`

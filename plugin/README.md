@@ -3,13 +3,11 @@
 This directory is the minimal installable Claude Code plugin: the manifest and the MCP
 registration pointing at a RUNNING papervault server (`http://127.0.0.1:8080/mcp`).
 
-The plugin does NOT bundle the server. Install and start the server first — full steps in
-[`../docs/INSTALL.md`](../docs/INSTALL.md). Then:
+The plugin does NOT bundle the server. Install and start the server first — full steps in `docs/INSTALL.md` of the papervault repository (this installed copy contains only the plugin shell). Then:
 
 ```
 /plugin marketplace add <path-or-git-url-of-this-repo>
 /plugin install papervault
 ```
 
-Version policy: `plugin.json` version tracks the repo release tags (bumped in the release
-checklist with every tag).
+Version policy: the version field here and in the repo's `.claude-plugin/marketplace.json` is bumped with every release tag (stated in the repo README's Releases section).

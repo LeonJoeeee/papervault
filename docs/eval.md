@@ -64,6 +64,7 @@ the shipped values.
 | `KS_MQ_RRF_K` | `60` | Reciprocal-rank-fusion constant when merging sub-query hits. |
 | `KS_MQ_SUB_CHUNK_TOP_K` | `60` | Chunk top-k per sub-query before fusion. |
 | `KS_MQ_ENABLE_RERANK` | `true` | Rerank the fused chunk set on the GPU. |
+| `KS_RERANK_POOL_CAP` | `0` | Prefix-cap the candidate pool fed to the cross-encoder (`0` = off; never caps below the requested top_n). Latency lever: the cross-encoder is the dominant retrieval cost. |
 | `KS_MQ_MAX_CHUNKS_PER_PAPER` | `0` | Per-paper chunk cap (`0` = no cap; raise to diversify served papers). |
 | `KS_MQ_MIN_COVERAGE` | `thin` | Coverage-gate floor before synthesis. |
 | `KS_MQ_CITATION_PRIOR` | `0` | Citation-count prior on fused ranking (`0` = off). |

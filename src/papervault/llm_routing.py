@@ -83,11 +83,18 @@ def _new_line(role: str) -> tuple[str | None, bool | object]:
 
 
 def _resolve_synth_slot(role: str) -> tuple[str, bool | None]:
-    """synth / decompose / judge / gate: default = (SYNTH slot, no thinking param);
-    the new ``PAPERVAULT_LLM_<ROLE>`` line, when set, overrides both axes."""
+    """synth / decompose / judge / gate: default = (SYNTH slot, no thinking param) —
+    EXCEPT the synth role itself, whose shipped default is thinking ON (arbitrated
+    2026-07-19, issue #8: judged pair showed +4.4pp citation-support precision at
+    +1-3 s/query; all other metrics no-harm). Attribution note: the judged arm was
+    the COMPOUND pro-model+thinking config — the model axis is delivered by the
+    deployment's ``PAPERVAULT_LLM_SYNTH`` line; this default ships the thinking
+    axis only. The ``PAPERVAULT_LLM_<ROLE>`` line, when set, overrides both axes."""
     new_model, new_thinking = _new_line(role)
     if new_model is not None:
         return (new_model, None if new_thinking is _UNSET else new_thinking)  # type: ignore[return-value]
+    if role == "synth":
+        return (config.SYNTH_MODEL, True)
     return (config.SYNTH_MODEL, None)
 
 

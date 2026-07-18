@@ -268,6 +268,7 @@ async def main_async(args: argparse.Namespace) -> None:
             "KS_MQ_ENABLE_RERANK": _mq._MQ_ENABLE_RERANK, "KS_MAX_TOTAL_TOKENS": _mq._MAX_TOTAL_TOKENS,
             "KS_SYNTH_STRICT_REFUSAL": _os.getenv("KS_SYNTH_STRICT_REFUSAL", "1"),
             "KS_RERANK_MAX_LENGTH": _os.getenv("KS_RERANK_MAX_LENGTH", "4096"),
+            "KS_RERANK_POOL_CAP": _os.getenv("KS_RERANK_POOL_CAP", "0"),
             "KS_MQ_CITATION_PRIOR": _os.getenv("KS_MQ_CITATION_PRIOR", "0"),
             "KS_MQ_CITATION_LAMBDA": _os.getenv("KS_MQ_CITATION_LAMBDA", "0.5"),
         },

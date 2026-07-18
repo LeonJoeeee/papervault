@@ -44,6 +44,29 @@ def test_partial_usage_mixes_values_and_gaps(caplog):
     assert "ptok=10" in line and "ctok=?" in line and "ttok=?" in line
 
 
+def test_library_call_site_wired(caplog, monkeypatch):
+    # Wiring regression guard (review nit 4): LLM.call must emit an LLMTOK line
+    # with the bare (prefix-stripped) model label.
+    import litellm
+
+    from papervault.library.llm import LLM
+
+    fake_resp = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))],
+        usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3, total_tokens=10),
+    )
+    monkeypatch.setattr(litellm, "completion", lambda **kw: fake_resp)
+    client = LLM("openai/mimo-v2.5-pro")
+    with caplog.at_level(logging.INFO, logger="papervault.library.llm"):
+        out = client.call("ping")
+    assert out == "hi"
+    lines = [r.getMessage() for r in caplog.records if "LLMTOK" in r.getMessage()]
+    (line,) = lines
+    assert "plane=pl" in line
+    assert "model=mimo-v2.5-pro" in line  # provider prefix stripped
+    assert "ptok=7" in line and "ctok=3" in line
+
+
 def test_emission_never_raises(caplog):
     class Poison:
         @property

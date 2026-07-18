@@ -9,6 +9,14 @@ litellm wrapper) calls :func:`log_usage` right after a successful completion:
 counts — real tokenizer numbers, not char estimates. A response without a usable
 ``usage`` block logs ``ptok=? ctok=? ttok=?`` so gaps are visible, not silent.
 
+Scope: the LIVE-SERVICE planes only. The offline eval/arbitration tools
+(``papervault.eval._ab_u1_judge``, ``papervault.eval.judge_mimo``) call the API
+directly and are deliberately outside the book — it accounts what serving costs,
+not what benchmarking costs.
+
+``model`` labels are normalized to the bare gateway/group name (no litellm
+provider prefix) so per-model roll-ups aggregate across planes.
+
 Emission can never affect the call: any exception inside is swallowed (the same
 never-change-the-outcome contract as the MCPCALL access log, PR #14).
 """
@@ -33,4 +41,6 @@ def log_usage(logger: logging.Logger, plane: str, model: str, dur_s: float, resp
             ttok if ttok is not None else "?",
         )
     except Exception:  # noqa: BLE001 — accounting must never change a call's outcome
-        logger.debug("LLMTOK emit failed", exc_info=True)
+        # Distinct prefix (not "LLMTOK ") so a grep-based accounting parser never
+        # hits a fieldless line even with DEBUG enabled.
+        logger.debug("LLMTOK-emit-failed", exc_info=True)

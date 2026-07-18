@@ -74,7 +74,9 @@ class LLM:
             max_tokens=self.max_tokens,
             num_retries=self.num_retries,
         )
-        log_usage(logger, "pl", self.model, time.monotonic() - t0, resp)
+        # Bare model name (strip the litellm provider prefix) so pl and ks lines
+        # aggregate under one label in per-model roll-ups.
+        log_usage(logger, "pl", self.model.rsplit("/", 1)[-1], time.monotonic() - t0, resp)
         return resp.choices[0].message.content or ""
 
 # Default well above litellm's small default so a long generation isn't truncated.

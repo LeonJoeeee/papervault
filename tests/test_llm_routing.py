@@ -79,9 +79,15 @@ def test_parse_empty_model_raises(bad):
 
 # ------------------------------------------------------------------- default resolution
 
-@pytest.mark.parametrize("role", ["synth", "decompose", "judge", "gate"])
+@pytest.mark.parametrize("role", ["decompose", "judge", "gate"])
 def test_synth_slot_roles_default_to_synth_model_no_thinking(role):
     assert route(role) == (_SYNTH, None)
+
+
+def test_synth_defaults_to_thinking_on():
+    # Arbitrated 2026-07-19 (issue #8): judged pair, +4.4pp citation-support
+    # precision at +1-3 s/query — shipped default for the synth role is thinking ON.
+    assert route("synth") == (_SYNTH, True)
 
 
 def test_build_defaults_to_build_model_thinking_on():
@@ -102,7 +108,7 @@ def test_synth_slot_roles_pass_through_empty_config_model(monkeypatch):
     # SYNTH_MODEL empty (PAPERVAULT_MODEL unset) → the resolver returns "" so the call site
     # rides the pool's per-group model (byte-identical to today).
     monkeypatch.setattr(config, "SYNTH_MODEL", "")
-    assert route("synth") == ("", None)
+    assert route("synth") == ("", True)  # thinking-on default rides even the empty-model passthrough
 
 
 def test_build_passes_through_empty_config_model(monkeypatch):
@@ -150,7 +156,7 @@ def test_new_var_overrides_verify(monkeypatch):
 def test_blank_new_var_falls_back_to_default(monkeypatch):
     # A blank line is treated as "not configured" (no error) → the default resolves.
     monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", "   ")
-    assert route("synth") == (_SYNTH, None)
+    assert route("synth") == (_SYNTH, True)
 
 
 def test_invalid_new_var_raises(monkeypatch):
@@ -235,7 +241,7 @@ def test_unknown_role_raises():
 
 
 def test_role_is_case_insensitive():
-    assert route("SYNTH") == (_SYNTH, None)
+    assert route("SYNTH") == (_SYNTH, True)
     assert route("Build") == (_BUILD, True)
 
 

@@ -52,13 +52,13 @@ systemctl --user enable --now papervault-mineru.service
 # 6. Preflight — verify GPU, databases, LLM config, domain pack
 papervault doctor
 
-> Note: `doctor` checks that an LLM key is PRESENT, not that it authenticates — a wrong
-> key surfaces only at the first real `query()` (as an auth error).
-
 # 7. Run the server
 papervault serve                         # streamable-http on 127.0.0.1:8080
 #   papervault serve --stdio             # subprocess transport
 ```
+
+> Note: `doctor` checks that an LLM key is PRESENT, not that it authenticates — a wrong
+> key surfaces only at the first real `query()` (as an auth error).
 
 `papervault doctor` must be green before serving. It checks the .env, data dirs,
 the workspace vars, the domain pack, GPU/VRAM, the OCR endpoint + local model

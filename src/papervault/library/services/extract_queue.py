@@ -345,7 +345,9 @@ class ExtractQueue:
             log.exception("extract queue: extract_md failed for %s", key)
 
         async with concurrency.lib_write_lock:
-            self.library.save()
+            # Drain-flush (issue #34): mid-burst saves ride the debounce; the item
+            # that empties the queue forces the flush so nothing stays dirty.
+            self.library.save(force=self._queue.qsize() == 0)
 
         # 3. Optional on_success chain. Pre-route-B this fed the
         # insight queue; post-route-B production wiring sets on_success

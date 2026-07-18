@@ -91,15 +91,21 @@ def _require_exclusive_gpu() -> None:
         sys.stderr.write("NOTE: eval co-tenancy override active (KS_EVAL_ALLOW_COTENANCY=1).\n")
         return
     import subprocess
+    # Canonical MinerU unit name follows the codebase default + operator override
+    # (mineru_server.py); a hardcoded legacy literal would no-op the gate on new deploys.
+    units = ("papervault.service",
+             os.environ.get("PAPER_LIBRARY_MINERU_UNIT", "papervault-mineru.service"))
     active = []
-    for unit in ("papervault.service", "paper-library-mineru.service"):
+    for unit in units:
         try:
             r = subprocess.run(["systemctl", "--user", "is-active", unit],
                                capture_output=True, text=True, timeout=10)
-            if r.stdout.strip() == "active":
+            if r.stdout.strip() in ("active", "activating"):
                 active.append(unit)
-        except Exception:  # noqa: BLE001 — no systemd (CI/container): nothing to guard
-            return
+        except FileNotFoundError:
+            return  # no systemd at all (CI/container): nothing to guard
+        except Exception:  # noqa: BLE001 — transient probe failure: keep checking; never
+            continue      # discard a positive already in hand (fail-loud philosophy)
     if active:
         sys.stderr.write(
             f"ABORT: {', '.join(active)} is RUNNING — an eval alongside the live service is an "

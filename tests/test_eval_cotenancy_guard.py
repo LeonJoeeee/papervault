@@ -40,3 +40,41 @@ def test_no_systemd_environment_is_permissive(monkeypatch):
         raise FileNotFoundError("systemctl not found")
     monkeypatch.setattr(subprocess, "run", no_systemd)
     run_eval._require_exclusive_gpu()  # no raise (CI/container)
+
+
+def test_second_unit_active_still_caught(monkeypatch):
+    monkeypatch.delenv("KS_EVAL_ALLOW_COTENANCY", raising=False)
+    calls = []
+    def fake(cmd, capture_output=True, text=True, timeout=10):
+        calls.append(cmd[-1])
+        return SimpleNamespace(stdout="inactive\n" if len(calls) == 1 else "activating\n")
+    monkeypatch.setattr(subprocess, "run", fake)
+    with pytest.raises(SystemExit):
+        run_eval._require_exclusive_gpu()
+    assert len(calls) == 2  # loop reached the second unit
+
+
+def test_positive_detection_survives_later_probe_error(monkeypatch):
+    # Review finding 2: unit1 active + unit2 probe throwing must STILL abort.
+    monkeypatch.delenv("KS_EVAL_ALLOW_COTENANCY", raising=False)
+    calls = []
+    def fake(cmd, capture_output=True, text=True, timeout=10):
+        calls.append(cmd[-1])
+        if len(calls) == 1:
+            return SimpleNamespace(stdout="active\n")
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    monkeypatch.setattr(subprocess, "run", fake)
+    with pytest.raises(SystemExit):
+        run_eval._require_exclusive_gpu()
+
+
+def test_mineru_unit_name_honors_operator_override(monkeypatch):
+    monkeypatch.delenv("KS_EVAL_ALLOW_COTENANCY", raising=False)
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_UNIT", "custom-mineru.service")
+    probed = []
+    def fake(cmd, capture_output=True, text=True, timeout=10):
+        probed.append(cmd[-1])
+        return SimpleNamespace(stdout="inactive\n")
+    monkeypatch.setattr(subprocess, "run", fake)
+    run_eval._require_exclusive_gpu()
+    assert "custom-mineru.service" in probed

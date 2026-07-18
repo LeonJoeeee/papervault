@@ -25,6 +25,7 @@ from pathlib import Path
 
 from papervault import config
 from papervault.llm_routing import route
+from papervault.llm_usage import log_usage
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,7 @@ class LLM:
         import litellm
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
+        t0 = time.monotonic()
         resp = litellm.completion(
             model=self.model,
             messages=messages,
@@ -72,6 +74,7 @@ class LLM:
             max_tokens=self.max_tokens,
             num_retries=self.num_retries,
         )
+        log_usage(logger, "pl", self.model, time.monotonic() - t0, resp)
         return resp.choices[0].message.content or ""
 
 # Default well above litellm's small default so a long generation isn't truncated.

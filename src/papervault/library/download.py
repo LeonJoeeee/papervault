@@ -20,6 +20,8 @@ from typing import Callable, Optional
 
 import requests
 
+from papervault.llm_routing import route
+
 from .models import (
     DOWNLOAD_STATUS_FAILED,
     DOWNLOAD_STATUS_METADATA_ONLY,
@@ -83,8 +85,6 @@ def _normalize_for_match(s: str) -> str:
     return ' '.join(s.split())
 
 
-_VERIFY_MODEL = os.environ.get("PAPER_PIPELINE_VERIFY_MODEL", "openai/mimo-v2.5")
-
 _VERIFY_PROMPT = (
     "You verify whether a downloaded PDF is the EXACT paper that was requested.\n"
     "You are given the requested paper's metadata and the first pages of the "
@@ -120,7 +120,11 @@ def _llm_verify_identity(head: str, paper: Paper, *, llm=None,
     if llm is None:
         try:
             from .llm import get_llm
-            llm = get_llm(model=_VERIFY_MODEL)
+
+            # verify role (issue #8): default = the current verify model
+            # (PAPER_PIPELINE_VERIFY_MODEL or openai/mimo-v2.5); operator-overridable
+            # via PAPERVAULT_LLM_VERIFY. Model only — the library plane sends no thinking param.
+            llm = get_llm(model=route("verify")[0])
         except Exception as exc:
             return True, f"verify_llm_unavailable: {repr(exc)[:60]}"
     msgs = [{"role": "system", "content": _VERIFY_PROMPT},

@@ -47,8 +47,24 @@ from papervault import config as _pv_config
 from papervault.domain import get_domain
 from papervault.knowledge.query import aquery as aq
 from papervault.knowledge.store.llm import mimo_complete
+from papervault.llm_routing import route
 
 logger = logging.getLogger("ks.query.multiquery")
+
+
+def _decompose_route_kwargs() -> dict[str, Any]:
+    """Model/thinking routing (issue #8) for the multiquery decompose/planning calls. Default
+    routes to the SYNTH slot with no thinking param (today's behavior — these calls ride the pool
+    default); an operator can flip the whole plane via PAPERVAULT_LLM_DECOMPOSE. Model is passed
+    only when non-empty (empty = ride the pool default, byte-identical to today) and
+    enable_thinking only when the route pins it."""
+    model, thinking = route("decompose")
+    kw: dict[str, Any] = {}
+    if model:
+        kw["model"] = model
+    if thinking is not None:
+        kw["enable_thinking"] = thinking
+    return kw
 
 # env-tunable for the #5 optimization loop (defaults = the baselined V-MQ values; unset → byte-identical).
 _N_SUBQ = int(os.getenv("KS_MQ_N_SUBQ", "5"))          # focused sub-queries (#5 default-promote: was 4)
@@ -251,7 +267,8 @@ async def _estimate_n_sources(intent: str) -> int:
     _decompose so it cannot regress the facet logic."""
     try:
         raw = await asyncio.wait_for(
-            mimo_complete(_FANOUT_PROMPT.format(intent=intent), system_prompt=_FANOUT_SYSTEM, temperature=0.0),
+            mimo_complete(_FANOUT_PROMPT.format(intent=intent), system_prompt=_FANOUT_SYSTEM,
+                          temperature=0.0, **_decompose_route_kwargs()),
             timeout=_DECOMPOSE_TIMEOUT_S,
         )
         if not (raw or "").strip():
@@ -283,6 +300,7 @@ async def _decompose(intent: str, n: int = _N_SUBQ) -> list[dict]:
                 # setdefault=131072; user 2026-06-14) so CoT never starves the output; the 300s
                 # decompose timeout is what bounds runaway cost. The array is short = unused free.
                 system_prompt=_DECOMPOSE_SYSTEM, temperature=0.3,
+                **_decompose_route_kwargs(),
             ),
             timeout=_DECOMPOSE_TIMEOUT_S,
         )
@@ -308,6 +326,7 @@ async def _decompose_standard(intent: str, n: int = _STD_MAX_TERMS) -> list[dict
                 # (llm.py setdefault; user 2026-06-14) so CoT can't starve the output -> empty ->
                 # silent single-query fallback; the 300s decompose timeout bounds runaway cost.
                 system_prompt=_STD_DECOMPOSE_SYSTEM, temperature=0.3,
+                **_decompose_route_kwargs(),
             ),
             timeout=_DECOMPOSE_TIMEOUT_S,
         )

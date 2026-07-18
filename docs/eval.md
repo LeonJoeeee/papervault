@@ -1,5 +1,7 @@
 # Evaluation
 
+> Measured floors live in [`docs/baselines.md`](baselines.md); this file is HOW they are measured.
+
 papervault ships its own eval harness (`src/papervault/eval/`) so retrieval quality is
 **reproducible, not claimed**. It measures the knowledge `query` path against a gold set:
 recall@served, citation recall, hallucination rate, and trap/refusal gates.

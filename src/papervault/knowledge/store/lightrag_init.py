@@ -81,9 +81,11 @@ _RERANK_BATCH_SIZE = int(os.getenv("KS_RERANK_BATCH_SIZE", "32"))
 # operate.py 1.5.4) — each source pre-sorted best-first — so a PREFIX cut drops each source's
 # lowest-ranked TAIL, keeps every source represented, and index positions stay valid against
 # the original list. The cross-encoder is ~78% of retrieval wall-clock at avg pool 220
-# (2026-07-18 pair), so cap 120 ≈ halves rerank compute IF recall holds — that arbitration
-# decides the default, never this code. Never caps below the requested top_n; negative = off.
-_RERANK_POOL_CAP = max(0, int(os.getenv("KS_RERANK_POOL_CAP", "0")))
+# (2026-07-18 pair). ARBITRATED 2026-07-18 (issue #21, 3 interleaved reps): cap 120 is
+# recall-neutral (paired mean −0.8pp, within the noise floor, direction-inconsistent) at
+# 1.90× retrieval speed → DEFAULT 120. cap 80 refuted (±8pp instability). 0 = uncapped.
+# Never caps below the requested top_n; negative = off.
+_RERANK_POOL_CAP = max(0, int(os.getenv("KS_RERANK_POOL_CAP", "120")))
 
 
 def _get_bge_model() -> object:

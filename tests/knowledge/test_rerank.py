@@ -303,7 +303,7 @@ def test_extraction_prompt_idempotent():
         lr_prompt.PROMPTS["entity_extraction_system_prompt"] = saved_sysp
 
 
-# ---- KS_RERANK_POOL_CAP (round-2 latency lever, default OFF) ----------------
+# ---- KS_RERANK_POOL_CAP (round-2 latency lever; default 120 since 2026-07-18) ----
 
 def test_pool_cap_scores_only_prefix(_stub_reranker, monkeypatch):
     monkeypatch.setattr(lightrag_init, "_RERANK_POOL_CAP", 3)
@@ -335,7 +335,7 @@ def test_pool_cap_zero_is_off(_stub_reranker, monkeypatch):
     _run(lightrag_init._bge_rerank(query="q", documents=docs, top_n=None))
 
     (pairs,) = fake.calls
-    assert len(pairs) == 4  # untouched pool — byte-identical default
+    assert len(pairs) == 4  # untouched pool — cap disabled
 
 
 def test_pool_cap_no_truncation_when_pool_small(_stub_reranker, monkeypatch):

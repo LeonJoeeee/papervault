@@ -791,7 +791,6 @@ def cmd_zotero_sync(args) -> int:
     Metadata-only: no file uploads (300 MB Zotero quota would saturate at
     scale). For PDFs, import library.bib via Zotero Desktop instead.
     """
-    import os
     from .integrations.zotero import ZoteroSync
 
     api_key = os.environ.get("ZOTERO_API_KEY") or ""
@@ -977,7 +976,6 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.library_path:
-        import os
         os.environ["PAPER_LIBRARY_PATH"] = args.library_path
     try:
         return args.func(args)

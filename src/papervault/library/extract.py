@@ -40,6 +40,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from papervault.llm_routing import route
+
 from .mineru_client import (
     MineruExtractionError,
     MineruTransportError,
@@ -310,7 +312,10 @@ def review_extract(extract_text: str, *, llm=None) -> dict:
     try:
         if llm is None:
             from .llm import get_llm
-            llm = get_llm()
+
+            # gate role (issue #8): the extract clarity/completeness gates. Default = the SYNTH
+            # slot (today's get_llm() default); operator-overridable via PAPERVAULT_LLM_GATE.
+            llm = get_llm(model=route("gate")[0])
         raw = llm.call([
             {"role": "system", "content": _REVIEW_PROMPT},
             {"role": "user", "content": extract_text},
@@ -450,7 +455,10 @@ def completeness_gate(full_text: str, *, llm=None) -> dict:
     try:
         if llm is None:
             from .llm import get_llm
-            llm = get_llm()
+
+            # gate role (issue #8): the extract clarity/completeness gates. Default = the SYNTH
+            # slot (today's get_llm() default); operator-overridable via PAPERVAULT_LLM_GATE.
+            llm = get_llm(model=route("gate")[0])
         raw = llm.call([
             {"role": "system", "content": _GATE_PROMPT},
             {"role": "user", "content": full_text},

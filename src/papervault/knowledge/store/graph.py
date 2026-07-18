@@ -36,13 +36,13 @@ from typing import Optional
 from lightrag import LightRAG
 from lightrag.utils import EmbeddingFunc
 
-from papervault import config as _pv
 from papervault.domain import get_domain
 from papervault.knowledge.config import CONFIG
 from papervault.knowledge.ingest.chunking import chunking_by_sentence_boundary
 from papervault.knowledge.store.extraction_prompt import apply_ks_extraction_prompt
 from papervault.knowledge.store.lightrag_init import _bge_embed, _bge_rerank
 from papervault.knowledge.store.llm import mimo_complete
+from papervault.llm_routing import route
 
 log = logging.getLogger("ks.store.graph")
 
@@ -133,15 +133,16 @@ async def get_graph() -> LightRAG:
     #       burning ~67s of reasoning CoT (2026-07-16). Default 1 = today's behavior; the
     #       knob exists so a FAST recall A/B can arbitrate before any flip.
     async def _build_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
-        kwargs.setdefault("model", os.getenv("KS_BUILD_MODEL") or _pv.BUILD_MODEL)
-        # LightRAG 1.5.x no longer tags the query-path keyword-extraction call with
-        # keyword_extraction=True; it now passes response_format={"type":"json_object"}
-        # (operate.py query kw path) — and in papervault's text-mode config that is the ONLY
-        # call carrying response_format, so it uniquely marks keyword extraction.
-        if kwargs.get("response_format") and os.getenv("KS_KW_THINKING", "1") == "0":
-            kwargs.setdefault("enable_thinking", False)
-        elif os.getenv("KS_BUILD_THINKING", "1") == "1":
-            kwargs.setdefault("enable_thinking", True)
+        # Model/thinking routing (issue #8): route the call by ROLE. LightRAG 1.5.x no longer
+        # tags the query-path keyword-extraction call with keyword_extraction=True; it now passes
+        # response_format={"type":"json_object"} (operate.py query kw path) — and in papervault's
+        # text-mode config that is the ONLY call carrying response_format, so it uniquely marks
+        # keyword extraction. route() folds in the legacy KS_BUILD_MODEL / KS_BUILD_THINKING /
+        # KS_KW_THINKING knobs (back-compat) so this is behavior-neutral at the current defaults.
+        model, thinking = route("keyword" if kwargs.get("response_format") else "build")
+        kwargs.setdefault("model", model)
+        if thinking is not None:
+            kwargs.setdefault("enable_thinking", thinking)
         return await mimo_complete(
             prompt, system_prompt=system_prompt, history_messages=history_messages, **kwargs
         )
@@ -149,7 +150,7 @@ async def get_graph() -> LightRAG:
     rag = LightRAG(
         working_dir=working_dir,
         llm_model_func=_build_llm,
-        llm_model_name=os.getenv("KS_BUILD_MODEL") or _pv.BUILD_MODEL,
+        llm_model_name=route("build")[0],
         llm_model_max_async=int(os.getenv("KS_LLM_MAX_ASYNC", "32")),        # 硬 LLM 天花板。默认 32(2026-06-04):6-key 时代 conc16 把 2400-chunk 抽取拖过 480s worker(59/100 error)→曾锁 8;补到 24 key 后 conc_probe 实测 conc12/24/36/48 全 0 error、max ≤83s«480s(争抢消失,~1.3 调用/key)。env 可调,应大致随活 key 数走(§7)
         max_parallel_insert=int(os.getenv("KS_MAX_PARALLEL_INSERT", "16")),  # 文档在飞数(默认 2 = 隐藏瓶颈)
         embedding_func_max_async=int(os.getenv("KS_EMBED_MAX_ASYNC", "16")), # embedding 并发(默认 8 = 隐藏瓶颈);三旋钮缺一不可(§7)

@@ -24,6 +24,7 @@ import time
 from pathlib import Path
 
 from papervault import config
+from papervault.llm_routing import route
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,14 @@ def get_llm(*, max_tokens: int | None = None, model: str | None = None):
     with the model mapped to the proxy GROUP (default/None → ``mimo-v2.5-pro``; explicit cheap → ``mimo-v2.5``). The proxy owns the
     real keys + failover. The DEFAULT (OFF) path below is UNCHANGED."""
     mt = max_tokens or _DEFAULT_MAX_TOKENS
+    # Default handle → the "judge" role (issue #8): library judges / intent parser / search all
+    # ride get_llm() with no explicit model. Default routes to the SYNTH slot (today's behavior);
+    # an operator can move them to a cheaper model via PAPERVAULT_LLM_JUDGE. An explicit model=
+    # (the verify + extract-gate call sites) bypasses this. Normalize to litellm form; an empty
+    # resolution → None → the pool's per-group model, byte-identical to today when nothing is set.
+    if model is None:
+        model = route("judge")[0]
+    model = _litellm_model(model) or None
     if config.USE_GATEWAY:
         return _get_llm_via_gateway(mt, model)
     if _KEYS_FILE.exists() or config.LLM_API_KEY:

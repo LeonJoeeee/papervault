@@ -24,6 +24,7 @@ import time
 from typing import Any
 
 from papervault.knowledge.store.llm import mimo_complete
+from papervault.llm_routing import route
 
 logger = logging.getLogger("ks.query.synth")
 
@@ -235,6 +236,16 @@ async def synth_answer(
     the out-feed must still return a well-formed {answer, cited_papers, kb_coverage}.
     """
     prompt = _build_prompt(data, intent)
+    # Model/thinking routing (issue #8): the research-plane synth call. Default routes to the
+    # SYNTH slot with no thinking param (today's behavior); an operator can pin the strong model
+    # + thinking ON via PAPERVAULT_LLM_SYNTH. Pass model only when non-empty (empty = ride the
+    # pool default, byte-identical to today) and enable_thinking only when the route pins it.
+    _model, _thinking = route("synth")
+    _route_kw: dict[str, Any] = {}
+    if _model:
+        _route_kw["model"] = _model
+    if _thinking is not None:
+        _route_kw["enable_thinking"] = _thinking
     # Timing log (2026-07-16, issue #3): synth wall-clock was an observability blind spot
     # — only the generic >=60s slow-call log in store/llm.py ever recorded it.
     t0 = time.monotonic()
@@ -245,6 +256,7 @@ async def synth_answer(
                 system_prompt=_SYNTH_SYSTEM,
                 temperature=0.2,
                 max_tokens=_SYNTH_MAX_TOKENS,
+                **_route_kw,
             ),
             timeout=timeout_s,
         )

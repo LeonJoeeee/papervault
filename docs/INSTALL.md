@@ -84,8 +84,8 @@ MCP server):
 
 ```bash
 # from the papervault repo
-/plugin marketplace add ./
-/plugin install papervault
+/plugin marketplace add ./        # the marketplace manifest routes to the minimal plugin/ subdir
+/plugin install papervault        # installs ONLY plugin/ (manifest + MCP registration), not the repo
 ```
 
 **Any other MCP client** — register the streamable-http endpoint

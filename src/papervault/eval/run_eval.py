@@ -81,6 +81,34 @@ def _reset_rerank_fails() -> None:
         pass
 
 
+def _require_exclusive_gpu() -> None:
+    """VRAM co-tenancy gate (issue #32). An eval process loads its own reranker+embedder
+    (~5-6 GB) — an un-budgeted third GPU tenant next to a RUNNING service. The freeze
+    discipline (stop services before arbitration) becomes code here: refuse to start while
+    either service unit is active, unless KS_EVAL_ALLOW_COTENANCY=1 (deliberate co-residency
+    experiments only). Fail-loud, same philosophy as the workspace gate below."""
+    if os.environ.get("KS_EVAL_ALLOW_COTENANCY") == "1":
+        sys.stderr.write("NOTE: eval co-tenancy override active (KS_EVAL_ALLOW_COTENANCY=1).\n")
+        return
+    import subprocess
+    active = []
+    for unit in ("papervault.service", "paper-library-mineru.service"):
+        try:
+            r = subprocess.run(["systemctl", "--user", "is-active", unit],
+                               capture_output=True, text=True, timeout=10)
+            if r.stdout.strip() == "active":
+                active.append(unit)
+        except Exception:  # noqa: BLE001 — no systemd (CI/container): nothing to guard
+            return
+    if active:
+        sys.stderr.write(
+            f"ABORT: {', '.join(active)} is RUNNING — an eval alongside the live service is an "
+            "un-budgeted GPU tenant (OOM risk) and violates the corpus-freeze discipline. Stop "
+            "the services first, or set KS_EVAL_ALLOW_COTENANCY=1 for a deliberate experiment.\n"
+        )
+        raise SystemExit(2)
+
+
 def _require_probe_workspace() -> str:
     """Prod-safety gate. Default: 'l0_probe' only. EXCEPTION (user-approved 2026-06-06): allow a
     READ-ONLY eval against prod 'l0' when KS_ALLOW_PROD_WORKSPACE=1 — run_eval is query-only (no
@@ -243,6 +271,7 @@ async def main_async(args: argparse.Namespace) -> None:
     from papervault.knowledge.store.graph import assert_safe_workspace, get_graph
 
     ws = _require_probe_workspace()
+    _require_exclusive_gpu()
     assert_safe_workspace()  # belt-and-suspenders: also run the production gate
 
     gold = load_gold(Path(args.gold))

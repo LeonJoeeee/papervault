@@ -331,17 +331,45 @@ class Library:
                         self._rotation_validated = True
                     except OSError:
                         pass  # backup is best-effort; the durable primary write follows
-            else:
-                # Later saves: the primary was OUR OWN atomic write under the save lock —
-                # valid by construction. Rotate by O(1) rename instead of a full-file
+            elif self._primary_sane():
+                # Later saves: the primary is a completed atomic write (ours or a peer's
+                # under the same file lock). Rotate by O(1) rename instead of a full-file
                 # parse+copy (the 33 MB-per-item cost behind issue #34). Crash between
                 # this replace and the write below leaves only .bak; _load() recovers.
+                # The cheap sanity gate keeps out-of-band corruption (truncation,
+                # bit-rot) from clobbering the last known-good .bak (D14).
                 try:
                     os.replace(self.index_path, self.index_bak_path)
                 except OSError:
                     pass
+            else:
+                # Sanity gate failed: primary corrupted out-of-band. PRESERVE .bak
+                # (do not rotate) and fall back to full validation on the next save.
+                self._rotation_validated = False
         data = {"version": 1, "papers": {k: p.model_dump() for k, p in self._papers.items()}}
         _atomic_write(self.index_path, json.dumps(data, ensure_ascii=False, indent=2))
+
+    def _primary_sane(self) -> bool:
+        """Cheap structural check (no full parse) that the primary index looks like a
+        completed JSON object write — guards the O(1) rotation against truncation."""
+        try:
+            size = self.index_path.stat().st_size
+            if size < 16:
+                return False
+            with self.index_path.open("rb") as fh:
+                head = fh.read(1)
+                fh.seek(-2, 2)
+                tail = fh.read(2)
+            return head == b"{" and tail.rstrip().endswith(b"}")
+        except OSError:
+            return False
+
+    def flush_if_dirty(self, **kw) -> bool:
+        """Force-persist iff a debounced save left state dirty. Returns True if it wrote."""
+        if not self._index_dirty:
+            return False
+        self.save(force=True, **kw)
+        return True
 
     def _save_bib(self) -> None:
         # Pass `library=self` so Paper.to_bibtex emits `file = {...}` fields

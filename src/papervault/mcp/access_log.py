@@ -34,7 +34,7 @@ import logging
 import time
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
 log = logging.getLogger("papervault.mcp.access")
 
@@ -44,7 +44,7 @@ _seq = itertools.count(1)
 def _fingerprint(kwargs: dict[str, Any]) -> str:
     parts = []
     for k, v in kwargs.items():
-        if hasattr(v, "request_id"):  # injected Context — logged via req=, not args=
+        if isinstance(v, Context):  # injected Context — logged via req=, not args=
             continue
         if isinstance(v, str):
             parts.append(f"{k}:len={len(v)}")
@@ -57,9 +57,14 @@ def _fingerprint(kwargs: dict[str, Any]) -> str:
 
 def _request_id(kwargs: dict[str, Any]) -> str:
     for v in kwargs.values():
-        rid = getattr(v, "request_id", None)
-        if rid is not None:
-            return str(rid)
+        if isinstance(v, Context):
+            try:
+                # Context.request_id is a property that RAISES (ValueError) when the
+                # Context is unbound (_request_context is None) — never let that
+                # surface as a call failure.
+                return str(v.request_id)
+            except Exception:
+                return "-"
     return "-"
 
 
@@ -78,11 +83,15 @@ def _wrap(name: str, fn):
             outcome = f"error:{type(exc).__name__}"
             raise
         finally:
-            log.info(
-                "MCPCALL seq=%d tool=%s req=%s dur=%.2fs outcome=%s args=%s",
-                seq, name, _request_id(kwargs),
-                time.monotonic() - t0, outcome, _fingerprint(kwargs),
-            )
+            try:
+                log.info(
+                    "MCPCALL seq=%d tool=%s req=%s dur=%.2fs outcome=%s args=%s",
+                    seq, name, _request_id(kwargs),
+                    time.monotonic() - t0, outcome, _fingerprint(kwargs),
+                )
+            except Exception:
+                # The access log must never change a call's outcome.
+                log.exception("MCPCALL emit failed (call outcome unaffected)")
 
     return logged
 

@@ -6,10 +6,12 @@ SDK invokes Tool.fn breaks these tests, exactly when the wrap would break live.
 """
 import asyncio
 import logging
+from typing import Optional
 
 import pytest
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.shared.context import RequestContext
 
 from papervault.mcp.access_log import install_access_log
 
@@ -20,6 +22,10 @@ def _build_toy() -> FastMCP:
     @mcp.tool()
     async def echo(text: str, items: list[str] | None = None) -> dict:
         return {"text": text, "n": len(items or [])}
+
+    @mcp.tool()
+    async def with_ctx(text: str, ctx: Optional[Context] = None) -> dict:
+        return {"text": text, "had_ctx": ctx is not None}
 
     @mcp.tool()
     async def boom(text: str) -> dict:
@@ -83,6 +89,44 @@ async def test_schema_rejected_call_never_reaches_wrapper(caplog):
         with pytest.raises(ToolError):
             await mcp._tool_manager._tools["echo"].run({"nope": 1})
     assert _mcpcall_lines(caplog) == []
+
+
+async def test_context_tool_logs_request_id_and_excludes_ctx(caplog):
+    # Pins the two production behaviors on the ctx-declaring path (all three real
+    # tools declare ctx): req= carries the MCP request id (heartbeat correlation),
+    # and the injected Context never appears in the args= fingerprint.
+    mcp = _build_toy()
+    rc = RequestContext(
+        request_id="REQ-999", meta=None, session=None, lifespan_context=None
+    )
+    ctx = Context(request_context=rc, fastmcp=mcp)
+    with caplog.at_level(logging.INFO, logger="papervault.mcp.access"):
+        result = await mcp._tool_manager._tools["with_ctx"].run(
+            {"text": "hi"}, context=ctx
+        )
+    assert result == {"text": "hi", "had_ctx": True}
+    (line,) = _mcpcall_lines(caplog)
+    assert "req=REQ-999" in line
+    assert "args=text:len=2" in line
+    assert "ctx" not in line.split("args=")[1]
+
+
+async def test_unbound_context_never_breaks_the_call(caplog):
+    # Regression (PR #14 review finding 1): Context.request_id is a property that
+    # RAISES when the Context is unbound — the wrapper must log req=- and leave
+    # the call result untouched, not convert success into ToolError.
+    mcp = _build_toy()
+    ctx = Context(request_context=None, fastmcp=mcp)
+    with pytest.raises(ValueError):
+        ctx.request_id  # precondition: unbound access really raises
+    with caplog.at_level(logging.INFO, logger="papervault.mcp.access"):
+        result = await mcp._tool_manager._tools["with_ctx"].run(
+            {"text": "hi"}, context=ctx
+        )
+    assert result == {"text": "hi", "had_ctx": True}
+    (line,) = _mcpcall_lines(caplog)
+    assert "req=-" in line
+    assert "outcome=ok" in line
 
 
 def test_install_survives_missing_internals(caplog):

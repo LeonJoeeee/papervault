@@ -336,3 +336,14 @@ def test_pool_cap_zero_is_off(_stub_reranker, monkeypatch):
 
     (pairs,) = fake.calls
     assert len(pairs) == 4  # untouched pool — byte-identical default
+
+
+def test_pool_cap_no_truncation_when_pool_small(_stub_reranker, monkeypatch):
+    monkeypatch.setattr(lightrag_init, "_RERANK_POOL_CAP", 10)
+    docs = ["d0", "d1", "d2"]
+    fake = _stub_reranker([0.1, 0.9, 0.5])
+    out = _run(lightrag_init._bge_rerank(query="q", documents=docs, top_n=2))
+
+    (pairs,) = fake.calls
+    assert len(pairs) == 3  # pool <= cap → untouched
+    assert len(out) == 2

@@ -76,13 +76,14 @@ _RERANK_MAX_LENGTH = int(os.getenv("KS_RERANK_MAX_LENGTH", "4096"))
 # the #28 OOM-retry shrinks further (→2→1). Set lower (e.g. 8) when co-renting the GPU with pl/MinerU.
 _RERANK_BATCH_SIZE = int(os.getenv("KS_RERANK_BATCH_SIZE", "32"))
 # Round-2 latency lever (issue #4, benchmark-arbitrated, default OFF = byte-identical):
-# cap the candidate pool BEFORE the cross-encoder. `documents` arrives in LightRAG's
-# pre-rerank retrieval order (descending vector relevance), so a PREFIX cut keeps the
-# best candidates and index positions stay valid against the original list. The
-# cross-encoder is ~78% of retrieval wall-clock at avg pool 220 (2026-07-18 pair),
-# so cap 120 ≈ halves rerank compute IF recall holds — that arbitration decides the
-# default, never this code. Never caps below the requested top_n.
-_RERANK_POOL_CAP = int(os.getenv("KS_RERANK_POOL_CAP", "0"))
+# cap the candidate pool BEFORE the cross-encoder. In KS's shipped `mix` mode the pool is
+# LightRAG's round-robin interleave of the vector/entity/relation sources (_merge_all_chunks,
+# operate.py 1.5.4) — each source pre-sorted best-first — so a PREFIX cut drops each source's
+# lowest-ranked TAIL, keeps every source represented, and index positions stay valid against
+# the original list. The cross-encoder is ~78% of retrieval wall-clock at avg pool 220
+# (2026-07-18 pair), so cap 120 ≈ halves rerank compute IF recall holds — that arbitration
+# decides the default, never this code. Never caps below the requested top_n; negative = off.
+_RERANK_POOL_CAP = max(0, int(os.getenv("KS_RERANK_POOL_CAP", "0")))
 
 
 def _get_bge_model() -> object:

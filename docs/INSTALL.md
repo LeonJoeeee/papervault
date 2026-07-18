@@ -52,6 +52,9 @@ systemctl --user enable --now papervault-mineru.service
 # 6. Preflight — verify GPU, databases, LLM config, domain pack
 papervault doctor
 
+> Note: `doctor` checks that an LLM key is PRESENT, not that it authenticates — a wrong
+> key surfaces only at the first real `query()` (as an auth error).
+
 # 7. Run the server
 papervault serve                         # streamable-http on 127.0.0.1:8080
 #   papervault serve --stdio             # subprocess transport
@@ -123,3 +126,10 @@ legal decision — comment the flag out (and skip the extra) to opt out. Anna's
 Archive additionally requires a personal member key (`ANNAS_ARCHIVE_API_KEY`).
 Before the repo flips public, this shipped default reverts to OFF — see
 [ADR-0004](adr/0004-grey-download-tiers-flag-gated.md) and its amendment.
+
+
+## Run papervault as a service (optional)
+
+`deploy/papervault.service` is a user-level systemd unit for the server. Its
+`WorkingDirectory`/`ExecStart` assume the clone lives at `~/projects/dev/papervault` —
+edit both paths to your clone location before `systemctl --user enable --now papervault`.

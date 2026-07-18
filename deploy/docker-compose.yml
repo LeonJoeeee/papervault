@@ -1,3 +1,8 @@
+# Project name pinned: without it Compose derives the project from the parent dir
+# ('deploy'), silently hijacking ANY other stack living in a deploy/ dir with services
+# named postgres/neo4j (bit this very lab's production DBs, 2026-07-19 walkthrough).
+name: papervault
+
 # papervault backing stores: Postgres (pgvector) + Neo4j.
 # The GPU services (embed/rerank in-process, MinerU OCR) run on the host, not here.
 #

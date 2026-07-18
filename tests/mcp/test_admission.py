@@ -1,6 +1,5 @@
 """Unit tests for the admission layers (issue #28) — through the real Tool.run path."""
 import asyncio
-import logging
 
 import pytest
 from mcp.server.fastmcp import FastMCP

@@ -19,7 +19,7 @@ mimo-v2.5 (build slot) via the LiteLLM gateway (12-key pool).
 | — same-window 1.4.16 reference | 0.8046 | same frozen window (papervault **+5.2 pp**) |
 | noise floor (run-level, historical) | 0.0132 | the flip/no-flip bar for retrieval changes |
 | hallucinated citation rate | **0.0** | every eval arm to date |
-| single-query end-to-end latency (with synthesis) | **172 s** | 2026-07-18 cutover smoke (44 cited papers); 207 s at rehearsal |
+| single-query end-to-end latency (with synthesis) | **172 s** (pre-cap); pool-cap 120 halves the retrieval stage (arbitrated 1.90×, issue #21) — live number to be re-measured | 2026-07-18 |
 | synthesis stage alone | 55–79 s | prompt ≈ 200k tokens |
 | long-call survival | ≥ 485 s proven | S17 progress heartbeat (45 s ticks) kept a deliberately-strict 120 s-SSE client alive |
 

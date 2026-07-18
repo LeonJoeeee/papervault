@@ -44,7 +44,10 @@ _LANES = int(os.getenv("PAPERVAULT_ADMISSION_LANES", "2"))
 # Conservative pre-data seeds (2026-07-18 MCPCALL observations).
 _SEED_AVG_S = {"query": 300.0, "search_papers": 320.0}
 
+# Units note (by design): layer 1 caps a session's TOTAL heavy budget (query +
+# search_papers share the session's permits); layer 2's depth/busy model is per-tool.
 _session_sems: dict[int, asyncio.Semaphore] = {}
+_session_active: dict[int, int] = {}             # tasks inside the wrapper per session key
 _depth: dict[str, int] = {}                      # per-tool in-flight + waiting
 _recent: dict[str, deque] = {}                   # per-tool completed durations
 
@@ -95,10 +98,11 @@ def _wrap(name: str, fn):
                             name, depth, projected)
                 return _busy_answer(name, depth, projected)
         _depth[name] = depth
+        skey = _session_key(kwargs)
+        _session_active[skey] = _session_active.get(skey, 0) + 1
         t_enter = time.monotonic()
         try:
-            sem = _session_sems.setdefault(_session_key(kwargs),
-                                           asyncio.Semaphore(_SESSION_INFLIGHT))
+            sem = _session_sems.setdefault(skey, asyncio.Semaphore(_SESSION_INFLIGHT))
             async with sem:
                 waited = time.monotonic() - t_enter
                 if waited > 1.0:
@@ -109,6 +113,14 @@ def _wrap(name: str, fn):
                 return result
         finally:
             _depth[name] = _depth.get(name, 1) - 1
+            # Evict the session's semaphore once NOTHING (holder or waiter) references
+            # its key — long-lived servers must not accumulate one entry per dead session.
+            n = _session_active.get(skey, 1) - 1
+            if n <= 0:
+                _session_active.pop(skey, None)
+                _session_sems.pop(skey, None)
+            else:
+                _session_active[skey] = n
 
     return admitted
 

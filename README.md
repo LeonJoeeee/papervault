@@ -37,7 +37,7 @@ See [`docs/INSTALL.md`](docs/INSTALL.md) for the full walkthrough. In brief:
 
 ```bash
 cp .env.example .env          # then fill in your LLM endpoint + key + data dir
-docker compose -f deploy/docker-compose.yml up -d   # Neo4j + Postgres
+docker compose --env-file .env -f deploy/docker-compose.yml up -d   # Neo4j + Postgres
 uv venv && uv pip install -e ".[mineru,grey]"       # beta standard: + local OCR + grey download tiers
 papervault doctor             # verify GPU, databases, LLM config
 papervault-mcp                # start the MCP server (== papervault serve)
@@ -58,7 +58,7 @@ operator's responsibility.
 
 papervault is consumed **by pin** (ADR-0001): deployments track an annotated git tag
 (`vX.Y.Z[-stage]`), never `main`. A release IS a tag — CI's build job produces the
-wheel/sdist for every commit, so tagging is the whole ceremony, plus one bump: set the version field in BOTH `plugin/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` to the tag (minus the `-beta` suffix) in the release commit. Current: `v0.1.4-beta`
+wheel/sdist for every commit, so tagging is the whole ceremony, plus one bump: set the version field in BOTH `plugin/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` to the tag (minus the `-beta` suffix) in the release commit. Current: `v0.1.6-beta`
 (closed beta).
 
 ## License

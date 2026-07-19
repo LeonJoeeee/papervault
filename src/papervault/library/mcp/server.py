@@ -1269,6 +1269,15 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                 paper, was_new = library.upsert(dict(cand))
                 if paper is None:
                     continue  # phantom quality-gate reject (logged); do NOT touch ingested_keys
+                # Persist the gate's judged domain tier onto the record (#57) so the
+                # ingest decision is auditable after the fact ("what did the gate think
+                # of this paper when it let it in"). j["tier"] is a keep tier here
+                # (ingest_ok already gated it to INGEST_TIERS). Stamp ONLY on a fresh
+                # ingest or a still-None record — never clobber a tier the audit path
+                # (set_domain_status) assigned; domain_status is left untouched. In-place
+                # mutation on the stored Paper; the batched library.save() below persists it.
+                if was_new or paper.domain_tier is None:
+                    paper.domain_tier = j["tier"]
                 # Same-key collapse — GATE THE WHOLE TAIL (not just the append):
                 # a second candidate resolving to an already-ingested key must
                 # not re-enqueue a download.

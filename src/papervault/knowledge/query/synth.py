@@ -152,10 +152,22 @@ _CRED_BY_SOURCE = {
 def _source_label(file_path: str) -> tuple[str, str]:
     """(citeable_key_label, credibility) from a chunk/entity file_path.
 
-    file_path = '<ingest_source>/<source_id>' (SDD §4.2). paper/<key> → the key is
-    the citeable token; textbook/web carry their id as the label.
+    Two provenance conventions coexist:
+      - paper distill:        '<ingest_source>/<source_id>' (paper/<key> → key is the
+        citeable token, credibility=empirical).
+      - operator docs (#45/#47): the COLON provenance key itself ('textbook:AuthorYear',
+        'notebook:idea-scope') — slash-free so it survives LightRAG 1.5 basenaming. The
+        source class in the prefix sets the credibility band (textbook→established); the
+        whole key is the label (attributed inline in prose, not [bracketed]).
     """
-    if not file_path or "/" not in file_path:
+    if not file_path:
+        return ("unknown", "preliminary")
+    # Operator-doc colon key: '<source>:<id>' with no slash (e.g. 'textbook:Schlickeiser2002').
+    if "/" not in file_path and ":" in file_path:
+        source = file_path.split(":", 1)[0]
+        if source in _CRED_BY_SOURCE:
+            return (file_path, _CRED_BY_SOURCE[source])
+    if "/" not in file_path:
         return ("unknown", "preliminary")
     source, _, sid = file_path.partition("/")
     cred = _CRED_BY_SOURCE.get(source, "preliminary")

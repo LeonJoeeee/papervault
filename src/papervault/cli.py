@@ -414,5 +414,72 @@ def serve(mcp_args: tuple[str, ...]) -> None:
     sys.exit(mcp_main())
 
 
+# --------------------------------------------------------------------------- #
+#  ingest-doc  (operator-supplied textbook / notebook → knowledge graph)       #
+# --------------------------------------------------------------------------- #
+
+@main.command("ingest-doc")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--kind", required=True, type=click.Choice(["textbook", "notebook"]),
+              help="source class: textbook (canonical, #45) or notebook (private, #47)")
+@click.option("--key", required=True,
+              help="provenance key: textbook:AuthorYear or notebook:<idea>-<scope>")
+@click.option("--max-tokens", type=int, default=None,
+              help="max tokens per ingested section (default PAPERVAULT_DOC_MAX_TOKENS=2400)")
+def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
+    """Ingest an OPERATOR-supplied document into the knowledge graph with typed provenance.
+
+    A markdown (.md) or plain-text (.txt) file the operator brings by hand — a canonical
+    textbook / major review (--kind textbook, issue #45) or one of the lab's own executor
+    notebooks (--kind notebook, issue #47) — enters the SAME LightRAG graph papers use, but
+    OUTSIDE the paper-library pipeline. Markdown is split heading-aware (chapter/section
+    boundaries) with a max-token cap; plain text uses the sentence-boundary chunker.
+
+    Guards (both default OFF — a stock/shared/beta instance refuses):
+      textbook → set PAPERVAULT_OPERATOR_SOURCES=1 (beta safety).
+      notebook → set PAPERVAULT_PRIVATE_SOURCES=1  (UNPUBLISHED research; shared/beta
+                 instances must NEVER ingest notebooks).
+
+    Out of scope for v1: retrieval weighting for canonical sources (#46), domain-pack
+    textbook lists, PDF OCR (supply extracted md/txt), and re-ingest of appended notebooks.
+    """
+    import asyncio
+
+    from papervault.knowledge.ingest.operator_docs import (
+        SourceDisabledError,
+        check_source_enabled,
+        ingest_document,
+        validate_key,
+    )
+
+    # Fail fast on key format + guard BEFORE booting the (heavy, workspace-gated) graph.
+    try:
+        validate_key(kind, key)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    try:
+        check_source_enabled(kind)
+    except SourceDisabledError as e:
+        raise click.ClickException(str(e))
+
+    async def _go() -> dict:
+        from papervault.knowledge.ledger.store import close_pool
+        from papervault.knowledge.store.graph import close_graph, get_graph
+
+        rag = await get_graph()  # workspace-gated (refuses prod 'l0' without opt-in)
+        try:
+            return await ingest_document(rag, kind, key, str(path), max_tokens=max_tokens)
+        finally:
+            await close_graph()
+            await close_pool()
+
+    result = asyncio.run(_go())
+    click.echo(
+        f"ingested {result['key']} ({result['kind']}): {result['sections']} section(s) — "
+        f"done={result.get('done', 0)} error={result.get('error', 0)} "
+        f"pending={result.get('pending', 0)}"
+    )
+
+
 if __name__ == "__main__":
     main()

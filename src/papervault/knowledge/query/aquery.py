@@ -12,6 +12,9 @@ Pipeline (verified against LightRAG 1.4.16 source):
   cited_papers = strip 'paper/' from data.references[].file_path (chunk-level, deduped,
                  single-valued, unknown_source filtered — NOT entity-level which is
                  FIFO-truncated 100/300; SDD §4.3 F12). NEVER regex-scraped from prose.
+  cited_sources= operator-supplied source keys (textbook:/notebook:/web:) from the same
+                 references[], kept SEPARATE from cited_papers (issues #45/#47) so a
+                 colon-prefixed provenance key is never mistaken for a pl paper key.
   kb_coverage  = assess(metadata.processing_info.total_entities_found); None-safe (empty
                  on failure/empty where processing_info is absent — SDD §6.4).
 
@@ -59,21 +62,40 @@ _ENABLE_RERANK = True
 # KS_MQ_SUB_CHUNK_TOP_K=60, KS_MQ_N_SUBQ=5, KS_TOP_K=100). Flag-gated deploy, never auto-on.
 _QUERY_VARIANT = os.getenv("KS_QUERY_VARIANT", "multiquery")  # #5 default-promote 2026-06-14 (was 'single'): V-MQ live
 
-_EMPTY = {"answer": "(KB 无相关知识)", "cited_papers": [], "kb_coverage": "empty"}
+_EMPTY = {"answer": "(KB 无相关知识)", "cited_papers": [], "cited_sources": [], "kb_coverage": "empty"}
+
+# Operator-supplied source classes (knowledge/ingest/operator_docs.py) carry the source
+# in a COLON prefix (`textbook:AuthorYear`, `notebook:idea-scope`) that survives LightRAG
+# 1.5's file_path basenaming (no slash to strip). These are NOT pl citation keys: they must
+# stay OUT of cited_papers (a slash-free file_path would otherwise be read as a bare paper
+# key) and surface in a SEPARATE cited_sources list. web: is anticipated by the synth prompt
+# / SDD §12 credibility bands; keep it here so a future web upstream is handled consistently.
+_SOURCE_PREFIXES = ("textbook:", "notebook:", "web:")
+
+
+def _is_source_key(fp: str) -> bool:
+    return any(fp.startswith(p) for p in _SOURCE_PREFIXES)
 
 
 def _cited_papers(data: dict[str, Any]) -> list[str]:
-    """Aggregate citation keys from data.references[].file_path (SDD §6.4 / §4.3).
+    """Aggregate pl citation keys from data.references[].file_path (SDD §6.4 / §4.3).
 
     references[] = chunk-level, deduped, single-valued file_path, unknown_source already
     filtered out by LightRAG (utils.py generate_reference_list_from_chunks). We keep only
     the 'paper/' prefix ones and strip the prefix → pl citation key. Sorted + deduped.
+    Operator-doc keys (textbook:/notebook:/web:) are excluded here — they go to
+    _cited_sources so a colon-prefixed source is never mistaken for a paper key.
     """
     refs = data.get("references") or []
     keys = set()
     for r in refs:
         fp = r.get("file_path") or ""
         if not fp or fp == "unknown_source":
+            continue
+        # An operator source (colon-prefixed provenance key) is NOT a paper — skip it here
+        # (it would otherwise fall into the slash-free bare-key branch below and pollute
+        # cited_papers). It is collected by _cited_sources instead.
+        if _is_source_key(fp):
             continue
         # Two coexisting formats: 1.4-built data stores 'paper/<key>' (the distill-side
         # prefix), while LightRAG 1.5.x normalizes file_path to its BASENAME at enqueue
@@ -89,6 +111,22 @@ def _cited_papers(data: dict[str, Any]) -> list[str]:
             continue
         if key:
             keys.add(key)
+    return sorted(keys)
+
+
+def _cited_sources(data: dict[str, Any]) -> list[str]:
+    """Aggregate operator-supplied source keys (textbook:/notebook:/web:) from
+    data.references[].file_path — SEPARATE from cited_papers (issues #45 / #47).
+
+    These carry the full colon-prefixed provenance key (e.g. `textbook:Schlickeiser2002`),
+    kept verbatim so the caller can tell the source class from the key. Sorted + deduped.
+    """
+    refs = data.get("references") or []
+    keys = set()
+    for r in refs:
+        fp = r.get("file_path") or ""
+        if fp and _is_source_key(fp):
+            keys.add(fp)
     return sorted(keys)
 
 
@@ -191,6 +229,12 @@ async def query(intent: str, rag: Any = None) -> dict[str, Any]:
 
     answer = await synth_answer(data, intent)
     cited_papers = _cited_papers(data)
+    cited_sources = _cited_sources(data)
     kb_coverage = _assess_coverage(metadata, data)
 
-    return {"answer": answer, "cited_papers": cited_papers, "kb_coverage": kb_coverage}
+    return {
+        "answer": answer,
+        "cited_papers": cited_papers,
+        "cited_sources": cited_sources,
+        "kb_coverage": kb_coverage,
+    }

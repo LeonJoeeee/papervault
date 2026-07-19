@@ -216,9 +216,10 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
 
     Returns:
       {
-        "answer":       "<prose answer with [paper_key] inline cites>",
-        "cited_papers": ["Reames2023", ...],   # feed these to get_paper
-        "kb_coverage":  "strong" | "thin" | "empty",   # honesty signal
+        "answer":        "<prose answer with [paper_key] inline cites>",
+        "cited_papers":  ["Reames2023", ...],   # feed these to get_paper
+        "cited_sources": ["textbook:Schlickeiser2002", ...],  # operator sources (not papers)
+        "kb_coverage":   "strong" | "thin" | "empty",   # honesty signal
       }
     kb_coverage="empty"/"thin" → rephrase more specifically, or fall back to
     paper-library `search_papers` for fresher external literature.

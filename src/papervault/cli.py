@@ -414,5 +414,97 @@ def serve(mcp_args: tuple[str, ...]) -> None:
     sys.exit(mcp_main())
 
 
+# --------------------------------------------------------------------------- #
+#  ingest-doc  (operator-supplied textbook / notebook → knowledge graph)       #
+# --------------------------------------------------------------------------- #
+
+@main.command("ingest-doc")
+@click.argument("path", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.option("--kind", required=True, type=click.Choice(["textbook", "notebook"]),
+              help="source class: textbook (canonical, #45) or notebook (private, #47)")
+@click.option("--key", required=True,
+              help="provenance key: textbook:AuthorYear or notebook:<idea>-<scope>")
+@click.option("--max-tokens", type=int, default=None,
+              help="max tokens per ingested section (default PAPERVAULT_DOC_MAX_TOKENS=2400)")
+def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
+    """Ingest an OPERATOR-supplied document into the knowledge graph with typed provenance.
+
+    A markdown (.md) or plain-text (.txt) file the operator brings by hand — a canonical
+    textbook / major review (--kind textbook, issue #45) or one of the lab's own executor
+    notebooks (--kind notebook, issue #47) — enters the SAME LightRAG graph papers use, but
+    OUTSIDE the paper-library pipeline. Markdown is split heading-aware (chapter/section
+    boundaries) with a max-token cap; plain text uses the sentence-boundary chunker.
+
+    Guards (both default OFF — a stock/shared/beta instance refuses):
+      textbook → set PAPERVAULT_OPERATOR_SOURCES=1 (beta safety).
+      notebook → set PAPERVAULT_PRIVATE_SOURCES=1  (UNPUBLISHED research; shared/beta
+                 instances must NEVER ingest notebooks).
+
+    CO-WRITE GATE: this is a MAINTENANCE-WINDOW operation — it writes the ledger + LightRAG
+    graph the live service is concurrently serving, so it REFUSES to run while
+    papervault.service (or the MinerU unit) is systemd-active (DB co-write corruption risk).
+    Stop the service first, or set KS_INGEST_ALLOW_COTENANCY=1 to override deliberately.
+
+    Out of scope for v1: retrieval weighting for canonical sources (#46), domain-pack
+    textbook lists, PDF OCR (supply extracted md/txt), and re-ingest of appended notebooks
+    (v1 is push-once — re-ingesting an already-ingested key is refused; --force/supersede is
+    future work).
+    """
+    import asyncio
+
+    from papervault.knowledge.ingest.operator_docs import (
+        AlreadyIngestedError,
+        SourceDisabledError,
+        check_source_enabled,
+        ingest_document,
+        validate_key,
+    )
+    from papervault.ops_guards import require_services_stopped
+
+    # Fail fast on key format + guard BEFORE booting the (heavy, workspace-gated) graph.
+    try:
+        validate_key(kind, key)
+    except ValueError as e:
+        raise click.ClickException(str(e))
+    try:
+        check_source_enabled(kind)
+    except SourceDisabledError as e:
+        raise click.ClickException(str(e))
+    # Co-write gate (blocker, PR #54): refuse while the live service is active — an operator
+    # doc ingest writing the same ledger + graph next to a serving instance risks DB co-write
+    # corruption. Reuses the shared systemd gate (eval uses the same one, issue #32).
+    require_services_stopped(
+        override_env="KS_INGEST_ALLOW_COTENANCY",
+        reason=("operator-doc ingest is a maintenance-window operation that writes the SAME "
+                "ledger + graph the live service is concurrently serving — a co-writer risks "
+                "DB co-write corruption."),
+    )
+
+    async def _go() -> dict:
+        from papervault.knowledge.ledger.store import close_pool
+        from papervault.knowledge.store.graph import close_graph, get_graph
+
+        rag = await get_graph()  # workspace-gated (refuses prod 'l0' without opt-in)
+        try:
+            return await ingest_document(rag, kind, key, str(path), max_tokens=max_tokens)
+        finally:
+            # Flush LightRAG storage backends BEFORE dropping the singleton (finalize_storages
+            # is the counterpart to initialize_storages) — a maintenance-window write must not
+            # leave buffered graph/vector/KV state unpersisted. close_graph only nulls the ref.
+            await rag.finalize_storages()
+            await close_graph()
+            await close_pool()
+
+    try:
+        result = asyncio.run(_go())
+    except AlreadyIngestedError as e:
+        raise click.ClickException(str(e))
+    click.echo(
+        f"ingested {result['key']} ({result['kind']}): {result['sections']} section(s) — "
+        f"done={result.get('done', 0)} error={result.get('error', 0)} "
+        f"pending={result.get('pending', 0)}"
+    )
+
+
 if __name__ == "__main__":
     main()

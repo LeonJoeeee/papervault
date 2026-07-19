@@ -9,7 +9,12 @@ And the empty/failure guards on the `query()` entrypoint (rag stubbed, no LightR
 """
 import asyncio
 
-from papervault.knowledge.query.aquery import _assess_coverage, _cited_papers, query
+from papervault.knowledge.query.aquery import (
+    _assess_coverage,
+    _cited_papers,
+    _cited_sources,
+    query,
+)
 
 
 def _success(references, entities_found, n_chunks):
@@ -79,6 +84,58 @@ def test_cited_papers_ignores_blank_or_malformed_paths():
     assert _cited_papers({"references": refs}) == ["Good2021"]
 
 
+# ---- _cited_sources (operator upstreams, SEPARATE from cited_papers) --------
+
+def test_cited_sources_separated_from_cited_papers():
+    # textbook:/notebook: colon keys go to cited_sources; papers stay in cited_papers.
+    refs = [
+        {"file_path": "paper/Reames2023"},
+        {"file_path": "textbook:Schlickeiser2002"},
+        {"file_path": "notebook:idea23-c12"},
+        {"file_path": "Bonomi2020"},           # 1.5-era bare paper key
+    ]
+    data = {"references": refs}
+    assert _cited_papers(data) == ["Bonomi2020", "Reames2023"]
+    assert _cited_sources(data) == ["notebook:idea23-c12", "textbook:Schlickeiser2002"]
+
+
+def test_colon_source_never_pollutes_cited_papers():
+    # a colon-prefixed source is slash-free → must NOT be read as a bare paper key.
+    refs = [{"file_path": "textbook:Schlickeiser2002"}]
+    assert _cited_papers({"references": refs}) == []
+    assert _cited_sources({"references": refs}) == ["textbook:Schlickeiser2002"]
+
+
+def test_cited_sources_web_and_dedup_sort():
+    refs = [
+        {"file_path": "web:nasa-srag"},
+        {"file_path": "textbook:A2020"},
+        {"file_path": "textbook:A2020"},        # dup
+    ]
+    assert _cited_sources({"references": refs}) == ["textbook:A2020", "web:nasa-srag"]
+
+
+def test_cited_sources_empty_when_none():
+    assert _cited_sources({"references": []}) == []
+    assert _cited_sources({}) == []
+    assert _cited_sources({"references": [{"file_path": "paper/X2020"}]}) == []
+
+
+def test_legacy_paper_slash_and_bare_keys_never_leak_into_cited_sources():
+    # pin: both coexisting paper file_path forms — the 1.4 'paper/<key>' slash form AND the
+    # 1.5 bare '<key>' basename — resolve to cited_papers and must NEVER appear in
+    # cited_sources (which is colon-prefixed operator upstreams only). 'unknown_source' is
+    # dropped by both.
+    refs = [
+        {"file_path": "paper/Reames2023"},   # 1.4 slash form
+        {"file_path": "Bonomi2020"},         # 1.5 bare basename
+        {"file_path": "unknown_source"},     # LightRAG sentinel
+    ]
+    data = {"references": refs}
+    assert _cited_papers(data) == ["Bonomi2020", "Reames2023"]
+    assert _cited_sources(data) == []
+
+
 # ---- _assess_coverage (graph signal, None-safe) -----------------------------
 
 def test_coverage_strong_thin_empty_thresholds():
@@ -117,11 +174,39 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-def test_query_failure_status_returns_empty():
+def test_query_failure_status_returns_empty(monkeypatch):
     # aquery_data failure: {status:'failure', data:{}, metadata:{failure_reason,mode}}
+    import papervault.knowledge.query.aquery as aq
+    monkeypatch.setattr(aq, "_QUERY_VARIANT", "single")  # exercise the aquery_data branch directly
     res = {"status": "failure", "message": "no results", "data": {}, "metadata": {"failure_reason": "no_results"}}
     out = _run(query("anything", rag=_StubRag(res)))
-    assert out == {"answer": "(KB 无相关知识)", "cited_papers": [], "kb_coverage": "empty"}
+    assert out == {"answer": "(KB 无相关知识)", "cited_papers": [], "cited_sources": [], "kb_coverage": "empty"}
+
+
+def test_query_returns_cited_sources_field(monkeypatch):
+    # success path: cited_papers and cited_sources are BOTH assembled + returned, separated.
+    import papervault.knowledge.query.aquery as aq
+
+    monkeypatch.setattr(aq, "_QUERY_VARIANT", "single")
+
+    async def _synth(data, intent):  # no LLM
+        return "synthesized answer"
+
+    monkeypatch.setattr(aq, "synth_answer", _synth)
+    res = {
+        "status": "success",
+        "data": {
+            "entities": [],
+            "relationships": [],
+            "chunks": [{"content": "c", "file_path": "textbook:A2020"}],
+            "references": [{"file_path": "paper/R2023"}, {"file_path": "textbook:A2020"}],
+        },
+        "metadata": {"processing_info": {"total_entities_found": 25}},
+    }
+    out = _run(query("anything", rag=_StubRag(res)))
+    assert out["cited_papers"] == ["R2023"]
+    assert out["cited_sources"] == ["textbook:A2020"]
+    assert out["kb_coverage"] == "strong"
 
 
 def test_query_empty_data_returns_empty():

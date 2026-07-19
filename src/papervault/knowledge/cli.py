@@ -87,6 +87,10 @@ def query(intent: str, json_out: bool) -> None:
     if cited:
         click.echo(f"--- cited_papers ({len(cited)}) ---")
         click.echo(", ".join(cited))
+    sources = result.get("cited_sources") or []
+    if sources:
+        click.echo(f"--- cited_sources ({len(sources)}) ---")
+        click.echo(", ".join(sources))
 
 
 @cli.command()

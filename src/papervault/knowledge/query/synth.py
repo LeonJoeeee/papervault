@@ -146,16 +146,31 @@ _CRED_BY_SOURCE = {
     "textbook": "established",
     "paper": "empirical",
     "web": "preliminary",
+    # notebook (#47): the lab's own executor notebooks — unpublished, in-progress reasoning.
+    # Lowest band: preliminary (never let a notebook out-rank a peer-reviewed paper/textbook).
+    "notebook": "preliminary",
 }
 
 
 def _source_label(file_path: str) -> tuple[str, str]:
     """(citeable_key_label, credibility) from a chunk/entity file_path.
 
-    file_path = '<ingest_source>/<source_id>' (SDD §4.2). paper/<key> → the key is
-    the citeable token; textbook/web carry their id as the label.
+    Two provenance conventions coexist:
+      - paper distill:        '<ingest_source>/<source_id>' (paper/<key> → key is the
+        citeable token, credibility=empirical).
+      - operator docs (#45/#47): the COLON provenance key itself ('textbook:AuthorYear',
+        'notebook:idea-scope') — slash-free so it survives LightRAG 1.5 basenaming. The
+        source class in the prefix sets the credibility band (textbook→established); the
+        whole key is the label (attributed inline in prose, not [bracketed]).
     """
-    if not file_path or "/" not in file_path:
+    if not file_path:
+        return ("unknown", "preliminary")
+    # Operator-doc colon key: '<source>:<id>' with no slash (e.g. 'textbook:Schlickeiser2002').
+    if "/" not in file_path and ":" in file_path:
+        source = file_path.split(":", 1)[0]
+        if source in _CRED_BY_SOURCE:
+            return (file_path, _CRED_BY_SOURCE[source])
+    if "/" not in file_path:
         return ("unknown", "preliminary")
     source, _, sid = file_path.partition("/")
     cred = _CRED_BY_SOURCE.get(source, "preliminary")
@@ -218,8 +233,8 @@ Retrieved knowledge:
 
 Answer the intent using the retrieved knowledge above. Cite EVERY substantive claim
 inline with [paper_key] using the paper_key shown in each chunk's source label (papers
-only; attribute textbook:/web: sources inline in prose, not in square brackets). Use ALL
-the relevant material and synthesize ACROSS sources — don't collapse a multi-paper body
+only; attribute textbook:/notebook:/web: sources inline in prose, not in square brackets).
+Use ALL the relevant material and synthesize ACROSS sources — don't collapse a multi-paper body
 of evidence into a single-paper summary. Pick whatever structure (prose / bullets /
 sections / table) and length best fits the question + the depth of coverage. If the
 material doesn't support the intent well, say so cleanly."""

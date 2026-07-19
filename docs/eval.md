@@ -47,6 +47,12 @@ before and after, same day (the corpus drifts as auto-ingest runs), and only fli
 if the recall delta clears the measured noise floor. This is how the reranker fp16 flip and the
 build-model switch were decided upstream.
 
+**Evidence convention.** Eval result files stay **local and untracked** — they embed verbatim
+paper chunks, which the repo's no-paper-data gate forbids (PRD DoD #7), so the results dir
+(`src/papervault/eval/results/`, plus the judge scratch dir) is gitignored by design. Arbitration
+verdicts therefore live on GitHub: quote the summary numbers on the relevant issue thread — never
+commit the raw results file.
+
 ## Retrieval tuning knobs (benchmark-arbitrated)
 
 The query path is tuned by a family of environment variables — exactly the levers the

@@ -19,7 +19,7 @@ mimo-v2.5 (build slot) via the LiteLLM gateway (12-key pool).
 | — same-window 1.4.16 reference | 0.8046 | same frozen window (papervault **+5.2 pp**) |
 | noise floor (run-level, historical) | 0.0132 | the flip/no-flip bar for retrieval changes |
 | hallucinated citation rate | **0.0** | every eval arm to date |
-| single-query end-to-end latency (with synthesis) | **172 s** (pre-cap); pool-cap 120 halves the retrieval stage (arbitrated 1.90×, issue #21) — live number to be re-measured | 2026-07-18 |
+| single-query end-to-end latency (with synthesis) | **187 s** (quiet-GPU single-shot, 41 cited, synth thinking ON); pool-cap 120's retrieval halving (arbitrated 1.90×, issue #21) absorbed the corpus growth + the thinking cost — supersedes the 172 s pre-cap / to-be-re-measured note | 2026-07-19, corpus ≈ 6.5k |
 | synthesis stage alone | 55–79 s | prompt ≈ 200k tokens |
 | long-call survival | ≥ 485 s proven | S17 progress heartbeat (45 s ticks) kept a deliberately-strict 120 s-SSE client alive |
 
@@ -34,6 +34,7 @@ synthesis layer. The e2e honesty gate lives there, not in retrieval.
 | end-to-end latency (incl. ingest triage of new finds) | 319 s mean, 222–525 s range | 2026-07-18, 12-intent baseline run (supersedes the 216–251 s 2-smoke figure) |
 | must-find recall (coverage: fraction of the frozen landmark pool the search surfaces; `scripts/mustfind_recall.py` vs `gold_search_pools.jsonl`) | **0.2361 mean / 0.00 min** | 2026-07-19, instrument v2 (audited served lists, lenient matcher, empty-serve retry+quarantine); single-shot — per-intent recall swings between runs, 3-rep protocol tracked on #37; results `mfr_v2_0719` |
 | result relevance (P@served: fraction of served papers the canonical judge scores ≥ 0.7 against the stated need, title+abstract) | **0.9111 mean / 0.7333 min** | 2026-07-18; **canonical judge = Claude opus blind panel, reasoning effort MAX** (12 fresh-context agents, one intent each, rubric-only, no access to other judges' scores); results `srb_v1_0718_claudejudge_max.json` |
+| ranking quality (order within the served list: P@5 / nDCG@15, canonical-judge relevance scores as graded truth over the `srb_v1_0718` served order) | **P@5 0.9667 mean / 0.60 min · nDCG@15 0.9828 mean** | 2026-07-18, same canonical judge; ranking is NOT the weak axis — coverage is |
 
 The coverage/precision split is the search business's honest portrait: 91 % of what it
 serves is relevant, but it surfaces fewer than 1 in 5 of the landmark papers a review

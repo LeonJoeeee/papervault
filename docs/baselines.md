@@ -5,6 +5,10 @@ floor", "published budget"). Every number here is a real measurement with a date
 conditions — never an aspiration. Organized by the caller-facing businesses; component
 instruments and arbitration rules at the end.
 
+> Result tags cited below (e.g. `frozen154_*`, `srb_v1_*`, `mfr_v2_*`) name LOCAL,
+> untracked evidence files (they embed verbatim paper text — see the Evidence convention
+> in `docs/eval.md`). They are provenance labels, not repo paths.
+
 **Reference conditions** (all numbers below unless stated): lab deployment #1 — RTX 3090
 24 GB (`CUDA_VISIBLE_DEVICES=1`), fp16 reranker @ max_length 4096, rerank 2×4
 (`KS_RERANK_MAX_ASYNC=2 × KS_RERANK_BATCH_SIZE=4`), `RERANK_TIMEOUT=480`, LightRAG 1.5.4,

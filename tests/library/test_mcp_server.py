@@ -1051,6 +1051,94 @@ async def test_search_ingest_gate_and_minimal_records(server, populated_lib, mon
 
 
 @pytest.mark.asyncio
+async def test_search_ingest_stamps_judged_tier_on_new_record(
+        server, populated_lib, monkeypatch):
+    """#57: a gate-surviving external candidate has the judge's domain tier stamped
+    onto its STORED record at ingest. Before the fix ``domain_tier`` stayed None for
+    every search-ingested paper (the gate ran but filed no receipt) — the winning
+    tier was unauditable after the fact. Uses DISTINCT per-candidate tiers so a bug
+    that stamped a constant (or nothing) would fail."""
+    async def fake_ingest(cands, *, llm=None):
+        out = {}
+        for i, c in enumerate(cands):
+            tl = c["title"].lower()
+            if "medical" in tl:                                   # off-domain → rejected
+                out[i] = {"reason": "", "tier": "3", "ingest_ok": False, "llm_is_paper": True}
+            elif "forecasting with neural processes" in tl:      # niche survivor → tier 2B
+                out[i] = {"reason": "", "tier": "2B", "ingest_ok": True, "llm_is_paper": True}
+            else:                                                 # everything else → tier 1A
+                out[i] = {"reason": "", "tier": "1A", "ingest_ok": True, "llm_is_paper": True}
+        return out, 0
+
+    async def fake_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {i: {"reason": "", "score": 0.9} for i in range(len(cands))}, 0
+
+    _wire_search(monkeypatch, ingest=fake_ingest, ret=fake_return)
+    server._paper_download_queue.add = lambda key, **kw: None
+
+    out = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    assert out["status"] == "ok"
+
+    by_title = {p.title: p for p in populated_lib.all_papers(include_quarantined=True)}
+    # The in-domain anchor survivor carries its judged tier (1A) — receipt filed.
+    anchor = next(p for t, p in by_title.items() if "physics-informed nets" in t)
+    assert anchor.domain_tier == "1A"
+    # The niche term-1 survivor carries ITS distinct judged tier (2B), proving the
+    # per-candidate winning tier — not a constant — reaches the matching record.
+    niche = next(p for t, p in by_title.items()
+                 if "forecasting with neural processes" in t)
+    assert niche.domain_tier == "2B"
+    # The ingest stamp NEVER touches domain_status (only the audit path sets it).
+    assert anchor.domain_status is None and niche.domain_status is None
+    # domain_tier is an internal audit field — it must NOT leak into caller records.
+    for r in out["results"]:
+        assert "domain_tier" not in r and "domain_status" not in r
+
+
+@pytest.mark.asyncio
+async def test_search_ingest_does_not_overwrite_audit_set_tier(
+        server, populated_lib, monkeypatch):
+    """#57 guard (requirement 2): when a surviving candidate MERGES into an existing
+    library paper whose ``domain_tier`` was already set by the audit path
+    (``set_domain_status``), the ingest stamp must NOT overwrite it — the audit
+    decision wins — and ``domain_status`` is left intact."""
+    # Pin an audit tier on the fixture's Potgieter2013 (DOI 10.1234/abc), staying
+    # in-domain (status None) so the search can dedup-merge into it.
+    populated_lib.set_domain_status("Potgieter2013", None, "1C")
+    assert populated_lib.get("Potgieter2013").domain_tier == "1C"
+
+    # An external candidate that dedup-merges into Potgieter2013 by DOI.
+    twin = {"title": "Solar wind modulation", "authors": ["Potgieter"], "year": 2013,
+            "venue": "ApJ", "abstract": "review of solar wind transport",
+            "doi": "10.1234/abc", "arxiv_id": "", "citation_count": 100,
+            "publication_types": ["JournalArticle"]}
+
+    async def fake_external(terms, *, year_min=None, year_max=None, ranking_hint="by_relevance"):
+        return [_tag(twin, 0, 0)], {}
+
+    async def fake_ingest(cands, *, llm=None):
+        # Gate WOULD assign a different tier (2A) — must NOT clobber the audit 1C.
+        return {i: {"reason": "", "tier": "2A", "ingest_ok": True, "llm_is_paper": True}
+                for i in range(len(cands))}, 0
+
+    async def fake_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {i: {"reason": "", "score": 0.9} for i in range(len(cands))}, 0
+
+    monkeypatch.setattr("papervault.library.mcp.server.parse_intent",
+                        lambda query, llm=None: _fake_plan())
+    monkeypatch.setattr("papervault.library.mcp.server.search_external_async", fake_external)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", fake_ingest)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_return", fake_return)
+    server._paper_download_queue.add = lambda key, **kw: None
+
+    out = await _call(server, "search_papers", {"query": "solar wind modulation"})
+    assert out["status"] == "ok"
+    p = populated_lib.get("Potgieter2013")
+    assert p.domain_tier == "1C"      # audit tier preserved, NOT overwritten by 2A
+    assert p.domain_status is None    # untouched
+
+
+@pytest.mark.asyncio
 async def test_search_ingest_plugs_reject_egu_abstract_and_contentless_stub(
         server, populated_lib, monkeypatch):
     """Junk-ingress PLUGs (2026-06-03): an EGU conference abstract (egusphere-egu DOI)

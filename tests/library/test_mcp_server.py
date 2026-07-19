@@ -1274,6 +1274,92 @@ async def test_search_sort_secondary_by_importance(server, populated_lib, monkey
     assert cites == [99, 5]   # higher citation_count first
 
 
+# ── ranking_hint × authority-prior interaction (finding 3) ─────────────────────
+# PI decision: an EXPLICIT caller ranking_hint (by_recency / by_importance) is the
+# caller's own ranking authority and WINS — the authority prior is SKIPPED entirely
+# so the caller's requested secondary order survives. These drive the WHOLE MCP path
+# with the prior turned ON. The two papers get EQUAL return score, so IF the prior
+# ran, authority (per-year citation rank) would fully decide their order. The data is
+# built so authority DISAGREES with the hint — a passing hint assertion therefore
+# PROVES the prior was skipped, not merely that it happened to agree.
+_OLD_HIGHAUTH = {  # 2010 / 3000 cites → ~187 per-yr: OLDER, far HIGHER authority
+    "title": "Older landmark cosmic ray transport study with a long descriptive title",
+    "authors": ["A"], "year": 2010, "venue": "JGR",
+    "abstract": "cosmic ray transport", "doi": "10.9/oldhigh", "arxiv_id": "",
+    "citation_count": 3000, "publication_types": ["JournalArticle"]}
+_NEW_LOWAUTH = {  # 2024 / 10 cites → ~5 per-yr: NEWER, far LOWER authority
+    "title": "Newer lightly-cited cosmic ray transport study with a long title",
+    "authors": ["B"], "year": 2024, "venue": "ApJ",
+    "abstract": "cosmic ray transport", "doi": "10.9/newlow", "arxiv_id": "",
+    "citation_count": 10, "publication_types": ["JournalArticle"]}
+# by_importance disagreement: MORE raw cites but ancient → LOWER per-year, vs FEWER
+# raw cites but fresh → HIGHER per-year. Raw-count order (the hint) and per-year
+# authority order are opposite, robustly for well over a century of ``now``.
+_HIRAW_LOWAUTH = {  # 1980 / 400 cites → ~9 per-yr: MORE raw cites, LOWER authority
+    "title": "Ancient heavily-cited cosmic ray transport study with a long title",
+    "authors": ["C"], "year": 1980, "venue": "JGR",
+    "abstract": "cosmic ray transport", "doi": "10.9/hiraw", "arxiv_id": "",
+    "citation_count": 400, "publication_types": ["JournalArticle"]}
+_LORAW_HIGHAUTH = {  # 2025 / 300 cites → ~300 per-yr: FEWER raw cites, HIGHER authority
+    "title": "Fresh fast-rising cosmic ray transport study with a long title",
+    "authors": ["D"], "year": 2025, "venue": "ApJ",
+    "abstract": "cosmic ray transport", "doi": "10.9/loraw", "arxiv_id": "",
+    "citation_count": 300, "publication_types": ["JournalArticle"]}
+
+
+@pytest.mark.asyncio
+async def test_search_authority_prior_skipped_when_ranking_hint_by_recency(
+        server, populated_lib, monkeypatch):
+    """Finding 3: prior ON + explicit ranking_hint=by_recency → the prior is SKIPPED,
+    the newer paper leads (recency wins) even though it has FAR lower authority. If
+    the prior had run it would have surfaced the older high-authority paper instead."""
+    monkeypatch.setattr("papervault.library.mcp.server.SEARCH_AUTHORITY_PRIOR", True)
+    # OLD (high authority) first in the fan-out → a pass proves the hint REORDERED.
+    fan_out = [_tag(_OLD_HIGHAUTH, 0, 0), _tag(_NEW_LOWAUTH, 0, 1)]
+    _wire_two_equal_score(monkeypatch, ranking_hint="by_recency", fan_out=fan_out)
+    server._paper_download_queue.add = lambda key, **kw: None
+
+    out = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    years = [r["year"] for r in out["results"] if r["year"] in (2010, 2024)]
+    assert years == [2024, 2010]   # recency wins; prior did NOT reorder to authority
+
+
+@pytest.mark.asyncio
+async def test_search_authority_prior_skipped_when_ranking_hint_by_importance(
+        server, populated_lib, monkeypatch):
+    """Finding 3: prior ON + explicit ranking_hint=by_importance → the prior is
+    SKIPPED, the higher RAW-citation paper leads even though the other paper has
+    higher per-year authority. If the prior had run, per-year authority would have
+    flipped the order."""
+    monkeypatch.setattr("papervault.library.mcp.server.SEARCH_AUTHORITY_PRIOR", True)
+    # LOW-raw (but high authority) first → a pass proves the hint REORDERED to raw DESC.
+    fan_out = [_tag(_LORAW_HIGHAUTH, 0, 0), _tag(_HIRAW_LOWAUTH, 0, 1)]
+    _wire_two_equal_score(monkeypatch, ranking_hint="by_importance", fan_out=fan_out)
+    server._paper_download_queue.add = lambda key, **kw: None
+
+    out = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    cites = [r["citation_count"] for r in out["results"] if r["citation_count"] in (300, 400)]
+    assert cites == [400, 300]   # raw-citation order wins; prior did NOT reorder
+
+
+@pytest.mark.asyncio
+async def test_search_authority_prior_reorders_on_default_hint(
+        server, populated_lib, monkeypatch):
+    """Positive control: prior ON + the DEFAULT by_relevance hint → the prior DOES
+    run through the MCP path, lifting the equal-score high-authority paper above the
+    low-authority one that led the fan-out. Proves the skip is specific to explicit
+    hints, not the flag being inert."""
+    monkeypatch.setattr("papervault.library.mcp.server.SEARCH_AUTHORITY_PRIOR", True)
+    # LOW authority first → only the prior can move HIGH authority to the top.
+    fan_out = [_tag(_NEW_LOWAUTH, 0, 0), _tag(_OLD_HIGHAUTH, 0, 1)]
+    _wire_two_equal_score(monkeypatch, ranking_hint="by_relevance", fan_out=fan_out)
+    server._paper_download_queue.add = lambda key, **kw: None
+
+    out = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    years = [r["year"] for r in out["results"] if r["year"] in (2010, 2024)]
+    assert years == [2010, 2024]   # high-authority 2010 paper lifted above the 2024 one
+
+
 @pytest.mark.asyncio
 async def test_search_judge_batches_dropped_zero_when_healthy(server, populated_lib,
                                                               monkeypatch):

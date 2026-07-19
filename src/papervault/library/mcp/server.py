@@ -227,7 +227,29 @@ _YEAR_NEUTRAL = 10**9           # None-year sentinel: sorts as NEITHER freshest 
 # the default stays 0 until the paired coverage+precision run (issue #46/#37)
 # clears the noise floor.
 SEARCH_AUTHORITY_PRIOR = os.environ.get("PAPERVAULT_SEARCH_AUTHORITY_PRIOR", "0") == "1"
-SEARCH_AUTHORITY_LAMBDA = float(os.environ.get("PAPERVAULT_SEARCH_AUTHORITY_LAMBDA", "0.5"))
+
+
+def _parse_authority_lambda(raw: str) -> float:
+    """Parse the λ knob DEFENSIVELY: a non-numeric value falls back to 0.5, and an
+    out-of-range value is CLAMPED to [0, 1] — λ<0 would invert the prior (penalize
+    standing), λ>1 would let authority swamp relevance. Both the fallback and the
+    clamp emit a WARNING so a fat-fingered env var is loud, never a silent wrong λ."""
+    try:
+        val = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "PAPERVAULT_SEARCH_AUTHORITY_LAMBDA=%r is not a float — using default 0.5", raw)
+        return 0.5
+    if not 0.0 <= val <= 1.0:
+        clamped = min(1.0, max(0.0, val))
+        logger.warning(
+            "PAPERVAULT_SEARCH_AUTHORITY_LAMBDA=%s out of [0,1] — clamped to %s", val, clamped)
+        return clamped
+    return val
+
+
+SEARCH_AUTHORITY_LAMBDA = _parse_authority_lambda(
+    os.environ.get("PAPERVAULT_SEARCH_AUTHORITY_LAMBDA", "0.5"))
 _AUTHORITY_RRF_K = 60           # RRF rank constant (mirrors KS_MQ_RRF_K)
 
 
@@ -257,18 +279,32 @@ def _authority_reorder(
     authority RANK via RRF, so an equal-relevance landmark rises above a 0-citation
     preprint. ``scored`` MUST already be sorted best→worst by relevance.
 
-    RANK-based (never raw counts): each candidate gets a relevance rank — papers
-    TIED on the return-gate score share a rank, so authority is the tie-breaker the
-    issue calls out — and an authority rank (its position when the SAME pool is
-    sorted by ``_authority_value`` DESC). The blend key is
-    ``1/(k + rel_rank) + λ · 1/(k + auth_rank)``; relevance stays PRIMARY (a single
-    authority-rank edge cannot overtake a full relevance-rank lead), authority is a
-    SOFT nudge that reorders near-ties. Pool-only, so a paper the relevance gate did
-    not return can never enter.
+    RANK-based (never raw counts): each candidate gets a DENSE relevance rank — papers
+    TIED on the return-gate score share a rank — and an authority rank (its position
+    when the SAME pool is sorted by ``_authority_value`` DESC). The blend key is
+    ``1/(k + rel_rank) + λ · 1/(k + auth_rank)``, k = 60.
 
-    DEFAULT OFF: when disabled (or the pool has <2 papers, or authority is uniform)
-    the input list is returned UNCHANGED → byte-identical ordering. The knobs are
-    read at call time via the module globals unless overridden (tests inject them)."""
+    STRENGTH — stated honestly because the arbitration must reason off real numbers,
+    not a reassuring label:
+      * This is a SOFT prior whose strength GROWS WITH λ — not a mere last-resort
+        tie-break. λ=0 collapses it to the pure relevance order; larger λ = more pull.
+      * WITHIN a relevance-score tie (a shared dense rel_rank) authority is PRIMARY:
+        it fully decides the order of every paper sharing that score. Because the
+        return gate emits dense scores, real pools carry such ties often.
+      * ACROSS distinct relevance ranks it still lifts a paper SEVERAL positions. In
+        this flat k=60 regime over a pool of ≤30, at λ=0.5 a best-authority paper
+        (auth_rank 0) overtakes a worst-authority paper leading it by up to ~11
+        relevance ranks in a full 30-pool (and by 1 rank in a pool of 4). So the
+        top-relevance paper is NOT guaranteed to stay #1: a rank-2 paper with the
+        best authority beats a #1 that carries the worst authority (pinned by the
+        adversarial boundary test in test_search_authority.py). Raising k weakens the
+        prior; raising λ strengthens it.
+    Pool-only, so a paper the relevance gate did not return can never enter.
+
+    DEFAULT OFF: when disabled (or the pool has <2 papers, or every paper shares one
+    authority value, or λ=0) the input order is returned UNCHANGED → byte-identical.
+    The knobs are read at call time via the module globals unless overridden (tests
+    inject them)."""
     if enabled is None:
         enabled = SEARCH_AUTHORITY_PRIOR
     if not enabled or len(scored) < 2:
@@ -1275,7 +1311,19 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         # the relevance order with an age-normalized citation authority rank, layered
         # here AFTER the relevance sort and BEFORE the top-N cut. DEFAULT OFF →
         # byte-identical; arbitration-pending (see PAPERVAULT_SEARCH_AUTHORITY_PRIOR).
-        scored = _authority_reorder(scored)
+        #
+        # ranking_hint interaction (PI decision): an EXPLICIT caller ranking_hint is
+        # the caller's own ranking authority and WINS. When the request carries a
+        # non-default hint (by_recency / by_importance) the authority prior is SKIPPED
+        # entirely, so the secondary order the caller asked for survives untouched.
+        # Only the default by_relevance leaves room for the prior to act.
+        if ranking_hint != "by_relevance":
+            if SEARCH_AUTHORITY_PRIOR:
+                logger.debug(
+                    "search_papers: authority prior SKIPPED — explicit ranking_hint=%r wins",
+                    ranking_hint)
+        else:
+            scored = _authority_reorder(scored)
 
         # ──── Stage 5: build minimal records, top-N (N = limit) ────────
         # Pure ``_paper_dict`` projection, ordered by relevance (the ORDER is the rank

@@ -113,11 +113,56 @@ def test_missing_year_paper_ranks_by_raw_count_in_blend():
 
 
 def test_relevance_stays_primary_across_a_full_rank_gap():
-    """A single authority-rank advantage cannot overtake a full relevance-rank lead:
-    the top-relevance paper stays #1 even with the WORST authority in the pool."""
+    """A single authority-rank advantage cannot overtake a full relevance-rank lead
+    WHEN the best-authority paper sits two relevance ranks down: the top-relevance
+    paper stays #1 here. (This is NOT a general 'relevance is primary' guarantee —
+    see ``test_adversarial_boundary_best_authority_overtakes_top_relevance`` for the
+    pool-of-4 case where a rank-2 best-authority paper DOES overtake the #1.)"""
     top = _cand("TopRel", year=2025, citation_count=0)          # best relevance, worst authority
     mid = _cand("MidRel", year=2010, citation_count=200)
     low = _cand("LowRel", year=2000, citation_count=5000)       # worst relevance, best authority
     scored = [(0.9, top), (0.8, mid), (0.7, low)]  # strictly decreasing relevance
     out = _authority_reorder(scored, enabled=True, now_year=2026, lam=0.5)
     assert out[0][1]["key"] == "TopRel"
+
+
+# ----------- KNOWN-BEHAVIOR PIN: authority is NOT strictly subordinate ----------
+# These two pin what the k=60 / λ=0.5 math ACTUALLY does, so an arbitration reasons
+# off real numbers rather than the reassuring "soft nudge" label. They assert the
+# real outcome, not a wish — if the blend math changes, they must be re-derived.
+
+
+def test_adversarial_boundary_best_authority_overtakes_top_relevance():
+    """ADVERSARIAL BOUNDARY (pool of 4, λ=0.5): the #1-relevance paper carries the
+    WORST authority, the #2-relevance paper the BEST. Per the flat k=60 RRF math the
+    rank-2 best-authority paper WINS — a 1-rank relevance lead is not enough to
+    survive the full authority spread in a 4-pool. This is the known behavior we are
+    pinning, not a behavior we prefer.
+
+    Blend (k=60): X(rel 0, auth 3)=1/60+0.5/63=0.0246032 vs
+    Y(rel 1, auth 0)=1/61+0.5/60=0.0247268 → Y > X.
+    """
+    x_top_worst = _cand("X_toprel_worstauth", year=2025, citation_count=0)     # 0/1   = 0     (worst auth)
+    y_rank2_best = _cand("Y_rank2_bestauth", year=2020, citation_count=6000)   # 6000/6= 1000  (best auth)
+    f1 = _cand("F1", year=2015, citation_count=100)                            # 100/11≈ 9.1
+    f2 = _cand("F2", year=2010, citation_count=200)                            # 200/16= 12.5
+    # strictly-decreasing relevance so rel_rank = 0,1,2,3 (X leads Y by exactly one)
+    scored = [(0.9, x_top_worst), (0.8, y_rank2_best), (0.7, f2), (0.6, f1)]
+    out = _authority_reorder(scored, enabled=True, now_year=2026, lam=0.5)
+    keys = [c["key"] for _s, c in out]
+    # Known behavior: the rank-2 best-authority paper overtakes the #1.
+    assert keys[0] == "Y_rank2_bestauth"
+    assert keys.index("Y_rank2_bestauth") < keys.index("X_toprel_worstauth")
+
+
+def test_lambda_zero_is_identity():
+    """λ=0 zeroes the authority term → the blend is pure relevance → the input order
+    is returned unchanged, even for a pool the authority prior WOULD reorder at
+    λ=0.5 (same adversarial pool as above)."""
+    x_top_worst = _cand("X_toprel_worstauth", year=2025, citation_count=0)
+    y_rank2_best = _cand("Y_rank2_bestauth", year=2020, citation_count=6000)
+    f1 = _cand("F1", year=2015, citation_count=100)
+    f2 = _cand("F2", year=2010, citation_count=200)
+    scored = [(0.9, x_top_worst), (0.8, y_rank2_best), (0.7, f2), (0.6, f1)]
+    out = _authority_reorder(scored, enabled=True, now_year=2026, lam=0.0)
+    assert [c["key"] for _s, c in out] == [c["key"] for _s, c in scored]

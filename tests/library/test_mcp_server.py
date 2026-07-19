@@ -1050,6 +1050,63 @@ async def test_search_ingest_gate_and_minimal_records(server, populated_lib, mon
     assert isinstance(ip["sources_unconfigured"], list)
 
 
+# ===== boot-failure observability: service_degraded (issue #34/#43 review) =====
+#
+# library/mcp/boot.py stashes a short summary on ``server._paper_boot_failed`` when
+# the detached background boot RAISES (stage queues / reconcile never came up). The
+# two heavy tools splice a top-level ``service_degraded`` field so a caller is TOLD
+# the plane is degraded instead of the failure living only in the server log.
+
+
+@pytest.mark.asyncio
+async def test_service_degraded_omitted_when_boot_healthy(server, monkeypatch):
+    """Healthy plane (``_paper_boot_failed`` unset/None) → the field is OMITTED
+    (not a null), so a healthy response stays clean for both heavy tools."""
+    async def fake_ingest(cands, *, llm=None):
+        return {}, 0
+    async def fake_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {}, 0
+    _wire_search(monkeypatch, ingest=fake_ingest, ret=fake_return)
+    # Hermetic: dodge search_papers' get_llm() credential preflight — the handle is
+    # never .call()'d (every LLM collaborator above is mocked / passes no llm).
+    monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda: object())
+
+    gp = await _call(server, "get_paper", {"identifiers": "Wei2024"})
+    assert gp["status"] == "ok"
+    assert "service_degraded" not in gp
+
+    sp = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    assert sp["status"] == "ok"
+    assert "service_degraded" not in sp
+
+
+@pytest.mark.asyncio
+async def test_service_degraded_surfaced_on_both_tools_when_boot_failed(server, monkeypatch):
+    """A stashed boot-failure summary is surfaced as a top-level ``service_degraded``
+    field on BOTH get_paper and search_papers — and stays distinct from the nested
+    search-BACKEND health channel (``intent_parsed.sources_degraded``)."""
+    reason = "library background boot failed: RuntimeError: migrate exploded"
+    server._paper_boot_failed = reason   # what boot.py's _deferred_boot except-arm sets
+
+    async def fake_ingest(cands, *, llm=None):
+        return {}, 0
+    async def fake_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {}, 0
+    _wire_search(monkeypatch, ingest=fake_ingest, ret=fake_return)
+    # Hermetic: dodge search_papers' get_llm() credential preflight (handle unused).
+    monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda: object())
+
+    gp = await _call(server, "get_paper", {"identifiers": "Wei2024"})
+    assert gp["status"] == "ok"
+    assert gp["service_degraded"] == reason
+
+    sp = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    assert sp["status"] == "ok"
+    assert sp["service_degraded"] == reason
+    # LIBRARY-PLANE degradation is a separate channel from SEARCH-BACKEND health.
+    assert sp["intent_parsed"]["sources_degraded"] == []
+
+
 @pytest.mark.asyncio
 async def test_search_ingest_plugs_reject_egu_abstract_and_contentless_stub(
         server, populated_lib, monkeypatch):

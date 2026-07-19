@@ -334,6 +334,29 @@ class Paper(BaseModel):
     # the paper to ``extract_failed`` (terminal).
     extract_attempts: int = 0
 
+    # Issue #43 (reconcile busy-loop): transport-defer marker. A
+    # ``MineruTransportError`` (backend unreachable) charges NO extract_attempt
+    # by design (C1 / SDD §2.2) so a brief blip retries; but a PROLONGED outage
+    # made reconcile re-enqueue the whole pending-extract set every sweep
+    # forever. ``extract_deferred_sig`` = a ``size:mtime`` signature of the PDF
+    # artifact this paper was last transport-deferred against; ``_epoch`` = the
+    # process-global extract-success epoch at defer time (see
+    # ``services.extract_defer``). While the signature matches the on-disk PDF
+    # AND no extraction has succeeded since, reconcile SKIPS re-enqueuing it.
+    # This is NOT a terminal ``download_status`` and loses no data: it auto-lifts
+    # when the PDF artifact changes (re-download) OR the backend recovers (any
+    # extract succeeds → the epoch advances). Both fields ARE persisted (they
+    # survive a save/load round-trip); the process-global success epoch is NOT —
+    # it starts at 1 on a fresh process, so a stamp persisted at epoch 0 (a paper
+    # deferred during an outage-from-boot) reads STALE on restart (0 != 1). NOTE
+    # the AUTHORITATIVE restart re-probe is ``extract_queue.start()``'s
+    # unconditional recovery scan (re-enqueues the whole EXTRACT set every boot),
+    # NOT this epoch — the epoch-start-at-1 rule only keeps reconcile's periodic
+    # SKIP decision consistent with that scan across a restart. Every non-transport
+    # extract outcome clears both fields.
+    extract_deferred_sig: Optional[str] = None
+    extract_deferred_epoch: int = 0
+
     # S3 (firecrawl terminal): one-shot resting marker for a firecrawl-md paper.
     # A firecrawl md only exists AFTER the full 18-tier PDF cascade missed, so
     # when ``_gate_firecrawl_md`` PASSes (the md is real full text) the real-PDF

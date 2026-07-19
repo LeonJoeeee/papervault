@@ -629,6 +629,106 @@ def test_c1_empty_md_belt_and_suspenders_charges(tmp_path, monkeypatch):
     assert not lib.has_extract(p.key, "md")
 
 
+# ----------- issue #43: transport-defer stamping (busy-loop fix) ------------
+#
+# A transport failure still charges nothing / does not terminalize (C1 above),
+# but it now ALSO stamps a per-artifact deferral marker so reconcile can stop
+# re-enqueuing the paper every sweep while the backend stays down. A NON-transport
+# outcome (success / per-doc defect) clears the marker; a success also advances
+# the process-global success epoch (backend-recovery signal).
+
+
+def test_transport_error_stamps_deferral_against_current_pdf(tmp_path, monkeypatch):
+    from papervault.library.mineru_client import MineruTransportError
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    lib, p = _pdf_paper(tmp_path)
+    p.download_status = "ok"
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, raises=MineruTransportError("mineru_import_failed"))
+
+    out = asyncio.run(extract.extract_md(p, lib, llm=object()))
+    assert out is None
+    # Deferred against the current PDF artifact + the current success epoch.
+    assert p.extract_deferred_sig == extract_defer.pdf_sig(lib, p.key)
+    assert p.extract_deferred_epoch == extract_defer.success_epoch()
+    # And, per C1, still non-terminal with no attempt charged.
+    assert p.extract_attempts == 0
+    assert p.download_status == "ok"
+    # The paper now reads as "deferred against this artifact".
+    assert extract_defer.is_extract_deferred(p, lib) is True
+
+
+def test_success_clears_deferral_and_advances_epoch(tmp_path, monkeypatch):
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    lib, p = _pdf_paper(tmp_path)
+    p.download_status = "ok"
+    # Pretend a prior sweep deferred it.
+    extract_defer.mark_extract_deferred(p, lib)
+    assert extract_defer.is_extract_deferred(p, lib) is True
+    epoch_before = extract_defer.success_epoch()
+
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, returns="REAL ASSEMBLED BODY of the paper. " * 30)
+    _stub_judges_pass(monkeypatch)
+    out = asyncio.run(extract.extract_md(p, lib, llm=object()))
+
+    assert out is not None and lib.has_extract(p.key, "md")
+    assert p.extract_deferred_sig is None            # cleared on success
+    assert extract_defer.success_epoch() == epoch_before + 1   # backend-recovery signal
+    assert extract_defer.is_extract_deferred(p, lib) is False
+
+
+def test_per_doc_defect_clears_stale_deferral(tmp_path, monkeypatch):
+    """A genuine per-doc extraction failure must NOT leave the paper marked
+    transport-deferred — it charges an attempt and keeps retrying up to budget,
+    so reconcile must not skip it."""
+    from papervault.library.mineru_client import MineruExtractionError
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    lib, p = _pdf_paper(tmp_path)
+    p.download_status = "ok"
+    extract_defer.mark_extract_deferred(p, lib)      # stale marker from a prior blip
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, raises=MineruExtractionError("truncated"))
+
+    out = asyncio.run(extract.extract_md(p, lib, llm=object()))
+    assert out is None
+    assert p.extract_attempts == 1                   # charged (per-doc defect)
+    assert p.extract_deferred_sig is None            # marker cleared → not skipped
+    assert extract_defer.is_extract_deferred(p, lib) is False
+
+
+def test_transport_defer_stamp_survives_save_load_roundtrip(tmp_path, monkeypatch):
+    """Worker save-to-disk pin: the transport-defer stamp the extract worker writes
+    (via ``extract_md``'s transport arm, then the worker's ``library.save()``) is a
+    PERSISTED ``Paper`` field, so it must survive a Library save/load round-trip —
+    otherwise a restart could not read the stamp back at all. (The process success
+    epoch is separately process-local; only the per-paper sig + epoch stamp is
+    persisted, and this pins that persistence.)"""
+    from papervault.library.mineru_client import MineruTransportError
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    lib, p = _pdf_paper(tmp_path)
+    p.download_status = "ok"
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, raises=MineruTransportError("mineru_import_failed"))
+
+    out = asyncio.run(extract.extract_md(p, lib, llm=object()))
+    assert out is None
+    sig, epoch = p.extract_deferred_sig, p.extract_deferred_epoch
+    assert sig is not None                          # stamped by the (worker) transport arm
+
+    lib.save()                                      # the worker's post-extract library.save()
+    # Reload from the SAME vault root (a restart) → deserialize the persisted stamp.
+    lib2 = Library(str(tmp_path))
+    p2 = lib2.get(p.key)
+    assert p2 is not None
+    assert p2.extract_deferred_sig == sig           # sig survived the round-trip
+    assert p2.extract_deferred_epoch == epoch        # epoch survived the round-trip
+
+
 def test_extract_md_no_pdf_returns_none(tmp_path, monkeypatch):
     """No PDF on disk → return None without touching the server or attempts."""
     lib = Library(tmp_path)

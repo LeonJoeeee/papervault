@@ -311,3 +311,148 @@ def test_resolve_sweep_transient_does_not_stamp(tmp_path, monkeypatch):
     p = lib.get(stub.key)
     assert p.doi == ""
     assert p.resolve_attempted_at is None  # NOT stamped -> retried next sweep
+
+
+# ─────────────── issue #43: transport-defer skip + bounded retry ────────────
+#
+# A paper with a PDF but no md, status ok (classify → EXTRACT), whose extraction
+# keeps failing on TRANSPORT (backend down) is left non-terminal + uncharged by
+# design (C1), so reconcile used to re-enqueue the whole pending-extract set
+# every sweep forever. The fix: extract_md stamps a per-artifact deferral marker;
+# reconcile SKIPS a still-deferred paper, but auto-re-enqueues it when the PDF
+# artifact changes (re-download) OR the backend recovers (a sibling extract
+# succeeds → the success epoch advances), and keeps a bounded recovery canary.
+
+
+def _mk_deferred_extract(lib, key):
+    """An EXTRACT-routed paper (pdf, no md, status ok) stamped transport-deferred
+    against its current PDF artifact + the current success epoch."""
+    from papervault.library.services import extract_defer
+    p = _mk(lib, key, "ok", pdf=True, md=False)
+    extract_defer.mark_extract_deferred(p, lib)
+    lib.save()
+    return p
+
+
+def test_reconcile_skips_transport_deferred_extract(tmp_path, monkeypatch):
+    """Terminal-state skip: a deferred EXTRACT paper is NOT re-enqueued. (Canary
+    disabled here to isolate the skip; the canary bound is its own test below.)"""
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    monkeypatch.setattr(extract_defer, "DEFER_CANARY", 0)
+    lib = Library(tmp_path)
+    p = _mk_deferred_extract(lib, "Deferred2024")
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+
+    counts = _run(reconcile_once(lib, dq, eq))
+
+    assert eq.added == []                       # skipped, not re-enqueued
+    assert counts["extract"] == 0
+    assert counts["extract_deferred"] == 1
+
+
+def test_reconcile_reenqueues_when_pdf_artifact_changes(tmp_path):
+    """Artifact-appearance retry: if the PDF changes (re-download lands new
+    bytes → new signature), the deferral no longer matches and the paper
+    re-enters extraction."""
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    lib = Library(tmp_path)
+    p = _mk_deferred_extract(lib, "Rezdl2024")
+    # A re-download replaces the PDF with different bytes → different size/mtime.
+    lib.pdf_path(p.key).write_bytes(b"%PDF-1.7 a DIFFERENT, larger real pdf body " * 4)
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+
+    counts = _run(reconcile_once(lib, dq, eq))
+
+    assert [k for k, _ in eq.added] == [p.key]  # re-enqueued (artifact changed)
+    assert counts["extract"] == 1
+    assert counts["extract_deferred"] == 0
+
+
+def test_reconcile_reenqueues_deferred_after_backend_recovery(tmp_path):
+    """Backend recovery: once ANY extraction succeeds (success epoch advances),
+    a deferred paper goes stale and is re-enqueued (no data loss)."""
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    lib = Library(tmp_path)
+    p = _mk_deferred_extract(lib, "Recov2024")
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+
+    # Backend comes back: a sibling extraction succeeds somewhere.
+    extract_defer.note_extract_success()
+
+    counts = _run(reconcile_once(lib, dq, eq))
+    assert [k for k, _ in eq.added] == [p.key]
+    assert counts["extract"] == 1
+    assert counts["extract_deferred"] == 0
+
+
+def test_reconcile_deferred_canary_is_bounded(tmp_path):
+    """During a stable outage reconcile still promotes a bounded canary slice
+    (DEFER_CANARY) to detect recovery — not the whole pending-extract set."""
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    lib = Library(tmp_path)
+    n = extract_defer.DEFER_CANARY + 5
+    for i in range(n):
+        _mk_deferred_extract(lib, f"Canary{i:03d}v2024")
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+
+    counts = _run(reconcile_once(lib, dq, eq))
+
+    # Only DEFER_CANARY promoted; the rest stay deferred (skipped).
+    assert counts["extract_canary"] == extract_defer.DEFER_CANARY
+    assert len(eq.added) == extract_defer.DEFER_CANARY
+    assert counts["extract_deferred"] == n - extract_defer.DEFER_CANARY
+
+
+def test_reconcile_extract_not_deferred_is_enqueued_normally(tmp_path):
+    """Control: an EXTRACT paper with NO deferral marker is enqueued as before."""
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()
+    lib = Library(tmp_path)
+    p = _mk(lib, "Plainextract2024", "ok", pdf=True, md=False)
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+
+    counts = _run(reconcile_once(lib, dq, eq))
+    assert [k for k, _ in eq.added] == [p.key]
+    assert counts["extract"] == 1
+    assert counts["extract_deferred"] == 0
+
+
+def test_reconcile_reprobes_persisted_epoch0_stamp_on_fresh_process(tmp_path):
+    """Restart-semantics (issue #43 corrected mechanism, PI decision).
+
+    A row PERSISTED transport-deferred at epoch 0 — the field default, i.e. the
+    prolonged-outage-FROM-BOOT case that never saw a success — must read STALE on a
+    FRESH process, whose success epoch starts at 1. So reconcile RE-PROBES it rather
+    than spuriously skipping a freshly-booted row. This is the SECONDARY epoch layer
+    agreeing with the authoritative ``extract_queue.start()`` recovery scan.
+
+    (Pre-fix the process also started at 0, so a persisted 0 MATCHED the fresh epoch
+    and the paper was wrongly SKIPPED — the exact staleness bug the epoch-start-at-1
+    change fixes.)"""
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()                          # fresh process → epoch 1
+    assert extract_defer.success_epoch() == 1               # start-at-1 is load-bearing
+
+    lib = Library(tmp_path)
+    p = _mk_deferred_extract(lib, "Epoch0restart2024")      # sig set; stamp epoch = 1
+    p.extract_deferred_epoch = 0                             # ...persisted under the epoch-0 regime
+    lib.save()
+
+    # Reload a FRESH Library from disk (a restart): the epoch-0 stamp persists,
+    # the process epoch is still the fresh-process 1.
+    lib2 = Library(str(tmp_path))
+    p2 = lib2.get(p.key)
+    assert p2.extract_deferred_epoch == 0                   # survived the round-trip
+    assert p2.extract_deferred_sig == extract_defer.pdf_sig(lib2, p2.key)  # sig still matches
+    # Epoch layer alone now reads it STALE (0 != 1) → re-probe, not skip.
+    assert extract_defer.is_extract_deferred(p2, lib2) is False
+
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+    counts = _run(reconcile_once(lib2, dq, eq))
+    assert [k for k, _ in eq.added] == [p2.key]             # re-enqueued (re-probed), not skipped
+    assert counts["extract"] == 1
+    assert counts["extract_deferred"] == 0

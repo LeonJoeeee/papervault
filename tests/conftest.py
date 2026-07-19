@@ -54,6 +54,9 @@ _INTEGRATION_NAMES = {
     "test_search_judge_drop_is_not_fail_open",
     "test_search_sort_secondary_by_recency",
     "test_search_sort_secondary_by_importance",
+    "test_search_authority_prior_skipped_when_ranking_hint_by_recency",
+    "test_search_authority_prior_skipped_when_ranking_hint_by_importance",
+    "test_search_authority_prior_reorders_on_default_hint",
     "test_search_judge_batches_dropped_zero_when_healthy",
     "test_search_ingest_upsert_passes_no_llm",
     # test_firecrawl_quality_gate.py — the re-entry gate drives a live judge LLM.

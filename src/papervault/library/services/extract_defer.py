@@ -25,9 +25,26 @@ it. The deferral is NOT terminal and carries NO data loss — it auto-lifts when
 
 Reconcile keeps probing recovery cheaply: while papers are deferred it still
 promotes a small bounded canary slice each sweep (``DEFER_CANARY``), so the very
-first post-recovery success advances the epoch and un-defers the rest. A process
-restart resets the epoch, so a booted server always re-probes the full set once
-(the persisted signature/epoch intentionally go stale on restart).
+first post-recovery success advances the epoch and un-defers the rest.
+
+Restart re-probing — TWO layers, don't conflate them (issue #43 review corrected
+the original single-mechanism claim):
+
+  1. AUTHORITATIVE full re-probe: ``extract_queue.start()`` runs an UNCONDITIONAL
+     recovery scan on every boot — it re-enqueues the entire EXTRACT-routed set
+     (``classify == EXTRACT``) regardless of any defer stamp, and the worker's
+     ``extract_md`` clears the stamp up front and re-attempts. So a booted server
+     ALWAYS re-probes the full deferred set once; the stamp does not gate this.
+  2. SECONDARY steady-state consistency: the process success-epoch starts at 1
+     (see ``_SUCCESS_EPOCH``). A paper deferred during a prolonged-outage-from-boot
+     carries a persisted stamp epoch of 0, so on a fresh process ``0 != 1`` reads
+     it STALE — reconcile's periodic sweep also treats it as needing a re-probe,
+     agreeing with layer 1 rather than spuriously skipping a freshly-booted row.
+
+The per-paper ``extract_deferred_sig`` / ``extract_deferred_epoch`` fields ARE
+persisted (real ``Paper`` columns); only the process-global epoch is reset on
+restart. Artifact-change staleness (a re-download → new signature) works
+identically across a restart.
 
 Everything here is process-local + duck-typed on ``library`` (``pdf_path`` only)
 so this module imports nothing heavy and introduces no import cycle.
@@ -52,9 +69,25 @@ except ValueError:
 # Advanced on every successful md extraction. Read (indirectly, via the per-paper
 # stored value) by reconcile to tell "no success since this paper was deferred"
 # (backend still down → keep skipping) from "a success happened since" (backend
-# recovered → re-enqueue). Intentionally NOT persisted: a fresh process starts at
-# 0, so any paper carrying a non-zero stored epoch reads as stale → re-probed.
-_SUCCESS_EPOCH = 0
+# recovered → re-enqueue) WITHIN a live process.
+#
+# This global itself is process-local (NOT persisted); the per-paper stamp
+# (``Paper.extract_deferred_epoch``) IS persisted. The initial value is 1, NOT 0,
+# and that is load-bearing for restart-staleness (issue #43 review): a paper that
+# was deferred during a prolonged outage from boot never saw a success, so its
+# persisted stamp is 0 (the field default / the old epoch-0 regime). Starting a
+# fresh process at 1 makes ``stored 0 != success_epoch() 1`` → that paper reads
+# STALE → reconcile re-probes it, matching intent. (Were the process to start at 0
+# too, the persisted 0 would spuriously MATCH and the paper would be skipped — the
+# bug this fixes.) NOTE this epoch is the SECONDARY / steady-state layer: the
+# authoritative restart re-probe is ``extract_queue.start()``'s UNCONDITIONAL
+# recovery scan, which re-enqueues the whole EXTRACT-routed set on every boot
+# regardless of any stamp (the worker then clears + re-attempts each). The epoch
+# only governs whether reconcile's periodic sweep SKIPS a still-deferred paper
+# between boots; starting it at 1 keeps that skip decision consistent with the
+# recovery scan across a restart.
+_INITIAL_SUCCESS_EPOCH = 1
+_SUCCESS_EPOCH = _INITIAL_SUCCESS_EPOCH
 
 
 def note_extract_success() -> None:
@@ -68,9 +101,10 @@ def success_epoch() -> int:
 
 
 def reset_for_test() -> None:
-    """Test hook: reset the process-global epoch to 0."""
+    """Test hook: reset the process-global epoch to the fresh-process initial
+    value (``_INITIAL_SUCCESS_EPOCH`` = 1), so a test mimics a booted process."""
     global _SUCCESS_EPOCH
-    _SUCCESS_EPOCH = 0
+    _SUCCESS_EPOCH = _INITIAL_SUCCESS_EPOCH
 
 
 # ── per-paper artifact signature ────────────────────────────────────────────

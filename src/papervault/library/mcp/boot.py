@@ -33,6 +33,12 @@ Graceful degradation during the warm-up window (the "sweep" is now background):
     (honest) and progresses once the background boot has started the queues —
     typically sub-second, at most the length of the recovery scan. Nothing is
     lost; the only change is the URGENT kick may be deferred by that window.
+
+Boot-failure observability: if the detached boot RAISES (queues/reconcile never
+come up), the failure is loud in the log AND on a monitored signal —
+``server._paper_boot_failed`` is set to a short summary. The heavy MCP tools
+(``get_paper`` / ``search_papers``) read it and surface a ``service_degraded``
+field so a caller sees the degradation instead of it living only in a log line.
 """
 from __future__ import annotations
 
@@ -58,7 +64,12 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
     # Handles filled in by the background boot; shutdown reads whatever exists.
     reconcile_task: asyncio.Task | None = None
     mineru_monitor_task: asyncio.Task | None = None
-    queues_started = False
+
+    # Boot-failure signal (monitored by the heavy MCP tools). None while the boot
+    # is healthy / in-flight; set to a short exception summary if _deferred_boot
+    # raises, so get_paper / search_papers can surface a ``service_degraded``
+    # field to callers instead of the failure being visible ONLY in the log.
+    server._paper_boot_failed = None  # type: ignore[attr-defined]
 
     async def _dirty_flusher() -> None:
         # Trailing-edge flush for debounced saves (issue #34 review): a burst that
@@ -77,7 +88,7 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
 
     async def _deferred_boot() -> None:
         """The potentially-long library warm-up — runs AFTER the port binds."""
-        nonlocal reconcile_task, mineru_monitor_task, queues_started
+        nonlocal reconcile_task, mineru_monitor_task
         try:
             # One-time download_status migration — normalize every legacy status to
             # the clean routing enum BEFORE the queues' recovery scans read a
@@ -101,7 +112,6 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
             log.info("paper-extract queue started")
             await download_queue.start()
             log.info("paper-download queue started")
-            queues_started = True
 
             from ..services.reconcile import reconcile_loop
             reconcile_task = asyncio.create_task(
@@ -119,7 +129,13 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
             log.info("library background boot complete (queues + reconcile live)")
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 — a boot failure must be loud, not silent
+        except Exception as exc:  # noqa: BLE001 — a boot failure must be loud, not silent
+            # Loud in the LOG *and* on a MONITORED signal: stash a short summary
+            # on the server so the heavy MCP tools can tell callers the service
+            # is degraded (queues/reconcile may be down) instead of the failure
+            # being buried in a log line no caller ever sees.
+            server._paper_boot_failed = (  # type: ignore[attr-defined]
+                f"library background boot failed: {type(exc).__name__}: {exc}"[:300])
             log.exception("library background boot FAILED; server keeps serving "
                           "reads but queues/reconcile may be down")
 
@@ -146,10 +162,16 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
                 await _t
             except (asyncio.CancelledError, Exception):
                 pass
-        # Stop the queues only if the background boot actually started them.
-        if queues_started:
-            await download_queue.stop()
-            await extract_queue.stop()
+        # Stop both queues UNCONDITIONALLY. Each ``stop()`` is idempotent-safe
+        # when the queue was never started (the boot raised before start(), or
+        # a shutdown races an in-flight boot): with no workers spawned the
+        # cancel/gather over an empty ``_workers`` list is a no-op, ``_pending``
+        # is already empty, and ``_started`` is simply re-set False. Relying on
+        # that is more robust than the old coarse ``queues_started`` flag, which
+        # went stale if the boot raised BETWEEN the two start() calls (extract
+        # started, download not) and then skipped stopping the started one.
+        await download_queue.stop()
+        await extract_queue.stop()
         # Graceful-shutdown flush: debounced state must reach disk before exit —
         # NEW records have no disk artifact and are NOT reconcile-recoverable.
         async with concurrency.lib_write_lock:

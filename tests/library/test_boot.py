@@ -86,11 +86,18 @@ def test_boot_task_starts_queues_and_shutdown_is_clean(tmp_path):
 
 def test_shutdown_before_boot_completes_is_clean(tmp_path):
     """A shutdown that races an in-flight boot (port bound, sweep still running)
-    must cancel the boot cleanly and not raise — the zombie-boot guard."""
+    must cancel the boot cleanly and not raise — the zombie-boot guard.
+
+    This ALSO pins the shutdown-robustness fix: the boot is cancelled while blocked
+    BEFORE either queue's ``start()`` ran, so shutdown calls ``stop()`` on two
+    NEVER-STARTED queues. The old code gated those stops behind a coarse
+    ``queues_started`` flag; shutdown now calls them UNCONDITIONALLY, relying on
+    ``stop()`` being idempotent-safe when unstarted (empty worker pool → no-op)."""
 
     async def scenario():
         server = build_server(library_path=str(tmp_path))
         eq = server._paper_extract_queue
+        dq = server._paper_download_queue
 
         gate = asyncio.Event()
         orig_start = eq.start
@@ -105,5 +112,9 @@ def test_shutdown_before_boot_completes_is_clean(tmp_path):
         # Boot is blocked mid-sweep; shut down anyway (do not release the gate).
         await asyncio.wait_for(shutdown(), timeout=5.0)
         assert server._paper_boot_task.done()
+        # Neither queue ever started, yet the unconditional stop() left both in a
+        # clean, un-started state without raising.
+        assert eq._started is False
+        assert dq._started is False
 
     asyncio.run(scenario())

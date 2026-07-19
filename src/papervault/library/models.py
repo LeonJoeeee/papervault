@@ -345,9 +345,15 @@ class Paper(BaseModel):
     # AND no extraction has succeeded since, reconcile SKIPS re-enqueuing it.
     # This is NOT a terminal ``download_status`` and loses no data: it auto-lifts
     # when the PDF artifact changes (re-download) OR the backend recovers (any
-    # extract succeeds → the epoch advances). Not persisted-meaningfully across
-    # restart on purpose — a fresh process (epoch 0) re-probes every deferred row
-    # once. Every non-transport extract outcome clears it.
+    # extract succeeds → the epoch advances). Both fields ARE persisted (they
+    # survive a save/load round-trip); the process-global success epoch is NOT —
+    # it starts at 1 on a fresh process, so a stamp persisted at epoch 0 (a paper
+    # deferred during an outage-from-boot) reads STALE on restart (0 != 1). NOTE
+    # the AUTHORITATIVE restart re-probe is ``extract_queue.start()``'s
+    # unconditional recovery scan (re-enqueues the whole EXTRACT set every boot),
+    # NOT this epoch — the epoch-start-at-1 rule only keeps reconcile's periodic
+    # SKIP decision consistent with that scan across a restart. Every non-transport
+    # extract outcome clears both fields.
     extract_deferred_sig: Optional[str] = None
     extract_deferred_epoch: int = 0
 

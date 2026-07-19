@@ -419,3 +419,40 @@ def test_reconcile_extract_not_deferred_is_enqueued_normally(tmp_path):
     assert [k for k, _ in eq.added] == [p.key]
     assert counts["extract"] == 1
     assert counts["extract_deferred"] == 0
+
+
+def test_reconcile_reprobes_persisted_epoch0_stamp_on_fresh_process(tmp_path):
+    """Restart-semantics (issue #43 corrected mechanism, PI decision).
+
+    A row PERSISTED transport-deferred at epoch 0 — the field default, i.e. the
+    prolonged-outage-FROM-BOOT case that never saw a success — must read STALE on a
+    FRESH process, whose success epoch starts at 1. So reconcile RE-PROBES it rather
+    than spuriously skipping a freshly-booted row. This is the SECONDARY epoch layer
+    agreeing with the authoritative ``extract_queue.start()`` recovery scan.
+
+    (Pre-fix the process also started at 0, so a persisted 0 MATCHED the fresh epoch
+    and the paper was wrongly SKIPPED — the exact staleness bug the epoch-start-at-1
+    change fixes.)"""
+    from papervault.library.services import extract_defer
+    extract_defer.reset_for_test()                          # fresh process → epoch 1
+    assert extract_defer.success_epoch() == 1               # start-at-1 is load-bearing
+
+    lib = Library(tmp_path)
+    p = _mk_deferred_extract(lib, "Epoch0restart2024")      # sig set; stamp epoch = 1
+    p.extract_deferred_epoch = 0                             # ...persisted under the epoch-0 regime
+    lib.save()
+
+    # Reload a FRESH Library from disk (a restart): the epoch-0 stamp persists,
+    # the process epoch is still the fresh-process 1.
+    lib2 = Library(str(tmp_path))
+    p2 = lib2.get(p.key)
+    assert p2.extract_deferred_epoch == 0                   # survived the round-trip
+    assert p2.extract_deferred_sig == extract_defer.pdf_sig(lib2, p2.key)  # sig still matches
+    # Epoch layer alone now reads it STALE (0 != 1) → re-probe, not skip.
+    assert extract_defer.is_extract_deferred(p2, lib2) is False
+
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+    counts = _run(reconcile_once(lib2, dq, eq))
+    assert [k for k, _ in eq.added] == [p2.key]             # re-enqueued (re-probed), not skipped
+    assert counts["extract"] == 1
+    assert counts["extract_deferred"] == 0

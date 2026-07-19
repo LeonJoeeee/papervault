@@ -64,6 +64,22 @@ from papervault.library.services.extract_queue import ExtractQueue
 logger = logging.getLogger(__name__)
 
 
+def _degraded_fields(server) -> dict:
+    """A ``{"service_degraded": <reason>}`` fragment when the library-plane boot
+    FAILED, else ``{}`` (field omitted → healthy).
+
+    ``library/mcp/boot.py`` stashes a short summary on ``server._paper_boot_failed``
+    if the detached background boot RAISES — the stage queues / reconcile never came
+    up, so a ``pending`` paper will NOT progress and ``get_paper``'s URGENT kick is a
+    no-op. The heavy tools splice this fragment into their response so a caller is
+    TOLD the plane is degraded (and why), instead of the failure living only in the
+    server log. Distinct from ``intent_parsed.sources_degraded`` (a SEARCH-BACKEND
+    outage signal); this is LIBRARY-PLANE (queue/reconcile) health. Defensive
+    ``getattr`` → absent/None attribute (healthy or pre-boot) yields ``{}``."""
+    reason = getattr(server, "_paper_boot_failed", None)
+    return {"service_degraded": reason} if reason else {}
+
+
 def _paper_dict(paper: Paper, library: Library) -> dict:
     """Minimal Executor-facing paper record — the **library↔executor interface** projection
     (2026-05; the canonical contract is ``docs/architecture.md``). 9 research fields
@@ -899,7 +915,10 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
             results.append(rec)
 
         await _maybe_progress(ctx, len(identifiers), len(identifiers), "done")
-        return {"status": "ok", "results": results}
+        # Surface a library-plane boot failure to the caller (queues/reconcile
+        # down → a pending paper won't progress + the URGENT kick above is a
+        # no-op). Omitted entirely when the plane is healthy.
+        return {"status": "ok", "results": results, **_degraded_fields(mcp)}
 
     # ---------------- search_papers ----------------
 
@@ -1351,6 +1370,10 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         return {
             "status": "ok",
             "results": results,
+            # Library-plane boot-failure signal (queues/reconcile down) — omitted
+            # when healthy. Top-level + distinct from the nested
+            # ``sources_degraded`` (which is search-BACKEND health, not plane health).
+            **_degraded_fields(mcp),
             "intent_parsed": {
                 "search_terms": plan["search_terms"],
                 "filters_applied": {

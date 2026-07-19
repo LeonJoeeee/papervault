@@ -614,6 +614,14 @@ async def extract_md(paper: Paper, library: Library, *,
 
     pdf_path = library.pdf_path(paper.key)
 
+    # Issue #43: this call is a fresh, committed extraction attempt. Clear any
+    # stale transport-defer stamp up front; exactly one outcome arm runs below,
+    # and ONLY the transport arm re-stamps it. So the stamp always reflects the
+    # most recent completed attempt (deferred ⟺ that attempt was transport-blocked).
+    from .services.extract_defer import (
+        clear_extract_deferred, mark_extract_deferred, note_extract_success)
+    clear_extract_deferred(paper)
+
     def _p(msg: str) -> None:
         """Best-effort progress callback emit."""
         if on_progress is None:
@@ -686,11 +694,17 @@ async def extract_md(paper: Paper, library: Library, *,
         # paper to EXTRACT on the next reconcile sweep. Non-mutation IS the
         # mechanism (SDD §2.4). A bare 500 / a `systemctl restart` window /
         # both endpoints down all land here and never condemn the paper.
+        # Issue #43: stamp the paper deferred against its CURRENT PDF artifact so
+        # reconcile stops re-enqueuing it every sweep while the backend stays
+        # down. Still NO attempt charged, still non-terminal — the deferral
+        # auto-lifts on artifact change or backend recovery (see extract_defer).
+        mark_extract_deferred(paper, library)
         library.log({"event": "extract_md_transport_retry", "key": paper.key,
                      "error": repr(exc)[:200],
-                     "attempts": paper.extract_attempts})
+                     "attempts": paper.extract_attempts,
+                     "deferred_sig": paper.extract_deferred_sig})
         _p(f"extract: TRANSPORT failure ({repr(exc)[:80]}) — "
-           f"no charge, will retry next sweep")
+           f"no charge, deferred (retry on artifact change / backend recovery)")
         return None
     except MineruExtractionError as exc:
         # ── genuine per-doc failure → charge, terminal at BUDGET ONLY ──
@@ -767,6 +781,10 @@ async def extract_md(paper: Paper, library: Library, *,
     # ---- 6. Save (label → mineru2.5-pro) ----
     _save_md(paper, library, "mineru2.5-pro", mineru_md)
     paper.download_status = DOWNLOAD_STATUS_OK
+    # Issue #43: a successful extraction proves the backend is producing output —
+    # advance the process-global success epoch so any papers deferred during the
+    # outage go stale next reconcile sweep and are re-enqueued (auto-recovery).
+    note_extract_success()
     library.log({"event": "extract_md_done", "key": paper.key,
                  "engine": "mineru2.5-pro",
                  "n_pages": probe.n_pages,

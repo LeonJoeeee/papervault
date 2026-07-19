@@ -9,6 +9,12 @@ Under streamable-http a FastMCP lifespan runs once per client connection, so —
 knowledge server's proven pattern — we wrap the Starlette app lifespan to own the
 server-lifetime lifecycle.
 
+Bind-before-sweep (issue #34): an ASGI server does not bind its socket until lifespan-startup
+returns, so the library warm-up must NOT block startup. ``start_library_bg`` therefore returns
+promptly and runs the long backlog recovery + reconcile in a detached background task; the
+lifespan yields immediately so uvicorn binds :8080 and serves while the backlog warms up (see
+``library/mcp/boot.py`` for the graceful-degradation contract during that window).
+
 Usage::
 
     papervault-mcp                      # streamable-http on 127.0.0.1:8080
@@ -92,9 +98,14 @@ def main() -> int:
     @asynccontextmanager
     async def _server_lifespan(_a):  # runs ONCE at server boot/shutdown (uvicorn's loop)
         async with _orig_lifespan(_a):                       # FastMCP session_manager.run()
-            shutdown_library = await start_library_bg(server, log)   # queues + reconcile + mineru
+            # Returns promptly (issue #34): the library backlog recovery + reconcile
+            # sweep run in a detached task, so this lifespan yields and the port binds
+            # BEFORE the (potentially minutes-long) sweep — callers are served during it.
+            shutdown_library = await start_library_bg(server, log)   # queues + reconcile + mineru (bg)
             await start_knowledge_bg()                       # scheduler + graph/pool
-            log.info("papervault MCP server ready on %s:%d", args.host, args.port)
+            log.info("papervault MCP server ready on %s:%d "
+                     "(serving; library backlog recovery running in background)",
+                     args.host, args.port)
             try:
                 yield
             finally:

@@ -56,6 +56,7 @@ from .. import fetch
 from ..store import Library
 from .classify import DOWNLOAD, EXTRACT, classify
 from . import concurrency
+from . import extract_defer
 
 log = logging.getLogger("papervault.library.reconcile")
 
@@ -415,14 +416,27 @@ async def reconcile_once(
         firecrawl-md papers (md on disk, no PDF) that the download queue's
         own recovery scan forgets — this is the bug D8 fixes.
       * ``EXTRACT``  → ``extract_queue.add(key, prio_by_pages(key))``
-        (>90 pages → PRIORITY_LOW, D10).
+        (>90 pages → PRIORITY_LOW, D10) — UNLESS the paper is transport-DEFERRED
+        against its current PDF artifact (issue #43: the extraction backend was
+        unreachable and has not recovered), in which case it is SKIPPED this
+        sweep (counted ``extract_deferred``) rather than re-enqueued forever. A
+        bounded canary slice of the deferred set is still promoted each sweep to
+        detect backend recovery (counted ``extract_canary``).
       * ``TERMINAL`` → skipped (audit-only).
 
     Idempotent + safe to call on a timer. Returns a counts dict
-    ``{"scanned", "download", "extract", "terminal", "errors"}`` for logging.
+    ``{"scanned", "download", "extract", "extract_deferred", "extract_canary",
+    "terminal", "errors", ...}`` for logging.
     """
     counts = {"scanned": 0, "download": 0, "extract": 0,
-              "terminal": 0, "errors": 0, "enriched": 0, "doi_resolved": 0}
+              "terminal": 0, "errors": 0, "enriched": 0, "doi_resolved": 0,
+              "extract_deferred": 0, "extract_canary": 0}
+
+    # Issue #43: keys that classify routes EXTRACT but that are transport-DEFERRED
+    # against their current PDF artifact (backend unreachable, no success since).
+    # We do NOT re-enqueue these — that is the busy-loop fix — but we keep a
+    # bounded canary slice (below) to detect backend recovery.
+    deferred_extract: list[str] = []
 
     papers = library.all_papers()
     for start in range(0, len(papers), batch_size):
@@ -435,9 +449,16 @@ async def reconcile_once(
                     download_queue.add(paper.key, concurrency.PRIORITY_NORMAL)
                     counts["download"] += 1
                 elif route == EXTRACT:
-                    prio = await _prio_by_pages(library, paper.key)
-                    extract_queue.add(paper.key, prio)
-                    counts["extract"] += 1
+                    if extract_defer.is_extract_deferred(paper, library):
+                        # Skip: extraction was transport-deferred against this
+                        # exact PDF and the backend has not recovered. Auto-lifts
+                        # on artifact change or a sibling extract success (#43).
+                        deferred_extract.append(paper.key)
+                        counts["extract_deferred"] += 1
+                    else:
+                        prio = await _prio_by_pages(library, paper.key)
+                        extract_queue.add(paper.key, prio)
+                        counts["extract"] += 1
                 else:  # TERMINAL — audit-only, never auto-revive.
                     counts["terminal"] += 1
             except Exception as exc:
@@ -449,6 +470,22 @@ async def reconcile_once(
                              "error": repr(exc)[:200]})
         # Yield between batches so a large sweep doesn't monopolize the loop.
         await asyncio.sleep(0)
+
+    # Issue #43 recovery probe: while papers are transport-deferred, still promote
+    # a small bounded canary slice each sweep. If the backend has recovered, a
+    # canary extraction succeeds → the process-global success epoch advances →
+    # every remaining deferred paper goes stale (is_extract_deferred → False) and
+    # is re-enqueued next sweep. During a stable outage this costs O(DEFER_CANARY)
+    # attempts/sweep instead of O(pending-set) — the busy-loop is bounded, not
+    # perpetual.
+    for key in deferred_extract[:extract_defer.DEFER_CANARY]:
+        try:
+            prio = await _prio_by_pages(library, key)
+            extract_queue.add(key, prio)
+            counts["extract_canary"] += 1
+            counts["extract_deferred"] -= 1
+        except Exception:
+            log.exception("reconcile: extract canary promotion failed for %s", key)
 
     # By-title DOI resolution pass — give no-DOI in-domain stubs a DOI so they
     # become enrich-eligible + download-able. Runs BEFORE the enrich pass so a
@@ -503,9 +540,10 @@ async def reconcile_once(
 
     library.log({"event": "reconcile_once_done", **counts})
     log.info(
-        "reconcile: scanned %d → download %d, extract %d, terminal %d, "
-        "errors %d",
+        "reconcile: scanned %d → download %d, extract %d "
+        "(deferred %d, canary %d), terminal %d, errors %d",
         counts["scanned"], counts["download"], counts["extract"],
+        counts["extract_deferred"], counts["extract_canary"],
         counts["terminal"], counts["errors"],
     )
     return counts

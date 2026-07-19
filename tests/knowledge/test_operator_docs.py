@@ -13,6 +13,7 @@ import pytest
 
 from papervault.knowledge.ingest import operator_docs as od
 from papervault.knowledge.ingest.operator_docs import (
+    AlreadyIngestedError,
     DocSection,
     SourceDisabledError,
     build_sections,
@@ -240,13 +241,20 @@ def test_enqueue_sections_empty_is_noop():
 #  ingest_document end-to-end (fake rag + monkeypatched ledger)                #
 # --------------------------------------------------------------------------- #
 
-def _patch_ledger(monkeypatch):
+def _patch_ledger(monkeypatch, existing=None):
+    """Stub the ledger: capture upsert writes, and serve `load` from `existing`
+    ({source_id: rec}, default empty = nothing previously ingested). The re-ingest
+    push-once pre-check (#3) reads `load`, so it must be stubbed for the hermetic path."""
     writes: list[tuple] = []
 
     async def _fake_upsert(ingest_source, source_id, *, doc_id, status, fingerprint=None):
         writes.append((ingest_source, source_id, doc_id, status))
 
+    async def _fake_load(ingest_source):
+        return dict(existing or {})
+
     monkeypatch.setattr(od.ledger, "upsert", _fake_upsert)
+    monkeypatch.setattr(od.ledger, "load", _fake_load)
     return writes
 
 
@@ -308,3 +316,122 @@ def test_ingest_document_empty_file_raises(monkeypatch, tmp_path):
         _run(od.ingest_document(
             FakeRag(), "textbook", "textbook:Schlickeiser2002", str(p), tokenizer=FakeTok(),
         ))
+
+
+# --------------------------------------------------------------------------- #
+#  F17 invariant — enqueue/process failure rewrites processing rows → error    #
+# --------------------------------------------------------------------------- #
+
+class BoomRag(FakeRag):
+    """enqueue succeeds, but the process phase raises — the class of blip (pipeline not
+    init / PG-Neo4j hiccup) that usually fires AFTER the ledger `processing` write but
+    BEFORE doc_status lands, orphaning the row. F17 must rewrite those rows to error."""
+
+    async def apipeline_process_enqueue_documents(self):
+        raise RuntimeError("pipeline not initialized")
+
+
+def test_ingest_document_enqueue_failure_rewrites_processing_to_error(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    writes = _patch_ledger(monkeypatch)
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta gamma\n\n# B\ndelta epsilon zeta", encoding="utf-8")
+
+    out = _run(od.ingest_document(
+        rag=BoomRag(), kind="textbook", key="textbook:Schlickeiser2002", path=str(p),
+        tokenizer=FakeTok(), max_tokens=6,
+    ))
+    # every section reported as error, none done/pending; the enqueue failure did not
+    # punch through to the caller (F17 batch backstop).
+    assert out["error"] == out["sections"] and out["sections"] >= 2
+    assert out["done"] == 0 and out["pending"] == 0
+    # the just-written `processing` rows were rewritten to `error` (never orphaned).
+    procs = [w for w in writes if w[3] == "processing"]
+    errs = [w for w in writes if w[3] == "error"]
+    assert len(procs) == out["sections"]
+    assert len(errs) == out["sections"]
+    assert {w[1] for w in procs} == {w[1] for w in errs}  # same source_ids
+
+
+def test_reconcile_missing_doc_status_row_marks_error(monkeypatch, tmp_path):
+    # stuck-guard: a section with NO terminal PROCESSED (here: no doc_status row at all —
+    # an F16 enqueue-drop orphan) is flipped to error in the single reconcile pass, not
+    # left processing.
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    writes = _patch_ledger(monkeypatch)
+
+    class NoStatusRag(FakeRag):
+        async def aget_docs_by_ids(self, ids):
+            return {}  # nothing came back terminal
+
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta gamma", encoding="utf-8")
+    out = _run(od.ingest_document(
+        NoStatusRag(), "textbook", "textbook:Schlickeiser2002", str(p),
+        tokenizer=FakeTok(), max_tokens=1000,
+    ))
+    assert out["error"] == out["sections"] and out["done"] == 0 and out["pending"] == 0
+    assert any(w[3] == "error" for w in writes)
+
+
+# --------------------------------------------------------------------------- #
+#  re-ingest safety — v1 push-once (#3)                                         #
+# --------------------------------------------------------------------------- #
+
+def test_ingest_document_already_ingested_refuses(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    # ledger already carries a section for this exact provenance key.
+    _patch_ledger(monkeypatch, existing={"Schlickeiser2002": object()})
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta gamma", encoding="utf-8")
+    with pytest.raises(AlreadyIngestedError) as e:
+        _run(od.ingest_document(
+            FakeRag(), "textbook", "textbook:Schlickeiser2002", str(p),
+            tokenizer=FakeTok(), max_tokens=1000,
+        ))
+    assert "push-once" in str(e.value) and "textbook:Schlickeiser2002" in str(e.value)
+
+
+def test_ingest_document_already_ingested_multi_section_refuses(monkeypatch, tmp_path):
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    # prior push landed as multiple `#s<N>` section rows — still counts as ingested.
+    _patch_ledger(monkeypatch, existing={
+        "Schlickeiser2002#s0": object(), "Schlickeiser2002#s1": object(),
+    })
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta gamma", encoding="utf-8")
+    with pytest.raises(AlreadyIngestedError):
+        _run(od.ingest_document(
+            FakeRag(), "textbook", "textbook:Schlickeiser2002", str(p), tokenizer=FakeTok(),
+        ))
+
+
+def test_ingest_document_sibling_key_not_treated_as_already_ingested(monkeypatch, tmp_path):
+    # prefix-safety: a DIFFERENT key that merely shares a prefix must NOT trip push-once.
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_ledger(monkeypatch, existing={"Schlickeiser2002b": object()})  # sibling key
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta gamma", encoding="utf-8")
+    out = _run(od.ingest_document(  # no raise — Schlickeiser2002 != Schlickeiser2002b
+        FakeRag(doc_status="processed"), "textbook", "textbook:Schlickeiser2002", str(p),
+        tokenizer=FakeTok(), max_tokens=1000,
+    ))
+    assert out["done"] == out["sections"]
+
+
+# --------------------------------------------------------------------------- #
+#  synth credibility label for operator-doc colon keys (#4)                    #
+# --------------------------------------------------------------------------- #
+
+def test_source_label_operator_colon_keys():
+    from papervault.knowledge.query.synth import _CRED_BY_SOURCE, _source_label
+
+    # notebook is banded (preliminary) and the WHOLE colon key is the label — not 'unknown'.
+    assert "notebook" in _CRED_BY_SOURCE
+    assert _source_label("notebook:idea23-c12") == ("notebook:idea23-c12", "preliminary")
+    assert _source_label("textbook:Schlickeiser2002") == ("textbook:Schlickeiser2002", "established")
+    assert _source_label("web:nasa-srag") == ("web:nasa-srag", "preliminary")
+    # legacy paper slash-form still resolves to the bare key + empirical.
+    assert _source_label("paper/Reames2023") == ("Reames2023", "empirical")
+    # an unknown colon source is not banded → falls back to unknown/preliminary.
+    assert _source_label("bogus:x") == ("unknown", "preliminary")

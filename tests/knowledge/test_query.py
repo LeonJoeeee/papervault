@@ -121,6 +121,21 @@ def test_cited_sources_empty_when_none():
     assert _cited_sources({"references": [{"file_path": "paper/X2020"}]}) == []
 
 
+def test_legacy_paper_slash_and_bare_keys_never_leak_into_cited_sources():
+    # pin: both coexisting paper file_path forms — the 1.4 'paper/<key>' slash form AND the
+    # 1.5 bare '<key>' basename — resolve to cited_papers and must NEVER appear in
+    # cited_sources (which is colon-prefixed operator upstreams only). 'unknown_source' is
+    # dropped by both.
+    refs = [
+        {"file_path": "paper/Reames2023"},   # 1.4 slash form
+        {"file_path": "Bonomi2020"},         # 1.5 bare basename
+        {"file_path": "unknown_source"},     # LightRAG sentinel
+    ]
+    data = {"references": refs}
+    assert _cited_papers(data) == ["Bonomi2020", "Reames2023"]
+    assert _cited_sources(data) == []
+
+
 # ---- _assess_coverage (graph signal, None-safe) -----------------------------
 
 def test_coverage_strong_thin_empty_thresholds():

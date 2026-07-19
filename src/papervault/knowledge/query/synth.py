@@ -146,6 +146,9 @@ _CRED_BY_SOURCE = {
     "textbook": "established",
     "paper": "empirical",
     "web": "preliminary",
+    # notebook (#47): the lab's own executor notebooks — unpublished, in-progress reasoning.
+    # Lowest band: preliminary (never let a notebook out-rank a peer-reviewed paper/textbook).
+    "notebook": "preliminary",
 }
 
 
@@ -230,8 +233,8 @@ Retrieved knowledge:
 
 Answer the intent using the retrieved knowledge above. Cite EVERY substantive claim
 inline with [paper_key] using the paper_key shown in each chunk's source label (papers
-only; attribute textbook:/web: sources inline in prose, not in square brackets). Use ALL
-the relevant material and synthesize ACROSS sources — don't collapse a multi-paper body
+only; attribute textbook:/notebook:/web: sources inline in prose, not in square brackets).
+Use ALL the relevant material and synthesize ACROSS sources — don't collapse a multi-paper body
 of evidence into a single-paper summary. Pick whatever structure (prose / bullets /
 sections / table) and length best fits the question + the depth of coverage. If the
 material doesn't support the intent well, say so cleanly."""

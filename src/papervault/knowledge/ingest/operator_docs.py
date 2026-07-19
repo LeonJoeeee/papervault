@@ -25,7 +25,9 @@ Design (mirrors the paper distill insertion path — ingest/distill.py):
                     `<kind>:<source_id>#s<N>`      (multi-section — unique per section)
         file_path = `<kind>:<source_id>`           (the base key — SHARED across all
                     sections so the query path cites the WHOLE book/notebook, not a
-                    section, and synth reads the credibility band from the prefix)
+                    section, and synth reads the credibility band off the source-class
+                    prefix: textbook→established, notebook→preliminary, via
+                    query/synth.py _CRED_BY_SOURCE)
     This is deliberately the COLON form (`textbook:Schlickeiser2002`), not the paper's
     SLASH form (`paper/<key>`): the query path's `_cited_papers` treats a slash-free
     file_path as a bare paper key, so a colon prefix is what keeps textbook/notebook keys
@@ -118,6 +120,11 @@ def validate_key(kind: str, key: str) -> tuple[str, str]:
 class SourceDisabledError(RuntimeError):
     """Raised when an operator-doc source class is ingested while its enabling flag is
     OFF. Carries a loud, WHY-explaining message (the CLI surfaces it verbatim)."""
+
+
+class AlreadyIngestedError(RuntimeError):
+    """Raised when a provenance key already has ledger sections (v1 push-once, #47). Carries
+    a message naming the key + section count (the CLI surfaces it verbatim)."""
 
 
 _GUARD_ENV = {
@@ -329,7 +336,14 @@ async def _reconcile_sections(rag, ingest_source: str, sections: list[DocSection
     """Read LightRAG doc_status terminal states for the just-enqueued sections and write
     the ledger back to done/error (the CLI runs enqueue+process synchronously, so terminal
     states are available inline — same dict-aware read as scheduler/round.reconcile_terminal).
-    Non-terminal rows stay `processing` and are reported as pending."""
+
+    STUCK-GUARD (mirrors scheduler/round.reconcile_terminal, F17): this is the ONE and ONLY
+    reconcile pass — the CLI runs synchronously with no daemon round to retry. So a section
+    that did NOT reach PROCESSED — FAILED, a lingering mid-state, an unexpected phase, or a
+    MISSING doc_status row (F16 enqueue-drop orphan) — is flipped to `error` here rather than
+    left orphaned in `processing` forever (which would also silently block a future re-ingest).
+    round.py needs a per-key counter because it re-scans every round; a single synchronous
+    pass collapses that to 'not PROCESSED now → error'."""
     from lightrag.base import DocStatus
 
     by_doc = {s.doc_id: s for s in sections}
@@ -341,13 +355,36 @@ async def _reconcile_sections(rag, ingest_source: str, sections: list[DocSection
         if ds == DocStatus.PROCESSED:
             await ledger.upsert(ingest_source, s.source_id, doc_id=doc_id, status="done")
             counts["done"] += 1
-        elif ds == DocStatus.FAILED:
+        else:
             await ledger.upsert(ingest_source, s.source_id, doc_id=doc_id, status="error")
             counts["error"] += 1
-            log.warning("operator-doc %s doc_status FAILED → ledger error", doc_id)
-        else:
-            counts["pending"] += 1
+            if ds == DocStatus.FAILED:
+                log.warning("operator-doc %s doc_status FAILED → ledger error", doc_id)
+            else:
+                log.warning(
+                    "operator-doc %s not PROCESSED in the single reconcile pass "
+                    "(doc_status=%s) → ledger error (stuck-guard)", doc_id, ds,
+                )
     return counts
+
+
+async def _assert_not_already_ingested(ingest_source: str, base_sid: str, key: str) -> None:
+    """v1 push-once (#47): REFUSE if this provenance key already has ANY ledger section.
+
+    Matches the doc's single row (`base_sid`) or its multi-section rows (`base_sid#s<N>`),
+    in ANY status — an errored or half-done prior push still counts, so a re-run can't
+    silently double-insert / orphan graph docs. Clearing + re-ingest (`--force`/supersede)
+    is deliberately future work; an operator must clear the old rows by hand for now.
+    Prefix-safe: only an exact `base_sid` or a `base_sid#s...` section id matches (a sibling
+    key like `<base_sid>b` does not)."""
+    existing = await ledger.load(ingest_source)  # {source_id: LedgerRecord}, workspace-scoped
+    hits = [sid for sid in existing if sid == base_sid or sid.startswith(f"{base_sid}#s")]
+    if hits:
+        raise AlreadyIngestedError(
+            f"{key} is already ingested ({len(hits)} ledger section(s)) — v1 is push-once. "
+            "Re-ingesting an existing key is REFUSED to avoid duplicate / orphaned graph docs; "
+            "clearing the old sections + re-ingest (--force / supersede) is future work."
+        )
 
 
 async def ingest_document(
@@ -362,11 +399,15 @@ async def ingest_document(
 ) -> dict:
     """End-to-end operator-doc ingest against a (workspace-gated) LightRAG instance.
 
-    guard → read → chunk → ledger(processing) → enqueue+process → reconcile(done/error).
-    Returns a small counter summary. Raises SourceDisabledError (guard OFF) or ValueError
-    (bad key / empty doc) before touching the graph.
+    guard → key-validate → push-once check → read → chunk → ledger(processing) →
+    enqueue+process → reconcile(done/error). Returns a small counter summary. Raises
+    SourceDisabledError (guard OFF), ValueError (bad key / empty doc), or
+    AlreadyIngestedError (key already ingested — v1 push-once) before/without touching the
+    graph write path.
     """
     check_source_enabled(kind)
+    ingest_source, base_sid = validate_key(kind, key)  # fail-fast on a malformed key
+    await _assert_not_already_ingested(ingest_source, base_sid, key)  # v1 push-once (#3)
     p = Path(path)
     text = (read_text or _read_text)(p)
     is_md = p.suffix.lower() in _MARKDOWN_SUFFIXES
@@ -381,7 +422,24 @@ async def ingest_document(
             kind, s.source_id, doc_id=s.doc_id, status="processing",
             fingerprint=_fingerprint(s.text),
         )
-    await enqueue_sections(rag, sections)
+    try:
+        # F17 batch-level backstop (mirrors distill_batch, distill.py): an enqueue/process
+        # setup / validation / connection blip usually raises BEFORE doc_status is written, so
+        # the just-written `processing` rows would be orphaned. Rewrite them to `error` and
+        # return — never punch a partial-write through to the caller.
+        await enqueue_sections(rag, sections)
+    except Exception as e:  # noqa: BLE001
+        for s in sections:
+            await ledger.upsert(
+                kind, s.source_id, doc_id=s.doc_id, status="error",
+                fingerprint=_fingerprint(s.text),
+            )
+        log.warning(
+            "ingest_document %s enqueue/process failed (%d section(s) → error): %r",
+            key, len(sections), e,
+        )
+        return {"key": key, "kind": kind, "sections": len(sections),
+                "done": 0, "error": len(sections), "pending": 0}
     counts = await _reconcile_sections(rag, kind, sections)
     log.info("ingest_document %s: %d section(s) %s", key, len(sections), counts)
     return {"key": key, "kind": kind, "sections": len(sections), **counts}

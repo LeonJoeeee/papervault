@@ -440,17 +440,26 @@ def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
       notebook → set PAPERVAULT_PRIVATE_SOURCES=1  (UNPUBLISHED research; shared/beta
                  instances must NEVER ingest notebooks).
 
+    CO-WRITE GATE: this is a MAINTENANCE-WINDOW operation — it writes the ledger + LightRAG
+    graph the live service is concurrently serving, so it REFUSES to run while
+    papervault.service (or the MinerU unit) is systemd-active (DB co-write corruption risk).
+    Stop the service first, or set KS_INGEST_ALLOW_COTENANCY=1 to override deliberately.
+
     Out of scope for v1: retrieval weighting for canonical sources (#46), domain-pack
-    textbook lists, PDF OCR (supply extracted md/txt), and re-ingest of appended notebooks.
+    textbook lists, PDF OCR (supply extracted md/txt), and re-ingest of appended notebooks
+    (v1 is push-once — re-ingesting an already-ingested key is refused; --force/supersede is
+    future work).
     """
     import asyncio
 
     from papervault.knowledge.ingest.operator_docs import (
+        AlreadyIngestedError,
         SourceDisabledError,
         check_source_enabled,
         ingest_document,
         validate_key,
     )
+    from papervault.ops_guards import require_services_stopped
 
     # Fail fast on key format + guard BEFORE booting the (heavy, workspace-gated) graph.
     try:
@@ -461,6 +470,15 @@ def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
         check_source_enabled(kind)
     except SourceDisabledError as e:
         raise click.ClickException(str(e))
+    # Co-write gate (blocker, PR #54): refuse while the live service is active — an operator
+    # doc ingest writing the same ledger + graph next to a serving instance risks DB co-write
+    # corruption. Reuses the shared systemd gate (eval uses the same one, issue #32).
+    require_services_stopped(
+        override_env="KS_INGEST_ALLOW_COTENANCY",
+        reason=("operator-doc ingest is a maintenance-window operation that writes the SAME "
+                "ledger + graph the live service is concurrently serving — a co-writer risks "
+                "DB co-write corruption."),
+    )
 
     async def _go() -> dict:
         from papervault.knowledge.ledger.store import close_pool
@@ -470,10 +488,17 @@ def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
         try:
             return await ingest_document(rag, kind, key, str(path), max_tokens=max_tokens)
         finally:
+            # Flush LightRAG storage backends BEFORE dropping the singleton (finalize_storages
+            # is the counterpart to initialize_storages) — a maintenance-window write must not
+            # leave buffered graph/vector/KV state unpersisted. close_graph only nulls the ref.
+            await rag.finalize_storages()
             await close_graph()
             await close_pool()
 
-    result = asyncio.run(_go())
+    try:
+        result = asyncio.run(_go())
+    except AlreadyIngestedError as e:
+        raise click.ClickException(str(e))
     click.echo(
         f"ingested {result['key']} ({result['kind']}): {result['sections']} section(s) — "
         f"done={result.get('done', 0)} error={result.get('error', 0)} "

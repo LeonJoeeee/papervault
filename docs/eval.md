@@ -78,6 +78,8 @@ the shipped values.
 | `KS_MQ_FANOUT` | `1` | Adaptive fan-out on/off (`KS_MQ_FANOUT_MAX`=100, `KS_MQ_FANOUT_SLOPE`=7 shape it). |
 | `KS_SYNTH_STRICT_REFUSAL` | `1` | Refuse to answer on thin/absent evidence (`0` = permissive). |
 | `KS_SYNTH_COVERAGE` | `0` | Coverage-oriented synthesis variant (`1` = on). |
+| `PAPERVAULT_SEARCH_AUTHORITY_PRIOR` | `0` | `search_papers` return ordering: soft RRF rank-blend of relevance with an age-normalized citation **authority** rank (`0` = off). **Arbitration pending (issue #46/#37) — default stays off until the paired coverage+precision run clears the noise floor** (P@served must hold the 0.9111 floor; must-find recall should rise). RANK-based, pool-only, never raw counts. |
+| `PAPERVAULT_SEARCH_AUTHORITY_LAMBDA` | `0.5` | Weight λ of the authority prior when it is on. |
 
 Changing any of these is a retrieval-affecting change: it must clear the eval noise floor before
 you flip the default.

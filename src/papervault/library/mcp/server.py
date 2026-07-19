@@ -206,6 +206,104 @@ LIB_CAP = 30                    # library round-robin pool size (= 1×BATCH_SIZE
 ALSO_INCLUDE_CAP = 30           # cap on the externally-vouched library recall tail (§2)
 _YEAR_NEUTRAL = 10**9           # None-year sentinel: sorts as NEITHER freshest NOR oldest (also-include, R2-F7)
 
+
+# ─── authority-weighted return ordering (issue #46, SOFT rank-blend prior) ───
+# User request 2026-07-19: higher-standing literature should rank higher in the
+# returns — explicitly a WEIGHTED blend, NOT hard tiers. After the return gate
+# (LLM3) scores relevance, an equal-relevance 0-citation preprint and a landmark
+# tie arbitrarily; this prior breaks that tie toward standing.
+#
+# Design (mirrors the KS_MQ_CITATION_PRIOR pattern in knowledge/query/multiquery.py,
+# _citation_rerank):
+#   * RANK-based RRF, NEVER raw citation counts — the June KS_MQ_CITATION_PRIOR
+#     lesson: median 29 vs max 70k citations lets giants dominate a raw blend.
+#   * POOL-ONLY: ranks are taken within the papers the relevance gate already
+#     returned, so an off-topic high-citation paper can never enter the results.
+#   * Authority signal v1 = age-normalized citation rank (citations per year since
+#     publication → favors durable classics AND fast-rising recent work), with a
+#     raw-count-rank fallback when the year is missing.
+#   * final key = 1/(K + relevance_rank) + λ · 1/(K + authority_rank).
+# Flag-gated, DEFAULT OFF → byte-identical ordering when off. Arbitration-pending:
+# the default stays 0 until the paired coverage+precision run (issue #46/#37)
+# clears the noise floor.
+SEARCH_AUTHORITY_PRIOR = os.environ.get("PAPERVAULT_SEARCH_AUTHORITY_PRIOR", "0") == "1"
+SEARCH_AUTHORITY_LAMBDA = float(os.environ.get("PAPERVAULT_SEARCH_AUTHORITY_LAMBDA", "0.5"))
+_AUTHORITY_RRF_K = 60           # RRF rank constant (mirrors KS_MQ_RRF_K)
+
+
+def _authority_value(cand: dict, now_year: int) -> float:
+    """Age-normalized authority signal for one candidate: citations PER YEAR since
+    publication (favors durable classics AND fast-rising recent work), falling back
+    to the RAW citation count when the year is missing. This VALUE only feeds a RANK
+    in ``_authority_reorder`` — its raw magnitude never enters the blend, so the
+    median-29-vs-max-70k skew that sank a raw-count prior cannot dominate here."""
+    cites = cand.get("citation_count") or 0
+    year = cand.get("year")
+    if isinstance(year, int) and year > 0:
+        age = max(1, now_year - year)      # publication year → age 1 (no divide-by-zero)
+        return cites / age
+    return float(cites)                    # missing-year fallback: raw count rank
+
+
+def _authority_reorder(
+    scored: list[tuple[float, dict]],
+    *,
+    now_year: int | None = None,
+    enabled: bool | None = None,
+    lam: float | None = None,
+    k: int = _AUTHORITY_RRF_K,
+) -> list[tuple[float, dict]]:
+    """Blend the return-gate relevance ordering with an age-normalized citation
+    authority RANK via RRF, so an equal-relevance landmark rises above a 0-citation
+    preprint. ``scored`` MUST already be sorted best→worst by relevance.
+
+    RANK-based (never raw counts): each candidate gets a relevance rank — papers
+    TIED on the return-gate score share a rank, so authority is the tie-breaker the
+    issue calls out — and an authority rank (its position when the SAME pool is
+    sorted by ``_authority_value`` DESC). The blend key is
+    ``1/(k + rel_rank) + λ · 1/(k + auth_rank)``; relevance stays PRIMARY (a single
+    authority-rank edge cannot overtake a full relevance-rank lead), authority is a
+    SOFT nudge that reorders near-ties. Pool-only, so a paper the relevance gate did
+    not return can never enter.
+
+    DEFAULT OFF: when disabled (or the pool has <2 papers, or authority is uniform)
+    the input list is returned UNCHANGED → byte-identical ordering. The knobs are
+    read at call time via the module globals unless overridden (tests inject them)."""
+    if enabled is None:
+        enabled = SEARCH_AUTHORITY_PRIOR
+    if not enabled or len(scored) < 2:
+        return scored
+    if lam is None:
+        lam = SEARCH_AUTHORITY_LAMBDA
+    if now_year is None:
+        from datetime import datetime, timezone
+        now_year = datetime.now(timezone.utc).year
+
+    # Relevance rank: DENSE over the return-gate score (input is relevance-DESC), so
+    # papers with the SAME score share a rank and the authority prior orders that tie.
+    rel_rank: list[int] = []
+    r = -1
+    prev: float | None = None
+    for score, _cand in scored:
+        if prev is None or score != prev:
+            r += 1
+            prev = score
+        rel_rank.append(r)
+
+    # Authority rank: position of each candidate when the pool is sorted by the
+    # age-normalized authority value DESC (stable → ties keep the relevance order).
+    order = sorted(range(len(scored)), key=lambda i: -_authority_value(scored[i][1], now_year))
+    auth_rank = [0] * len(scored)
+    for pos, i in enumerate(order):
+        auth_rank[i] = pos
+
+    def _blend(i: int) -> float:
+        return 1.0 / (k + rel_rank[i]) + lam * (1.0 / (k + auth_rank[i]))
+
+    # Stable sort on the negated blend → an all-uniform-authority pool is byte-identical.
+    return [scored[i] for i in sorted(range(len(scored)), key=lambda i: -_blend(i))]
+
+
 # ─── §8 source-health derivation (sources_degraded / sources_unconfigured) ───
 # ONE health-layer dict is the truthiness authority — NO per-source
 # ``is_configured()`` stub. A backend ABSENT from the dict is ALWAYS configured
@@ -1172,6 +1270,12 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                 return (-score, -(cand.get("citation_count") or 0))
             return (-score,)
         scored.sort(key=_sort_key)
+
+        # Issue #46: optional authority-weighted reorder — a SOFT RRF rank-blend of
+        # the relevance order with an age-normalized citation authority rank, layered
+        # here AFTER the relevance sort and BEFORE the top-N cut. DEFAULT OFF →
+        # byte-identical; arbitration-pending (see PAPERVAULT_SEARCH_AUTHORITY_PRIOR).
+        scored = _authority_reorder(scored)
 
         # ──── Stage 5: build minimal records, top-N (N = limit) ────────
         # Pure ``_paper_dict`` projection, ordered by relevance (the ORDER is the rank

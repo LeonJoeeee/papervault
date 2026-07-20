@@ -302,9 +302,28 @@ def _try_arxiv(paper: Paper) -> Optional[bytes]:
         return None
     arxiv_id = re.sub(r"v\d+$", "", paper.arxiv_id.strip())
     url = f"https://arxiv.org/pdf/{arxiv_id}"
-    r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, allow_redirects=True)
+    try:
+        r = requests.get(url, timeout=TIMEOUT,
+                         headers={"User-Agent": USER_AGENT}, allow_redirects=True)
+    except requests.RequestException:
+        # Transient network error (timeout / connection reset): the id may be
+        # perfectly real — we just couldn't reach arxiv. Never null on this.
+        return None
     if r.ok and _is_pdf_bytes(r.content):
         return r.content
+    # A definitive 404 means arxiv has no such paper: the arxiv_id is a
+    # fabricated / mistyped identifier (issue #62 — the ingest gate emits
+    # format-valid-but-nonexistent arxiv ids for ~84% of arxiv-bearing
+    # metadata_only papers, e.g. "8977.2023", "2025.35859"). Null it so the
+    # fake id stops misleading cite-check and future resolution; keep the DOI,
+    # which is reliable. Only 404 is definitive — a 403/5xx/non-pdf-200 can be
+    # transient throttling or a withdrawn-but-real record, so leave those be.
+    # The in-place clear is persisted by the caller's library.save() after
+    # download_paper (same write-back contract as _try_arxiv_by_title).
+    if r.status_code == 404:
+        log.warning("arxiv[%s]: 404 — nulling fabricated arxiv_id=%r (keeping doi=%r)",
+                    paper.key, paper.arxiv_id, paper.doi)
+        paper.arxiv_id = ""
     return None
 
 

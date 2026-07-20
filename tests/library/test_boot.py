@@ -16,11 +16,30 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 
 from papervault.library.mcp.boot import start_background
+from papervault.library.store import Library
 from papervault.mcp.server import build_server
 
 log = logging.getLogger("test.boot")
+
+
+def _make_extract_paper(tmp_path) -> None:
+    """Seed the vault at ``tmp_path`` with ONE EXTRACT-routed paper (status ok +
+    a PDF on disk + no md), so the boot recovery scan enqueues it and a worker
+    reaches the MinerU extraction path."""
+    lib = Library(tmp_path)
+    p, _ = lib.upsert({
+        "title": "Boot resilience paper ok pdf no md for extract recovery",
+        "authors": ["ROne"], "year": 2020,
+    })
+    p.download_status = "ok"
+    p.download_source = "fake"
+    pdf = lib.pdf_path(p.key)
+    pdf.parent.mkdir(parents=True, exist_ok=True)
+    pdf.write_bytes(b"%PDF-1.4\nfake")
+    lib.save()
 
 
 def test_start_background_returns_before_recovery_scan(tmp_path):
@@ -116,5 +135,92 @@ def test_shutdown_before_boot_completes_is_clean(tmp_path):
         # clean, un-started state without raising.
         assert eq._started is False
         assert dq._started is False
+
+    asyncio.run(scenario())
+
+
+def test_bind_not_gated_on_mineru_reachability(tmp_path):
+    """A down/hung MinerU (OCR at :30000 refused or the readiness probe blocking)
+    must NOT gate the port bind (issue #34): ``start_background`` returns promptly
+    and the detached boot COMPLETES even while the MinerU readiness probe blocks
+    forever. Extraction stays degraded (the worker handles MinerU-down per-item,
+    C1) but the bind/boot never wait on it.
+
+    The readiness probe is replaced with one that HANGS (never returns), so if the
+    boot/bind path awaited MinerU readiness anywhere this test would time out. It
+    does not: MinerU is touched only on the worker critical path, never on the
+    bind path. Seed one EXTRACT-routed paper so the recovery scan has real work.
+    """
+    from papervault.library.services import mineru_server
+
+    _make_extract_paper(tmp_path)
+
+    async def scenario():
+        mineru_server.reset_server_controller_for_test()
+        ctrl = mineru_server.get_server_controller()
+
+        release = asyncio.Event()   # never set during the boot window → probe hangs
+
+        async def hanging_ensure_ready() -> None:
+            await release.wait()     # simulate :30000 unreachable / vLLM still loading
+
+        ctrl.ensure_ready = hanging_ensure_ready  # type: ignore[method-assign]
+        try:
+            server = build_server(library_path=str(tmp_path))
+            eq = server._paper_extract_queue
+
+            # The bind point (lifespan yield) is reached the instant this returns —
+            # it must NOT wait on the hung MinerU probe.
+            shutdown = await asyncio.wait_for(start_background(server, log), timeout=2.0)
+
+            # The DETACHED boot completes (queues up, reconcile up) despite MinerU
+            # being unreachable — the boot never awaits the extraction backend.
+            await asyncio.wait_for(server._paper_boot_task, timeout=5.0)
+            assert eq._started is True
+            # MinerU-down is NOT a boot failure — reads stay healthy, only
+            # extraction degrades, so no service_degraded signal is raised.
+            assert server._paper_boot_failed is None
+
+            release.set()  # unpark any worker that reached the probe before teardown
+            await asyncio.wait_for(shutdown(), timeout=5.0)
+        finally:
+            release.set()
+            mineru_server.reset_server_controller_for_test()
+
+    asyncio.run(scenario())
+
+
+def test_recovery_scan_probes_pdf_off_the_event_loop(tmp_path, monkeypatch):
+    """The ``pdf_probe`` recovery scan (a BLOCKING ``subprocess.run``) must run
+    OFF the event loop so the detached boot does not freeze serving during the
+    sweep (issue #34 serve-during-sweep): the port binds, but an in-line probe
+    would still leave uvicorn unable to answer for the whole scan. Assert the
+    probe executes on a worker thread, not the loop's main thread.
+    """
+    from papervault.library import extract as extract_mod
+
+    _make_extract_paper(tmp_path)
+
+    probe_threads: list[str] = []
+
+    def spy_probe(path, **kw):
+        probe_threads.append(threading.current_thread().name)
+        return extract_mod.PDFProbe(bad=False, n_pages=1, reason="ok")
+
+    async def fake_extract_mineru(*a, **kw):
+        # Keep the test hermetic — never touch a real :30000 if a worker ticks.
+        raise extract_mod.MineruTransportError("test: mineru unreachable")
+
+    monkeypatch.setattr(extract_mod, "pdf_probe", spy_probe)
+    monkeypatch.setattr(extract_mod, "extract_mineru", fake_extract_mineru)
+
+    async def scenario():
+        server = build_server(library_path=str(tmp_path))
+        eq = server._paper_extract_queue
+        await eq.start()
+        assert probe_threads, "recovery scan never probed the EXTRACT paper"
+        assert all(t != threading.main_thread().name for t in probe_threads), (
+            f"pdf_probe ran on the event-loop thread (blocks serving): {probe_threads}")
+        await eq.stop()
 
     asyncio.run(scenario())

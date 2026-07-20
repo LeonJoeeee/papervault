@@ -563,13 +563,16 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
     Set ``ANNAS_ARCHIVE_API_KEY`` to your member secret key
     (https://annas-archive.gl/account → "Secret key").
 
-    Steps:
-      1. ``GET /scidb/<DOI>`` to discover the md5 hash for the paper.
-         Anna's renders the paper page if found; if not, falls back to a
-         "Search" page (``<title>`` contains 'Search - Anna's Archive').
-      2. ``GET /dyn/api/fast_download.json?md5=<HASH>&key=<KEY>`` →
-         returns ``{download_url: "..."}``.
-      3. Fetch the URL and verify it's a real PDF.
+    Two download paths, PRIMARY first:
+      1. ``GET /scidb/<DOI>`` with the member secret as cookie
+         ``aa_account_id2=<KEY>``. For a member this page embeds a direct
+         ``https://<partner>/d3/...`` download URL. Fetching it (same cookie)
+         returns the PDF. This is the **SciDB path — UNLIMITED** (does NOT
+         consume the 25/day fast-download quota; verified 2026-07-20). Since
+         every ingest target is a scientific paper, this is the right path.
+      2. FALLBACK ``GET /dyn/api/fast_download.json?md5=<HASH>&key=<KEY>`` →
+         ``{download_url: "..."}``. Capped at 25/day (``downloads_per_day``);
+         used only if the scidb page yields no d3 link.
 
     Anna's coverage is roughly sci-hub union LibGen plus their own
     scrapes. For modern paywalled papers that escape both, Anna's is the
@@ -581,10 +584,13 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
     if not paper.doi:
         return None
     base = "https://annas-archive.gl"
-    # 1. /scidb/<DOI> → md5
+    # The member secret rides as a cookie so the scidb page renders the
+    # unlimited direct-download (d3) link rather than a captcha/upsell page.
+    cookies = {"aa_account_id2": api_key}
+    # 1. /scidb/<DOI> → member page (with d3 link) + md5 for the fallback.
     try:
         r = requests.get(f"{base}/scidb/{paper.doi}", timeout=TIMEOUT,
-                         headers={"User-Agent": USER_AGENT})
+                         headers={"User-Agent": USER_AGENT}, cookies=cookies)
     except Exception as exc:
         log.warning("annas_archive[%s]: scidb request failed %r", paper.key, exc)
         return None
@@ -593,11 +599,30 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
     title_m = re.search(r"<title[^>]*>([^<]+)</title>", r.text)
     if title_m and "Search - Anna" in title_m.group(1):
         return None  # Paper not in Anna's index
+
+    # PRIMARY (unlimited SciDB): the member page embeds a direct d3 URL.
+    # Host class allows hyphen/uppercase/port — partner CDN hosts often carry
+    # them, and a too-narrow class would silently miss the unlimited path.
+    d3_m = re.search(r'https?://[A-Za-z0-9.:\-]+/d3/[^"\s\\]+', r.text)
+    if d3_m:
+        try:
+            # No cookie on the d3 GET: the partner URL is self-signed and
+            # downloads without the member secret (verified) — don't transmit
+            # the credential to a third-party host.
+            pdf = requests.get(d3_m.group(0), timeout=60, allow_redirects=True,
+                               headers={"User-Agent": USER_AGENT})
+            if pdf.ok and _is_pdf_bytes(pdf.content):
+                return pdf.content
+        except Exception as exc:
+            log.warning("annas_archive[%s]: scidb d3 fetch failed %r",
+                        paper.key, exc)
+        # fall through to the fast-download API on any d3 miss
+
     md5_m = re.search(r'href="/md5/([a-f0-9]+)"', r.text)
     if not md5_m:
         return None
     md5 = md5_m.group(1)
-    # 2. API → download_url
+    # 2. FALLBACK — fast_download API (25/day quota) → download_url
     try:
         api = requests.get(
             f"{base}/dyn/api/fast_download.json",
@@ -607,7 +632,10 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
         )
         data = api.json()
     except Exception as exc:
-        log.warning("annas_archive[%s]: API exception %r", paper.key, exc)
+        # Log the type only — the failing URL carries key=<secret> as a query
+        # param and %r of a requests exception would leak it into the log.
+        log.warning("annas_archive[%s]: fast_download API exception %s",
+                    paper.key, type(exc).__name__)
         return None
     url = data.get("download_url")
     if not url:

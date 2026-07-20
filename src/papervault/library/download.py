@@ -601,11 +601,16 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
         return None  # Paper not in Anna's index
 
     # PRIMARY (unlimited SciDB): the member page embeds a direct d3 URL.
-    d3_m = re.search(r'https?://[a-z0-9.]+/d3/[^"\s\\]+', r.text)
+    # Host class allows hyphen/uppercase/port — partner CDN hosts often carry
+    # them, and a too-narrow class would silently miss the unlimited path.
+    d3_m = re.search(r'https?://[A-Za-z0-9.:\-]+/d3/[^"\s\\]+', r.text)
     if d3_m:
         try:
+            # No cookie on the d3 GET: the partner URL is self-signed and
+            # downloads without the member secret (verified) — don't transmit
+            # the credential to a third-party host.
             pdf = requests.get(d3_m.group(0), timeout=60, allow_redirects=True,
-                               headers={"User-Agent": USER_AGENT}, cookies=cookies)
+                               headers={"User-Agent": USER_AGENT})
             if pdf.ok and _is_pdf_bytes(pdf.content):
                 return pdf.content
         except Exception as exc:
@@ -627,7 +632,10 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
         )
         data = api.json()
     except Exception as exc:
-        log.warning("annas_archive[%s]: API exception %r", paper.key, exc)
+        # Log the type only — the failing URL carries key=<secret> as a query
+        # param and %r of a requests exception would leak it into the log.
+        log.warning("annas_archive[%s]: fast_download API exception %s",
+                    paper.key, type(exc).__name__)
         return None
     url = data.get("download_url")
     if not url:

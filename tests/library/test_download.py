@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 
 import pytest
+import requests
 import responses
 
 from papervault.library import Library, download
@@ -1101,3 +1102,57 @@ def test_researchgate_pdf_link_missing_returns_none(lib):
         body=detail_html, status=200,
     )
     assert download._try_researchgate(p) is None
+
+
+# ─── issue #62: fabricated arxiv_id nulling ──────────────────────────────
+# The ingest gate emits format-valid-but-nonexistent arxiv ids (~84% of
+# arxiv-bearing metadata_only papers 404 on arxiv.org). _try_arxiv already
+# GETs arxiv.org/pdf/<id>; on a DEFINITIVE 404 it nulls the fake id (keeping
+# the reliable DOI) so it stops misleading cite-check / downstream resolution.
+
+@responses.activate
+def test_arxiv_404_nulls_fabricated_id_keeps_doi(lib):
+    p, _ = lib.upsert({"title": "Paper with a fabricated arxiv id",
+                       "authors": ["A"], "year": 2023,
+                       "doi": "10.1/real", "arxiv_id": "8977.2023"})
+    responses.add(responses.GET, "https://arxiv.org/pdf/8977.2023", status=404)
+    assert download._try_arxiv(p) is None
+    assert p.arxiv_id == ""       # fake id dropped
+    assert p.doi == "10.1/real"   # DOI never touched
+
+
+@responses.activate
+def test_arxiv_transient_error_does_not_null(lib):
+    """A connection/timeout error is NOT a not-found signal — the id might be
+    real, so it must survive untouched."""
+    p, _ = lib.upsert({"title": "Paper we could not reach arxiv for",
+                       "authors": ["A"], "year": 2023,
+                       "doi": "10.1/real", "arxiv_id": "2401.09999"})
+    responses.add(responses.GET, "https://arxiv.org/pdf/2401.09999",
+                  body=requests.ConnectionError("network down"))
+    assert download._try_arxiv(p) is None
+    assert p.arxiv_id == "2401.09999"   # preserved on transient failure
+    assert p.doi == "10.1/real"
+
+
+@responses.activate
+def test_arxiv_success_leaves_id_intact(lib):
+    p, _ = lib.upsert({"title": "Paper with a genuine arxiv id",
+                       "authors": ["A"], "year": 2024,
+                       "doi": "10.1/real", "arxiv_id": "2401.00001"})
+    responses.add(responses.GET, "https://arxiv.org/pdf/2401.00001",
+                  body=PDF_BYTES, status=200)
+    assert download._try_arxiv(p) == PDF_BYTES
+    assert p.arxiv_id == "2401.00001"   # a real id is never nulled
+
+
+@responses.activate
+def test_arxiv_non_404_error_does_not_null(lib):
+    """Only a definitive 404 nulls the id. A 403 (throttling) or 5xx could be
+    transient / a withdrawn-but-real record, so the id must be left in place."""
+    p, _ = lib.upsert({"title": "Paper arxiv 403-throttled us on",
+                       "authors": ["A"], "year": 2024,
+                       "doi": "10.1/real", "arxiv_id": "2401.00002"})
+    responses.add(responses.GET, "https://arxiv.org/pdf/2401.00002", status=403)
+    assert download._try_arxiv(p) is None
+    assert p.arxiv_id == "2401.00002"   # non-404 leaves it intact

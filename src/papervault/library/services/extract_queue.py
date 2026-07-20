@@ -157,7 +157,17 @@ class ExtractQueue:
             # an in-thread pypdf parse — one bad PDF must not wedge the
             # recovery scan at startup. A bad probe → n_pages 0 → normal lane
             # (extract_md re-probes and routes it to extract_failed there).
-            n_pages = (pdf_probe(str(pdf_path)).n_pages
+            #
+            # Issue #34 (serve-during-sweep): pdf_probe is a BLOCKING
+            # subprocess.run. This recovery scan runs inside the DETACHED boot
+            # (boot.py) AFTER the port binds, but on the SAME event loop as the
+            # server — so probing in-line freezes the loop for the whole
+            # ~1100-paper scan: the port is bound yet uvicorn cannot SERVE a
+            # request until the scan ends (the bound-but-not-serving tail of the
+            # boot hang). Run it OFF-loop, mirroring reconcile._prio_by_pages, so
+            # request handling interleaves with the scan. The probe's own
+            # subprocess + hard timeout still bound the actual work.
+            n_pages = ((await asyncio.to_thread(pdf_probe, str(pdf_path))).n_pages
                        if pdf_path.exists() else 0)
             if n_pages > long_threshold:
                 self._enqueue(paper.key, concurrency.PRIORITY_LOW)

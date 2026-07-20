@@ -48,7 +48,7 @@ from papervault.library.models import (
     Paper,
 )
 from papervault.library.search import search_all, search_external_async  # noqa: F401  # search_all kept for back-compat test monkeypatch
-from papervault.library.services import ResolverService, SearchService
+from papervault.library.services import ResolverService
 from papervault.library.services import concurrency
 from papervault.library.services.intent_parser import parse_intent
 from papervault.library.services.judge import judge_ingest, judge_return
@@ -773,7 +773,6 @@ def build_server(library_path: Optional[str] = None,
         )
 
     resolver_svc = ResolverService(library)
-    search_svc = SearchService(library)
 
     # When composed into the unified papervault server, tools register onto the passed-in
     # instance (which owns the combined instructions); standalone, build our own.

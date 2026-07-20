@@ -201,6 +201,26 @@ def _check_ocr_and_models(r: _Report) -> None:
         r.warn("mineru", f"{base} unreachable ({detail}) — extracts will queue until the "
                          "OCR server is up")
 
+    # --- MinerU CLIENT parsing libs (import-level, NOT the server) ---
+    # #56: the serving venv can have a healthy /health (server up) yet lack the
+    # client-side parsing libs, so EVERY extract fails with mineru_import_failed
+    # while doctor stays green — the exact silent-death that hid the 07-18 cutover
+    # breakage. Probe the same lazy imports the extract path uses
+    # (mineru_client.py :256-257) so the check catches a client/server split.
+    try:
+        from mineru.cli.common import aio_do_parse  # noqa: F401,WPS433
+        from mineru_vl_utils.vlm_client.base_client import (  # noqa: F401,WPS433
+            RequestError,
+            ServerError,
+        )
+        r.ok("mineru client", "parsing libs importable")
+    except Exception as e:  # noqa: BLE001
+        detail = str(e).splitlines()[0] if str(e) else type(e).__name__
+        r.warn("mineru client",
+               f"import failed ({detail}) — the OCR server may be up but EVERY extract "
+               "will return mineru_import_failed; install the mineru client libs into the "
+               "serving venv (not the vllm extra)")
+
     # --- BGE embed + reranker checkpoints (download ~4.5 GB on first use) ---
     embed = os.environ.get("BGE_M3_MODEL_PATH", "BAAI/bge-m3")
     rerank = os.environ.get("BGE_RERANKER_MODEL_PATH", "BAAI/bge-reranker-v2-m3")

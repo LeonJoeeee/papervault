@@ -815,6 +815,11 @@ async def test_search_malformed_intent_returns_error(server, monkeypatch):
     assert out["status"] == "error"
     assert out["results"] == []
     assert "message" in out
+    # Issue #69: the unparseable-intent dead-end is no longer opaque — it carries a
+    # STRUCTURED reframe hint the caller can act on (reason + how-to + worked example).
+    hint = out["reframe_hint"]
+    assert set(hint) == {"reason", "how_to_reframe", "example"}
+    assert all(isinstance(v, str) and v for v in hint.values())
 
 
 @pytest.mark.asyncio
@@ -1353,6 +1358,41 @@ async def test_search_judge_drop_is_not_fail_open(server, populated_lib, monkeyp
     # §8: the per-gate dropped-batch counts are surfaced in intent_parsed so a
     # silent recall loss is machine-visible.
     assert out["intent_parsed"]["judge_batches_dropped"] == {"ingest": 1, "return": 1}
+    # Issue #69: a judge-DROP empty (a transient LLM failure, retry-worthy) must NOT
+    # carry a reframe hint — the RETRY signal (judge_batches_dropped) is the right
+    # advice here, not "reword your query" (the query was never actually judged).
+    assert "reframe_hint" not in out
+
+
+@pytest.mark.asyncio
+async def test_search_clean_empty_returns_reframe_hint(server, populated_lib, monkeypatch):
+    """Issue #69: a CLEAN run (no judge drops) that scores every candidate below the
+    return threshold comes back with results:[] — but NOT an opaque dead-end. It
+    carries a STRUCTURED reframe hint so an abstract / methodology-only / cross-domain
+    query gets actionable "reframe as task+problem+want" guidance to try next."""
+    async def pass_ingest(cands, *, llm=None):
+        return {i: {"reason": "", "tier": "1A", "ingest_ok": True, "llm_is_paper": True}
+                for i in range(len(cands))}, 0
+
+    async def lowscore_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        # Every candidate BELOW RETURN_THRESHOLD (0.4) → all dropped by the threshold,
+        # NOT by a judge-batch drop. return_dropped stays 0 → a genuine no-match.
+        return {i: {"reason": "", "score": 0.1} for i in range(len(cands))}, 0
+
+    _wire_search(monkeypatch, ingest=pass_ingest, ret=lowscore_return)
+    # Hermetic: dodge search_papers' get_llm() credential preflight — every LLM
+    # collaborator is mocked, so the handle is never actually called.
+    monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda: object())
+    server._paper_download_queue.add = lambda key, **kw: None
+
+    out = await _call(server, "search_papers", {"query": "abstract methodology-only intent"})
+    assert out["status"] == "ok"
+    assert out["results"] == []
+    # Clean run: no batch was dropped, so the empty is a genuine no-match (not a retry case).
+    assert out["intent_parsed"]["judge_batches_dropped"] == {"ingest": 0, "return": 0}
+    hint = out["reframe_hint"]
+    assert set(hint) == {"reason", "how_to_reframe", "example"}
+    assert all(isinstance(v, str) and v for v in hint.values())
 
 
 def _wire_two_equal_score(monkeypatch, *, ranking_hint, fan_out):

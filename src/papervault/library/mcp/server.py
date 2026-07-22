@@ -567,6 +567,54 @@ def _augment_not_found(resolution: dict, identifier: str) -> dict:
     return out
 
 
+# ─────────────── search_papers dead-end → reframe hint (issue #69) ───────────
+# When search_papers dead-ends — the intent is UNPARSEABLE, or a clean run
+# genuinely matched NOTHING — the caller (an LLM agent) used to get an OPAQUE
+# result: a bare {status:error} with a one-line message, or {status:ok,
+# results:[]} with no explanation. Abstract / methodology-only / CROSS-DOMAIN-
+# METHOD queries are the class that dead-ends here ("model-discrepancy prior",
+# "Laplace-approximation failure" — bare method terms that don't anchor to the
+# corpus on their own). Those queries are exactly the pipeline's value axis
+# (method transfer across fields), so a silent dead-end quietly steers the
+# executor away from cross-domain borrowing.
+#
+# The cure is INSTRUCTIVE, not just diagnostic: hand back a STRUCTURED reframe
+# hint the caller can act on — the documented usage is "say what you're DOING,
+# then what you WANT to find", which grounds an abstract method in a concrete
+# task the search can match. The example is drawn verbatim from the idea23
+# field report (2026-07-20): the abstract phrasing failed, the "I'm doing X,
+# hit problem Y, looking for Z" rewording worked normally.
+def _reframe_hint() -> dict:
+    """Structured, caller-actionable guidance for a search_papers dead-end.
+
+    Attached (never raised) whenever the tool would otherwise return an opaque
+    dead-end: an unparseable intent, or a clean run that matched nothing. Names
+    the likely cause (abstract / methodology-only phrasing) and the documented
+    cure (concrete task → problem → want), with a worked before/after example.
+    """
+    return {
+        "reason": (
+            "The query read as abstract / methodology-only, so it did not anchor "
+            "to concrete literature — bare method terms rarely match on their own, "
+            "especially for a cross-domain method transfer (using a method from "
+            "field A to attack a problem in field B)."
+        ),
+        "how_to_reframe": (
+            "Say what you're DOING, then what you WANT to find: a concrete task + "
+            "the specific problem you hit + the kind of paper you're after. Anchor "
+            "the abstract method to the concrete system/phenomenon you're applying "
+            "it to, then let the method be one facet — not the whole query."
+        ),
+        "example": (
+            "Instead of 'structural uncertainty / model-discrepancy prior / "
+            "Laplace-approximation failure', try: 'I'm doing gradient inversion of "
+            "a differentiable PDE solver and found discretisation error dominates "
+            "statistical uncertainty — looking for how others quantify "
+            "structural/model error in physics-based inverse problems.'"
+        ),
+    }
+
+
 # Fuzzy auto-resolve thresholds (SDD §6a-bis). The absolute per-#1 floor PLUS a
 # #1-vs-#2 score-gap so a dominant top hit (e.g. 1.0 vs a trivial 0.30 second)
 # resolves directly to `found` instead of bouncing to `ambiguous` on count
@@ -1040,12 +1088,15 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         except ValueError as e:  # §1: a fully-unparseable intent → structured error,
             # never a raw exception out of the tool. (parse_intent already degrades a
             # partial/missing-key plan to safe defaults; this only fires on no-JSON.)
+            # Issue #69: don't dead-end opaquely — attach a structured reframe hint
+            # so the caller can turn the unparseable intent into a query that lands.
             logger.warning("search_papers: intent parse failed for %r: %s", query, e)
             return {
                 "status": "error",
                 "message": ("could not parse the query into a search plan — try a "
                             "clearer natural-language description of what you want to find"),
                 "results": [],
+                "reframe_hint": _reframe_hint(),
             }
 
         # Filters come entirely from the LLM's read of the intent (llm-in design).
@@ -1375,9 +1426,20 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         sources_unconfigured, sources_degraded = _derive_source_health(
             degraded_map, T,
         )
+        # Issue #69: a CLEAN run that matched nothing is an opaque dead-end for the
+        # caller — attach a structured reframe hint so an abstract/methodology query
+        # gets actionable "reframe as task+problem+want" guidance instead of a bare
+        # empty list. GATED to a clean run: when a judge batch was DROPPED (a
+        # transient LLM failure, not a genuine no-match) the right signal is RETRY,
+        # already carried by ``judge_batches_dropped`` — a reframe hint would
+        # mis-advise rewording a query that was never actually judged.
+        reframe_fields: dict = {}
+        if not results and ingest_dropped == 0 and return_dropped == 0:
+            reframe_fields["reframe_hint"] = _reframe_hint()
         return {
             "status": "ok",
             "results": results,
+            **reframe_fields,
             # Library-plane boot-failure signal (queues/reconcile down) — omitted
             # when healthy. Top-level + distinct from the nested
             # ``sources_degraded`` (which is search-BACKEND health, not plane health).

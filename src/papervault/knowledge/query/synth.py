@@ -23,7 +23,9 @@ import os
 import time
 from typing import Any
 
-from papervault.knowledge.store.llm import mimo_complete
+from openai import APIConnectionError
+
+from papervault.knowledge.store.llm import _error_code, mimo_complete
 from papervault.llm_routing import route
 
 logger = logging.getLogger("ks.query.synth")
@@ -240,6 +242,52 @@ sections / table) and length best fits the question + the depth of coverage. If 
 material doesn't support the intent well, say so cleanly."""
 
 
+# Bounded internal retry for the synth MiMo call (issue #70). By the time synth runs, RETRIEVAL
+# already SUCCEEDED — so a single TRANSIENT synth hiccup (a timeout, a connection reset, a 5xx /
+# 429 from the gateway, or a silent empty-200) must NOT burn that successful retrieval and push
+# retry logic onto every caller. Retry a few times with exponential backoff BEFORE the honest
+# SYNTH_FAILED fallback. Mirrors the library judge path (services/judge.py), which already retries
+# transient LLM hiccups. DETERMINISTIC failures (400 validation, or an all-deployments-blocked
+# 401/403 — the KeyPool's terminal "All configured LLM keys failed" RuntimeError, and the gateway's
+# raw 4xx) can't recover on an immediate re-send, so they FAIL FAST to the same fallback. A true
+# full outage of transient errors still exhausts the retries and then falls back — that terminal
+# graceful-degradation behavior is unchanged (issue #70: "a true full outage SHOULD still exhaust
+# retries and fall back"). Both knobs env-tunable (a test shrinks the backoff to 0).
+_SYNTH_MAX_RETRIES = int(os.getenv("KS_SYNTH_MAX_RETRIES", "2"))     # → up to 3 attempts
+_SYNTH_BACKOFF_BASE = float(os.getenv("KS_SYNTH_BACKOFF_BASE", "2.0"))
+
+
+def _is_transient_synth_status(code: int | None) -> bool:
+    """HTTP status → is it worth re-sending the SAME synth request? 429 (rate-limit) and 5xx
+    (server / gateway) recover on retry; 4xx (400 validation / 401 / 403 all-blocked / 404 / 422)
+    do NOT. Mirrors store/llm.py's transient/permanent split (_PERMANENT_CODES = {401, 403})."""
+    if code is None:
+        return False
+    return code == 408 or code == 429 or 500 <= code <= 599
+
+
+def _is_transient_synth_error(exc: Exception) -> bool:
+    """True iff a synth MiMo failure is a TRANSIENT hiccup worth a bounded internal retry.
+
+    Transient (RETRY): a timeout (synth's own business-deadline ``wait_for``, or a transport-level
+    ``APITimeoutError``), a connection reset / gateway-unreachable (``APIConnectionError``), or an
+    HTTP 429 / 5xx from the gateway. Deterministic (FAIL FAST): a 4xx validation/auth error (400 /
+    401 / 403 / 404 / 422), and anything else — notably the KeyPool's terminal ``RuntimeError("All
+    configured LLM keys failed …")``, which already represents EXHAUSTED internal failover (its
+    worst case is every deployment 403-blocked, a deterministic outage that a re-send won't fix).
+    ``asyncio.CancelledError`` is a ``BaseException`` and is never reached here (never retried)."""
+    # A timeout — synth's own wait_for deadline (asyncio.TimeoutError) or the transport-level
+    # APITimeoutError (a subclass of APIConnectionError, handled just below).
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    # Connection reset / gateway unreachable (also catches APITimeoutError).
+    if isinstance(exc, APIConnectionError):
+        return True
+    # HTTP-status-bearing errors: reuse the store layer's best-effort status extraction so the
+    # transient/permanent classification convention lives in ONE place.
+    return _is_transient_synth_status(_error_code(exc))
+
+
 async def synth_answer(
     data: dict[str, Any],
     intent: str,
@@ -261,29 +309,64 @@ async def synth_answer(
         _route_kw["model"] = _model
     if _thinking is not None:
         _route_kw["enable_thinking"] = _thinking
-    # Timing log (2026-07-16, issue #3): synth wall-clock was an observability blind spot
-    # — only the generic >=60s slow-call log in store/llm.py ever recorded it.
-    t0 = time.monotonic()
-    try:
-        raw = await asyncio.wait_for(
-            mimo_complete(
-                prompt,
-                system_prompt=_SYNTH_SYSTEM,
-                temperature=0.2,
-                max_tokens=_SYNTH_MAX_TOKENS,
-                **_route_kw,
-            ),
-            timeout=timeout_s,
-        )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("synth MiMo call failed after %.0fs: %s", time.monotonic() - t0, e)
-        return _SYNTH_FAILED_MSG
-    logger.info("synth done in %.0fs (prompt_chars=%d)", time.monotonic() - t0, len(prompt))
-    answer = raw.strip()
-    if not answer:
-        # S16 (SDD §6.4): an empty/whitespace-200 is a SILENT failure — OK status, no usable
-        # text (content filter, degenerate generation, gateway hiccup). Treat it as a synth
-        # failure (honesty fallback) rather than handing the out-feed a blank answer string.
-        logger.warning("synth MiMo returned empty/whitespace 200 — treating as failure (S16)")
-        return _SYNTH_FAILED_MSG
-    return answer
+    # Bounded retry (issue #70): retry ONLY transient hiccups (see _is_transient_synth_error);
+    # fail fast on deterministic ones; fall back to _SYNTH_FAILED_MSG once retries are exhausted.
+    attempts = _SYNTH_MAX_RETRIES + 1
+    for attempt in range(attempts):
+        # Timing log (2026-07-16, issue #3): synth wall-clock was an observability blind spot
+        # — only the generic >=60s slow-call log in store/llm.py ever recorded it.
+        t0 = time.monotonic()
+        try:
+            raw = await asyncio.wait_for(
+                mimo_complete(
+                    prompt,
+                    system_prompt=_SYNTH_SYSTEM,
+                    temperature=0.2,
+                    max_tokens=_SYNTH_MAX_TOKENS,
+                    **_route_kw,
+                ),
+                timeout=timeout_s,
+            )
+        except Exception as e:  # noqa: BLE001 — CancelledError is BaseException, never caught here
+            dt = time.monotonic() - t0
+            transient = _is_transient_synth_error(e)
+            if transient and attempt < attempts - 1:
+                backoff = _SYNTH_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    "synth MiMo call failed after %.0fs (transient, attempt %d/%d) — retrying "
+                    "in %.1fs: %s", dt, attempt + 1, attempts, backoff, e)
+                await asyncio.sleep(backoff)
+                continue
+            # Deterministic (fail fast), OR transient with retries exhausted (true outage) → the
+            # honest fallback. Retrieval still succeeded, so the caller gets cited_papers.
+            reason = "transient, retries exhausted" if transient else "deterministic — fail fast"
+            logger.warning(
+                "synth MiMo call failed after %.0fs (%s, attempt %d/%d): %s",
+                dt, reason, attempt + 1, attempts, e)
+            return _SYNTH_FAILED_MSG
+
+        answer = raw.strip()
+        if not answer:
+            # S16 (SDD §6.4): an empty/whitespace-200 is a SILENT failure — OK status, no usable
+            # text (content filter, degenerate generation, gateway hiccup). This is exactly the
+            # "malformed response" transient class from issue #70, so RETRY it like a transient
+            # exception before the honesty fallback (rather than handing back a blank answer).
+            if attempt < attempts - 1:
+                backoff = _SYNTH_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    "synth MiMo returned empty/whitespace 200 (S16, attempt %d/%d) — retrying "
+                    "in %.1fs", attempt + 1, attempts, backoff)
+                await asyncio.sleep(backoff)
+                continue
+            logger.warning(
+                "synth MiMo returned empty/whitespace 200 (S16) after %d attempts — "
+                "treating as failure", attempts)
+            return _SYNTH_FAILED_MSG
+
+        logger.info(
+            "synth done in %.0fs (prompt_chars=%d, attempt %d/%d)",
+            time.monotonic() - t0, len(prompt), attempt + 1, attempts)
+        return answer
+
+    # Unreachable: the final loop iteration always returns. Defensive fallback for total safety.
+    return _SYNTH_FAILED_MSG

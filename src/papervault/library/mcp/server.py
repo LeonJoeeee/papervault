@@ -356,6 +356,92 @@ def _authority_reorder(
     return [scored[i] for i in sorted(range(len(scored)), key=lambda i: -_blend(i))]
 
 
+# ─── canonical reserved slots (issue #37, HARD floor for the canon) ───
+# Diagnosis (issue #22/#37): search serves the topical FRONTIER (P@served ~0.91) but
+# BURIES the canon — even when the intent names the experiment, the original
+# high-citation measurement papers (PAMELA/Adriani2009, AMS/Aguilar2013,
+# Parker1965) rank BELOW the served-15 cut although they ARE in the library. The
+# soft authority prior (#46) only nudges the ORDER; it cannot GUARANTEE a buried
+# classic reaches the slate. This lever RESERVES N of the served slots for the
+# highest-citation, intent-relevant papers in the pool.
+#
+# Contract:
+#   * POOL-ONLY + intent-gated: candidates come ONLY from ``scored`` (papers that
+#     already cleared the RETURN_THRESHOLD relevance gate), so an off-topic giant can
+#     NEVER be reserved in — the reserved papers are by construction relevant to THIS
+#     intent. Precision risk is bounded to swapping one gate-passing paper for another.
+#   * RAW citation_count is the canon signal, NOT age-normalized like #46: the canon
+#     we miss is OLD high-cite measurement papers, which age-normalization would
+#     penalize — this is why #37 is a DISTINCT, complementary lever to the #46 prior.
+#   * MINIMAL displacement: the N most-cited relevant papers are guaranteed into the
+#     served top-N; a reserved paper ALREADY in the relevance head costs no extra slot
+#     (no-op promotion), so only the truly-buried classics displace the lowest-relevance
+#     served papers — one swap per buried classic.
+#   * DEFAULT OFF (N=0) → the SAME list object is returned, byte-identical order. Also a
+#     no-op when the pool already fits the slate or every reserved paper is already served.
+def _parse_canon_reserved_slots(raw: str) -> int:
+    """Parse the reserved-slot count DEFENSIVELY: a non-int falls back to 0 (off) and a
+    negative value is clamped to 0, each with a WARNING so a fat-fingered env is loud."""
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "PAPERVAULT_CANON_RESERVED_SLOTS=%r is not an int — using 0 (off)", raw)
+        return 0
+    if val < 0:
+        logger.warning(
+            "PAPERVAULT_CANON_RESERVED_SLOTS=%s < 0 — clamped to 0 (off)", val)
+        return 0
+    return val
+
+
+CANON_RESERVED_SLOTS = _parse_canon_reserved_slots(
+    os.environ.get("PAPERVAULT_CANON_RESERVED_SLOTS", "0"))
+
+
+def _reserve_canon_slots(
+    scored: list[tuple[float, dict]],
+    *,
+    limit: int,
+    n: int | None = None,
+) -> list[tuple[float, dict]]:
+    """Reserve ``n`` of the served-``limit`` slots for the highest-citation papers in
+    ``scored`` (already relevance-DESC and gate-passed). Returns the pool reordered so
+    the served top-``limit`` is guaranteed to contain the n most-cited papers; the rest
+    keep their incoming (relevance / #46) order. Pool-only — nothing new can enter.
+
+    No-op (returns the SAME list) when the lever is off (n<=0), the pool already fits the
+    slate (len<=limit), or every reserved paper is already within the served head. When it
+    DOES act it displaces exactly one lowest-relevance served paper per buried classic."""
+    if n is None:
+        n = CANON_RESERVED_SLOTS
+    if n <= 0 or limit <= 0 or len(scored) <= limit:
+        return scored
+    n = min(n, limit)                      # cannot reserve more than the whole slate
+    by_cite = sorted(range(len(scored)),
+                     key=lambda i: -(scored[i][1].get("citation_count") or 0))
+    reserved = by_cite[:n]                  # the n most-cited relevant papers
+    if all(i < limit for i in reserved):
+        return scored                       # every reserved paper already served → no-op
+    reserved_set = set(reserved)
+    non_reserved = [i for i in range(len(scored)) if i not in reserved_set]  # relevance order
+    keep = non_reserved[:limit - n]         # top (limit-n) by relevance, classics excluded
+    order = keep + reserved + non_reserved[limit - n:]
+    return [scored[i] for i in order]
+
+
+# ─── frozen-corpus eval switch (issue #37 arbitration, DEFAULT OFF) ───
+# ``search_papers`` normally INGESTS what it discovers (Stage 3: upsert new external
+# papers + enqueue their download/extract + library.save()). That mutates the library on
+# every call — the ONE write path in an otherwise read-only tool. During a paired
+# lever arbitration the corpus MUST stay byte-frozen (a drifting library confounds the
+# ON-vs-OFF delta — cf. the 2026-07-18 pollution incident). This flag skips Stage 3
+# entirely so search becomes read-only: no upsert, no enqueue, no save; return_pool
+# collapses to the in-library candidates. NOT a production path — it drops fresh
+# external discoveries from the results; its ONLY purpose is the frozen paired eval.
+SEARCH_NO_INGEST = os.environ.get("PAPERVAULT_SEARCH_NO_INGEST", "0") == "1"
+
+
 # ─── §8 source-health derivation (sources_degraded / sources_unconfigured) ───
 # ONE health-layer dict is the truthiness authority — NO per-source
 # ``is_configured()`` stub. A backend ABSENT from the dict is ALWAYS configured
@@ -1268,7 +1354,16 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         # (domain tier ∈ 1A-2C AND is_paper); a separate RETURN gate (Stage 4) decides
         # what comes back to the agent. Library cands skip the ingest judge entirely.
         await _maybe_progress(ctx, 3, 5, "judging new papers for ingest")
-        ingest_judgments, ingest_dropped = await judge_ingest(ext_pool, llm=search_llm)
+        # Frozen-corpus eval (issue #37, DEFAULT OFF): SEARCH_NO_INGEST short-circuits the
+        # ONLY write path in this tool. Empty judgments → every loop iteration hits the
+        # ``j is None`` continue, so NOTHING is upserted or enqueued; the trailing
+        # ``library.save()`` is guarded below. Search becomes read-only and return_pool
+        # collapses to lib_pool. Skips the judge_ingest LLM call too (cost + true read-only).
+        if SEARCH_NO_INGEST:
+            ingest_judgments, ingest_dropped = {}, 0
+            logger.info("search_papers: NO_INGEST — Stage 3 write path skipped (frozen corpus)")
+        else:
+            ingest_judgments, ingest_dropped = await judge_ingest(ext_pool, llm=search_llm)
 
         ingested_dicts: list[dict] = []
         ingested_keys: set[str] = set()   # same-key collapse → keeps ingested_dicts key-unique
@@ -1337,7 +1432,8 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                     download_queue.add(paper.key)
                 ingested_dicts.append(paper_to_dict(paper))  # canonical (key + "library" origin)
                 ingested_keys.add(paper.key)                 # FINAL tail statement (lockstep)
-            library.save()
+            if not SEARCH_NO_INGEST:
+                library.save()   # the ONE disk write; skipped under the frozen-eval switch
 
         # ──── Stage 4: LLM3 judge_return(lib + ingested) → threshold ───
         # Everything here is already vetted (in-library, or just passed the ingest gate);
@@ -1402,6 +1498,15 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                     ranking_hint)
         else:
             scored = _authority_reorder(scored)
+
+        # Issue #37: reserved canonical slots — guarantee the N most-cited intent-relevant
+        # papers reach the served slate, layered AFTER the relevance / #46 order and just
+        # BEFORE the top-N cut (so the reserved papers survive the truncation). DEFAULT
+        # OFF (N=0) → byte-identical. Unlike the #46 prior this is a HARD floor and uses
+        # RAW citations (the buried canon is OLD high-cite work). Pool-only — nothing new
+        # can enter. Applies under ANY ranking_hint: reserving the canon is the caller's
+        # coverage need, orthogonal to the recency/importance secondary sort.
+        scored = _reserve_canon_slots(scored, limit=effective_limit)
 
         # ──── Stage 5: build minimal records, top-N (N = limit) ────────
         # Pure ``_paper_dict`` projection, ordered by relevance (the ORDER is the rank

@@ -65,9 +65,14 @@ grey = [
     "scrapling>=0.2",
     "firecrawl-py>=1.0",
 ]
-# PDF -> markdown via a local MinerU2.5-Pro vLLM server (heavy GPU dep, own venv
-# in practice). The http-client path needs only the mineru client libs.
-mineru = ["mineru[core,vllm]>=3.2"]
+# PDF -> markdown OCR. The papervault service is an http-CLIENT of a MinerU vLLM server that
+# runs in its OWN venv (.venv-mineru) — so THIS venv needs only mineru's client libs, NOT the
+# heavy local `vllm` extra. Pulling `[vllm]` here dragged in xgrammar==0.2.4 which has no
+# cp312 x86_64 wheel → uninstallable on this py3.12 host (#84). Client-only = `mineru[core]`.
+# torchvision is pinned (a mineru transitive, not a core dep): it must match the installed
+# torch's ABI — a drift to an incompatible torchvision (0.28 vs torch 2.11) crashes the shared
+# torch stack, which is what broke BGE-M3 embedding for the whole service (#84).
+mineru = ["mineru[core]>=3.2", "torchvision==0.26.0"]
 # Zotero metadata sync (optional integration).
 zotero = ["pyzotero>=1.5"]
 dev = [
@@ -78,6 +83,13 @@ dev = [
     "responses>=0.25",
     "ruff>=0.6",
 ]
+
+[tool.uv]
+# The deploy host is Linux x86_64 with an NVIDIA GPU. Force the resolver to only pick
+# distributions that ship a wheel for this platform — otherwise a transitive (e.g. the
+# vllm->xgrammar chain) can lock to a version with aarch64/macOS wheels only and become
+# uninstallable here (#84). uv's own resolver hint recommends this.
+required-environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 
 [project.scripts]
 papervault = "papervault.cli:main"

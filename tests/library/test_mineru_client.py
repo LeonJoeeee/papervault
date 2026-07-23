@@ -86,14 +86,92 @@ def test_extract_mineru_no_endpoints_is_transport():
 
 
 def test_extract_mineru_import_failure_is_transport(monkeypatch):
-    """mineru is an optionally-absent heavy dep (it is NOT in the test venv).
-    Calling extract_mineru with an endpoint surfaces the missing import as a
-    TRANSPORT error (deploy problem, not a per-doc defect) — never an extraction
-    charge. This proves the lazy-import contract: ``import papervault.library.extract``
-    works without mineru, and the failure is classified transport at call time."""
+    """A DOWN/absent MinerU surfaces as a TRANSPORT error (deploy problem, not a
+    per-doc defect) — never an extraction charge. With the #76 reachability
+    pre-check ON (default), an unreachable ``127.0.0.1:30000`` is classified
+    transport BEFORE the lazy import even runs; in a mineru-less venv the absent
+    import would classify the same way if the pre-check were bypassed. Either
+    path proves the contract: no per-doc charge for a deploy/transport failure,
+    and ``import papervault.library.extract`` never requires mineru at import."""
     eps = [mc.Endpoint("a", "http://127.0.0.1:30000")]
     with pytest.raises(mc.MineruTransportError):
         asyncio.run(mc.extract_mineru(b"%PDF-1.4 fake", eps, stem="x"))
+
+
+# ------------- issue #76: async reachability pre-check (loop-safety) ---------
+# aio_do_parse's client construction runs SYNCHRONOUS work on the S4 event loop
+# and stalls when MinerU is unreachable (py-spy caught MainThread there), which
+# starved the MCP handshake. The pre-check fast-fails a down server off-block.
+
+
+def test_precheck_unreachable_short_circuits_before_parse(monkeypatch):
+    """Pre-check ON + an unreachable server ⇒ MineruTransportError raised BEFORE
+    aio_do_parse is ever entered (the loop-blocking construction never runs)."""
+    _install_fake_mineru(monkeypatch, None)
+
+    async def _boom(**_kw):
+        raise AssertionError("aio_do_parse must NOT be called when unreachable")
+    import sys
+    sys.modules["mineru.cli.common"].aio_do_parse = _boom
+
+    async def _down(*_a, **_k):
+        return False
+    monkeypatch.setattr(mc, "_any_endpoint_ready", _down)
+    monkeypatch.setattr(mc, "_PRECHECK_ENABLED", True, raising=False)
+
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    with pytest.raises(mc.MineruTransportError) as ei:
+        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
+    assert "precheck" in str(ei.value)
+
+
+def test_precheck_off_reaches_parse(monkeypatch):
+    """PAPER_LIBRARY_MINERU_PRECHECK=0 (flag off) skips the probe entirely and
+    goes straight to aio_do_parse — the pre-#76 behaviour (revert lever)."""
+    md_written = {}
+
+    async def _fake_parse(**kw):
+        from pathlib import Path
+        out = Path(kw["output_dir"]) / kw["pdf_file_names"][0] / "vlm"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{kw['pdf_file_names'][0]}.md").write_text("# body")
+        md_written["ok"] = True
+
+    _install_fake_mineru(monkeypatch, _fake_parse)
+
+    async def _must_not_probe(*_a, **_k):
+        raise AssertionError("pre-check must be skipped when flag off")
+    monkeypatch.setattr(mc, "_any_endpoint_ready", _must_not_probe)
+    monkeypatch.setattr(mc, "_PRECHECK_ENABLED", False, raising=False)
+
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    md = asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
+    assert md == "# body" and md_written.get("ok")
+
+
+def test_any_endpoint_ready_passes_if_one_up(monkeypatch):
+    """``_any_endpoint_ready`` is ANY, not ALL — one healthy endpoint in a
+    2-endpoint set is enough to proceed (preserves round-robin failover)."""
+    async def _health(url, _timeout):
+        return url.endswith(":30001")  # only the 2nd endpoint is up
+    monkeypatch.setattr(mc, "_endpoint_health_ok", _health)
+    eps = [mc.Endpoint("a", "http://a:30000"), mc.Endpoint("b", "http://b:30001")]
+    assert asyncio.run(mc._any_endpoint_ready(eps, 1.0)) is True
+
+    async def _all_down(_url, _timeout):
+        return False
+    monkeypatch.setattr(mc, "_endpoint_health_ok", _all_down)
+    assert asyncio.run(mc._any_endpoint_ready(eps, 1.0)) is False
+
+
+def test_endpoint_health_ok_down_is_false_fast():
+    """The real async probe against a closed localhost port returns False
+    quickly (connection-refused) without raising — the loop-safe fast path."""
+    import time
+    t0 = time.monotonic()
+    ok = asyncio.run(mc._endpoint_health_ok("http://127.0.0.1:30000", 2.5))
+    assert ok is False
+    assert time.monotonic() - t0 < 2.5  # refused resolves well under the timeout
 
 
 def test_read_md_from_outdir_missing_is_extraction(tmp_path):
@@ -157,6 +235,13 @@ def _install_fake_mineru(monkeypatch, aio_do_parse):
     ):
         monkeypatch.setitem(sys.modules, name, mod)
     monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0, raising=False)  # no real sleeps
+
+    # Issue #76: force the async reachability pre-check to "reachable" so these
+    # tests exercise the retry-loop classification (the server is stubbed as
+    # up-and-answering; the pre-check is covered separately below).
+    async def _reachable(*_a, **_k):
+        return True
+    monkeypatch.setattr(mc, "_any_endpoint_ready", _reachable)
     return ServerError
 
 

@@ -126,6 +126,64 @@ _BACKOFF_BASE = float(
 _BACKOFF_CAP = float(
     os.environ.get("PAPER_LIBRARY_MINERU_BACKOFF_CAP", "30.0"))
 
+# ── Reachability pre-check (issue #76 — MCP event-loop robustness) ──────────
+# ``aio_do_parse``'s VLM-http-client CONSTRUCTION (``vlm_analyze._get_model_async``
+# / ``__new__``) runs SYNCHRONOUS work on the S4 single event loop before any
+# awaitable I/O — py-spy repeatedly caught MainThread stuck there when the MinerU
+# server is unreachable (a fresh cold construction blocks ~1.3s; a hanging /
+# modelscope-cold-fetch endpoint blocks far longer — 10-40s observed). On a
+# restart with an extract backlog while MinerU is DOWN, that on-loop block plus
+# the ~30s outer async retry churn per paper starves the MCP
+# ``initialize``/``tools/list`` handshake (issue #76 / ai-research-lab#31 Cause B).
+# The same event-loop-starvation class PR #75 fixed for the KS query path.
+#
+# Fix (mirrors PR #75's flag-gated, behaviour-preserving shape): before the
+# blocking construction, run a FULLY-ASYNC ``/health`` probe with a SHORT timeout.
+# A down/hanging server resolves to unreachable in ≤``_PRECHECK_TIMEOUT`` seconds
+# WITHOUT ever blocking the loop, and we raise ``MineruTransportError`` —
+# ``extract_md``'s existing C1 transport arm then defers the paper with NO charge
+# (identical OUTCOME to the pre-#76 path, reached fast + off-block instead of via
+# the on-loop construction stall). A reachable server (``/health`` 200) proceeds
+# exactly as before, so an up MinerU is byte-unchanged. Health-up-but-model-not-
+# loaded transients still fall through to ``aio_do_parse``'s bare-500→transport
+# handling (unchanged). ``PAPER_LIBRARY_MINERU_PRECHECK=0`` restores the pre-#76
+# straight-to-``aio_do_parse`` behaviour (diagnostic/revert lever).
+_PRECHECK_ENABLED = os.environ.get(
+    "PAPER_LIBRARY_MINERU_PRECHECK", "1").strip().lower() in ("1", "true", "yes")
+_PRECHECK_TIMEOUT = float(
+    os.environ.get("PAPER_LIBRARY_MINERU_PRECHECK_TIMEOUT", "2.5"))
+
+
+async def _endpoint_health_ok(url: str, timeout: float) -> bool:
+    """True iff ``url`` answers ``GET /health`` 200 within ``timeout`` seconds.
+
+    Fully async (``httpx.AsyncClient``) so a DOWN (connection-refused) or HANGING
+    (black-holed connect / slow ``/health``) server resolves to ``False`` WITHOUT
+    blocking the event loop — the whole point of the #76 pre-check. Any error /
+    timeout ⇒ ``False`` (treat as unreachable, conservative: a false-negative only
+    costs a transport-defer + reconcile retry, never a wrong per-doc charge)."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            r = await client.get(url.rstrip("/") + "/health")
+        return r.status_code == 200
+    except Exception:  # noqa: BLE001 — any failure ⇒ not reachable
+        return False
+
+
+async def _any_endpoint_ready(endpoints: list[Endpoint], timeout: float) -> bool:
+    """True iff ANY endpoint answers ``/health`` 200 (probed concurrently).
+
+    ``any`` — not ``all`` — preserves the round-robin failover contract: proceed
+    to ``aio_do_parse`` while at least ONE card is up, so a single dead endpoint
+    in a 2-endpoint set never blocks the healthy one. Steady state has ONE
+    endpoint, so this degenerates to a single probe."""
+    results = await asyncio.gather(
+        *(_endpoint_health_ok(ep.url, timeout) for ep in endpoints),
+        return_exceptions=True,
+    )
+    return any(r is True for r in results)
+
 
 # ------------------------- ServerError discriminator -----------------------
 
@@ -247,6 +305,21 @@ async def extract_mineru(
     """
     if not endpoints:
         raise MineruTransportError("no_endpoints_configured")
+
+    # Reachability pre-check (issue #76): fast-fail a DOWN/unreachable MinerU
+    # here — on the loop but FULLY ASYNC (never blocks it) — BEFORE the
+    # synchronous ``aio_do_parse`` client construction that py-spy caught
+    # starving the MCP handshake, and before the heavy lazy import + ~30s retry
+    # churn below. A down server ⇒ MineruTransportError ⇒ ``extract_md`` C1
+    # transport arm ⇒ deferred, NO charge (same outcome as pre-#76, reached in
+    # ≤_PRECHECK_TIMEOUT s async instead of via the on-loop stall). Off-flag
+    # (PAPER_LIBRARY_MINERU_PRECHECK=0) restores the straight-to-parse path.
+    if _PRECHECK_ENABLED and not await _any_endpoint_ready(
+            endpoints, _PRECHECK_TIMEOUT):
+        raise MineruTransportError(
+            "mineru_unreachable_precheck: no endpoint answered GET /health 200 "
+            f"within {_PRECHECK_TIMEOUT:.1f}s "
+            f"({', '.join(e.url for e in endpoints)})")
 
     # Lazy import: mineru is a heavy, optionally-absent dep (it is installed in
     # the server unit's venv and the daemon's import path per SDD §3.0, but

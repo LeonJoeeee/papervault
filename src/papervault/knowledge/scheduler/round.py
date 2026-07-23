@@ -31,6 +31,7 @@ from papervault.knowledge.ingest.distill import distill_batch, remove_one
 from papervault.knowledge.ingest.fingerprint import fingerprint
 from papervault.knowledge.ingest.vault import load_clean_index
 from papervault.knowledge.ledger import store as ledger
+from papervault.knowledge.scheduler.opdoc_pickup import drain_pending
 from papervault.knowledge.scheduler.reconcile import Diff, diff
 
 log = logging.getLogger("ks.scheduler.round")
@@ -217,6 +218,16 @@ async def main_loop(rag, *, interval: float = DEFAULT_ROUND_INTERVAL,
                 await run_round(rag, stuck_limit=stuck_limit)
             except Exception:  # noqa: BLE001 — 单轮异常不杀循环;下轮重试(distill 批级已自兜底,这里是兜底之兜底)
                 log.exception("run_round failed; retrying next interval")
+            # #81 windowless operator-doc pickup: scan the pending dir and ingest dropped
+            # textbook/notebook md against the SAME singleton rag. Runs HERE, after run_round,
+            # in this one serial task → never concurrent with a paper round (single-writer
+            # invariant free; off-loop inherited via ingest_document). drain_pending never
+            # raises (it routes a bad file to failed/), but wrap it anyway so a bug there can
+            # never break the while-True loop or the paper sync.
+            try:
+                await drain_pending(rag)
+            except Exception:  # noqa: BLE001 — 兜底之兜底:pickup 异常不杀循环、不影响 paper sync
+                log.exception("drain_pending failed; retrying next interval")
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         log.info("scheduler main_loop cancelled — graceful stop")

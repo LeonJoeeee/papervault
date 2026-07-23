@@ -20,6 +20,10 @@ from papervault.knowledge.ingest.operator_docs import (
 )
 from papervault.knowledge.scheduler import opdoc_pickup as op
 from papervault.knowledge.scheduler.opdoc_pickup import drain_pending, parse_drop_name
+from papervault.library.mineru_client import (
+    MineruExtractionError,
+    MineruTransportError,
+)
 
 
 def _run(coro):
@@ -43,20 +47,51 @@ class FakeIngest:
         return {"key": key, "kind": kind, "sections": 1, "done": 1, "error": 0, "pending": 0}
 
 
+class FakeExtract:
+    """Stand-in for `mineru_client.extract_mineru` — records each call (stem / pdf byte count)
+    and optionally raises a preconfigured exception. Lets the PDF-front-end tests drive OCR
+    success + the transport-vs-extraction error split with NO MinerU server / GPU / network."""
+
+    def __init__(self, md: str = "# OCR A\nalpha beta gamma", raise_exc: Exception | None = None):
+        self.md = md
+        self.raise_exc = raise_exc
+        self.calls: list[dict] = []
+
+    async def __call__(self, pdf_bytes, endpoints, *, stem="doc", **kwargs):
+        self.calls.append({"stem": stem, "n_bytes": len(pdf_bytes), "endpoints": endpoints})
+        if self.raise_exc is not None:
+            raise self.raise_exc
+        return self.md
+
+
 @pytest.fixture
 def pending(tmp_path, monkeypatch):
     """A tmp pending dir wired via KS_OPDOC_PENDING_DIR + a fresh FakeIngest patched in."""
     d = tmp_path / "pending"
     d.mkdir()
     monkeypatch.setenv("KS_OPDOC_PENDING_DIR", str(d))
-    op._disabled_logged.clear()  # process-local dedup set — isolate cross-test
+    op._disabled_logged.clear()      # process-local dedup sets — isolate cross-test
+    op._mineru_down_logged.clear()
     fake = FakeIngest()
     monkeypatch.setattr(op, "ingest_document", fake)
     return d, fake
 
 
+def _patch_extract(monkeypatch, extract: FakeExtract):
+    """Patch the OCR front-end so PDF tests need no MinerU / GPU / network. `endpoints_from_env`
+    is stubbed to a sentinel (the faked extract ignores it)."""
+    monkeypatch.setattr(op, "extract_mineru", extract)
+    monkeypatch.setattr(op, "endpoints_from_env", lambda: ["ep0"])
+
+
 def _drop(d, name, body="# Ch1\nalpha beta gamma", *, force=False):
     (d / name).write_text(body, encoding="utf-8")
+    if force:
+        (d / (name + ".force")).write_text("", encoding="utf-8")
+
+
+def _drop_pdf(d, name, body=b"%PDF-1.4 fake pdf bytes", *, force=False):
+    (d / name).write_bytes(body)
     if force:
         (d / (name + ".force")).write_text("", encoding="utf-8")
 
@@ -71,6 +106,18 @@ def test_parse_drop_name_both_prefixes():
     # notebook keys legitimately carry hyphens — only the FIRST hyphen splits kind from body.
     assert parse_drop_name("notebook-idea23-c12.md") == ("notebook", "notebook:idea23-c12")
     assert parse_drop_name("textbook-Foo2020.markdown") == ("textbook", "textbook:Foo2020")
+
+
+def test_parse_drop_name_pdf_suffix():
+    # (d) PDF drops derive the SAME key as their .md twin — only drain_pending branches on suffix.
+    assert parse_drop_name("textbook-Foo2020.pdf") == ("textbook", "textbook:Foo2020")
+    # notebook keys carry hyphens under .pdf exactly as under .md (only the first hyphen splits).
+    assert parse_drop_name("notebook-idea23-c12.pdf") == ("notebook", "notebook:idea23-c12")
+    # suffix match is case-insensitive.
+    assert parse_drop_name("textbook-Schlickeiser2002.PDF") == (
+        "textbook", "textbook:Schlickeiser2002")
+    # 'paper' is still not an operator-doc kind, .pdf or not.
+    assert parse_drop_name("paper-Reames2023.pdf") is None
 
 
 @pytest.mark.parametrize("name", [
@@ -174,7 +221,7 @@ def test_one_bad_file_does_not_block_the_rest(pending):
     _drop(d, "textbook-Good2020.md")
     counts = _run(drain_pending(rag=object()))
 
-    assert counts == {"ingested": 1, "already": 0, "failed": 1, "disabled": 0}
+    assert counts == {"ingested": 1, "already": 0, "failed": 1, "disabled": 0, "deferred": 0}
     assert (d / "failed" / "textbook-Bad2020.md").exists()
     assert (d / "processed" / "textbook-Good2020.md").exists()
 
@@ -214,14 +261,14 @@ def test_non_matching_files_ignored(pending):
     counts = _run(drain_pending(rag=object()))
 
     assert fake.calls == []                       # nothing derivable as an operator doc
-    assert counts == {"ingested": 0, "already": 0, "failed": 0, "disabled": 0}
+    assert counts == {"ingested": 0, "already": 0, "failed": 0, "disabled": 0, "deferred": 0}
     assert (d / "README.md").exists()             # untouched
 
 
 def test_missing_pending_dir_is_noop(tmp_path, monkeypatch):
     monkeypatch.setenv("KS_OPDOC_PENDING_DIR", str(tmp_path / "does-not-exist"))
     counts = _run(drain_pending(rag=object()))
-    assert counts == {"ingested": 0, "already": 0, "failed": 0, "disabled": 0}
+    assert counts == {"ingested": 0, "already": 0, "failed": 0, "disabled": 0, "deferred": 0}
 
 
 # --------------------------------------------------------------------------- #
@@ -285,3 +332,130 @@ def test_drain_end_to_end_real_ingest_document(tmp_path, monkeypatch):
     assert any(w[3] == "processing" for w in writes)
     assert any(w[3] == "done" for w in writes)
     assert all(w[0] == "textbook" for w in writes)
+
+
+# --------------------------------------------------------------------------- #
+#  PDF front-end (#81 follow-up): OCR via MinerU → md → SAME ingest path        #
+# --------------------------------------------------------------------------- #
+
+def test_pdf_drop_ocr_then_ingest_end_to_end(tmp_path, monkeypatch):
+    """(a) A `textbook-Foo2020.pdf` drop → patched `extract_mineru` returns markdown → the REAL
+    ingest_document runs over the PRODUCED md (heading-aware, colon-prefixed ids) → the pdf
+    lands in processed/ with the OCR'd md kept alongside it. No MinerU / GPU / network."""
+    from papervault.knowledge.ingest import operator_docs as od
+
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")  # textbook source ON (pre-OCR gate)
+    d = tmp_path / "pending"
+    d.mkdir()
+    monkeypatch.setenv("KS_OPDOC_PENDING_DIR", str(d))
+    op._disabled_logged.clear()
+    op._mineru_down_logged.clear()
+
+    writes: list[tuple] = []
+
+    async def _fake_upsert(ingest_source, source_id, *, doc_id, status, fingerprint=None):
+        writes.append((ingest_source, source_id, doc_id, status))
+
+    async def _fake_load(ingest_source):
+        return {}
+
+    monkeypatch.setattr(od.ledger, "upsert", _fake_upsert)
+    monkeypatch.setattr(od.ledger, "load", _fake_load)
+
+    extract = FakeExtract(md="# A\nalpha beta gamma\n\n# B\ndelta epsilon zeta")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Foo2020.pdf")
+
+    rag = FakeRag(doc_status="processed")
+    counts = _run(drain_pending(rag))
+
+    assert counts["ingested"] == 1
+    # extract_mineru was called with the pdf's own stem (an inherently fs-safe name).
+    assert len(extract.calls) == 1
+    assert extract.calls[0]["stem"] == "textbook-Foo2020"
+    # the REAL ingest ran over the OCR'd markdown → colon-prefixed textbook provenance ids.
+    assert rag.enqueued is not None
+    assert all(i.startswith("textbook:Foo2020") for i in rag.enqueued["ids"])
+    assert any(w[3] == "done" for w in writes) and all(w[0] == "textbook" for w in writes)
+    # the pdf moved to processed/, and the produced md is kept beside it (not re-scannable).
+    assert not (d / "textbook-Foo2020.pdf").exists()
+    assert (d / "processed" / "textbook-Foo2020.pdf").exists()
+    assert (d / "processed" / "textbook-Foo2020.md").exists()
+    # staging dir left clean — the md was moved out of .ocr/.
+    assert not (d / ".ocr" / "textbook-Foo2020.md").exists()
+
+
+def test_pdf_transport_error_left_in_pending(pending, monkeypatch):
+    """(b) `MineruTransportError` (MinerU down/unreachable) → the pdf is LEFT in pending to
+    retry next round; it is NEVER moved to failed/ (a server outage must not condemn a good
+    pdf), and ingest_document is never reached."""
+    d, fake = pending
+    extract = FakeExtract(raise_exc=MineruTransportError("mineru unreachable"))
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Foo2020.pdf")
+
+    counts = _run(drain_pending(rag=object()))
+
+    assert counts["deferred"] == 1 and counts["failed"] == 0
+    assert extract.calls != []          # OCR was attempted…
+    assert fake.calls == []             # …but ingest was never reached
+    assert (d / "textbook-Foo2020.pdf").exists()                     # LEFT in pending
+    assert not (d / "failed" / "textbook-Foo2020.pdf").exists()      # NOT condemned
+    assert not (d / "processed" / "textbook-Foo2020.pdf").exists()
+
+
+def test_pdf_transport_error_logs_once_across_rounds(pending, monkeypatch, caplog):
+    """The MinerU-down warning is logged ONCE while the outage persists (SourceDisabled
+    pattern), not once per round — so a persistent outage never spams the scheduler log."""
+    d, fake = pending
+    extract = FakeExtract(raise_exc=MineruTransportError("mineru unreachable"))
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Foo2020.pdf")
+
+    with caplog.at_level(logging.WARNING, logger="ks.scheduler.opdoc_pickup"):
+        _run(drain_pending(rag=object()))   # round 1
+        _run(drain_pending(rag=object()))   # round 2 (pdf still there → re-attempted)
+
+    assert len(extract.calls) == 2          # OCR retried both rounds
+    assert (d / "textbook-Foo2020.pdf").exists()
+    down_warnings = [r for r in caplog.records if "MinerU unreachable" in r.getMessage()]
+    assert len(down_warnings) == 1          # logged only ONCE
+
+
+def test_pdf_extraction_error_moves_to_failed(pending, monkeypatch):
+    """(c) `MineruExtractionError` (per-doc OCR defect) → the pdf is moved to failed/ (LOUD),
+    and ingest_document is never reached."""
+    d, fake = pending
+    extract = FakeExtract(raise_exc=MineruExtractionError("thin_or_missing_md"))
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Foo2020.pdf", force=True)
+
+    counts = _run(drain_pending(rag=object()))
+
+    assert counts["failed"] == 1
+    assert fake.calls == []             # ingest never reached — OCR failed first
+    assert (d / "failed" / "textbook-Foo2020.pdf").exists()          # routed to failed/
+    assert (d / "failed" / "textbook-Foo2020.pdf.force").exists()    # sidecar follows the doc
+    assert not (d / "textbook-Foo2020.pdf").exists()
+
+
+def test_pdf_disabled_source_skips_ocr_and_left_in_place(pending, monkeypatch):
+    """A PDF for a DISABLED source class must NOT burn a MinerU/GPU OCR pass every round — the
+    source is gated BEFORE OCR, so extract_mineru is never called; the pdf is left in pending
+    (a re-enable picks it up), exactly like a disabled .md drop."""
+    d, fake = pending
+    extract = FakeExtract()
+    monkeypatch.delenv("PAPERVAULT_PRIVATE_SOURCES", raising=False)  # notebook source OFF
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "notebook-idea23-c12.pdf")
+
+    counts = _run(drain_pending(rag=object()))
+
+    assert counts["disabled"] == 1
+    assert extract.calls == []          # OCR NEVER ran for a disabled source
+    assert fake.calls == []             # ingest never reached
+    assert (d / "notebook-idea23-c12.pdf").exists()                  # left in pending
+    assert not (d / "failed" / "notebook-idea23-c12.pdf").exists()

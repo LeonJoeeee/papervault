@@ -12,6 +12,26 @@ makes operator-doc ingest WINDOWLESS by routing it through the SAME single write
   which scans the dir and `await ingest_document(...)`s each file against the process-wide
   singleton LightRAG — the very same instance (and single writer) that builds papers.
 
+THE GENERAL "any input → document → RAG" QUEUE. This is one queue with one single writer;
+the input type just picks a preprocessing front-end that all converge on the SAME
+`ingest_document` call:
+  - `textbook-<Key>.md` / `.markdown`  → ingested directly (heading-aware chunking).
+  - `textbook-<Key>.pdf`               → OCR'd to markdown via the SHARED MinerU pipeline
+                                         (`mineru_client.extract_mineru`, the very engine the
+                                         paper-library extract path uses), then the produced
+                                         md is fed through `ingest_document` exactly like a
+                                         native `.md` drop. Same queue, same single writer —
+                                         OCR is just a preprocessing step for PDF inputs.
+  - `.url` (FUTURE, NOT built)          → a fetch front-end would download → md → ingest.
+                                         The dispatch below is shaped so adding it is a new
+                                         suffix branch that also converges on `ingest_document`.
+
+PDF OCR error routing mirrors the paper extract path's transport-vs-extraction split (C1):
+  - `MineruTransportError` (MinerU down/unreachable — TRANSIENT) → LEAVE the pdf in pending
+    and retry next round when MinerU is back; log ONCE (the SourceDisabled pattern). Never
+    move to failed/ — a server outage must not condemn a good PDF.
+  - `MineruExtractionError` (per-doc OCR defect — TERMINAL) → move to failed/, log LOUD.
+
 INVARIANTS INHERITED FOR FREE (why this needs no new queue / lock / endpoint):
   - SINGLE WRITER: `main_loop` is ONE serial `asyncio.Task`; `drain_pending` runs AFTER
     `run_round` in that same task, so it never overlaps a paper round → no two-writer race.
@@ -39,6 +59,7 @@ rows then re-ingests clean. A boot-time operator-doc reconcile pass is durable f
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
@@ -48,19 +69,43 @@ from papervault.knowledge.ingest.operator_docs import (
     KINDS,
     AlreadyIngestedError,
     SourceDisabledError,
+    check_source_enabled,
     ingest_document,
+)
+from papervault.library.mineru_client import (
+    MineruExtractionError,
+    MineruTransportError,
+    endpoints_from_env,
+    extract_mineru,
 )
 
 log = logging.getLogger("ks.scheduler.opdoc_pickup")
 
 DEFAULT_PENDING_DIR = "/data/paper-vault/operator-drop/pending"
 _MARKDOWN_SUFFIXES = {".md", ".markdown"}
+_PDF_SUFFIX = ".pdf"
+# Every suffix the pickup recognizes as an operator-doc drop: markdown (ingested directly) or
+# PDF (OCR'd to markdown first, then ingested through the SAME path). A future `.url` front-end
+# would add its suffix here + a branch in `drain_pending` that also lands on `ingest_document`.
+_DROP_SUFFIXES = _MARKDOWN_SUFFIXES | {_PDF_SUFFIX}
 _FORCE_SIDECAR_SUFFIX = ".force"
+# Staging for OCR'd markdown: a dot-prefixed SUBDIR under the pending dir. The drain lists
+# FILES only (`is_file()`), so a subdir is never scanned — the produced `textbook-<Key>.md`
+# can therefore carry a real `.md` suffix (→ heading-aware chunking) without ever being
+# mistaken for its own operator-doc drop on a later round.
+_OCR_STAGING_SUBDIR = ".ocr"
 
 # Files whose source class is currently DISABLED that we've already logged, so a disabled
 # source doesn't spam the log once per round (the file legitimately stays in pending until the
 # flag is turned on). Cleared for a file once it successfully ingests. Process-local by design.
 _disabled_logged: set[str] = set()
+
+# PDFs left in pending because MinerU is DOWN/unreachable that we've already logged, so a
+# server outage doesn't spam the log once per round (the pdf legitimately stays in pending
+# until MinerU is back). A SEPARATE set from `_disabled_logged` so a source-flag warning and
+# a MinerU-down warning never suppress each other for the same path. Cleared once the pdf
+# OCRs (MinerU answered) or is otherwise moved out of pending. Process-local by design.
+_mineru_down_logged: set[str] = set()
 
 
 def _pending_dir() -> Path:
@@ -68,15 +113,17 @@ def _pending_dir() -> Path:
 
 
 def parse_drop_name(name: str) -> tuple[str, str] | None:
-    """`textbook-<Key>.md` → (kind, `<kind>:<Key>`); None if not an operator-doc drop.
+    """`textbook-<Key>.md` / `textbook-<Key>.pdf` → (kind, `<kind>:<Key>`); None otherwise.
 
     The kind is the prefix before the FIRST hyphen; the key body is everything after (notebook
-    keys legitimately contain hyphens, e.g. `notebook-idea23-c12` → `idea23-c12`). Returns None
-    for a non-markdown file or any name without a recognized `<kind>-` prefix (so `.force`
+    keys legitimately contain hyphens, e.g. `notebook-idea23-c12` → `idea23-c12`). Recognizes
+    both markdown (`.md`/`.markdown`) and PDF (`.pdf`) drops — key derivation is IDENTICAL for
+    both, only `drain_pending` branches on the suffix (a `.pdf` is OCR'd to md first). Returns
+    None for any other suffix or any name without a recognized `<kind>-` prefix (so `.force`
     sidecars, `paper-*.md`, `README.md`, plain `.txt`, etc. are silently skipped).
     """
     p = Path(name)
-    if p.suffix.lower() not in _MARKDOWN_SUFFIXES:
+    if p.suffix.lower() not in _DROP_SUFFIXES:
         return None
     stem = p.stem
     for kind in KINDS:
@@ -102,6 +149,54 @@ def _move(path: Path, dest_dir: Path) -> None:
         log.exception("opdoc pickup: failed to move %s to %s/ (%r)", path.name, dest_dir.name, e)
 
 
+async def _ocr_to_staged_md(pdf_path: Path) -> Path:
+    """OCR a dropped PDF to markdown via the SHARED MinerU pipeline and stage the md.
+
+    The PDF front-end of the general input→document→RAG queue. Reads the pdf bytes OFF-LOOP
+    (`to_thread` — a book PDF is large), awaits the async whole-PDF `extract_mineru` (the very
+    engine paper-library's extract path uses; it round-robins / fails over across the
+    `MINERU_URL` endpoints and never blocks the loop), then writes the produced markdown
+    OFF-LOOP to `<pending>/.ocr/<pdf-stem>.md` and returns that path. The `.md` suffix routes
+    `ingest_document` to heading-aware chunking; the `.ocr` staging subdir is never scanned by
+    the drain. `stem=pdf_path.stem` (e.g. `textbook-Foo2020`) is a real filesystem name, so it
+    is inherently fs-safe for MinerU's `<out>/<stem>/vlm/<stem>.md` read-back path.
+
+    Raises `MineruTransportError` (server down/unreachable — TRANSIENT, caller leaves the pdf
+    in pending) or `MineruExtractionError` (per-doc OCR defect — TERMINAL, caller → failed/).
+    """
+    pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
+    md_text = await extract_mineru(pdf_bytes, endpoints_from_env(), stem=pdf_path.stem)
+
+    def _write() -> Path:
+        staging = pdf_path.parent / _OCR_STAGING_SUBDIR
+        staging.mkdir(parents=True, exist_ok=True)
+        md_path = staging / f"{pdf_path.stem}.md"
+        md_path.write_text(md_text, encoding="utf-8")
+        return md_path
+
+    return await asyncio.to_thread(_write)
+
+
+def _discard_staged(staged_md: Path | None, dest_dir: Path) -> None:
+    """Move a staged OCR md (if any) into dest_dir alongside its PDF, best-effort.
+
+    Keeping the OCR output next to the processed/failed PDF preserves EXACTLY what was ingested
+    (or what failed to ingest) without re-OCRing — a cheap debugging artifact. A no-op for a
+    native `.md` drop (`staged_md is None`). Never raises: a stray staged md lives in the
+    unscanned `.ocr` subdir, so a failed move here can never leak back into the drain."""
+    if staged_md is None:
+        return
+    try:
+        if staged_md.exists():
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(staged_md), str(dest_dir / staged_md.name))
+    except Exception as e:  # noqa: BLE001 — a staged-md move failure must not abort the drain
+        log.warning(
+            "opdoc pickup: failed to move staged md %s to %s/ (%r)",
+            staged_md.name, dest_dir.name, e,
+        )
+
+
 async def drain_pending(rag) -> dict:
     """Scan the pending dir once and ingest each dropped operator doc against `rag`.
 
@@ -111,7 +206,10 @@ async def drain_pending(rag) -> dict:
     loop keeps turning. (The caller in `main_loop` also wraps this in a belt-and-braces except.)
     """
     pending = _pending_dir()
-    counts = {"ingested": 0, "already": 0, "failed": 0, "disabled": 0}
+    # `deferred` = left in pending on a TRANSIENT block (MinerU down): neither ingested nor
+    # failed, will retry next round. Distinct from `disabled` (source flag OFF) so the summary
+    # tells a server-outage backlog apart from a flag-gated one.
+    counts = {"ingested": 0, "already": 0, "failed": 0, "disabled": 0, "deferred": 0}
     if not pending.is_dir():
         return counts
     processed_dir = pending / "processed"
@@ -119,18 +217,62 @@ async def drain_pending(rag) -> dict:
 
     for path in sorted(pending.iterdir()):
         if not path.is_file():
-            continue  # skip the processed/ and failed/ subdirs
+            continue  # skip the processed/, failed/ and .ocr/ subdirs
         parsed = parse_drop_name(path.name)
         if parsed is None:
             continue  # not an operator-doc drop (.force sidecar, README.md, .txt, …)
         kind, key = parsed
         force = path.with_name(path.name + _FORCE_SIDECAR_SUFFIX).exists()
+
+        # ── PDF front-end: OCR → markdown BEFORE ingest. A native .md/.markdown drop skips
+        #    this entirely (staged_md stays None) and is ingested from its own path. ──
+        ingest_path = str(path)
+        staged_md: Path | None = None
+        if path.suffix.lower() == _PDF_SUFFIX:
+            try:
+                # Gate BEFORE OCR: a disabled source must not burn a MinerU/GPU pass every
+                # round. ingest_document re-checks (harmlessly) once we reach it.
+                check_source_enabled(kind)
+                staged_md = await _ocr_to_staged_md(path)
+            except SourceDisabledError as e:
+                if str(path) not in _disabled_logged:
+                    _disabled_logged.add(str(path))
+                    log.warning(
+                        "opdoc pickup: %s source disabled — leaving %s in pending until enabled (%s)",
+                        key, path.name, e,
+                    )
+                counts["disabled"] += 1
+                continue
+            except MineruTransportError as e:
+                # TRANSIENT: MinerU down/unreachable → LEAVE the pdf in pending (retry next
+                # round when MinerU is back). Do NOT move to failed/. Log ONCE (SourceDisabled
+                # pattern) so a persistent outage doesn't spam the log every round.
+                if str(path) not in _mineru_down_logged:
+                    _mineru_down_logged.add(str(path))
+                    log.warning(
+                        "opdoc pickup: %s MinerU unreachable — leaving %s in pending until "
+                        "MinerU is back (%s)", key, path.name, e,
+                    )
+                counts["deferred"] += 1
+                continue
+            except MineruExtractionError as e:
+                # TERMINAL per-doc OCR defect (400/422 / structured-500 / thin md) → failed/.
+                log.error("opdoc pickup: %s MinerU OCR failed (per-doc defect) → failed/ (%r)", key, e)
+                _mineru_down_logged.discard(str(path))
+                _move(path, failed_dir)
+                counts["failed"] += 1
+                continue
+            # MinerU answered → the pdf is no longer "down"; clear its once-log latch.
+            _mineru_down_logged.discard(str(path))
+            ingest_path = str(staged_md)
+
         try:
-            result = await ingest_document(rag, kind, key, str(path), force=force)
+            result = await ingest_document(rag, kind, key, ingest_path, force=force)
         except AlreadyIngestedError:
             # Push-once: the key is already in the graph — nothing to do, it's DONE.
             log.info("opdoc pickup: %s already ingested (push-once) → processed/", key)
             _move(path, processed_dir)
+            _discard_staged(staged_md, processed_dir)
             _disabled_logged.discard(str(path))
             counts["already"] += 1
         except SourceDisabledError as e:
@@ -145,11 +287,13 @@ async def drain_pending(rag) -> dict:
         except Exception as e:  # noqa: BLE001 — one bad file must NOT crash the scheduler loop
             log.exception("opdoc pickup: %s FAILED to ingest → failed/ (%r)", key, e)
             _move(path, failed_dir)
+            _discard_staged(staged_md, failed_dir)
             _disabled_logged.discard(str(path))
             counts["failed"] += 1
         else:
             log.info("opdoc pickup: ingested %s (force=%s) → processed/ %s", key, force, result)
             _move(path, processed_dir)
+            _discard_staged(staged_md, processed_dir)
             _disabled_logged.discard(str(path))
             counts["ingested"] += 1
 

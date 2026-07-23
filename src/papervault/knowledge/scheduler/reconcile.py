@@ -15,6 +15,13 @@ the round drives:
 (指纹没变)→ 永卡 error,违 §6.1.e『下轮重试』。故 error 行无条件并入 to_redistill 走 delete-then-insert
 重投(REDISTILL 幂等)。
 
+★ error_parked 熔断出口(#84):'error' 会**无条件**重投(上一条),对 systemic build 失败(如 embedding
+stack 断,每篇每轮都失败)= 每 60s 一轮 redistill(删旧 doc)+重投+再失败,无限 churn 且不断删图。
+故 ledger 在连续失败达 KS_REDISTILL_MAX_ATTEMPTS 后把该 key 泊到 **'error_parked'**(store._next_attempts_status)。
+error_parked 是**终态**:它既不等于 'error' 也不等于 'pending_remove',故落到下面所有 elif 之外 = **不再进
+to_redistill**,churn 被有界收住。仅指纹变化(下面第一支,内容真变)或显式 force re-ingest(清 ledger 行)能
+复活它 —— 这正是我们要的:人来决定是否重试,而不是无限自动重投。
+
 ★ pending_remove 死状态修(SDD §6.1.e/F3, drill-r7):pending_remove = adelete 撞 403 busy 的中间态。
 其指纹被 ledger.upsert 的 COALESCE 保留(§4.1)。它有两类:
   - key∉idx(真删 REMOVE_PHASE 撞 403):由 to_remove 兜(to_remove = key∉idx),下轮 REMOVE_ONE 再删。
@@ -73,5 +80,7 @@ def diff(
             d.to_redistill.append((key, fp))
         elif existing.status == "pending_remove":   # F3: in-index REDISTILL-撞-403 的续删出口(否则永卡死状态)
             d.to_redistill.append((key, fp))
+        # #84: error_parked (连续失败达阈值后泊车) 是终态 —— 故意不进任何 list(fp 变已在上面复活它)。
+        # 无 elif:落空即"本轮不动它",systemic build 失败不再每轮 redistill+删图无限 churn。
     d.to_remove = [key for key in led if key not in idx]
     return d

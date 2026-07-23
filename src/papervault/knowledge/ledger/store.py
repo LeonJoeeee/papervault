@@ -3,8 +3,15 @@
 Replaces the dead v2 table `paper_attempts`. Per (workspace, ingest_source, source_id):
 fingerprint + doc_id + status. async psycopg pool (mirrors sidecar/crud.py).
 
-status 权威枚举(SDD §13):processing | done | done_meta | error | pending_remove
+status 权威枚举(SDD §13):processing | done | done_meta | error | error_parked | pending_remove
 (absent = 无行)。
+
+REDISTILL 熔断(#84):`attempts` 列记录该 key **连续** build 失败次数。每次写 status='error'
+自增;写成功终态(done/done_meta)或**指纹真变**(新内容)清零。累计到 KS_REDISTILL_MAX_ATTEMPTS
+(默认 3)时,该次 'error' 写入被改写成终态 **'error_parked'**(泊车)—— reconcile.diff 不再把
+error_parked 并入 to_redistill,于是 systemic build 失败(如 #84 embedding stack 断)不会每 60s
+一轮无限 redistill+remove(删图)+重投,把 churn 有界收住。泊车 key 仅由(a)显式 force re-ingest
+(ledger.delete 清行,attempts 归零)或(b)指纹变化(内容真变)复活。
 
 WORKSPACE 隔离(SDD §4.1/§6.5,blocker ① 落地):`ks_ledger` 与 LightRAG 表同库,过去
 共用单表无 workspace 维度 → l0_probe 跑 run_round 会写/删生产 l0 账本行(铁律(1))。
@@ -17,6 +24,7 @@ load/count_by_status/delete)全部按当前 workspace 过滤。workspace 不由 
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator, Optional
@@ -30,7 +38,62 @@ from papervault.knowledge.store.graph import assert_safe_workspace
 
 log = logging.getLogger(__name__)
 
-VALID_STATUS = {"processing", "done", "done_meta", "error", "pending_remove"}
+VALID_STATUS = {"processing", "done", "done_meta", "error", "error_parked", "pending_remove"}
+
+# REDISTILL circuit-breaker (#84): after this many CONSECUTIVE build failures a key is PARKED
+# (status→error_parked, terminal — reconcile.diff no longer re-distills it), instead of being
+# re-distilled + re-removed (graph churn) every round forever on a systemic build break.
+DEFAULT_MAX_ATTEMPTS = 3
+
+
+def _max_attempts() -> int:
+    """Consecutive-failure threshold before a key is parked (env KS_REDISTILL_MAX_ATTEMPTS).
+
+    Read at call time (not import) so an operator can retune without a restart and tests can
+    monkeypatch the env. A value <= 0 disables parking (a key can never reach the threshold —
+    it stays 'error' and keeps retrying, the pre-#84 behavior)."""
+    try:
+        return int(os.getenv("KS_REDISTILL_MAX_ATTEMPTS", str(DEFAULT_MAX_ATTEMPTS)))
+    except ValueError:
+        return DEFAULT_MAX_ATTEMPTS
+
+
+def _next_attempts_status(
+    prev_attempts: int,
+    prev_fingerprint: Optional[str],
+    new_status: str,
+    new_fingerprint: Optional[str],
+    max_attempts: int,
+) -> tuple[int, str]:
+    """PURE circuit-breaker transition (#84) — the single source of truth for attempts + parking.
+
+    Given the row's current (attempts, fingerprint) and the incoming (status, fingerprint),
+    return the (attempts, effective_status) to persist. `upsert` reads the prior row and applies
+    this; the in-memory FakeLedger in the round tests calls the SAME function, so the DB-free
+    round/diff tests exercise the real decision (not a re-implemented fake).
+
+      - new_status == 'error'                → attempts+1; PARK (→'error_parked') once it reaches
+                                               max_attempts (>0). This is the loop that ran away
+                                               in #84 (error → to_redistill → build fails → error).
+      - new_status in {done, done_meta}      → success ⇒ reset attempts to 0 (a good build clears
+                                               the streak, so a later transient failure gets a
+                                               fresh budget).
+      - a genuinely NEW fingerprint          → content actually changed ⇒ reset to 0 (revives a
+                                               parked key with a fresh attempt budget; this is the
+                                               fingerprint-change revival path).
+      - anything else (processing/pending_remove, or a same-fp write) → PRESERVE the count, so the
+        streak spans the intermediate 'processing' a redistill sets between two failures.
+    """
+    if new_status == "error":
+        n = prev_attempts + 1
+        if max_attempts > 0 and n >= max_attempts:
+            return n, "error_parked"
+        return n, "error"
+    if new_status in ("done", "done_meta"):
+        return 0, new_status
+    if new_fingerprint is not None and new_fingerprint != prev_fingerprint:
+        return 0, new_status
+    return prev_attempts, new_status
 
 
 def _workspace() -> str:
@@ -51,6 +114,7 @@ CREATE TABLE IF NOT EXISTS ks_ledger (
     fingerprint       text,
     doc_id            text NOT NULL,
     status            text NOT NULL,
+    attempts          integer NOT NULL DEFAULT 0,
     last_processed_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (workspace, ingest_source, source_id)
 )
@@ -66,6 +130,7 @@ class LedgerRecord:
     fingerprint: Optional[str]
     doc_id: str
     status: str
+    attempts: int = 0  # consecutive build-failure count (#84 circuit-breaker); 0 = clean
 
 
 _pool: Optional[AsyncConnectionPool] = None
@@ -115,6 +180,12 @@ async def ensure_schema() -> None:
         await conn.execute(_CREATE_TABLE)
         # idempotent column add (cheap catalog no-op if already present — keep unconditional).
         await conn.execute("ALTER TABLE ks_ledger ADD COLUMN IF NOT EXISTS workspace text")
+        # #84 circuit-breaker: consecutive build-failure counter. NOT NULL DEFAULT 0 backfills
+        # every existing row to 0 in the same catalog op (cheap; no table rewrite for a constant
+        # default on PG ≥ 11), so pre-#84 rows start with a clean streak. Idempotent no-op once present.
+        await conn.execute(
+            "ALTER TABLE ks_ledger ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0"
+        )
         # ★ condition the cold-migration steps (backfill UPDATE + SET NOT NULL) on a one-shot
         # introspect, mirroring the ④/⑤ guards below. The backfill UPDATE + `ALTER COLUMN
         # SET NOT NULL` were previously UNCONDITIONAL every startup: on an already-migrated
@@ -214,20 +285,46 @@ async def upsert(
         raise ValueError(f"invalid ledger status: {status!r} (allowed: {sorted(VALID_STATUS)})")
     ws = _workspace()
     async with _conn() as conn:
+        # Read the prior row (attempts + fingerprint) so the #84 circuit-breaker transition and
+        # the §4.1 fingerprint-COALESCE are computed together in Python via the pure
+        # `_next_attempts_status` helper. The scheduler is a single serial writer per workspace
+        # (SDD §6.6 进程内串行), so this read-then-upsert on one pooled connection has no
+        # concurrent same-key writer to race — and it keeps ONE source of truth for the parking
+        # rule (the same helper the FakeLedger tests drive), instead of a duplicated SQL CASE.
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT attempts, fingerprint FROM ks_ledger "
+                "WHERE workspace=%s AND ingest_source=%s AND source_id=%s",
+                (ws, ingest_source, source_id),
+            )
+            prev = await cur.fetchone()
+        prev_attempts = int(prev["attempts"]) if prev and prev["attempts"] is not None else 0
+        prev_fp = prev["fingerprint"] if prev else None
+        eff_attempts, eff_status = _next_attempts_status(
+            prev_attempts, prev_fp, status, fingerprint, _max_attempts()
+        )
+        # 指纹更新语义(SDD §4.1):仅显式传新指纹才更新;不传(None)的"只改 status"转移
+        # (pending_remove/error)保留已存指纹,否则被覆成 NULL → 下轮 diff 误判 REDISTILL。
+        eff_fp = fingerprint if fingerprint is not None else prev_fp
+        if eff_status == "error_parked" and status == "error":
+            log.warning(
+                "ks_ledger: %s/%s PARKED after %d consecutive build failures (status→error_parked, "
+                "no longer re-distilled; revive via force re-ingest or a content/fingerprint change) — #84",
+                ingest_source, source_id, eff_attempts,
+            )
         await conn.execute(
             """
             INSERT INTO ks_ledger
-                (workspace, ingest_source, source_id, fingerprint, doc_id, status, last_processed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, now())
+                (workspace, ingest_source, source_id, fingerprint, doc_id, status, attempts, last_processed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (workspace, ingest_source, source_id) DO UPDATE SET
-                -- 指纹更新语义(SDD §4.1):仅显式传新指纹才更新;不传(None)的"只改 status"转移
-                -- (pending_remove/error)保留已存指纹,否则被覆成 NULL → 下轮 diff 误判 REDISTILL。
-                fingerprint       = COALESCE(EXCLUDED.fingerprint, ks_ledger.fingerprint),
+                fingerprint       = EXCLUDED.fingerprint,
                 doc_id            = EXCLUDED.doc_id,
                 status            = EXCLUDED.status,
+                attempts          = EXCLUDED.attempts,
                 last_processed_at = now()
             """,
-            (ws, ingest_source, source_id, fingerprint, doc_id, status),
+            (ws, ingest_source, source_id, eff_fp, doc_id, eff_status, eff_attempts),
         )
         await conn.commit()
 
@@ -299,4 +396,5 @@ def _to_record(row: dict) -> LedgerRecord:
         fingerprint=row["fingerprint"],
         doc_id=row["doc_id"],
         status=row["status"],
+        attempts=int(row.get("attempts") or 0),
     )

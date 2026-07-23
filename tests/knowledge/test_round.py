@@ -12,7 +12,11 @@ import pytest
 import papervault.knowledge.ingest.distill as distill
 import papervault.knowledge.scheduler.round as rnd
 from papervault.knowledge.ingest.paper_library_client import PaperRecord
-from papervault.knowledge.ledger.store import LedgerRecord
+from papervault.knowledge.ledger.store import (
+    LedgerRecord,
+    _max_attempts,
+    _next_attempts_status,
+)
 
 
 # ---------------------------------------------------------------- fakes
@@ -26,9 +30,17 @@ class FakeLedger:
 
     async def upsert(self, ingest_source, source_id, *, doc_id, status, fingerprint=None):
         prev = self.rows.get(source_id)
-        # mirror COALESCE: keep existing fingerprint when None is passed
-        fp = fingerprint if fingerprint is not None else (prev.fingerprint if prev else None)
-        self.rows[source_id] = LedgerRecord("l0_probe", ingest_source, source_id, fp, doc_id, status)
+        prev_attempts = prev.attempts if prev else 0
+        prev_fp = prev.fingerprint if prev else None
+        # Drive the REAL #84 circuit-breaker transition (attempts + parking) and the §4.1
+        # fingerprint-COALESCE, so these round tests exercise production logic — not a re-impl.
+        eff_attempts, eff_status = _next_attempts_status(
+            prev_attempts, prev_fp, status, fingerprint, _max_attempts()
+        )
+        fp = fingerprint if fingerprint is not None else prev_fp  # mirror COALESCE
+        self.rows[source_id] = LedgerRecord(
+            "l0_probe", ingest_source, source_id, fp, doc_id, eff_status, eff_attempts
+        )
 
     async def delete(self, ingest_source, source_id):
         self.rows.pop(source_id, None)
@@ -235,3 +247,101 @@ async def test_run_round_tail_process_when_nothing_to_do(fake_ledger, monkeypatc
     assert summary["to_distill"] == 0 and summary["to_redistill"] == 0 and summary["to_remove"] == 0
     assert not any(k == "enqueue" for k, _ in rag.calls)   # no batch
     assert ("process", None) in rag.calls                  # but tail process still runs
+
+
+# ---------------------------------------------------------------- #84 circuit-breaker
+
+
+def test_attempts_helper_increments_and_parks_at_threshold():
+    # PURE (DB-free) test of the real transition helper store._next_attempts_status.
+    assert _next_attempts_status(0, "fp", "error", "fp", 3) == (1, "error")
+    assert _next_attempts_status(1, "fp", "error", "fp", 3) == (2, "error")
+    assert _next_attempts_status(2, "fp", "error", "fp", 3) == (3, "error_parked")  # threshold → park
+    assert _next_attempts_status(3, "fp", "error", "fp", 3) == (4, "error_parked")  # stays parked
+
+
+def test_attempts_helper_success_resets_streak():
+    assert _next_attempts_status(2, "fp", "done", "fp", 3) == (0, "done")
+    assert _next_attempts_status(5, "fp", "done_meta", "META", 3) == (0, "done_meta")
+
+
+def test_attempts_helper_fingerprint_change_resets_but_same_fp_preserves():
+    # a genuinely NEW fingerprint (content changed) resets → revives a parked key with a fresh budget
+    assert _next_attempts_status(3, "old", "processing", "new", 3) == (0, "processing")
+    # same fingerprint on a non-terminal write PRESERVES the streak (spans the redistill 'processing')
+    assert _next_attempts_status(2, "fp", "processing", "fp", 3) == (2, "processing")
+    # status-only transition (fingerprint None) also preserves the count
+    assert _next_attempts_status(2, "fp", "pending_remove", None, 3) == (2, "pending_remove")
+
+
+def test_attempts_helper_disabled_when_threshold_non_positive():
+    # KS_REDISTILL_MAX_ATTEMPTS<=0 disables parking: an error keeps counting but never parks (pre-#84)
+    assert _next_attempts_status(99, "fp", "error", "fp", 0) == (100, "error")
+
+
+@pytest.mark.asyncio
+async def test_run_round_parks_key_after_max_consecutive_build_failures(fake_ledger, monkeypatch):
+    # THE headline #84 property: a paper whose build fails every round (systemic break) is PARKED
+    # after KS_REDISTILL_MAX_ATTEMPTS consecutive failures, and the round then STOPS re-distilling it
+    # — no more delete-then-reinsert graph churn. We set the threshold to 2 to prove it is env-driven
+    # (not hardcoded) and keep the loop short.
+    monkeypatch.setenv("KS_REDISTILL_MAX_ATTEMPTS", "2")
+    rnd._stuck.clear()
+    idx = {"A": _rec("A")}
+    monkeypatch.setattr(rnd, "load_clean_index", lambda *a, **k: idx)
+    monkeypatch.setattr(rnd, "fingerprint", lambda rec: "fA")          # content NEVER changes
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec, *a, **k: "body of A")
+
+    rag = FakeRag(enqueue_raises=True)  # every distill_batch F17-errors the queued key
+
+    # Round 1: A is new → to_distill → enqueue raises → error (attempts 1, < 2, NOT parked yet)
+    s1 = await rnd.run_round(rag)
+    assert s1["to_distill"] == 1
+    assert fake_ledger.rows["A"].status == "error" and fake_ledger.rows["A"].attempts == 1
+
+    # Round 2: error → to_redistill → delete ok → enqueue raises → error (attempts 2 == threshold → PARK)
+    s2 = await rnd.run_round(rag)
+    assert s2["to_redistill"] == 1
+    assert fake_ledger.rows["A"].status == "error_parked"
+    assert fake_ledger.rows["A"].attempts == 2
+
+    # Round 3: parked → diff drops it → the round does NOTHING to A (no delete, no enqueue = no churn)
+    calls_before = len(rag.calls)
+    s3 = await rnd.run_round(rag)
+    assert s3["to_redistill"] == 0 and s3["to_distill"] == 0 and s3["redistill_removed"] == 0
+    new_calls = rag.calls[calls_before:]
+    assert not any(kind == "enqueue" for kind, _ in new_calls)  # never re-enqueued
+    assert not any(kind == "delete" for kind, _ in new_calls)   # never re-deleted (graph churn stopped)
+    assert fake_ledger.rows["A"].status == "error_parked"       # stays parked
+
+
+@pytest.mark.asyncio
+async def test_run_round_successful_build_resets_the_streak(fake_ledger, monkeypatch):
+    # #84: a successful build (reconcile PROCESSED → done) clears the consecutive-failure streak, so a
+    # later transient failure does NOT immediately re-park a key that was one step from the threshold.
+    from lightrag.base import DocStatus
+
+    monkeypatch.setenv("KS_REDISTILL_MAX_ATTEMPTS", "3")
+    rnd._stuck.clear()
+    idx = {"A": _rec("A")}
+    monkeypatch.setattr(rnd, "load_clean_index", lambda *a, **k: idx)
+    monkeypatch.setattr(rnd, "fingerprint", lambda rec: "fA")
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec, *a, **k: "body of A")
+
+    # A starts one failure away from parking (attempts=2, status=error).
+    fake_ledger.rows = {
+        "A": LedgerRecord("l0_probe", "paper", "A", "fA", "paper:A", "error", 2),
+    }
+    rag = FakeRag(doc_statuses={"paper:A": DocStatus.PROCESSED})  # this round's build will succeed
+
+    # Round 1: error → redistill → delete ok → enqueue OK → status=processing (streak preserved at 2).
+    await rnd.run_round(rag)
+    assert fake_ledger.rows["A"].status == "processing" and fake_ledger.rows["A"].attempts == 2
+
+    # Round 2: reconcile reads PROCESSED → done → streak RESET to 0.
+    await rnd.run_round(rag)
+    assert fake_ledger.rows["A"].status == "done" and fake_ledger.rows["A"].attempts == 0
+
+    # A subsequent single failure lands at attempts=1 (NOT parked) — proving the streak really reset.
+    await fake_ledger.upsert("paper", "A", doc_id="paper:A", status="error", fingerprint="fA")
+    assert fake_ledger.rows["A"].status == "error" and fake_ledger.rows["A"].attempts == 1

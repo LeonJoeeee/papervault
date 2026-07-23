@@ -51,6 +51,45 @@ async def test_ledger_roundtrip_state_and_validation():
         assert await store.get("paper", _K) is None
 
 
+async def test_ledger_redistill_circuit_breaker_parks_and_resets(monkeypatch):
+    """#84: the real ks_ledger `attempts` column + parking transition (store._next_attempts_status
+    applied inside upsert against Postgres). Verifies against the DB what the DB-free FakeLedger
+    round tests verify in-memory: consecutive 'error' writes increment attempts and PARK the key at
+    KS_REDISTILL_MAX_ATTEMPTS; a 'done' resets; a genuine fingerprint change resets/revives.
+    """
+    monkeypatch.setenv("KS_REDISTILL_MAX_ATTEMPTS", "3")
+    await store.ensure_schema()
+    _CB = "__TEST_KEY_CB_DELETE_ME__"
+
+    async def _upsert(status, fp="fp1"):
+        await store.upsert("paper", _CB, doc_id=f"paper:{_CB}", status=status, fingerprint=fp)
+        return await store.get("paper", _CB)
+
+    try:
+        # start clean at processing (attempts 0)
+        assert (await _upsert("processing")).attempts == 0
+
+        # the redistill loop: error → (redistill sets processing, SAME fp preserves streak) → error → ...
+        assert (await _upsert("error")).attempts == 1              # 1st failure, still plain 'error'
+        assert (await _upsert("processing")).attempts == 1         # same-fp processing preserves streak
+        assert (await _upsert("error")).attempts == 2              # 2nd failure
+        assert (await _upsert("processing")).attempts == 2         # preserve
+        r = await _upsert("error")                                 # 3rd failure == threshold → PARK
+        assert r.status == "error_parked" and r.attempts == 3
+
+        # a genuine fingerprint change (content changed) resets the streak and revives it
+        r2 = await _upsert("processing", fp="fp2")
+        assert r2.status == "processing" and r2.attempts == 0 and r2.fingerprint == "fp2"
+
+        # a successful build resets too
+        assert (await _upsert("error", fp="fp2")).attempts == 1
+        rd = await _upsert("done", fp="fp2")
+        assert rd.status == "done" and rd.attempts == 0
+    finally:
+        await store.delete("paper", _CB)
+        assert await store.get("paper", _CB) is None
+
+
 async def test_ensure_schema_pk_idempotent_on_migrated_table(monkeypatch):
     """blocker ① tail (SDD §4.1 ④): ensure_schema's PK rebuild guard must be idempotent.
 

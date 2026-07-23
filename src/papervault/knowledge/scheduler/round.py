@@ -31,6 +31,7 @@ from papervault.knowledge.ingest.distill import distill_batch, remove_one
 from papervault.knowledge.ingest.fingerprint import fingerprint
 from papervault.knowledge.ingest.vault import load_clean_index
 from papervault.knowledge.ledger import store as ledger
+from papervault.knowledge.ledger.store import _max_attempts
 from papervault.knowledge.scheduler.opdoc_pickup import drain_pending
 from papervault.knowledge.scheduler.reconcile import Diff, diff
 
@@ -201,6 +202,21 @@ async def run_round(
         "distill": counters,
     }
     log.info("run_round: %s", summary)
+
+    # OPTIONAL global gate (#84, nice-to-have): a round that ATTEMPTED builds (to_distill/to_redistill
+    # non-empty) but landed ZERO progress AND saw batch-level (F17) enqueue/process failures is the
+    # signature of a SYSTEMIC build break (embedding / LLM / graph backend down) — not per-paper bad
+    # content. Per-key parking already bounds the churn within KS_REDISTILL_MAX_ATTEMPTS rounds; this
+    # LOUD log surfaces the systemic cause in minutes instead of an hour of near-silent churn.
+    build_errored = counters.get("errored", 0)
+    round_progress = term["done"] + counters.get("queued", 0)
+    if build_errored > 0 and round_progress == 0 and (d.to_distill or d.to_redistill):
+        log.error(
+            "run_round: BUILD APPEARS SYSTEMICALLY BROKEN — %d key(s) failed at batch enqueue/process "
+            "with 0 successful builds this round. Keys PARK after %d consecutive failures "
+            "(status=error_parked, no longer re-distilled). Check the embedding/LLM/graph backend NOW (#84).",
+            build_errored, _max_attempts(),
+        )
     return summary
 
 

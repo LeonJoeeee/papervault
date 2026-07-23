@@ -14,7 +14,12 @@ import papervault.knowledge.mcp.server as srv
 
 
 @pytest.fixture(autouse=True)
-def _reset_bg():
+def _reset_bg(monkeypatch):
+    # These are scheduler-lifecycle tests, not embedding tests. start_background now runs a
+    # boot-time embedding self-check (#84) before wiring the scheduler; with no GPU/model on CI
+    # that check fails and start_background would never create the task under test. Bypass it so
+    # these tests exercise the scheduler-wiring contract they're actually about.
+    monkeypatch.setenv("KS_SKIP_EMBED_SELFCHECK", "1")
     srv._bg_task = None
     yield
     # cleanup any task a test created so it doesn't leak

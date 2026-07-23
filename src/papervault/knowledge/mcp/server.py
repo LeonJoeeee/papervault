@@ -49,6 +49,77 @@ def _auto_ingest_enabled() -> bool:
     return os.getenv("KS_AUTO_INGEST_ENABLED", "false").strip().lower() in ("1", "true", "yes")
 
 
+def _skip_embed_selfcheck() -> bool:
+    """Escape hatch for the boot-time embedding self-check (issue #84). Set
+    KS_SKIP_EMBED_SELFCHECK=1 (CI / tests / a known-good boot) to bypass the smoke-test and
+    start the scheduler without exercising the GPU embed path."""
+    return os.getenv("KS_SKIP_EMBED_SELFCHECK", "").strip().lower() in ("1", "true", "yes")
+
+
+# Boot-time embedding self-check timeout (issue #84). The smoke-test loads BGE-M3 (a
+# multi-second GPU model load on a cold boot) + does ONE tiny encode; 60s is generous
+# headroom for the load while still bounding a HANG so a wedged embed stack can never block
+# boot forever. Env-tunable.
+_EMBED_SELFCHECK_TIMEOUT_SEC = float(os.getenv("KS_EMBED_SELFCHECK_TIMEOUT_SEC", "60"))
+
+
+async def _embedding_stack_ok() -> bool:
+    """Boot-time embedding smoke-test (issue #84) — FAIL SAFE.
+
+    On 2026-07-23 a torch/torchvision ABI drift crashed BGE-M3 embedding on EVERY call, yet
+    the service booted fine and the scheduler CHURNED for an hour — re-distilling then failing
+    every document (deleting + re-inserting ~218 graph docs/round) before anyone noticed. This
+    check embeds ONE short string through the REAL embedder path (`_bge_embed` → the same
+    BGE-M3 / torch / torchvision stack the build uses), BEFORE the scheduler starts. If it
+    raises — or hangs past KS_EMBED_SELFCHECK_TIMEOUT_SEC — we DO NOT start `main_loop`:
+    auto-ingest stays off and the destructive re-distill loop never begins. Queries can still
+    be served (degraded) since the query path opens the graph lazily on its own.
+
+    Escape hatch: KS_SKIP_EMBED_SELFCHECK=1 bypasses it (CI / tests / a known-good boot).
+
+    Returns True to proceed (passed OR skipped), False to refuse to start the scheduler.
+    Never raises — any failure is caught, logged LOUD + actionable, and turned into False.
+    """
+    if _skip_embed_selfcheck():
+        log.info("KS embedding self-check SKIPPED (KS_SKIP_EMBED_SELFCHECK set)")
+        return True
+
+    # Imported here (not at module load) so a broken FlagEmbedding/torch import chain surfaces
+    # inside the guarded probe below, exactly like the per-call build path — not at server import.
+    from papervault.knowledge.store.lightrag_init import _bge_embed
+
+    async def _probe() -> int:
+        vec = await _bge_embed(["knowledge-system boot embedding self-check"])
+        # A real embed returns a (1, dim) array → len == 1. A silent empty result is also a fault.
+        return len(vec) if vec is not None else 0
+
+    try:
+        # wait_for bounds a HANG. On timeout the coroutine is cancelled; if the encode is stuck
+        # in the offload worker thread that thread cannot be cancelled, but it is abandoned and
+        # boot proceeds WITHOUT the scheduler — the fail-safe outcome we want.
+        n = await asyncio.wait_for(_probe(), timeout=_EMBED_SELFCHECK_TIMEOUT_SEC)
+    except Exception as e:  # noqa: BLE001 — ANY failure (import/ABI/CUDA/timeout) must fail safe
+        log.error(
+            "KS embedding self-check FAILED — scheduler NOT started to avoid churning a broken "
+            "build (re-distilling + failing every document, ~218 graph docs/round). Fix the "
+            "torch/embedding stack (e.g. torchvision ABI drift), then restart. Queries still "
+            "served (degraded). Bypass with KS_SKIP_EMBED_SELFCHECK=1 once known-good. "
+            "Error: %s: %s",
+            type(e).__name__, e, exc_info=True,
+        )
+        return False
+    if n < 1:
+        log.error(
+            "KS embedding self-check FAILED — embedder returned an EMPTY result (len=%d); "
+            "scheduler NOT started to avoid churning a broken build. Fix the embedding stack, "
+            "then restart. Bypass with KS_SKIP_EMBED_SELFCHECK=1 once known-good.",
+            n,
+        )
+        return False
+    log.info("KS embedding self-check passed (embedded 1 probe string → %d vector).", n)
+    return True
+
+
 # The S4 auto-ingest scheduler + the LightRAG graph / asyncpg pool are SERVER-LIFETIME singletons,
 # NOT per-session. CRITICAL (bug fixed 2026-06-19): under streamable-http the MCP SDK runs the FastMCP
 # `lifespan` (below) ONCE PER CLIENT SESSION — lowlevel Server.run() does
@@ -73,6 +144,15 @@ async def start_background() -> None:
     if not _auto_ingest_enabled():
         log.info("auto-ingest DISABLED (set KS_AUTO_INGEST_ENABLED=true to opt in)")
         return
+
+    # issue #84 — boot-time embedding self-check BEFORE the scheduler. A broken embed stack
+    # (torch/torchvision ABI drift) must NOT let the destructive re-distill loop start and
+    # churn a broken build. Runs before get_graph() so a broken stack fails fast without even
+    # opening the graph/PG pools; queries still work (they open the graph lazily). FAIL SAFE:
+    # on failure we log LOUD and return without starting main_loop.
+    if not await _embedding_stack_ok():
+        return
+
     from papervault.knowledge.scheduler.round import DEFAULT_ROUND_INTERVAL, main_loop
     from papervault.knowledge.store.graph import get_graph
 

@@ -52,6 +52,7 @@ and incremental re-ingest of appended notebooks (#47) — v1 is push-once.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -502,8 +503,13 @@ async def ingest_document(
     p = Path(path)
     text = (read_text or _read_text)(p)
     is_md = p.suffix.lower() in _MARKDOWN_SUFFIXES
-    sections = build_sections(
-        kind, key, text, is_markdown=is_md, tokenizer=tokenizer, max_tokens=max_tokens
+    # build_sections tiktoken-encodes the WHOLE document synchronously — for a 1000-page book
+    # that's a ~1s CPU-bound loop that would stall the event loop serving live queries (#81).
+    # It's pure (no rag, no await), so offload it to a thread — benefits both the scheduler
+    # pickup path (drain_pending) and the CLI.
+    sections = await asyncio.to_thread(
+        build_sections, kind, key, text,
+        is_markdown=is_md, tokenizer=tokenizer, max_tokens=max_tokens,
     )
     if not sections:
         raise ValueError(f"{path}: no content to ingest (empty after chunking)")

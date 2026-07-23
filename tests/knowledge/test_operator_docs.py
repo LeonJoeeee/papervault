@@ -584,6 +584,39 @@ def test_source_label_operator_colon_keys():
     assert _source_label("notebook:idea23-c12#s2") == ("notebook:idea23-c12", "preliminary")
 
 
+# --------------------------------------------------------------------------- #
+#  #81 — build_sections runs OFF the event loop (asyncio.to_thread)             #
+# --------------------------------------------------------------------------- #
+
+def test_build_sections_runs_off_loop(monkeypatch, tmp_path):
+    """#81: build_sections tiktoken-encodes the whole doc synchronously (a ~1s stall for a
+    1000-page book), so ingest_document must run it via asyncio.to_thread — i.e. on a WORKER
+    thread, never the event loop thread serving live queries. Spy on the thread it executes on.
+    """
+    import threading
+
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_ledger(monkeypatch)
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta gamma\n\n# B\ndelta epsilon zeta", encoding="utf-8")
+
+    loop_thread = threading.get_ident()  # the thread asyncio.run drives the loop on
+    seen: dict[str, int] = {}
+    real = od.build_sections
+
+    def _spy(*a, **kw):
+        seen["thread"] = threading.get_ident()
+        return real(*a, **kw)
+
+    monkeypatch.setattr(od, "build_sections", _spy)
+    out = _run(od.ingest_document(
+        FakeRag(doc_status="processed"), "textbook", "textbook:Schlickeiser2002", str(p),
+        tokenizer=FakeTok(), max_tokens=6,
+    ))
+    assert out["done"] == out["sections"]           # still works end to end
+    assert seen["thread"] != loop_thread            # ran off the event loop thread
+
+
 def test_strip_section_suffix():
     # multi-section file_path → book-level key; bare/paper keys unchanged; only a trailing #s<N>.
     assert od.strip_section_suffix("textbook:Schlickeiser2002#s0") == "textbook:Schlickeiser2002"

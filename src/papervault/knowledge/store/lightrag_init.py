@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 
 from papervault.knowledge.config import CONFIG
 
@@ -41,6 +42,11 @@ log = logging.getLogger("ks.store.lightrag_init")
 
 _BGE_MODEL: object = None
 _BGE_RERANKER: object = None
+# Guards the two lazy GPU-model singletons (issue #31). The models are now LOADED inside the
+# offload worker thread (not on the event loop), so first-use construction can race across
+# threads (embed sem may be >1; rerank sem defaults 2). Double-checked locking keeps the load
+# single-flight without adding any steady-state cost (the None fast-path skips the lock).
+_MODEL_LOAD_LOCK = threading.Lock()
 
 # Rerank concurrency gate + integrity counter (2026-06-07, eval-trust drill).
 # Unlike embedding (embedding_func_max_async=16 in graph.py), LightRAG calls rerank_model_func
@@ -89,29 +95,79 @@ _RERANK_POOL_CAP = max(0, int(os.getenv("KS_RERANK_POOL_CAP", "120")))
 
 
 def _get_bge_model() -> object:
-    """Load BGE-M3 model once and cache (singleton)."""
+    """Load BGE-M3 model once and cache (singleton). Thread-safe (loaded off-loop, issue #31)."""
     global _BGE_MODEL
     if _BGE_MODEL is None:
-        from FlagEmbedding import BGEM3FlagModel
+        with _MODEL_LOAD_LOCK:
+            if _BGE_MODEL is None:
+                from FlagEmbedding import BGEM3FlagModel
 
-        _BGE_MODEL = BGEM3FlagModel(
-            CONFIG.bge_m3.model_path,
-            use_fp16=True,
-            devices=[CONFIG.bge_m3.device],
-        )
+                _BGE_MODEL = BGEM3FlagModel(
+                    CONFIG.bge_m3.model_path,
+                    use_fp16=True,
+                    devices=[CONFIG.bge_m3.device],
+                )
     return _BGE_MODEL
 
 
-async def _bge_embed(texts: list[str]):
-    """LightRAG embedding func — wraps BGE-M3 inference."""
+# Embedding GPU-offload gate (issue #31, 2026-07-23 — MCP event-loop robustness).
+# BGE-M3 `model.encode` is a SYNCHRONOUS CUDA call. Historically it ran DIRECTLY on the S4
+# single event loop, so a query's query/keyword embedding froze the loop for the encode's
+# duration — and under the reviewer fan-out (many concurrent retrievals) those blocking bursts
+# starved the MCP `initialize`/`tools/list` handshake path (idle 0.2s → 26-60s under load), the
+# same event-loop-starvation class the rerank path already fixed via `asyncio.to_thread`
+# (Fix A/B above) and the pl OCR-gate decouple. Two coupled changes restore loop liveness:
+#   (1) KS_EMBED_OFFLOAD (default ON): run encode in a worker thread so the loop stays free.
+#   (2) A GPU-concurrency semaphore (_get_embed_sem, KS_EMBED_GPU_MAX_ASYNC, default 1). The OLD
+#       sync-on-loop behaviour ALSO had a hidden side effect: it SERIALIZED embedding (the loop
+#       ran one encode at a time) and so pinned the embed VRAM peak at a single forward pass.
+#       Moving to to_thread without a gate would let LightRAG's embedding_func_max_async (16)
+#       fan 16 concurrent forward passes onto the shared BGE-M3 singleton → a VRAM-peak +
+#       shared-nn.Module concurrency change on the co-rented 3090. Default 1 preserves BOTH the
+#       old serialization AND the old single-pass VRAM peak — strictly loop-liveness with zero
+#       throughput/VRAM regression on the query path (query embeds are tiny). Raise it for build
+#       throughput when the card has headroom; this mirrors the rerank Fix-A semaphore exactly.
+_EMBED_OFFLOAD = os.getenv("KS_EMBED_OFFLOAD", "1").strip().lower() in ("1", "true", "yes")
+_EMBED_SEM: object = None
+
+
+def _get_embed_sem() -> "asyncio.Semaphore":
+    """Lazy per-process semaphore bounding concurrent GPU embed forward passes (issue #31).
+
+    Lazy so it binds to the running event loop on first use, inheriting KS's one-loop-per-process
+    invariant (same rationale as _get_rerank_sem). Default 1 = serialize embed on the shared GPU0,
+    matching the VRAM/serialization profile of the old sync-on-loop path. KS_EMBED_GPU_MAX_ASYNC
+    raises it (build throughput) when the card has headroom."""
+    global _EMBED_SEM
+    if _EMBED_SEM is None:
+        _EMBED_SEM = asyncio.Semaphore(int(os.getenv("KS_EMBED_GPU_MAX_ASYNC", "1")))
+    return _EMBED_SEM
+
+
+def _bge_encode_sync(texts: list[str]):
     import numpy as np
 
+    # Load INSIDE the worker thread (issue #31): the first-use model load is a multi-second
+    # synchronous CUDA op — keeping it off the event loop is the whole point of the offload.
     model = _get_bge_model()
     # BGE-M3 supports 8192; the live chunker feeds chunk_token_size=2400 (tiktoken) chunks
     # (BGE-M3 tokenizer counts them ~2617 mean / ~3485 max). max_length=512 silently truncated
     # most of every chunk before embedding (fixed 2026-05-30 per the harden audit); 8192 covers them.
     result = model.encode(texts, batch_size=32, max_length=8192)
     return np.array(result["dense_vecs"])
+
+
+async def _bge_embed(texts: list[str]):
+    """LightRAG embedding func — wraps BGE-M3 inference.
+
+    The synchronous CUDA load+encode is offloaded to a thread (KS_EMBED_OFFLOAD) under a
+    GPU-concurrency semaphore so it never blocks the S4 single event loop (issue #31).
+    KS_EMBED_OFFLOAD=0 restores the legacy sync-on-loop call (kept only as a diagnostic/revert
+    lever — it is the pre-#31 bug)."""
+    if not _EMBED_OFFLOAD:
+        return _bge_encode_sync(texts)
+    async with _get_embed_sem():
+        return await asyncio.to_thread(_bge_encode_sync, texts)
 
 
 def _get_bge_reranker() -> object:
@@ -131,7 +187,11 @@ def _get_bge_reranker() -> object:
     caller. If this raises, the reranker is genuinely unusable and the build/query path should
     surface it, not mask it."""
     global _BGE_RERANKER
-    if _BGE_RERANKER is None:
+    if _BGE_RERANKER is not None:
+        return _BGE_RERANKER
+    with _MODEL_LOAD_LOCK:  # single-flight: the load runs off-loop in a worker thread (issue #31)
+        if _BGE_RERANKER is not None:
+            return _BGE_RERANKER
         import torch
         from sentence_transformers import CrossEncoder
 
@@ -259,11 +319,17 @@ async def _bge_rerank(
         if len(documents) > cap:
             log.debug("rerank pool capped %d -> %d (KS_RERANK_POOL_CAP)", len(documents), cap)
             documents = documents[:cap]
-    model = _get_bge_reranker()
     pairs = [(query, d) for d in documents]
+    # Load AND predict inside the worker thread (issue #31): _get_bge_reranker() runs a
+    # multi-second CrossEncoder load + preflight on first use — doing it here, off the event
+    # loop, keeps the handshake path live at cold start. A load/preflight failure surfaces via
+    # the except below (counted + logged loud), preserving the F21 fail-loud contract.
+    def _load_and_predict(_pairs):
+        return _predict_with_oom_retry(_get_bge_reranker(), _pairs)
+
     async with _get_rerank_sem():
         try:
-            scores = await asyncio.to_thread(_predict_with_oom_retry, model, pairs)
+            scores = await asyncio.to_thread(_load_and_predict, pairs)
         except Exception as e:  # noqa: BLE001 — terminal: record + loud, never silently degrade
             _RERANK_FAILURES += 1
             log.error(

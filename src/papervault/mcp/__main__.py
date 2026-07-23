@@ -80,6 +80,7 @@ def main() -> int:
     from papervault.knowledge.mcp.server import start_background as start_knowledge_bg
     from papervault.knowledge.mcp.server import stop_background as stop_knowledge_bg
     from papervault.library.mcp.boot import start_background as start_library_bg
+    from papervault.mcp import loop_monitor
     from papervault.mcp.server import build_server
 
     server = build_server(library_path=args.library_path)
@@ -103,12 +104,14 @@ def main() -> int:
             # BEFORE the (potentially minutes-long) sweep — callers are served during it.
             shutdown_library = await start_library_bg(server, log)   # queues + reconcile + mineru (bg)
             await start_knowledge_bg()                       # scheduler + graph/pool
+            await loop_monitor.start()                       # #31 event-loop-lag observability (opt-in)
             log.info("papervault MCP server ready on %s:%d "
                      "(serving; library backlog recovery running in background)",
                      args.host, args.port)
             try:
                 yield
             finally:
+                await loop_monitor.stop()
                 await stop_knowledge_bg()
                 await shutdown_library()
 

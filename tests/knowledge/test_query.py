@@ -115,6 +115,21 @@ def test_cited_sources_web_and_dedup_sort():
     assert _cited_sources({"references": refs}) == ["textbook:A2020", "web:nasa-srag"]
 
 
+def test_cited_sources_collapses_per_section_suffix():
+    # #79: a multi-section textbook now carries per-section file_paths (`<key>#s<N>`). The
+    # trailing #s<N> is stripped so all sections of one book collapse to ONE book-level entry —
+    # the caller cites the whole book, not section 3. The colon key still never leaks to papers.
+    refs = [
+        {"file_path": "textbook:Schlickeiser2002#s0"},
+        {"file_path": "textbook:Schlickeiser2002#s3"},
+        {"file_path": "textbook:Schlickeiser2002#s17"},
+        {"file_path": "notebook:idea23-c12#s1"},
+    ]
+    data = {"references": refs}
+    assert _cited_sources(data) == ["notebook:idea23-c12", "textbook:Schlickeiser2002"]
+    assert _cited_papers(data) == []  # per-section colon keys still excluded from papers
+
+
 def test_cited_sources_empty_when_none():
     assert _cited_sources({"references": []}) == []
     assert _cited_sources({}) == []

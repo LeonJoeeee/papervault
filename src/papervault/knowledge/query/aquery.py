@@ -35,6 +35,7 @@ from typing import Any
 
 from lightrag import QueryParam
 
+from papervault.knowledge.ingest.operator_docs import strip_section_suffix
 from papervault.knowledge.query.synth import synth_answer
 
 logger = logging.getLogger("ks.query.aquery")
@@ -118,15 +119,18 @@ def _cited_sources(data: dict[str, Any]) -> list[str]:
     """Aggregate operator-supplied source keys (textbook:/notebook:/web:) from
     data.references[].file_path — SEPARATE from cited_papers (issues #45 / #47).
 
-    These carry the full colon-prefixed provenance key (e.g. `textbook:Schlickeiser2002`),
-    kept verbatim so the caller can tell the source class from the key. Sorted + deduped.
+    These carry the colon-prefixed provenance key (e.g. `textbook:Schlickeiser2002`), kept so
+    the caller can tell the source class from the key. A multi-section operator doc carries a
+    per-section file_path (`<key>#s<N>`, issue #79) — strip the `#s<N>` so every section of one
+    book collapses to a SINGLE book-level entry here (the caller cites the whole book, not a
+    section). Sorted + deduped.
     """
     refs = data.get("references") or []
     keys = set()
     for r in refs:
         fp = r.get("file_path") or ""
         if fp and _is_source_key(fp):
-            keys.add(fp)
+            keys.add(strip_section_suffix(fp))  # #79: book-level key, sections collapse to one
     return sorted(keys)
 
 

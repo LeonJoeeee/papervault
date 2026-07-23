@@ -23,11 +23,18 @@ Design (mirrors the paper distill insertion path — ingest/distill.py):
     file_path basename normalization (no slash to strip):
         doc_id    = `<kind>:<source_id>`           (single section) or
                     `<kind>:<source_id>#s<N>`      (multi-section — unique per section)
-        file_path = `<kind>:<source_id>`           (the base key — SHARED across all
-                    sections so the query path cites the WHOLE book/notebook, not a
-                    section, and synth reads the credibility band off the source-class
-                    prefix: textbook→established, notebook→preliminary, via
-                    query/synth.py _CRED_BY_SOURCE)
+        file_path = `<kind>:<source_id>`           (single section) or
+                    `<kind>:<source_id>#s<N>`      (multi-section — UNIQUE per section, #79)
+    file_path is UNIQUE per section (issue #79): LightRAG 1.5's enqueue de-dups documents by
+    canonical file_path basename (pipeline._add_content: a 2nd doc_id reusing an already-seen
+    file_path is dropped BEFORE it gets a doc_status row), so a SHARED file_path silently
+    dropped sections 2..N of a multi-section doc — only section 0 landed, the rest wedged as
+    ledger `error`. Each section now gets its own file_path (`<key>#s<N>`); the WHOLE-book
+    citation key is recovered at QUERY time by stripping the trailing `#s<N>`
+    (`strip_section_suffix`, consumed by query/synth._source_label + query/aquery._cited_sources),
+    so citations still attribute to the book/notebook, not a section. synth still reads the
+    credibility band off the source-class prefix (textbook→established, notebook→preliminary,
+    via query/synth.py _CRED_BY_SOURCE), which the `#s<N>` suffix never touches.
     This is deliberately the COLON form (`textbook:Schlickeiser2002`), not the paper's
     SLASH form (`paper/<key>`): the query path's `_cited_papers` treats a slash-free
     file_path as a bare paper key, so a colon prefix is what keeps textbook/notebook keys
@@ -111,6 +118,27 @@ def validate_key(kind: str, key: str) -> tuple[str, str]:
             f"malformed {kind} key {key!r} — expected {_KEY_FORMAT_HINT[kind]}"
         )
     return kind, source_id
+
+
+# The per-section file_path suffix (#79). build_sections gives each section of a MULTI-section
+# operator doc a UNIQUE file_path `<key>#s<N>` so LightRAG 1.5's enqueue-time filename-dedup
+# (pipeline._add_content) can't drop sections 2..N for reusing section 0's file_path. Every
+# QUERY-time reader that attributes a citation to the WHOLE book/notebook strips this suffix to
+# recover the book-level provenance key.
+_SECTION_SUFFIX_RE = re.compile(r"#s\d+$")
+
+
+def strip_section_suffix(file_path: str) -> str:
+    """Recover the book-level provenance key from a per-section operator-doc file_path (#79).
+
+    build_sections tags each section of a multi-section doc with a UNIQUE file_path
+    `<key>#s<N>` (defeats LightRAG's filename-dedup — see the module docstring). The query
+    path attributes citations to the WHOLE book/notebook, so every reader of the chunk-level
+    file_path (query/synth._source_label, query/aquery._cited_sources) strips the trailing
+    `#s<N>` here so all sections collapse back to the base key. A bare key (single-section
+    doc) or a paper file_path (`paper/<key>`, no `#s<N>`) is returned UNCHANGED. Mirrors how
+    LightRAG's normalize_document_file_path strips a `[hint]` suffix (utils_pipeline.py)."""
+    return _SECTION_SUFFIX_RE.sub("", file_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -271,8 +299,11 @@ class DocSection:
     """One operator-doc section as it enters LightRAG.
 
     doc_id     unique per section (`<kind>:<source_id>` or `...#s<N>`).
-    file_path  the base key, SHARED across all sections of one doc (book/notebook-level
-               provenance in the query path's cited_sources + synth credibility band).
+    file_path  UNIQUE per section (#79): the base key for a single-section doc, or
+               `<key>#s<N>` for a multi-section one — a shared file_path made LightRAG's
+               enqueue filename-dedup silently drop sections 2..N. The book/notebook-level
+               provenance is recovered at query time via `strip_section_suffix` (drops the
+               `#s<N>`) so cited_sources + the synth credibility band still see the whole book.
     source_id  the ledger source_id (doc_id without the `<kind>:` prefix).
     text       the section body handed to LightRAG (re-chunked there for retrieval).
     """
@@ -306,7 +337,11 @@ def build_sections(
         sections.append(
             DocSection(
                 doc_id=f"{ingest_source}:{sid}",
-                file_path=key,  # base key = `<kind>:<base_sid>`, shared across sections
+                # UNIQUE per section (#79): a single-section doc keeps the bare `key`; a
+                # multi-section one gets `<key>#s{i}` so LightRAG's enqueue filename-dedup
+                # can't drop sections 2..N. == doc_id in both cases; the book-level key is
+                # recovered at query time via strip_section_suffix.
+                file_path=key if single else f"{key}#s{i}",
                 source_id=sid,
                 text=body,
             )
@@ -387,6 +422,55 @@ async def _assert_not_already_ingested(ingest_source: str, base_sid: str, key: s
         )
 
 
+async def _purge_sections(rag, ingest_source: str, base_sid: str, key: str) -> dict:
+    """Delete every landed LightRAG doc + ledger row for one operator-doc provenance key (#79).
+
+    The cleanup path that makes `--force` re-ingest possible. Before #79 a half-committed key
+    (e.g. the filename-dedup bug landing only section 0, the rest wedged `error`) was stuck
+    forever: re-ingest was REFUSED (_assert_not_already_ingested) with no cleanup path. This
+    matches the base-key row and every `<base_sid>#s<N>` section row (workspace-scoped via
+    ledger.load — same prefix-safe rule as the push-once check), deletes each row's landed
+    LightRAG doc by its stored doc_id FIRST (rag.adelete_by_doc_id, the same primitive
+    distill.remove_one uses; a not_found doc is benign — the ledger row is still cleared), then
+    the ledger row (ledger.delete, the ingest_source-agnostic primitive). Idempotent: a key
+    with no rows is a clean no-op. Best-effort on the graph side — a delete that raises / returns
+    an unexpected status is logged LOUD and counted, but the ledger row is still cleared so the
+    wedge is always broken (a fresh re-ingest reuses the SAME doc_ids, so a surviving orphan is
+    then overwritten by the re-insert)."""
+    existing = await ledger.load(ingest_source)  # {source_id: LedgerRecord}, workspace-scoped
+    victims = [
+        rec for sid, rec in existing.items()
+        if sid == base_sid or sid.startswith(f"{base_sid}#s")
+    ]
+    counts = {"docs_deleted": 0, "docs_failed": 0, "ledger_rows_deleted": 0}
+    for rec in victims:
+        did = getattr(rec, "doc_id", None) or f"{ingest_source}:{getattr(rec, 'source_id', '')}"
+        try:
+            r = await rag.adelete_by_doc_id(did)
+            status = getattr(r, "status", None)
+            if status is None and isinstance(r, dict):
+                status = r.get("status")
+            if status in ("success", "not_found"):
+                counts["docs_deleted"] += 1
+            else:
+                counts["docs_failed"] += 1
+                log.warning("purge %s: adelete_by_doc_id(%s) unexpected status=%s", key, did, status)
+        except Exception as e:  # noqa: BLE001 — never let one doc block clearing the wedge
+            counts["docs_failed"] += 1
+            log.warning("purge %s: adelete_by_doc_id(%s) raised: %r", key, did, e)
+        await ledger.delete(ingest_source, getattr(rec, "source_id"))
+        counts["ledger_rows_deleted"] += 1
+    if victims:
+        log.info("purge %s: %s", key, counts)
+    return counts
+
+
+async def purge_key(rag, kind: str, key: str) -> dict:
+    """Validate a provenance key then purge its LightRAG docs + ledger rows (#79 --force)."""
+    ingest_source, base_sid = validate_key(kind, key)
+    return await _purge_sections(rag, ingest_source, base_sid, key)
+
+
 async def ingest_document(
     rag,
     kind: str,
@@ -396,17 +480,24 @@ async def ingest_document(
     tokenizer: Any = None,
     max_tokens: Optional[int] = None,
     read_text: Callable[[Path], str] | None = None,
+    force: bool = False,
 ) -> dict:
     """End-to-end operator-doc ingest against a (workspace-gated) LightRAG instance.
 
-    guard → key-validate → push-once check → read → chunk → ledger(processing) →
-    enqueue+process → reconcile(done/error). Returns a small counter summary. Raises
+    guard → key-validate → [force? purge] → push-once check → read → chunk → ledger(processing)
+    → enqueue+process → reconcile(done/error). Returns a small counter summary. Raises
     SourceDisabledError (guard OFF), ValueError (bad key / empty doc), or
-    AlreadyIngestedError (key already ingested — v1 push-once) before/without touching the
-    graph write path.
+    AlreadyIngestedError (key already ingested and NOT --force) before/without touching the
+    graph write path. `force=True` (#79) PURGES an already-ingested key (its landed graph docs
+    + ledger rows) first so the push-once check passes and the key is re-ingested clean —
+    the escape hatch for a half-committed / stale key; the purge counts ride back under
+    `result["purged"]`.
     """
     check_source_enabled(kind)
     ingest_source, base_sid = validate_key(kind, key)  # fail-fast on a malformed key
+    # #79 --force: clear a prior (possibly half-committed) ingest of this key BEFORE the
+    # push-once check, so a wedged key can be re-ingested instead of being refused forever.
+    purged = await _purge_sections(rag, ingest_source, base_sid, key) if force else None
     await _assert_not_already_ingested(ingest_source, base_sid, key)  # v1 push-once (#3)
     p = Path(path)
     text = (read_text or _read_text)(p)
@@ -438,11 +529,17 @@ async def ingest_document(
             "ingest_document %s enqueue/process failed (%d section(s) → error): %r",
             key, len(sections), e,
         )
-        return {"key": key, "kind": kind, "sections": len(sections),
-                "done": 0, "error": len(sections), "pending": 0}
+        result = {"key": key, "kind": kind, "sections": len(sections),
+                  "done": 0, "error": len(sections), "pending": 0}
+        if purged is not None:
+            result["purged"] = purged
+        return result
     counts = await _reconcile_sections(rag, kind, sections)
     log.info("ingest_document %s: %d section(s) %s", key, len(sections), counts)
-    return {"key": key, "kind": kind, "sections": len(sections), **counts}
+    result = {"key": key, "kind": kind, "sections": len(sections), **counts}
+    if purged is not None:
+        result["purged"] = purged
+    return result
 
 
 def _read_text(p: Path) -> str:

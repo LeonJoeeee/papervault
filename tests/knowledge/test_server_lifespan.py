@@ -25,6 +25,11 @@ from papervault.knowledge.mcp import server
 def _clean_env(monkeypatch):
     monkeypatch.delenv("KS_AUTO_INGEST_ENABLED", raising=False)
     monkeypatch.delenv("KS_AUTO_INGEST_INTERVAL_SEC", raising=False)
+    # Bypass the boot-time embedding self-check (issue #84): these tests pin the scheduler
+    # WIRING (get_graph/main_loop are stubbed), not the GPU embed stack, so the self-check
+    # (which would load a real BGE-M3 model) is orthogonal here. Its own coverage lives in
+    # tests/knowledge/test_embed_selfcheck.py.
+    monkeypatch.setenv("KS_SKIP_EMBED_SELFCHECK", "1")
     yield
 
 

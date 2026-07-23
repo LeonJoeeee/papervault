@@ -72,6 +72,44 @@ def test_diff_in_index_pending_remove_redistilled():
     assert d.to_remove == []
 
 
+def test_diff_error_parked_is_not_redistilled():
+    # #84 circuit-breaker: a key parked after N consecutive build failures (status=error_parked)
+    # with an UNCHANGED fingerprint must fall through ALL diff branches — it is NOT re-distilled.
+    # This is the property that bounds the runaway (systemic build break → every 'error' key was
+    # unconditionally re-added to to_redistill every round → infinite delete+re-enqueue churn).
+    idx = {"A": "A", "B": "B"}
+    fps = {"A": "h1", "B": "h2"}
+    led = {
+        "A": _led("A", "h1", status="error_parked"),  # parked, fp unchanged → LEFT ALONE
+        "B": _led("B", "h2", status="error"),         # plain error, fp unchanged → still retried
+    }
+    d = diff(idx, led, fp_of=lambda rec: fps[rec])
+    assert sorted(k for k, _ in d.to_redistill) == ["B"]  # only the un-parked error retries
+    assert "A" not in {k for k, _ in d.to_redistill}
+    assert d.to_distill == [] and d.to_remove == []       # parked A touched by nothing
+
+
+def test_diff_error_parked_revived_by_fingerprint_change():
+    # #84 revival: a parked key whose CONTENT actually changed (fingerprint differs) IS re-distilled
+    # — the fp-change branch fires before the status checks, giving genuinely-new content a fresh try.
+    idx = {"A": "A"}
+    led = {"A": _led("A", "h_old", status="error_parked")}  # parked, but fp will differ
+    d = diff(idx, led, fp_of=lambda rec: "h_new")
+    assert sorted(k for k, _ in d.to_redistill) == ["A"]
+    assert d.to_redistill[0] == ("A", "h_new")  # carries the NEW fp
+    assert d.to_distill == [] and d.to_remove == []
+
+
+def test_diff_error_parked_gone_from_index_still_removed():
+    # A parked key that disappears from the vault must still be REMOVED (key∉idx → to_remove),
+    # exactly like any other ledger status — parking only suppresses re-distill, not removal.
+    idx: dict[str, str] = {}
+    led = {"A": _led("A", "h1", status="error_parked")}
+    d = diff(idx, led, fp_of=lambda rec: "h1")
+    assert d.to_remove == ["A"]
+    assert d.to_redistill == [] and d.to_distill == []
+
+
 def test_diff_not_in_index_pending_remove_goes_to_remove():
     # The OTHER pending_remove path: a real REMOVE (key gone from vault) that hit 403.
     # key∉idx → to_remove re-drives the delete next round; NOT to_redistill (no point

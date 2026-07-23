@@ -46,11 +46,23 @@ the rest (notebook keys legitimately contain hyphens, e.g. `notebook-idea23-c12`
 A sidecar `<file>.force` present ⇒ `force=True` (purge + re-ingest, to REPLACE an older
 version); absent ⇒ push-once (an already-ingested key is refused and treated as done).
 
-OUTCOME ROUTING (a bad file must NEVER crash the scheduler loop):
-  success                → move file (+ any `.force` sidecar) to `processed/`
-  AlreadyIngestedError   → move to `processed/` (push-once: it's already done)
-  SourceDisabledError    → LEAVE in place, log ONCE (source flag OFF; a re-enable picks it up)
-  any other error        → move to `failed/` + log LOUD (malformed key, enqueue blip, …)
+OUTCOME ROUTING (a bad file must NEVER crash the scheduler loop). `ingest_document` RETURNS
+a `{done, error, sections, ...}` split (it can succeed, partly succeed, or build NOTHING all
+WITHOUT raising), so a non-exception return is inspected — not assumed to be success (#84):
+  full success (done>0, error==0)  → move file (+ any `.force` sidecar) to `processed/`
+  PARTIAL (done>0, error>0)        → move to `processed/` + log LOUD (some sections landed;
+                                     a `.force` re-drop rebuilds the errored ones)
+  NOTHING built (done==0)          → move to `failed/` + write a `<file>.reason` note + log
+                                     LOUD, count `failed`. #84: `ingest_document` can RETURN
+                                     (no exception) with done=0 when EVERY section failed to
+                                     build — e.g. a transient embedding/LLM outage errored the
+                                     whole book (textbook:Bubeck2015 = done=0/error=51 during
+                                     the #84 embedding break). That is a REAL FAILURE, never a
+                                     silent success — it stays visibly failed + re-droppable
+                                     instead of being marked done and lost.
+  AlreadyIngestedError             → move to `processed/` (push-once: it's already done)
+  SourceDisabledError              → LEAVE in place, log ONCE (source flag OFF; a re-enable picks it up)
+  any other error                  → move to `failed/` + log LOUD (malformed key, enqueue blip, …)
 
 RESTART RECOVERY (issue #81 known gap): an in-flight ingest interrupted by a restart leaves a
 `processing` ledger row the paper `reconcile_terminal` (scans only `ingest_source="paper"`)
@@ -197,6 +209,29 @@ def _discard_staged(staged_md: Path | None, dest_dir: Path) -> None:
         )
 
 
+def _write_reason(dest_dir: Path, filename: str, key: str, result: dict) -> None:
+    """Drop a small `<filename>.reason` note beside a doc routed to failed/ on a done==0 build.
+
+    Records WHY it failed — the `done`/`error`/`sections` split from `ingest_document` — so an
+    operator can see the file built NOTHING (every section errored, e.g. a transient
+    embedding/LLM outage) and is RE-DROPPABLE (optionally with a `.force` sidecar to rebuild),
+    not a permanent per-doc defect. Best-effort: never raises — a missing reason note must not
+    abort the drain (the failed/ move already stands on its own)."""
+    try:
+        done = result.get("done", 0) if isinstance(result, dict) else 0
+        error = result.get("error", 0) if isinstance(result, dict) else 0
+        sections = result.get("sections", done + error) if isinstance(result, dict) else 0
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / (filename + ".reason")).write_text(
+            f"{key}: build produced NOTHING — done={done} error={error} sections={sections}. "
+            "Every section failed to build (likely a transient embedding/LLM/build outage, not "
+            "a per-doc defect). Re-drop this file (optionally with a .force sidecar) to retry.\n",
+            encoding="utf-8",
+        )
+    except Exception as e:  # noqa: BLE001 — a reason-note write must not abort the drain
+        log.warning("opdoc pickup: failed to write reason note for %s (%r)", filename, e)
+
+
 async def drain_pending(rag) -> dict:
     """Scan the pending dir once and ingest each dropped operator doc against `rag`.
 
@@ -208,8 +243,10 @@ async def drain_pending(rag) -> dict:
     pending = _pending_dir()
     # `deferred` = left in pending on a TRANSIENT block (MinerU down): neither ingested nor
     # failed, will retry next round. Distinct from `disabled` (source flag OFF) so the summary
-    # tells a server-outage backlog apart from a flag-gated one.
-    counts = {"ingested": 0, "already": 0, "failed": 0, "disabled": 0, "deferred": 0}
+    # tells a server-outage backlog apart from a flag-gated one. `partial` = some sections built
+    # and some errored (moved to processed/ but LOUD-warned); kept disjoint from `ingested`
+    # (a FULL build) and `failed` (done==0, NOTHING built) so each drained file counts once (#84).
+    counts = {"ingested": 0, "already": 0, "failed": 0, "partial": 0, "disabled": 0, "deferred": 0}
     if not pending.is_dir():
         return counts
     processed_dir = pending / "processed"
@@ -291,11 +328,48 @@ async def drain_pending(rag) -> dict:
             _disabled_logged.discard(str(path))
             counts["failed"] += 1
         else:
-            log.info("opdoc pickup: ingested %s (force=%s) → processed/ %s", key, force, result)
-            _move(path, processed_dir)
-            _discard_staged(staged_md, processed_dir)
-            _disabled_logged.discard(str(path))
-            counts["ingested"] += 1
+            # `ingest_document` RETURNED — but a return is NOT proof of success. Inspect the
+            # done/error section split (#84): a book where EVERY section failed to build comes
+            # back done=0 WITHOUT raising, and must not be silently marked done + lost.
+            done = result.get("done", 0) if isinstance(result, dict) else 0
+            error = result.get("error", 0) if isinstance(result, dict) else 0
+            sections = result.get("sections", done + error) if isinstance(result, dict) else 0
+            if done > 0 and error == 0:
+                # FULL success: every section built.
+                log.info("opdoc pickup: ingested %s (force=%s) → processed/ %s", key, force, result)
+                _move(path, processed_dir)
+                _discard_staged(staged_md, processed_dir)
+                _disabled_logged.discard(str(path))
+                counts["ingested"] += 1
+            elif done > 0:
+                # PARTIAL: some sections landed in the graph, some errored. The landed sections
+                # ARE ingested (re-scanning would hit push-once), so move to processed/ — but
+                # LOUD-warn with the split so an operator can re-drop with a `.force` sidecar to
+                # rebuild the errored sections.
+                log.warning(
+                    "opdoc pickup: %s PARTIAL ingest (done=%d error=%d of %d section(s)) → "
+                    "processed/ — some sections landed; re-drop with a .force sidecar to rebuild "
+                    "the errored ones. %s", key, done, error, sections, result,
+                )
+                _move(path, processed_dir)
+                _discard_staged(staged_md, processed_dir)
+                _disabled_logged.discard(str(path))
+                counts["partial"] += 1
+            else:
+                # done == 0: NOTHING built (a transient build outage errored every section — e.g.
+                # the #84 embedding break took textbook:Bubeck2015 to done=0/error=51). This is a
+                # REAL FAILURE, NOT a success: route to failed/ + drop a `.reason` note so it's
+                # visibly failed + re-droppable, never silently "done" in processed/ and lost.
+                log.error(
+                    "opdoc pickup: %s built NOTHING (done=0 error=%d of %d section(s)) → failed/ "
+                    "— likely a transient build outage; re-drop to retry. %s",
+                    key, error, sections, result,
+                )
+                _move(path, failed_dir)
+                _discard_staged(staged_md, failed_dir)
+                _write_reason(failed_dir, path.name, key, result)
+                _disabled_logged.discard(str(path))
+                counts["failed"] += 1
 
     if any(counts.values()):
         log.info("opdoc pickup drain: %s", counts)

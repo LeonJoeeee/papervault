@@ -59,6 +59,8 @@ _INTEGRATION_NAMES = {
     "test_search_authority_prior_reorders_on_default_hint",
     "test_search_judge_batches_dropped_zero_when_healthy",
     "test_search_ingest_upsert_passes_no_llm",
+    "test_search_ingest_stamps_judged_tier_on_new_record",
+    "test_search_ingest_does_not_overwrite_audit_set_tier",
     # test_firecrawl_quality_gate.py — the re-entry gate drives a live judge LLM.
     "test_firecrawl_reentry_historical_md_passes_gate_stays_ok",
     "test_firecrawl_reentry_historical_stub_fails_gate_is_deleted_terminal",

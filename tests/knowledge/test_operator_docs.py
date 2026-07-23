@@ -23,6 +23,7 @@ from papervault.knowledge.ingest.operator_docs import (
     split_headed_markdown,
     validate_key,
 )
+from papervault.knowledge.ledger.store import LedgerRecord
 
 
 class FakeTok:
@@ -41,6 +42,7 @@ class FakeRag:
         self.enqueued: dict | None = None
         self.processed = False
         self._doc_status = doc_status
+        self.deleted_doc_ids: list[str] = []
 
     async def apipeline_enqueue_documents(self, *, input, ids, file_paths):  # noqa: A002
         self.enqueued = {"input": list(input), "ids": list(ids), "file_paths": list(file_paths)}
@@ -50,6 +52,37 @@ class FakeRag:
 
     async def aget_docs_by_ids(self, ids):
         return {i: {"status": self._doc_status} for i in ids}
+
+    async def adelete_by_doc_id(self, doc_id):
+        # The #79 --force purge primitive (mirrors distill.remove_one's call). Record the id and
+        # report success — a not_found doc would be fine too (purge treats both as deleted).
+        self.deleted_doc_ids.append(doc_id)
+        return {"status": "success"}
+
+
+class DedupRag(FakeRag):
+    """Fake LightRAG that REPRODUCES the 1.5 enqueue-time filename-dedup (#79 root cause).
+
+    LightRAG's pipeline._add_content drops any 2nd+ doc_id in a batch that reuses an
+    already-seen CANONICAL file_path (basename, `[hint]`-stripped) — BEFORE it ever gets a
+    doc_status row. For slash-free / hint-free operator-doc keys the canonical basename == the
+    raw file_path (Path(x).name == x), so we dedup on the raw file_path. A dropped doc_id
+    returns NO terminal status, so the single reconcile pass sees it as never-PROCESSED and
+    flips its ledger row to `error` — exactly the 38-section→1 silent loss the fix repairs."""
+
+    async def apipeline_enqueue_documents(self, *, input, ids, file_paths):  # noqa: A002
+        self.enqueued = {"input": list(input), "ids": list(ids), "file_paths": list(file_paths)}
+        seen_fp: set[str] = set()
+        self.landed_ids: list[str] = []
+        for did, fp in zip(ids, file_paths):
+            if fp in seen_fp:
+                continue  # filename-dedup: dropped, no doc_status row ever written
+            seen_fp.add(fp)
+            self.landed_ids.append(did)
+
+    async def aget_docs_by_ids(self, ids):
+        # Only the docs that actually LANDED (survived filename-dedup) carry a terminal status.
+        return {i: {"status": self._doc_status} for i in ids if i in self.landed_ids}
 
 
 def _run(coro):
@@ -183,7 +216,7 @@ def test_build_sections_single_uses_bare_key():
     assert s.source_id == "Schlickeiser2002"             # ledger source_id (prefix stripped)
 
 
-def test_build_sections_multi_suffixes_and_shares_file_path():
+def test_build_sections_multi_suffixes_and_unique_file_path():
     md = "# A\nalpha beta gamma\n\n# B\ndelta epsilon zeta"
     secs = build_sections(
         "textbook", "textbook:Schlickeiser2002", md,
@@ -193,9 +226,15 @@ def test_build_sections_multi_suffixes_and_shares_file_path():
     assert [s.doc_id for s in secs] == [
         "textbook:Schlickeiser2002#s0", "textbook:Schlickeiser2002#s1",
     ]
-    # file_path is the SHARED base key → the query path cites the whole book, not a section.
-    assert all(s.file_path == "textbook:Schlickeiser2002" for s in secs)
+    # file_path is UNIQUE per section (#79) — a shared file_path made LightRAG's filename-dedup
+    # silently drop sections 2..N. Here file_path == doc_id (`<key>#s<N>`).
+    assert [s.file_path for s in secs] == [
+        "textbook:Schlickeiser2002#s0", "textbook:Schlickeiser2002#s1",
+    ]
+    assert len({s.file_path for s in secs}) == 2  # distinct → no dedup collision
     assert [s.source_id for s in secs] == ["Schlickeiser2002#s0", "Schlickeiser2002#s1"]
+    # …but the book-level key is recoverable for query-time citation attribution.
+    assert {od.strip_section_suffix(s.file_path) for s in secs} == {"textbook:Schlickeiser2002"}
 
 
 def test_build_sections_notebook_provenance():
@@ -218,15 +257,16 @@ def test_build_sections_bad_key_raises():
 
 def test_enqueue_sections_two_phase_with_provenance_keys():
     secs = [
-        DocSection("textbook:X2020#s0", "textbook:X2020", "X2020#s0", "body zero"),
-        DocSection("textbook:X2020#s1", "textbook:X2020", "X2020#s1", "body one"),
+        DocSection("textbook:X2020#s0", "textbook:X2020#s0", "X2020#s0", "body zero"),
+        DocSection("textbook:X2020#s1", "textbook:X2020#s1", "X2020#s1", "body one"),
     ]
     rag = FakeRag()
     out = _run(enqueue_sections(rag, secs))
     assert out["queued"] == 2
     assert rag.processed is True                         # process phase ran
     assert rag.enqueued["ids"] == ["textbook:X2020#s0", "textbook:X2020#s1"]
-    assert rag.enqueued["file_paths"] == ["textbook:X2020", "textbook:X2020"]  # shared
+    # UNIQUE per section (#79) — distinct file_paths so LightRAG's filename-dedup keeps both.
+    assert rag.enqueued["file_paths"] == ["textbook:X2020#s0", "textbook:X2020#s1"]
     assert rag.enqueued["input"] == ["body zero", "body one"]
 
 
@@ -242,19 +282,26 @@ def test_enqueue_sections_empty_is_noop():
 # --------------------------------------------------------------------------- #
 
 def _patch_ledger(monkeypatch, existing=None):
-    """Stub the ledger: capture upsert writes, and serve `load` from `existing`
-    ({source_id: rec}, default empty = nothing previously ingested). The re-ingest
-    push-once pre-check (#3) reads `load`, so it must be stubbed for the hermetic path."""
+    """Stub the ledger: capture upsert writes, serve `load` from a mutable `state` seeded from
+    `existing` ({source_id: rec}, default empty = nothing previously ingested), and let `delete`
+    mutate that state so `load` REFLECTS purges. The re-ingest push-once pre-check (#3) reads
+    `load`, and the #79 --force purge deletes rows then re-checks `load`, so both must be stubbed
+    for the hermetic path."""
     writes: list[tuple] = []
+    state = dict(existing or {})  # source_id -> rec; delete() pops, load() returns a snapshot
 
     async def _fake_upsert(ingest_source, source_id, *, doc_id, status, fingerprint=None):
         writes.append((ingest_source, source_id, doc_id, status))
 
     async def _fake_load(ingest_source):
-        return dict(existing or {})
+        return dict(state)
+
+    async def _fake_delete(ingest_source, source_id):
+        state.pop(source_id, None)
 
     monkeypatch.setattr(od.ledger, "upsert", _fake_upsert)
     monkeypatch.setattr(od.ledger, "load", _fake_load)
+    monkeypatch.setattr(od.ledger, "delete", _fake_delete)
     return writes
 
 
@@ -420,6 +467,101 @@ def test_ingest_document_sibling_key_not_treated_as_already_ingested(monkeypatch
 
 
 # --------------------------------------------------------------------------- #
+#  #79 — multi-section survives LightRAG filename-dedup (the invisible bug)     #
+# --------------------------------------------------------------------------- #
+
+def test_multi_section_survives_lightrag_filename_dedup(monkeypatch, tmp_path):
+    """#79 REGRESSION: a multi-section doc must not lose sections to LightRAG's filename-dedup.
+
+    FAILS against the OLD shared-file_path code: sections 1..N reuse section 0's file_path, so
+    LightRAG drops them at enqueue (no doc_status) → reconcile flips them to `error` → done=1,
+    error=N-1 (the observed 38-section→1 silent loss). PASSES after the fix: each section gets a
+    UNIQUE file_path → all N land → done=N, error=0. `DedupRag` simulates the exact enqueue-time
+    filename-dedup (drops a doc_id reusing an already-seen file_path)."""
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    writes = _patch_ledger(monkeypatch)
+    # 6 small heading-blocks, cap=6 forces each into its own section → 6 sections.
+    md = "\n\n".join(f"# H{i}\nalpha beta" for i in range(6))
+    p = tmp_path / "book.md"
+    p.write_text(md, encoding="utf-8")
+
+    rag = DedupRag(doc_status="processed")
+    out = _run(od.ingest_document(
+        rag, "textbook", "textbook:Schlickeiser2002", str(p),
+        tokenizer=FakeTok(), max_tokens=6,
+    ))
+    assert out["sections"] == 6                       # the doc really did split into 6 sections
+    assert out["done"] == out["sections"]             # ALL survived the dedup (was 1 pre-fix)
+    assert out["error"] == 0
+    # every enqueued section carried a DISTINCT file_path — the fix that defeats the dedup.
+    assert len(set(rag.enqueued["file_paths"])) == out["sections"]
+    # ledger recorded a done row per section (none wedged in error).
+    dones = [w for w in writes if w[3] == "done"]
+    assert len(dones) == out["sections"]
+
+
+# --------------------------------------------------------------------------- #
+#  #79 — --force purges a stuck/existing key then re-ingests                    #
+# --------------------------------------------------------------------------- #
+
+def _rec(doc_id: str, source_id: str) -> LedgerRecord:
+    return LedgerRecord(
+        workspace="test", ingest_source="textbook", source_id=source_id,
+        fingerprint="fp", doc_id=doc_id, status="error",
+    )
+
+
+def test_ingest_document_force_purges_then_reingests(monkeypatch, tmp_path):
+    """#79 --force: an already-ingested (here half-committed/errored) key is PURGED — its
+    landed graph docs (adelete_by_doc_id) + ledger rows (ledger.delete) removed — then
+    re-ingested clean, instead of being refused forever by the push-once guard."""
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    # a prior push left 2 section rows for this key (e.g. the pre-fix wedge: s0 done, s1 error).
+    existing = {
+        "Schlickeiser2002#s0": _rec("textbook:Schlickeiser2002#s0", "Schlickeiser2002#s0"),
+        "Schlickeiser2002#s1": _rec("textbook:Schlickeiser2002#s1", "Schlickeiser2002#s1"),
+    }
+    writes = _patch_ledger(monkeypatch, existing=existing)
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta\n\n# B\ndelta epsilon", encoding="utf-8")
+
+    rag = FakeRag(doc_status="processed")
+    out = _run(od.ingest_document(
+        rag, "textbook", "textbook:Schlickeiser2002", str(p),
+        tokenizer=FakeTok(), max_tokens=6, force=True,
+    ))
+    # purge deleted BOTH prior ledger rows and BOTH landed graph docs (by their stored doc_ids).
+    assert out["purged"]["ledger_rows_deleted"] == 2
+    assert out["purged"]["docs_deleted"] == 2
+    assert out["purged"]["docs_failed"] == 0
+    assert set(rag.deleted_doc_ids) == {
+        "textbook:Schlickeiser2002#s0", "textbook:Schlickeiser2002#s1",
+    }
+    # …and the re-ingest then SUCCEEDED (push-once did not fire — purge cleared the rows).
+    assert out["done"] == out["sections"] and out["sections"] >= 2 and out["error"] == 0
+    # the re-ingest wrote fresh processing rows (post-purge).
+    assert any(w[3] == "processing" for w in writes)
+
+
+def test_force_purge_of_absent_key_is_noop_then_ingests(monkeypatch, tmp_path):
+    """--force on a key that was never ingested is a clean no-op purge (0 rows), then a normal
+    first ingest — --force must be safe to pass unconditionally."""
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_ledger(monkeypatch)  # empty ledger
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta\n\n# B\ndelta epsilon", encoding="utf-8")
+
+    rag = FakeRag(doc_status="processed")
+    out = _run(od.ingest_document(
+        rag, "textbook", "textbook:Schlickeiser2002", str(p),
+        tokenizer=FakeTok(), max_tokens=6, force=True,
+    ))
+    assert out["purged"]["ledger_rows_deleted"] == 0
+    assert rag.deleted_doc_ids == []
+    assert out["done"] == out["sections"] and out["error"] == 0
+
+
+# --------------------------------------------------------------------------- #
 #  synth credibility label for operator-doc colon keys (#4)                    #
 # --------------------------------------------------------------------------- #
 
@@ -435,3 +577,19 @@ def test_source_label_operator_colon_keys():
     assert _source_label("paper/Reames2023") == ("Reames2023", "empirical")
     # an unknown colon source is not banded → falls back to unknown/preliminary.
     assert _source_label("bogus:x") == ("unknown", "preliminary")
+    # #79: a per-section file_path (`<key>#s<N>`) attributes to the WHOLE book (suffix stripped),
+    # so all sections of one book cite as one key; the credibility band is unchanged.
+    assert _source_label("textbook:Schlickeiser2002#s0") == ("textbook:Schlickeiser2002", "established")
+    assert _source_label("textbook:Schlickeiser2002#s37") == ("textbook:Schlickeiser2002", "established")
+    assert _source_label("notebook:idea23-c12#s2") == ("notebook:idea23-c12", "preliminary")
+
+
+def test_strip_section_suffix():
+    # multi-section file_path → book-level key; bare/paper keys unchanged; only a trailing #s<N>.
+    assert od.strip_section_suffix("textbook:Schlickeiser2002#s0") == "textbook:Schlickeiser2002"
+    assert od.strip_section_suffix("textbook:Schlickeiser2002#s37") == "textbook:Schlickeiser2002"
+    assert od.strip_section_suffix("textbook:Schlickeiser2002") == "textbook:Schlickeiser2002"
+    assert od.strip_section_suffix("paper/Reames2023") == "paper/Reames2023"
+    assert od.strip_section_suffix("notebook:idea-c12") == "notebook:idea-c12"
+    # not a section suffix — a mid-string #s or a non-numeric tail is left intact.
+    assert od.strip_section_suffix("textbook:X2020#section") == "textbook:X2020#section"

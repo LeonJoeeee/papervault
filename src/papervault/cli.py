@@ -446,7 +446,10 @@ def serve(mcp_args: tuple[str, ...]) -> None:
               help="provenance key: textbook:AuthorYear or notebook:<idea>-<scope>")
 @click.option("--max-tokens", type=int, default=None,
               help="max tokens per ingested section (default PAPERVAULT_DOC_MAX_TOKENS=2400)")
-def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
+@click.option("--force", is_flag=True,
+              help="if the key already exists, PURGE it (ledger rows + landed graph docs) "
+                   "then re-ingest — the escape hatch for a half-committed / stale key (#79)")
+def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None, force: bool) -> None:
     """Ingest an OPERATOR-supplied document into the knowledge graph with typed provenance.
 
     A markdown (.md) or plain-text (.txt) file the operator brings by hand — a canonical
@@ -465,10 +468,13 @@ def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
     papervault.service (or the MinerU unit) is systemd-active (DB co-write corruption risk).
     Stop the service first, or set KS_INGEST_ALLOW_COTENANCY=1 to override deliberately.
 
+    Re-ingest: an already-ingested key is REFUSED by default (push-once). Pass --force to
+    PURGE the prior ingest first (its ledger rows + landed graph docs) then re-ingest clean —
+    the escape hatch for a key left half-committed (#79) or one you want to replace wholesale.
+
     Out of scope for v1: retrieval weighting for canonical sources (#46), domain-pack
-    textbook lists, PDF OCR (supply extracted md/txt), and re-ingest of appended notebooks
-    (v1 is push-once — re-ingesting an already-ingested key is refused; --force/supersede is
-    future work).
+    textbook lists, PDF OCR (supply extracted md/txt), and INCREMENTAL re-ingest of appended
+    notebooks (--force is a full purge+replace, not an append).
     """
     import asyncio
 
@@ -506,7 +512,9 @@ def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
 
         rag = await get_graph()  # workspace-gated (refuses prod 'l0' without opt-in)
         try:
-            return await ingest_document(rag, kind, key, str(path), max_tokens=max_tokens)
+            return await ingest_document(
+                rag, kind, key, str(path), max_tokens=max_tokens, force=force
+            )
         finally:
             # Flush LightRAG storage backends BEFORE dropping the singleton (finalize_storages
             # is the counterpart to initialize_storages) — a maintenance-window write must not
@@ -519,6 +527,13 @@ def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None) -> None:
         result = asyncio.run(_go())
     except AlreadyIngestedError as e:
         raise click.ClickException(str(e))
+    purged = result.get("purged")
+    if purged:
+        msg = (f"purged prior '{key}': {purged['ledger_rows_deleted']} ledger row(s), "
+               f"{purged['docs_deleted']} graph doc(s) deleted")
+        if purged.get("docs_failed"):
+            msg += f", {purged['docs_failed']} graph delete(s) FAILED (see log)"
+        click.echo(msg)
     click.echo(
         f"ingested {result['key']} ({result['kind']}): {result['sections']} section(s) — "
         f"done={result.get('done', 0)} error={result.get('error', 0)} "

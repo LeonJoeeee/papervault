@@ -25,6 +25,7 @@ from typing import Any
 
 from openai import APIConnectionError
 
+from papervault.knowledge.ingest.operator_docs import strip_section_suffix
 from papervault.knowledge.store.llm import _error_code, mimo_complete
 from papervault.llm_routing import route
 
@@ -163,7 +164,9 @@ def _source_label(file_path: str) -> tuple[str, str]:
       - operator docs (#45/#47): the COLON provenance key itself ('textbook:AuthorYear',
         'notebook:idea-scope') — slash-free so it survives LightRAG 1.5 basenaming. The
         source class in the prefix sets the credibility band (textbook→established); the
-        whole key is the label (attributed inline in prose, not [bracketed]).
+        whole key is the label (attributed inline in prose, not [bracketed]). A multi-section
+        doc carries a per-section file_path (`<key>#s<N>`, issue #79) — strip the `#s<N>` so
+        the label attributes to the WHOLE book/notebook, not one section.
     """
     if not file_path:
         return ("unknown", "preliminary")
@@ -171,7 +174,8 @@ def _source_label(file_path: str) -> tuple[str, str]:
     if "/" not in file_path and ":" in file_path:
         source = file_path.split(":", 1)[0]
         if source in _CRED_BY_SOURCE:
-            return (file_path, _CRED_BY_SOURCE[source])
+            # #79: drop the per-section suffix so the cite is the book-level key.
+            return (strip_section_suffix(file_path), _CRED_BY_SOURCE[source])
     if "/" not in file_path:
         return ("unknown", "preliminary")
     source, _, sid = file_path.partition("/")

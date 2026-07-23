@@ -32,18 +32,25 @@ def _run(coro):
 
 class FakeIngest:
     """Stand-in for `ingest_document` — records each call (kind/key/path/force) and, per key,
-    optionally raises a preconfigured exception. Lets the routing tests drive every branch
-    (success / AlreadyIngested / disabled / other-error) with no graph, ledger, or LLM."""
+    optionally raises a preconfigured exception OR RETURNS a preconfigured done/error split.
+    Lets the routing tests drive every branch (full success / partial / done==0-nothing-built /
+    AlreadyIngested / disabled / other-error) with no graph, ledger, or LLM. The default return
+    is a clean full success (done=1/error=0); `return_for[key]` overrides the done/error split
+    for a key (the #84 branches: done=0 real failure, done>0/error>0 partial)."""
 
     def __init__(self):
         self.calls: list[dict] = []
         self.raise_for: dict[str, Exception] = {}
+        self.return_for: dict[str, dict] = {}
 
     async def __call__(self, rag, kind, key, path, *, force=False):
         self.calls.append({"kind": kind, "key": key, "path": path, "force": force})
         exc = self.raise_for.get(key)
         if exc is not None:
             raise exc
+        override = self.return_for.get(key)
+        if override is not None:
+            return {"key": key, "kind": kind, "pending": 0, **override}
         return {"key": key, "kind": kind, "sections": 1, "done": 1, "error": 0, "pending": 0}
 
 
@@ -221,9 +228,79 @@ def test_one_bad_file_does_not_block_the_rest(pending):
     _drop(d, "textbook-Good2020.md")
     counts = _run(drain_pending(rag=object()))
 
-    assert counts == {"ingested": 1, "already": 0, "failed": 1, "disabled": 0, "deferred": 0}
+    assert counts == {
+        "ingested": 1, "already": 0, "failed": 1, "partial": 0, "disabled": 0, "deferred": 0}
     assert (d / "failed" / "textbook-Bad2020.md").exists()
     assert (d / "processed" / "textbook-Good2020.md").exists()
+
+
+# --------------------------------------------------------------------------- #
+#  (#84) ingest_document RETURNS a done/error split — a return is NOT success   #
+#        done==0 (NOTHING built) → failed/ + .reason; done>0/error>0 → partial  #
+# --------------------------------------------------------------------------- #
+
+def test_done_zero_routes_to_failed_not_silently_processed(pending):
+    """#84 regression: `ingest_document` RETURNS (no exception) with done=0 — EVERY section
+    failed to build (a transient build outage; textbook:Bubeck2015 = done=0/error=51 during the
+    #84 embedding break). The drain MUST NOT treat this as success: route to failed/ (NOT
+    processed/), count it `failed` (NOT `ingested`), and drop a `.reason` note — so the book is
+    visibly failed + re-droppable, never silently marked done and lost."""
+    d, fake = pending
+    fake.return_for["textbook:Bubeck2015"] = {"sections": 51, "done": 0, "error": 51}
+    _drop(d, "textbook-Bubeck2015.md")
+
+    counts = _run(drain_pending(rag=object()))
+
+    assert counts["failed"] == 1
+    assert counts["ingested"] == 0 and counts["partial"] == 0
+    # routed to failed/, NOT silently marked done in processed/ (the actual #84 bug).
+    assert (d / "failed" / "textbook-Bubeck2015.md").exists()
+    assert not (d / "processed" / "textbook-Bubeck2015.md").exists()
+    assert not (d / "textbook-Bubeck2015.md").exists()
+    # a `.reason` note records the done/error split so it reads as re-droppable, not a defect.
+    reason = d / "failed" / "textbook-Bubeck2015.md.reason"
+    assert reason.exists()
+    body = reason.read_text(encoding="utf-8")
+    assert "done=0" in body and "error=51" in body
+
+
+def test_done_zero_reason_and_sidecar_follow_to_failed(pending):
+    """A done==0 failure carries its `.force` sidecar to failed/ (like any failed move) AND the
+    `.reason` note lands beside it — so a re-drop is a clean, self-documenting retry."""
+    d, fake = pending
+    fake.return_for["textbook:Foo2020"] = {"sections": 3, "done": 0, "error": 3}
+    _drop(d, "textbook-Foo2020.md", force=True)
+
+    counts = _run(drain_pending(rag=object()))
+
+    assert counts["failed"] == 1
+    assert (d / "failed" / "textbook-Foo2020.md").exists()
+    assert (d / "failed" / "textbook-Foo2020.md.force").exists()       # sidecar follows the doc
+    assert (d / "failed" / "textbook-Foo2020.md.reason").exists()      # reason note beside it
+    assert not (d / "processed" / "textbook-Foo2020.md").exists()
+
+
+def test_partial_ingest_moves_to_processed_with_loud_warning(pending, caplog):
+    """done>0 AND error>0 — some sections landed in the graph, some errored. The landed sections
+    ARE ingested (re-scanning would hit push-once), so the file moves to processed/ — but a LOUD
+    warning records the split so an operator can re-drop with `.force` to rebuild the errored
+    sections. Counted `partial` (disjoint from `ingested` and `failed`)."""
+    d, fake = pending
+    fake.return_for["textbook:Foo2020"] = {"sections": 5, "done": 3, "error": 2}
+    _drop(d, "textbook-Foo2020.md")
+
+    with caplog.at_level(logging.WARNING, logger="ks.scheduler.opdoc_pickup"):
+        counts = _run(drain_pending(rag=object()))
+
+    assert counts["partial"] == 1
+    assert counts["ingested"] == 0 and counts["failed"] == 0
+    assert (d / "processed" / "textbook-Foo2020.md").exists()          # landed sections are in
+    assert not (d / "failed" / "textbook-Foo2020.md").exists()
+    # LOUD warning naming the done/error split (so a partial is never silent).
+    partial_warnings = [r for r in caplog.records if "PARTIAL" in r.getMessage()]
+    assert len(partial_warnings) == 1
+    assert "done=3" in partial_warnings[0].getMessage()
+    assert "error=2" in partial_warnings[0].getMessage()
 
 
 # --------------------------------------------------------------------------- #
@@ -261,14 +338,16 @@ def test_non_matching_files_ignored(pending):
     counts = _run(drain_pending(rag=object()))
 
     assert fake.calls == []                       # nothing derivable as an operator doc
-    assert counts == {"ingested": 0, "already": 0, "failed": 0, "disabled": 0, "deferred": 0}
+    assert counts == {
+        "ingested": 0, "already": 0, "failed": 0, "partial": 0, "disabled": 0, "deferred": 0}
     assert (d / "README.md").exists()             # untouched
 
 
 def test_missing_pending_dir_is_noop(tmp_path, monkeypatch):
     monkeypatch.setenv("KS_OPDOC_PENDING_DIR", str(tmp_path / "does-not-exist"))
     counts = _run(drain_pending(rag=object()))
-    assert counts == {"ingested": 0, "already": 0, "failed": 0, "disabled": 0, "deferred": 0}
+    assert counts == {
+        "ingested": 0, "already": 0, "failed": 0, "partial": 0, "disabled": 0, "deferred": 0}
 
 
 # --------------------------------------------------------------------------- #

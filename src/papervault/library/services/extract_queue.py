@@ -291,9 +291,12 @@ class ExtractQueue:
             _note_mineru_activity()
             # fd-watermark early-warning (#93): the extract worker is the OCR
             # critical path where sockets to the MinerU/gateway backends are
-            # opened, so this is the most relevant host for the cheap, throttled
-            # (≤1 line/60s) open-fd check — it fires LOUD near the soft-limit
-            # cliff instead of failing silently with 'Too many open files'.
+            # opened, so this is the most relevant host for the cheap open-fd
+            # check — it fires LOUD near the soft-limit cliff instead of failing
+            # silently with 'Too many open files'. Runs once PER PAPER here (the
+            # underlying /proc/self/fd listing is not gated by the warn throttle
+            # — see check_fd_watermark — but it is microseconds, so per-paper is
+            # fine); only the WARN LINE is throttled to ≤1/60s.
             check_fd_watermark(log)
             try:
                 await self._process_one(key, priority)

@@ -322,7 +322,16 @@ def _incref_current_loop() -> None:
 
 async def _decref_current_loop_and_maybe_close() -> None:
     """Decrement the current loop's in-flight parse count; when it reaches 0,
-    aclose + evict this loop's cached mineru async client (the #93 fix)."""
+    aclose + evict this loop's cached mineru async client (the #93 fix).
+
+    Under a SERIAL drain (one book at a time on the daemon loop) this closes +
+    rebuilds the client once per book. That is INTENTIONAL and negligible: the
+    MinerU endpoint is loopback plain HTTP (no TLS handshake), so a fresh
+    httpx.AsyncClient + TCP connect costs microseconds against a multi-second
+    GPU parse — and the singleton predictor (model-name, etc.) is untouched, only
+    its per-loop httpx client is rebuilt. When parses overlap (the up-to
+    _EXTRACT_CONCURRENCY daemon path) the client is reused until the burst drains
+    to 0, so the hot path keeps its pooled connections."""
     loop = asyncio.get_running_loop()
     n = _loop_parse_refcounts.get(loop, 0) - 1
     if n > 0:
@@ -379,8 +388,15 @@ def check_fd_watermark(logger: Optional[logging.Logger] = None) -> None:
     Warn (at most once per ``_FD_WARN_INTERVAL`` s) when the process's open-fd
     count crosses ``_FD_WARN_FRACTION`` of the ``RLIMIT_NOFILE`` SOFT limit, so
     the next fd/socket leak fails LOUD early instead of silently at the
-    'Too many open files' cliff. Best-effort: any error is swallowed, and the
-    check is O(dir-listing) so it is safe to call on a hot loop."""
+    'Too many open files' cliff. Best-effort: any error is swallowed.
+
+    Placement/throttle note: the throttle timestamp advances ONLY when a warn
+    actually fires, so in the healthy case (fds below the threshold) the early
+    ``return`` never triggers and the ``resource.getrlimit`` + ``os.listdir``
+    run on EVERY call — i.e. once per paper at the intended extract-worker host.
+    That is deliberate and cheap (an fd-dir listing of a few hundred entries is
+    microseconds); the 60 s throttle exists only to de-dupe the WARN LINE during
+    a sustained high-fd condition, not to gate the (negligible) probe cost."""
     global _fd_warn_last_log
     try:
         now = time.monotonic()

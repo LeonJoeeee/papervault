@@ -47,6 +47,7 @@ from ..extract import (
     _LONG_PAPER_PAGE_THRESHOLD,
     extract_md,
 )
+from ..mineru_client import check_fd_watermark
 from ..store import Library
 from . import concurrency
 from .classify import EXTRACT, classify
@@ -288,6 +289,12 @@ class ExtractQueue:
             # timeout doesn't let the monitor stop the server out from under the
             # extract we're about to run (review fix #5).
             _note_mineru_activity()
+            # fd-watermark early-warning (#93): the extract worker is the OCR
+            # critical path where sockets to the MinerU/gateway backends are
+            # opened, so this is the most relevant host for the cheap, throttled
+            # (≤1 line/60s) open-fd check — it fires LOUD near the soft-limit
+            # cliff instead of failing silently with 'Too many open files'.
+            check_fd_watermark(log)
             try:
                 await self._process_one(key, priority)
             except asyncio.CancelledError:

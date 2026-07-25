@@ -16,7 +16,10 @@ THE GENERAL "any input → document → RAG" QUEUE. This is one queue with one s
 the input type just picks a preprocessing front-end that all converge on the SAME
 `ingest_document` call:
   - `textbook-<Key>.md` / `.markdown`  → ingested directly (heading-aware chunking).
-  - `textbook-<Key>.pdf`               → OCR'd to markdown via the SHARED MinerU pipeline
+  - `textbook-<Key>.pdf`               → STRUCTURALLY pre-validated (issue #89: the same
+                                         isolated-subprocess `pdf_probe` the paper extract path
+                                         runs — `%PDF` magic + a pypdf page-count parse), THEN
+                                         OCR'd to markdown via the SHARED MinerU pipeline
                                          (`mineru_client.extract_mineru`, the very engine the
                                          paper-library extract path uses), then the produced
                                          md is fed through `ingest_document` exactly like a
@@ -26,7 +29,26 @@ the input type just picks a preprocessing front-end that all converge on the SAM
                                          The dispatch below is shaped so adding it is a new
                                          suffix branch that also converges on `ingest_document`.
 
+CORRUPT-PDF DRAIN-STALL GUARD (issue #89). A PDF with a VALID `%PDF` magic but a broken
+internal structure (missing trailer / bad xref — an operator's truncated download) makes
+MinerU's pdfium document-loader retry-loop WITHOUT converging. Because the drain runs inside
+the single SERIAL scheduler `main_loop`, that once froze the WHOLE KS scheduler for ~30 min
+(no `run_round`, no other textbooks built) until the OCR call finally errored on its own. The
+paper extract path never had this problem — it runs `pdf_probe` (an isolated-subprocess `%PDF`
++ pypdf page-count check) BEFORE OCR and passes a `wall_clock_deadline` into `extract_mineru`.
+The drain had NEITHER guard. Both are now mirrored here:
+  - PRE-OCR PROBE (primary): every `.pdf` drop is run through `library.extract.pdf_probe`
+    (off-loop) BEFORE any OCR; a corrupt/unparseable file → `failed/` + a `.reason` note,
+    OCR skipped entirely. This catches the common corrupt-drop case in milliseconds.
+  - BOUNDED OCR CALL (backstop): `_ocr_to_staged_md` threads a `wall_clock_deadline`
+    (`KS_OPDOC_OCR_TIMEOUT_SEC`, default 30 min) into `extract_mineru`, so even a corruption
+    the probe misses (or a server-side hang) costs ONE bounded period, never an indefinite
+    stall — on the cap the client raises `MineruExtractionError` (server alive) → failed/, or
+    `MineruTransportError` (server dead) → left in pending.
+
 PDF OCR error routing mirrors the paper extract path's transport-vs-extraction split (C1):
+  - CORRUPT/UNPARSEABLE PDF (pre-OCR probe `bad`) → move to failed/ + `.reason`, NEVER call
+    OCR (issue #89). Terminal: re-dropping the same bytes fails identically (a bad copy).
   - `MineruTransportError` (MinerU down/unreachable — TRANSIENT) → LEAVE the pdf in pending
     and retry next round when MinerU is back; log ONCE (the SourceDisabled pattern). Never
     move to failed/ — a server outage must not condemn a good PDF.
@@ -75,6 +97,7 @@ import asyncio
 import logging
 import os
 import shutil
+import time
 from pathlib import Path
 
 from papervault.knowledge.ingest.operator_docs import (
@@ -84,6 +107,12 @@ from papervault.knowledge.ingest.operator_docs import (
     check_source_enabled,
     ingest_document,
 )
+# The SAME isolated-subprocess structural PDF probe the paper extract path runs (%PDF magic +
+# a pypdf page-count parse in a throwaway child with a hard wall-clock alarm). Reused verbatim
+# here (issue #89) so the operator-drain PDF front-end validates identically to the paper path
+# before OCR. Import is light — it pulls no torch / mineru (verified) and library never imports
+# knowledge, so there is no cycle.
+from papervault.library.extract import pdf_probe
 from papervault.library.mineru_client import (
     MineruExtractionError,
     MineruTransportError,
@@ -122,6 +151,31 @@ _mineru_down_logged: set[str] = set()
 
 def _pending_dir() -> Path:
     return Path(os.getenv("KS_OPDOC_PENDING_DIR", DEFAULT_PENDING_DIR))
+
+
+# Backstop wall-clock cap for ONE operator-doc OCR call (issue #89), read per-call (like
+# `_pending_dir`) so an operator can retune it without a code edit. Default 30 min — matches
+# the paper extract ceiling (PAPER_LIBRARY_EXTRACT_CEILING_SECONDS), which is proven not to
+# kill a legitimate large-document OCR. The primary corruption defence is the cheap pre-OCR
+# `pdf_probe`; this only bounds a corruption the probe MISSED or a genuine server-side hang.
+_DEFAULT_OCR_TIMEOUT_SEC = 30 * 60.0
+
+
+def _ocr_timeout_seconds() -> float:
+    """Seconds to bound a single `extract_mineru` OCR call in the drain (issue #89).
+
+    Threaded into `extract_mineru` as a `wall_clock_deadline`. When the cap fires while the
+    MinerU server is ALIVE (a slow/looping doc read-timing-out) the client raises
+    `MineruExtractionError` → the pdf is routed to failed/; when it fires while the server is
+    DEAD the client raises `MineruTransportError` → the pdf is left in pending (deferred). A
+    value <= 0 DISABLES the backstop (deadline=None) — the call is then bounded only by the
+    mineru_client's own per-request http_timeout × inline-retry budget (the pre-#89 behaviour),
+    an escape hatch for an operator loading a document larger than the default cap allows.
+    """
+    try:
+        return float(os.getenv("KS_OPDOC_OCR_TIMEOUT_SEC", str(_DEFAULT_OCR_TIMEOUT_SEC)))
+    except (TypeError, ValueError):
+        return _DEFAULT_OCR_TIMEOUT_SEC
 
 
 def parse_drop_name(name: str) -> tuple[str, str] | None:
@@ -175,9 +229,22 @@ async def _ocr_to_staged_md(pdf_path: Path) -> Path:
 
     Raises `MineruTransportError` (server down/unreachable — TRANSIENT, caller leaves the pdf
     in pending) or `MineruExtractionError` (per-doc OCR defect — TERMINAL, caller → failed/).
+
+    BOUNDED (issue #89): the call carries a `wall_clock_deadline` (`KS_OPDOC_OCR_TIMEOUT_SEC`,
+    default 30 min) so a corrupt PDF that slipped past the pre-OCR probe — or any server-side
+    hang — can NEVER stall this serial drain indefinitely. Crossing the cap raises
+    `MineruExtractionError` (server alive → the caller routes to failed/) or `MineruTransportError`
+    (server dead → the caller leaves the pdf in pending). Before #89 the drain passed NO deadline,
+    so a doomed file was bounded only by the client's per-request http_timeout × inline retries
+    (~40 min worst case) — the root of the 30-min stall this guards.
     """
     pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
-    md_text = await extract_mineru(pdf_bytes, endpoints_from_env(), stem=pdf_path.stem)
+    timeout = _ocr_timeout_seconds()
+    deadline = time.time() + timeout if timeout > 0 else None
+    md_text = await extract_mineru(
+        pdf_bytes, endpoints_from_env(), stem=pdf_path.stem,
+        wall_clock_deadline=deadline,
+    )
 
     def _write() -> Path:
         staging = pdf_path.parent / _OCR_STAGING_SUBDIR
@@ -232,6 +299,32 @@ def _write_reason(dest_dir: Path, filename: str, key: str, result: dict) -> None
         log.warning("opdoc pickup: failed to write reason note for %s (%r)", filename, e)
 
 
+def _write_corrupt_pdf_reason(dest_dir: Path, filename: str, key: str, reason: str) -> None:
+    """Drop a `<filename>.reason` note beside a PDF routed to failed/ by the pre-OCR probe (#89).
+
+    Records that the file was rejected BEFORE any OCR call because it is not a parseable PDF
+    (`reason` = the pdf_probe verdict: `not_pdf` / `zero_pages` / `probe_timeout` / `probe_crash`
+    / `probe_spawn_error:*`), i.e. a valid `%PDF` magic hiding a broken internal structure
+    (missing trailer / bad xref) that would retry-loop MinerU's pdfium loader and stall the
+    drain. This is DISTINCT from the done==0 build-failure reason note: that one says "re-drop
+    to retry a transient outage"; THIS one says the bytes are corrupt, so a re-drop of the SAME
+    file fails identically — a good copy is needed. Best-effort: never raises (the failed/ move
+    already stands on its own)."""
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        (dest_dir / (filename + ".reason")).write_text(
+            f"{key}: corrupt/unparseable PDF — rejected pre-OCR by the structural probe "
+            f"(reason={reason}). The file has a valid %PDF header but a broken internal "
+            "structure (e.g. missing trailer / bad xref), which would retry-loop MinerU's "
+            "pdfium loader and stall the drain — so OCR was SKIPPED (issue #89). Re-dropping "
+            "the same bytes will fail identically; replace it with a non-corrupt copy of the PDF.\n",
+            encoding="utf-8",
+        )
+    except Exception as e:  # noqa: BLE001 — a reason-note write must not abort the drain
+        log.warning(
+            "opdoc pickup: failed to write corrupt-pdf reason note for %s (%r)", filename, e)
+
+
 async def drain_pending(rag) -> dict:
     """Scan the pending dir once and ingest each dropped operator doc against `rag`.
 
@@ -266,11 +359,10 @@ async def drain_pending(rag) -> dict:
         ingest_path = str(path)
         staged_md: Path | None = None
         if path.suffix.lower() == _PDF_SUFFIX:
+            # Gate BEFORE OCR: a disabled source must not burn a MinerU/GPU pass every
+            # round. ingest_document re-checks (harmlessly) once we reach it.
             try:
-                # Gate BEFORE OCR: a disabled source must not burn a MinerU/GPU pass every
-                # round. ingest_document re-checks (harmlessly) once we reach it.
                 check_source_enabled(kind)
-                staged_md = await _ocr_to_staged_md(path)
             except SourceDisabledError as e:
                 if str(path) not in _disabled_logged:
                     _disabled_logged.add(str(path))
@@ -280,6 +372,31 @@ async def drain_pending(rag) -> dict:
                     )
                 counts["disabled"] += 1
                 continue
+
+            # ── Pre-OCR structural validation (issue #89) ──────────────────────────────────
+            # A PDF with a VALID `%PDF` magic but a broken xref/trailer (an operator's truncated
+            # download) makes MinerU's pdfium loader retry-loop for ~30 min, freezing this SERIAL
+            # drain (and the whole scheduler) until OCR errors out on its own. Catch it CHEAPLY
+            # here with the SAME isolated-subprocess pypdf probe the paper extract path runs
+            # (%PDF magic + a page-count parse in a throwaway child with a hard wall-clock alarm),
+            # run OFF-LOOP so the probe never blocks the scheduler loop. A corrupt/unparseable
+            # file → failed/ + a `.reason` note, OCR skipped ENTIRELY. This is the PRIMARY
+            # corruption defence; `_ocr_to_staged_md`'s bounded call is the backstop for a miss.
+            probe = await asyncio.to_thread(pdf_probe, str(path))
+            if probe.bad:
+                log.error(
+                    "opdoc pickup: %s corrupt/unparseable PDF (%s) → failed/ — skipped OCR "
+                    "entirely (a broken xref/trailer would retry-loop MinerU's pdfium loader "
+                    "and stall the drain, issue #89). %s", key, probe.reason, path.name,
+                )
+                _mineru_down_logged.discard(str(path))
+                _move(path, failed_dir)
+                _write_corrupt_pdf_reason(failed_dir, path.name, key, probe.reason)
+                counts["failed"] += 1
+                continue
+
+            try:
+                staged_md = await _ocr_to_staged_md(path)
             except MineruTransportError as e:
                 # TRANSIENT: MinerU down/unreachable → LEAVE the pdf in pending (retry next
                 # round when MinerU is back). Do NOT move to failed/. Log ONCE (SourceDisabled

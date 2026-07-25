@@ -40,13 +40,18 @@ immediately (no retry — a retry hits the same wall).
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
+import resource
+import sys
 import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+log = logging.getLogger(__name__)
 
 
 # --------------------------- typed exceptions (C1) -------------------------
@@ -268,10 +273,185 @@ def _read_md_from_outdir(outdir: Path, stem: str) -> str:
     return text
 
 
+# ---------------- transport lifecycle: shared MinerU client (#93) ----------
+#
+# The OCR path delegates the actual HTTP to mineru's ``aio_do_parse``, which
+# drives a PROCESS-GLOBAL singleton ``HttpVlmClient``
+# (``mineru.backend.vlm.vlm_analyze.ModelSingleton``). That client caches ONE
+# ``httpx.AsyncClient`` PER EVENT LOOP and, on every loop switch, DROPS the
+# other loop's client WITHOUT ``aclose()``
+# (``mineru_vl_utils/vlm_client/http_client.py`` ``_aio_client`` ->
+# ``self._aio_client_cache.clear()``). Each dropped client keeps its pooled
+# keepalive sockets to the MinerU server OPEN, and is later GC'd against a
+# now-closed loop.
+#
+# On a SINGLE persistent loop this is harmless (one client, reused — verified
+# flat). But whenever OCR touches a SECOND event loop in the same process
+# (e.g. a transient ``asyncio.run`` turn beside the daemon's persistent loop),
+# every switch leaks the previous loop's pooled sockets: issue #93's outage
+# (~306 ESTABLISHED sockets to the MinerU port, ~2 leaked per OCR'd book,
+# 1024-fd cliff) and the ``'_UnixSelectorEventLoop' object has no attribute
+# '_ssock'`` teardown error (a dropped client finalized on its dead loop).
+#
+# Fix (transport-lifecycle only — call semantics/timeouts/retry/error model are
+# untouched): papervault owns the per-loop client's lifecycle. ``extract_mineru``
+# brackets each parse with a per-loop reference count; when the LAST in-flight
+# parse on a loop finishes (refcount hits 0), we ``aclose()`` THAT loop's cached
+# mineru client and evict it from mineru's cache — ON that loop, while it is
+# still alive, BEFORE it is torn down. Reference-counted so the up-to
+# ``_EXTRACT_CONCURRENCY`` concurrent parses on the daemon loop never close a
+# client another parse is still using. ALL access to mineru internals is GUARDED
+# (getattr / try) so a mineru build without these attributes — or a unit test
+# with a stubbed ``aio_do_parse`` — degrades to today's behaviour, never crashes.
+# ``PAPER_LIBRARY_MINERU_CLIENT_CLOSE=0`` disables the close (revert lever).
+
+_CLIENT_CLOSE_ENABLED = os.environ.get(
+    "PAPER_LIBRARY_MINERU_CLIENT_CLOSE", "1").strip().lower() in ("1", "true", "yes")
+
+# Per-event-loop count of extract_mineru calls currently in flight, keyed by the
+# loop object (matches mineru's own per-loop cache key). Only ever touched from
+# ON the loop it counts, so no lock is needed (asyncio is single-threaded per
+# loop). Entries are popped at refcount 0, so a transient loop is not pinned.
+_loop_parse_refcounts: "dict[object, int]" = {}
+
+
+def _incref_current_loop() -> None:
+    loop = asyncio.get_running_loop()
+    _loop_parse_refcounts[loop] = _loop_parse_refcounts.get(loop, 0) + 1
+
+
+async def _decref_current_loop_and_maybe_close() -> None:
+    """Decrement the current loop's in-flight parse count; when it reaches 0,
+    aclose + evict this loop's cached mineru async client (the #93 fix).
+
+    Under a SERIAL drain (one book at a time on the daemon loop) this closes +
+    rebuilds the client once per book. That is INTENTIONAL and negligible: the
+    MinerU endpoint is loopback plain HTTP (no TLS handshake), so a fresh
+    httpx.AsyncClient + TCP connect costs microseconds against a multi-second
+    GPU parse — and the singleton predictor (model-name, etc.) is untouched, only
+    its per-loop httpx client is rebuilt. When parses overlap (the up-to
+    _EXTRACT_CONCURRENCY daemon path) the client is reused until the burst drains
+    to 0, so the hot path keeps its pooled connections."""
+    loop = asyncio.get_running_loop()
+    n = _loop_parse_refcounts.get(loop, 0) - 1
+    if n > 0:
+        _loop_parse_refcounts[loop] = n
+        return
+    _loop_parse_refcounts.pop(loop, None)
+    if _CLIENT_CLOSE_ENABLED:
+        await _close_mineru_client_for_loop(loop)
+
+
+async def _close_mineru_client_for_loop(loop) -> None:
+    """aclose() + evict the mineru singleton's cached ``httpx.AsyncClient`` for
+    ``loop`` (must be the running loop, so aclose runs on the client's own loop).
+
+    Fully guarded/best-effort: a mineru without the expected internals, or any
+    aclose error, is swallowed — closing the client must never fail an extract.
+    """
+    # Only touch mineru's singleton if its VLM backend is ALREADY imported in
+    # this process (a real parse ran). Never TRIGGER the heavy torch/vllm import
+    # just to clean up — a unit test with a stubbed aio_do_parse (mineru's VLM
+    # backend never loaded) must stay light and hit the no-op path here.
+    mod = sys.modules.get("mineru.backend.vlm.vlm_analyze")
+    ModelSingleton = getattr(mod, "ModelSingleton", None) if mod is not None else None
+    if ModelSingleton is None:  # pragma: no cover - no real OCR in this process
+        return
+    try:
+        predictors = list(getattr(ModelSingleton(), "_models", {}).values())
+    except Exception:  # noqa: BLE001 - never break the extract on cleanup
+        return
+    for predictor in predictors:
+        client = getattr(predictor, "client", None)
+        cache = getattr(client, "_aio_client_cache", None)
+        if not isinstance(cache, dict):
+            continue
+        aio = cache.pop(loop, None)
+        if aio is None:
+            continue
+        try:
+            await aio.aclose()
+        except Exception:  # noqa: BLE001 - best-effort transport teardown
+            pass
+
+
+# ------------------------- fd-watermark guard (#93) ------------------------
+
+_FD_WARN_FRACTION = float(os.environ.get("PAPER_LIBRARY_FD_WARN_FRACTION", "0.6"))
+_FD_WARN_INTERVAL = 60.0     # at most one warn line per this many seconds
+_fd_warn_last_log = 0.0
+
+
+def check_fd_watermark(logger: Optional[logging.Logger] = None) -> None:
+    """Cheap, throttled open-fd watermark check (issue #93).
+
+    Warn (at most once per ``_FD_WARN_INTERVAL`` s) when the process's open-fd
+    count crosses ``_FD_WARN_FRACTION`` of the ``RLIMIT_NOFILE`` SOFT limit, so
+    the next fd/socket leak fails LOUD early instead of silently at the
+    'Too many open files' cliff. Best-effort: any error is swallowed.
+
+    Placement/throttle note: the throttle timestamp advances ONLY when a warn
+    actually fires, so in the healthy case (fds below the threshold) the early
+    ``return`` never triggers and the ``resource.getrlimit`` + ``os.listdir``
+    run on EVERY call — i.e. once per paper at the intended extract-worker host.
+    That is deliberate and cheap (an fd-dir listing of a few hundred entries is
+    microseconds); the 60 s throttle exists only to de-dupe the WARN LINE during
+    a sustained high-fd condition, not to gate the (negligible) probe cost."""
+    global _fd_warn_last_log
+    try:
+        now = time.monotonic()
+        if now - _fd_warn_last_log < _FD_WARN_INTERVAL:
+            return
+        soft, _hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if not soft or soft <= 0:
+            return
+        n = len(os.listdir("/proc/self/fd"))
+        if n >= _FD_WARN_FRACTION * soft:
+            _fd_warn_last_log = now
+            (logger or log).warning(
+                "open-fd watermark: %d/%d fds (%.0f%% of the soft limit) — "
+                "possible fd/socket leak (see issue #93)",
+                n, soft, 100.0 * n / soft)
+    except Exception:  # noqa: BLE001 - a health probe must never raise
+        pass
+
+
 # ------------------------------- main entry --------------------------------
 
 
 async def extract_mineru(
+    pdf_bytes: bytes,
+    endpoints: list[Endpoint],
+    *,
+    stem: str = "doc",
+    http_timeout: float = _MINERU_HTTP_TIMEOUT,
+    wall_clock_deadline: Optional[float] = None,
+) -> str:
+    """One whole-PDF MinerU parse → returns the markdown string.
+
+    Thin transport-lifecycle wrapper (issue #93) around :func:`_extract_mineru_impl`:
+    it reference-counts in-flight parses PER EVENT LOOP and, when the last parse
+    on this loop finishes, aclose()s + evicts this loop's cached mineru async
+    client so its pooled sockets never leak on a later loop switch. The parse
+    logic, error model, timeouts and retries are entirely in the impl below —
+    UNCHANGED. See the "transport lifecycle" block above for the mechanism.
+    """
+    if not endpoints:
+        raise MineruTransportError("no_endpoints_configured")
+    _incref_current_loop()
+    try:
+        return await _extract_mineru_impl(
+            pdf_bytes,
+            endpoints,
+            stem=stem,
+            http_timeout=http_timeout,
+            wall_clock_deadline=wall_clock_deadline,
+        )
+    finally:
+        await _decref_current_loop_and_maybe_close()
+
+
+async def _extract_mineru_impl(
     pdf_bytes: bytes,
     endpoints: list[Endpoint],
     *,

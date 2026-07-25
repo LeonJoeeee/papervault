@@ -11,6 +11,10 @@ smoke (SDD §8.B), not here.
 from __future__ import annotations
 
 import asyncio
+import os
+import sys
+import types
+from unittest.mock import Mock
 
 import pytest
 
@@ -270,3 +274,236 @@ def test_connect_fail_exhausted_is_transport(monkeypatch):
     eps = [mc.Endpoint("a", "http://a:30000")]
     with pytest.raises(mc.MineruTransportError):
         asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
+
+
+# =================== transport-lifecycle: per-loop client close (#93) =========
+#
+# These are PURE-PYTHON regression tests for the socket-leak fix: NO mineru
+# install and NO live server. They fake ``sys.modules["mineru.backend.vlm.
+# vlm_analyze"]`` with a stub ``ModelSingleton`` -> predictor -> client ->
+# ``_aio_client_cache`` graph, exactly the internals ``_close_mineru_client_for_loop``
+# walks, and assert the refcount / eviction / kill-switch / fd-guard behaviour so a
+# future refactor can't silently reintroduce the leak (issue #93).
+
+
+class _StubAioClient:
+    """Stand-in for a mineru per-loop ``httpx.AsyncClient``; records aclose()."""
+
+    def __init__(self) -> None:
+        self.aclosed = False
+
+    async def aclose(self) -> None:
+        self.aclosed = True
+
+
+class _RaisingAioClient:
+    """aclose() records the call THEN raises — proves eviction is aclose-safe."""
+
+    def __init__(self) -> None:
+        self.aclose_called = False
+
+    async def aclose(self) -> None:
+        self.aclose_called = True
+        raise RuntimeError("aclose boom")
+
+
+class _StubHttpClient:
+    def __init__(self, cache: dict) -> None:
+        self._aio_client_cache = cache
+
+
+class _StubPredictor:
+    def __init__(self, cache: dict) -> None:
+        self.client = _StubHttpClient(cache)
+
+
+class _StubModelSingleton:
+    """Mimics mineru's process-global singleton: ``ModelSingleton()._models`` is a
+    class-level dict of predictors (populated per test)."""
+
+    _models: dict = {}
+
+
+def _install_fake_singleton(monkeypatch, models: dict) -> None:
+    """Install a fake ``mineru.backend.vlm.vlm_analyze`` module whose
+    ``ModelSingleton()._models`` is ``models``."""
+    _StubModelSingleton._models = dict(models)
+    mod = types.ModuleType("mineru.backend.vlm.vlm_analyze")
+    mod.ModelSingleton = _StubModelSingleton
+    monkeypatch.setitem(sys.modules, "mineru.backend.vlm.vlm_analyze", mod)
+
+
+def test_client_close_refcount_closes_only_at_zero(monkeypatch):
+    """Two in-flight parses on ONE loop: the first decref does NOT close the
+    shared client (another parse still using it); the second (count 0) does."""
+    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
+    mc._loop_parse_refcounts.clear()
+    stub = _StubAioClient()
+
+    async def _body():
+        loop = asyncio.get_running_loop()
+        _install_fake_singleton(monkeypatch, {"k": _StubPredictor({loop: stub})})
+        mc._incref_current_loop()
+        mc._incref_current_loop()
+        await mc._decref_current_loop_and_maybe_close()      # 2 -> 1, NO close
+        assert stub.aclosed is False
+        assert mc._loop_parse_refcounts.get(loop) == 1
+        await mc._decref_current_loop_and_maybe_close()      # 1 -> 0, CLOSE
+        assert stub.aclosed is True
+        assert loop not in mc._loop_parse_refcounts
+
+    asyncio.run(_body())
+
+
+def test_client_close_evicts_only_current_loop(monkeypatch):
+    """Close-at-zero acloses + evicts ONLY the current loop's cached client;
+    another loop's cached client in the same cache is left untouched."""
+    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
+    mc._loop_parse_refcounts.clear()
+    cur = _StubAioClient()
+    other = _StubAioClient()
+    other_loop = object()   # stand-in key for a DIFFERENT event loop
+
+    async def _body():
+        loop = asyncio.get_running_loop()
+        cache = {loop: cur, other_loop: other}
+        _install_fake_singleton(monkeypatch, {"k": _StubPredictor(cache)})
+        mc._incref_current_loop()
+        await mc._decref_current_loop_and_maybe_close()      # 0 -> close current only
+        assert cur.aclosed is True
+        assert loop not in cache
+        assert other.aclosed is False
+        assert cache.get(other_loop) is other
+
+    asyncio.run(_body())
+
+
+def test_client_close_evicts_even_if_aclose_raises(monkeypatch):
+    """If aclose() raises, the entry is STILL evicted (pop precedes aclose) and
+    the error is swallowed, so the next parse rebuilds a fresh client cleanly."""
+    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
+    mc._loop_parse_refcounts.clear()
+    bad = _RaisingAioClient()
+
+    async def _body():
+        loop = asyncio.get_running_loop()
+        cache = {loop: bad}
+        _install_fake_singleton(monkeypatch, {"k": _StubPredictor(cache)})
+        mc._incref_current_loop()
+        await mc._decref_current_loop_and_maybe_close()      # aclose raises -> swallowed
+        assert bad.aclose_called is True
+        assert loop not in cache                             # evicted -> rebuild path clear
+
+    asyncio.run(_body())
+
+
+def test_client_close_disabled_leaves_client_cached(monkeypatch):
+    """PAPER_LIBRARY_MINERU_CLIENT_CLOSE=0 (``_CLIENT_CLOSE_ENABLED`` False):
+    the wrapper is inert — refcount still cleaned up, but the client is left
+    OPEN + cached (no aclose, no eviction)."""
+    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", False)
+    mc._loop_parse_refcounts.clear()
+    stub = _StubAioClient()
+
+    async def _body():
+        loop = asyncio.get_running_loop()
+        cache = {loop: stub}
+        _install_fake_singleton(monkeypatch, {"k": _StubPredictor(cache)})
+        mc._incref_current_loop()
+        await mc._decref_current_loop_and_maybe_close()      # 0, but close DISABLED
+        assert stub.aclosed is False
+        assert cache.get(loop) is stub                       # left open + cached
+        assert loop not in mc._loop_parse_refcounts          # refcount still popped
+
+    asyncio.run(_body())
+
+
+def test_extract_mineru_wrapper_brackets_and_closes_on_success(monkeypatch):
+    """The public wrapper increfs BEFORE the parse (refcount==1 during it) and,
+    in its finally, decrefs + closes this loop's client on the success path."""
+    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
+    mc._loop_parse_refcounts.clear()
+    closed: list = []
+
+    async def _fake_impl(*_a, **_k):
+        assert mc._loop_parse_refcounts.get(asyncio.get_running_loop()) == 1
+        return "MD"
+
+    async def _fake_close(loop):
+        closed.append(loop)
+
+    monkeypatch.setattr(mc, "_extract_mineru_impl", _fake_impl)
+    monkeypatch.setattr(mc, "_close_mineru_client_for_loop", _fake_close)
+
+    async def _body():
+        loop = asyncio.get_running_loop()
+        eps = [mc.Endpoint("a", "http://127.0.0.1:30000")]
+        assert await mc.extract_mineru(b"%PDF", eps, stem="x") == "MD"
+        assert loop not in mc._loop_parse_refcounts
+        assert closed == [loop]
+
+    asyncio.run(_body())
+
+
+def test_extract_mineru_wrapper_decrefs_and_closes_on_error(monkeypatch):
+    """The finally runs on the ERROR path too: a raising parse still decrefs +
+    closes, so an exception never leaks a refcount or a client."""
+    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
+    mc._loop_parse_refcounts.clear()
+    closed: list = []
+
+    async def _boom_impl(*_a, **_k):
+        raise mc.MineruTransportError("boom")
+
+    async def _fake_close(loop):
+        closed.append(loop)
+
+    monkeypatch.setattr(mc, "_extract_mineru_impl", _boom_impl)
+    monkeypatch.setattr(mc, "_close_mineru_client_for_loop", _fake_close)
+
+    async def _body():
+        loop = asyncio.get_running_loop()
+        eps = [mc.Endpoint("a", "http://127.0.0.1:30000")]
+        with pytest.raises(mc.MineruTransportError):
+            await mc.extract_mineru(b"%PDF", eps, stem="x")
+        assert loop not in mc._loop_parse_refcounts
+        assert closed == [loop]
+
+    asyncio.run(_body())
+
+
+def test_fd_watermark_warns_once_then_throttles(monkeypatch):
+    """check_fd_watermark warns when open fds cross 60% of the soft limit, then
+    THROTTLES to ≤1 warn / _FD_WARN_INTERVAL s on immediate re-calls."""
+    monkeypatch.setattr(mc.resource, "getrlimit", lambda _which: (10, 1000))
+    monkeypatch.setattr(mc, "_FD_WARN_FRACTION", 0.6)
+    monkeypatch.setattr(mc, "_fd_warn_last_log", 0.0)
+    real_listdir = os.listdir
+    monkeypatch.setattr(
+        mc.os, "listdir",
+        lambda p: ["fd"] * 8 if p == "/proc/self/fd" else real_listdir(p))
+
+    logger = Mock()
+    mc.check_fd_watermark(logger)   # 8/10 = 80% >= 60% -> WARN
+    mc.check_fd_watermark(logger)   # immediate -> throttled
+    assert logger.warning.call_count == 1
+
+
+def test_fd_watermark_never_raises_on_proc_error(monkeypatch):
+    """A failed /proc/self/fd read is swallowed — the guard must never raise
+    (nor warn) on the hot loop."""
+    monkeypatch.setattr(mc.resource, "getrlimit", lambda _which: (10, 1000))
+    monkeypatch.setattr(mc, "_FD_WARN_FRACTION", 0.6)
+    monkeypatch.setattr(mc, "_fd_warn_last_log", 0.0)
+    real_listdir = os.listdir
+
+    def _boom(p):
+        if p == "/proc/self/fd":
+            raise OSError("proc read failed")
+        return real_listdir(p)
+
+    monkeypatch.setattr(mc.os, "listdir", _boom)
+
+    logger = Mock()
+    mc.check_fd_watermark(logger)   # must swallow, no raise
+    assert logger.warning.call_count == 0

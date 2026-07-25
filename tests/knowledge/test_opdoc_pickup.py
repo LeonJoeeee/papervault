@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 import pytest
 
@@ -65,7 +66,10 @@ class FakeExtract:
         self.calls: list[dict] = []
 
     async def __call__(self, pdf_bytes, endpoints, *, stem="doc", **kwargs):
-        self.calls.append({"stem": stem, "n_bytes": len(pdf_bytes), "endpoints": endpoints})
+        # Record wall_clock_deadline too (#89): the drain must thread a bounded deadline into
+        # extract_mineru so a doomed file can never stall the serial drain indefinitely.
+        self.calls.append({"stem": stem, "n_bytes": len(pdf_bytes), "endpoints": endpoints,
+                           "wall_clock_deadline": kwargs.get("wall_clock_deadline")})
         if self.raise_exc is not None:
             raise self.raise_exc
         return self.md
@@ -91,13 +95,30 @@ def _patch_extract(monkeypatch, extract: FakeExtract):
     monkeypatch.setattr(op, "endpoints_from_env", lambda: ["ep0"])
 
 
+# A minimal but STRUCTURALLY-VALID one-page PDF: pypdf opens it, so the pre-OCR `pdf_probe`
+# (issue #89) passes it and the drop proceeds to OCR. Used as the default `_drop_pdf` body so
+# every PDF test now runs through the REAL structural probe (not a stub) before the faked OCR.
+_VALID_PDF = (
+    b"%PDF-1.4\n"
+    b"1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+    b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+    b"3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 612 792]>>endobj\n"
+    b"xref\n0 4\n0000000000 65535 f \n0000000009 00000 n \n"
+    b"0000000052 00000 n \n0000000101 00000 n \n"
+    b"trailer<</Size 4/Root 1 0 R>>\nstartxref\n164\n%%EOF\n"
+)
+# CORRUPT: a valid `%PDF` magic + a TRUNCATED body (no xref/trailer) — the incident's exact
+# shape (valid header, broken internal structure). pypdf raises → `pdf_probe` verdict `not_pdf`.
+_CORRUPT_PDF = _VALID_PDF[:120]
+
+
 def _drop(d, name, body="# Ch1\nalpha beta gamma", *, force=False):
     (d / name).write_text(body, encoding="utf-8")
     if force:
         (d / (name + ".force")).write_text("", encoding="utf-8")
 
 
-def _drop_pdf(d, name, body=b"%PDF-1.4 fake pdf bytes", *, force=False):
+def _drop_pdf(d, name, body=_VALID_PDF, *, force=False):
     (d / name).write_bytes(body)
     if force:
         (d / (name + ".force")).write_text("", encoding="utf-8")
@@ -538,3 +559,188 @@ def test_pdf_disabled_source_skips_ocr_and_left_in_place(pending, monkeypatch):
     assert fake.calls == []             # ingest never reached
     assert (d / "notebook-idea23-c12.pdf").exists()                  # left in pending
     assert not (d / "failed" / "notebook-idea23-c12.pdf").exists()
+
+
+# --------------------------------------------------------------------------- #
+#  (#89) corrupt-PDF drain-stall guard: pre-OCR structural probe + bounded OCR  #
+# --------------------------------------------------------------------------- #
+
+def test_pdf_corrupt_rejected_pre_ocr_to_failed(pending, monkeypatch):
+    """(#89) A PDF with a valid `%PDF` magic but a truncated/corrupt body is REJECTED to failed/
+    by the REAL pre-OCR structural probe (`library.extract.pdf_probe`) WITHOUT ever calling OCR —
+    the exact stall the drain used to hit (pdfium retry-loop for ~30 min). A `.reason` note marks
+    it corrupt (re-drop of the same bytes won't help), counted `failed` + logged LOUD."""
+    d, fake = pending
+    extract = FakeExtract()  # records calls; MUST stay empty — OCR is never reached
+    # Source ON so it is the STRUCTURAL PROBE (not the source gate) that rejects the file.
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Sullivan2015.pdf", body=_CORRUPT_PDF)
+
+    counts = _run(drain_pending(rag=object()))
+
+    assert counts["failed"] == 1
+    assert extract.calls == []          # OCR NEVER called — the whole point of #89
+    assert fake.calls == []             # ingest never reached
+    assert (d / "failed" / "textbook-Sullivan2015.pdf").exists()          # quarantined
+    assert not (d / "textbook-Sullivan2015.pdf").exists()
+    assert not (d / "processed" / "textbook-Sullivan2015.pdf").exists()
+    # a `.reason` note marks it corrupt (DISTINCT from the done==0 transient-outage reason note).
+    reason = d / "failed" / "textbook-Sullivan2015.pdf.reason"
+    assert reason.exists()
+    body = reason.read_text(encoding="utf-8")
+    assert "corrupt" in body.lower() and "pre-OCR" in body
+
+
+def test_pdf_corrupt_force_sidecar_follows_to_failed(pending, monkeypatch):
+    """The corrupt-PDF rejection carries any `.force` sidecar to failed/ (like every failed move),
+    so a re-drop is clean once the operator supplies a good copy."""
+    d, fake = pending
+    extract = FakeExtract()
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Sullivan2015.pdf", body=_CORRUPT_PDF, force=True)
+
+    counts = _run(drain_pending(rag=object()))
+
+    assert counts["failed"] == 1
+    assert extract.calls == []          # OCR never called
+    assert (d / "failed" / "textbook-Sullivan2015.pdf").exists()
+    assert (d / "failed" / "textbook-Sullivan2015.pdf.force").exists()    # sidecar follows the doc
+    assert (d / "failed" / "textbook-Sullivan2015.pdf.reason").exists()   # reason note beside it
+
+
+def test_pdf_corrupt_disabled_source_gated_before_probe(pending, monkeypatch):
+    """A corrupt PDF for a DISABLED source is still gated by the source flag FIRST (left in
+    pending, counted `disabled`) — the pre-OCR probe only runs once the source is enabled, so a
+    disabled source is never even probed and the file is never condemned."""
+    d, fake = pending
+    extract = FakeExtract()
+    monkeypatch.delenv("PAPERVAULT_PRIVATE_SOURCES", raising=False)  # notebook source OFF
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "notebook-idea23-c12.pdf", body=_CORRUPT_PDF)
+
+    counts = _run(drain_pending(rag=object()))
+
+    assert counts["disabled"] == 1 and counts["failed"] == 0
+    assert extract.calls == []
+    assert (d / "notebook-idea23-c12.pdf").exists()                 # left in pending, not failed/
+    assert not (d / "failed" / "notebook-idea23-c12.pdf").exists()
+
+
+def test_pdf_valid_passes_probe_and_reaches_ocr(tmp_path, monkeypatch):
+    """A VALID PDF (pypdf opens it) PASSES the real pre-OCR probe and proceeds to OCR → ingest,
+    so the #89 guard never false-rejects a good drop. Uses the REAL ingest_document over a fake
+    rag (no MinerU / GPU / network)."""
+    from papervault.knowledge.ingest import operator_docs as od
+
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    d = tmp_path / "pending"
+    d.mkdir()
+    monkeypatch.setenv("KS_OPDOC_PENDING_DIR", str(d))
+    op._disabled_logged.clear()
+    op._mineru_down_logged.clear()
+
+    async def _fake_upsert(ingest_source, source_id, *, doc_id, status, fingerprint=None):
+        pass
+
+    async def _fake_load(ingest_source):
+        return {}
+
+    monkeypatch.setattr(od.ledger, "upsert", _fake_upsert)
+    monkeypatch.setattr(od.ledger, "load", _fake_load)
+
+    extract = FakeExtract(md="# A\nalpha beta gamma\n\n# B\ndelta epsilon zeta")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Good2020.pdf", body=_VALID_PDF)
+
+    rag = FakeRag(doc_status="processed")
+    counts = _run(drain_pending(rag))
+
+    assert counts["ingested"] == 1
+    assert len(extract.calls) == 1      # a VALID pdf DID reach OCR (the probe passed it)
+    assert (d / "processed" / "textbook-Good2020.pdf").exists()
+
+
+def test_pdf_ocr_call_is_bounded_by_wall_clock_deadline(tmp_path, monkeypatch):
+    """(#89 backstop) The drain threads a `wall_clock_deadline` into `extract_mineru`, so even a
+    corruption the probe misses (or a server-side hang) costs ONE bounded period, never an
+    indefinite stall. A VALID pdf reaches OCR; assert the call received a deadline ~= now +
+    KS_OPDOC_OCR_TIMEOUT_SEC. (Before #89 the drain passed NO deadline — the root of the stall.)"""
+    from papervault.knowledge.ingest import operator_docs as od
+
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    monkeypatch.setenv("KS_OPDOC_OCR_TIMEOUT_SEC", "123")
+    d = tmp_path / "pending"
+    d.mkdir()
+    monkeypatch.setenv("KS_OPDOC_PENDING_DIR", str(d))
+    op._disabled_logged.clear()
+    op._mineru_down_logged.clear()
+
+    async def _fake_upsert(ingest_source, source_id, *, doc_id, status, fingerprint=None):
+        pass
+
+    async def _fake_load(ingest_source):
+        return {}
+
+    monkeypatch.setattr(od.ledger, "upsert", _fake_upsert)
+    monkeypatch.setattr(od.ledger, "load", _fake_load)
+
+    extract = FakeExtract(md="# A\nalpha beta gamma")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Good2020.pdf", body=_VALID_PDF)
+
+    before = time.time()
+    _run(drain_pending(FakeRag(doc_status="processed")))
+    after = time.time()
+
+    assert len(extract.calls) == 1
+    dl = extract.calls[0]["wall_clock_deadline"]
+    assert dl is not None                       # a bound WAS passed (the #89 fix)
+    assert before + 123 <= dl <= after + 123    # ~= call-time + KS_OPDOC_OCR_TIMEOUT_SEC
+
+
+def test_pdf_ocr_timeout_zero_disables_deadline(tmp_path, monkeypatch):
+    """KS_OPDOC_OCR_TIMEOUT_SEC<=0 DISABLES the backstop cap (deadline=None) — the escape hatch
+    for a document larger than the default cap allows; the call then relies on the mineru_client's
+    own http_timeout × inline-retry budget (the pre-#89 bound)."""
+    from papervault.knowledge.ingest import operator_docs as od
+
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    monkeypatch.setenv("KS_OPDOC_OCR_TIMEOUT_SEC", "0")
+    d = tmp_path / "pending"
+    d.mkdir()
+    monkeypatch.setenv("KS_OPDOC_PENDING_DIR", str(d))
+    op._disabled_logged.clear()
+    op._mineru_down_logged.clear()
+
+    async def _fake_upsert(ingest_source, source_id, *, doc_id, status, fingerprint=None):
+        pass
+
+    async def _fake_load(ingest_source):
+        return {}
+
+    monkeypatch.setattr(od.ledger, "upsert", _fake_upsert)
+    monkeypatch.setattr(od.ledger, "load", _fake_load)
+
+    extract = FakeExtract(md="# A\nalpha beta gamma")
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Good2020.pdf", body=_VALID_PDF)
+
+    _run(drain_pending(FakeRag(doc_status="processed")))
+
+    assert len(extract.calls) == 1
+    assert extract.calls[0]["wall_clock_deadline"] is None   # backstop disabled
+
+
+def test_ocr_timeout_seconds_env(monkeypatch):
+    """`_ocr_timeout_seconds` reads KS_OPDOC_OCR_TIMEOUT_SEC per-call: default 30 min, honors an
+    override, allows a disable (<=0), and falls back to the default on a garbage value."""
+    monkeypatch.delenv("KS_OPDOC_OCR_TIMEOUT_SEC", raising=False)
+    assert op._ocr_timeout_seconds() == 30 * 60.0        # default = 30 min (paper ceiling parity)
+    monkeypatch.setenv("KS_OPDOC_OCR_TIMEOUT_SEC", "600")
+    assert op._ocr_timeout_seconds() == 600.0
+    monkeypatch.setenv("KS_OPDOC_OCR_TIMEOUT_SEC", "0")
+    assert op._ocr_timeout_seconds() == 0.0
+    monkeypatch.setenv("KS_OPDOC_OCR_TIMEOUT_SEC", "not-a-number")
+    assert op._ocr_timeout_seconds() == 30 * 60.0        # garbage → default (never crash)

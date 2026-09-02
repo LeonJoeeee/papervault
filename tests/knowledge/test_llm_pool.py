@@ -467,3 +467,25 @@ async def test_direct_pool_streams_and_fails_over_on_midstream_error(tmp_path, m
     assert await pool.complete("ping") == "Hello"
     assert [c["stream"] for c in created] == [True, True]
     assert all("disabled" not in g for g in json.loads(f.read_text()))
+
+
+async def test_stream_cut_before_finish_is_an_error_not_an_empty_answer(tmp_path, monkeypatch, caplog):
+    """A stream that ends WITHOUT any finish_reason was truncated upstream (the relay's cut, a
+    dropped connection). Returning "" would be a silent success that the callers' retry /
+    fail-over can never see — it must raise like any other failed attempt."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [_chunk(reasoning="hmm"), _chunk(content="par")])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
+        with pytest.raises(llm_mod.StreamTruncated):
+            await pool.complete("ping")
+    assert any("attempt-fail" in r.getMessage() for r in caplog.records)
+
+
+async def test_stream_that_finishes_with_empty_content_is_a_legit_empty_answer(tmp_path, monkeypatch):
+    """finish_reason present + no content = the model genuinely answered nothing (same as the plain
+    call's `content: None` → ""); NOT a truncation."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [_chunk(reasoning="hmm"), _chunk(content=None, finish="stop")])
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping") == ""

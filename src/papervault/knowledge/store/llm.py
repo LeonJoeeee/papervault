@@ -187,6 +187,15 @@ def _sdk_model(model: str | None) -> str:
     return m
 
 
+class StreamTruncated(RuntimeError):
+    """The stream ended before any chunk carried a ``finish_reason``: the relay's cut, a dropped
+    connection, or an upstream that gave up mid-answer. Raised instead of returning a partial /
+    empty str, so the callers' existing failure routing (transient fail-over on the direct path,
+    attempt-fail + re-raise on the gateway path, LightRAG's own retry) sees it as the failed
+    attempt it is. Measured 2026-09-02: a cut stream is otherwise indistinguishable from a
+    normal end — no error event, just no more chunks."""
+
+
 class _Collected:
     """A streamed completion joined back into the NON-stream response shape the two call
     paths already consume: ``.choices[0].message.content`` and ``.usage`` (for log_usage)."""
@@ -204,7 +213,8 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
     dropped; the trailing usage-only chunk is kept for accounting); otherwise it is the plain
     call. A caller-supplied ``stream``/``stream_options`` is overridden either way — the
     contract returns str, never an iterator. Mid-stream errors propagate unchanged so the
-    callers' status routing (transient fail-over / attempt-fail logging) is untouched."""
+    callers' status routing (transient fail-over / attempt-fail logging) is untouched, and a
+    stream that ends with no finish_reason raises ``StreamTruncated`` for the same reason."""
     kwargs = {k: v for k, v in openai_kwargs.items() if k not in ("stream", "stream_options")}
     if not _STREAM:
         return await client.chat.completions.create(model=model, messages=messages, **kwargs)
@@ -236,6 +246,13 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
                 res = close()
                 if asyncio.iscoroutine(res):
                     await res
+    if finish is None:
+        # Every completed OpenAI-style stream carries a finish_reason on its last content
+        # chunk; none at all means the stream was cut. "" here would be a silent success.
+        raise StreamTruncated(
+            f"stream ended without a finish_reason after {len(parts)} content pieces "
+            f"({sum(len(p) for p in parts)} chars)"
+        )
     return _Collected("".join(parts), usage, finish)
 
 

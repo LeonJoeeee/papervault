@@ -190,11 +190,13 @@ def _sdk_model(model: str | None) -> str:
 
 
 class StreamTruncated(RuntimeError):
-    """The stream ended before any chunk carried a ``finish_reason``: the relay's cut, a dropped
-    connection, or an upstream that gave up mid-answer. Raised instead of returning a partial /
-    empty str, so the callers' existing failure routing (transient fail-over on the direct path,
-    attempt-fail + re-raise on the gateway path, LightRAG's own retry) sees it as the failed
-    attempt it is. Measured 2026-09-02: a cut stream is otherwise indistinguishable from a
+    """The stream ended or broke before any chunk carried a ``finish_reason``: the relay's cut,
+    a dropped connection (``httpx.ReadTimeout`` / ``RemoteProtocolError`` while iterating — the
+    SDK does not normalise those), or a streamed error event. Raised instead of returning a
+    partial / empty str, so the callers' existing failure routing (transient fail-over on the
+    direct path, attempt-fail + re-raise on the gateway path, synth's bounded retry, LightRAG's
+    own retry) sees ONE transient type. The original exception, when there is one, is chained as
+    ``__cause__``. Measured 2026-09-02: a cut stream is otherwise indistinguishable from a
     normal end — no error event, just no more chunks."""
 
 
@@ -248,6 +250,15 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
                 fr = getattr(choice, "finish_reason", None)
                 if fr:
                     finish = fr
+    except Exception as e:  # noqa: BLE001 — CancelledError is BaseException, never caught here
+        # While ITERATING, openai's AsyncStream reads the body directly and lets transport
+        # failures (httpx.ReadTimeout / RemoteProtocolError) and streamed error events (a
+        # status-less APIError) through as-is — only request setup is normalised to
+        # APIConnectionError. Normalise them here to the one transient type the callers'
+        # classifiers know, with the cause chained for the log.
+        raise StreamTruncated(
+            f"stream broke after {len(parts)} content pieces: {type(e).__name__}: {e}"
+        ) from e
     finally:
         # Release the HTTP connection promptly on error/cancellation (the SDK's AsyncStream
         # exposes an async close(); a plain async iterator has nothing to close).

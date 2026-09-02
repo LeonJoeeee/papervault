@@ -126,3 +126,16 @@ async def test_stream_truncated_retried_then_succeeds(monkeypatch):
     out = await synth_answer(_DATA, _INTENT)
     assert out == "answer after the cut [X2023]"
     assert len(calls) == 2
+
+
+async def test_midstream_transport_error_reaches_synth_as_transient(monkeypatch):
+    """End to end: the wrapper turns a mid-stream httpx failure into StreamTruncated (cause
+    chained); synth must retry it like a connection reset, not fall back at once."""
+    import httpx
+    cause = httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+    err = StreamTruncated("stream broke after 3 content pieces: RemoteProtocolError")
+    err.__cause__ = cause
+    calls = _install(monkeypatch, [err, "answer after the reset [X2023]"])
+    out = await synth_answer(_DATA, _INTENT)
+    assert out == "answer after the reset [X2023]"
+    assert len(calls) == 2

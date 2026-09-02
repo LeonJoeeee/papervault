@@ -19,6 +19,8 @@ import os
 import time
 from pathlib import Path
 
+import httpx
+import openai
 import pytest
 
 import papervault.knowledge.store.llm as llm_mod
@@ -50,6 +52,13 @@ class _FakeError(Exception):
     def __init__(self, status_code: int):
         super().__init__(f"fake http {status_code}")
         self.status_code = status_code
+
+
+@pytest.fixture(autouse=True)
+def _stream_on(monkeypatch):
+    """Pin the documented default (streaming ON) regardless of the developer's / deployment's
+    .env, so the streaming tests exercise the streaming branch; the kill-switch test overrides."""
+    monkeypatch.setattr(llm_mod, "_STREAM", True)
 
 
 def _pin_order(monkeypatch):
@@ -440,16 +449,41 @@ async def test_caller_stream_kwarg_never_leaks_a_stream_object(tmp_path, monkeyp
     assert all(c["stream"] is True for c in created)
 
 
-async def test_gateway_stream_error_midway_raises_and_logs_attempt_fail(tmp_path, monkeypatch, caplog):
+_MIDSTREAM_ERRORS = [
+    # What openai's AsyncStream actually raises while ITERATING (it reads response.aiter_bytes()
+    # directly; only request setup is normalised to APIConnectionError/APITimeoutError):
+    httpx.RemoteProtocolError("peer closed connection without sending complete message body"),
+    httpx.ReadTimeout("timed out"),
+    openai.APIError("upstream error event", httpx.Request("POST", "http://gw.example/v1/chat/completions"), body=None),
+]
+
+
+@pytest.mark.parametrize("err", _MIDSTREAM_ERRORS, ids=lambda e: type(e).__name__)
+async def test_gateway_midstream_failure_becomes_stream_truncated(tmp_path, monkeypatch, caplog, err):
+    """A failure while iterating the stream is normalised to StreamTruncated (cause chained) so
+    every caller's classifier sees ONE transient type instead of status-less httpx/APIError
+    instances; the gateway path still logs the attempt-fail before re-raising."""
     _gateway_mode(monkeypatch)
-    _install_fake_stream_client(
-        monkeypatch, lambda key: [_chunk(content="par"), _FakeError(500)])
+    _install_fake_stream_client(monkeypatch, lambda key: [_chunk(content="par"), err])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
+        with pytest.raises(llm_mod.StreamTruncated) as ei:
+            await pool.complete("ping")
+    assert ei.value.__cause__ is err
+    assert any("attempt-fail" in r.getMessage() and "err=StreamTruncated" in r.getMessage()
+               for r in caplog.records)
+
+
+async def test_request_time_error_is_not_wrapped(tmp_path, monkeypatch, caplog):
+    """An error raised by create() itself (before any chunk) keeps its type and status — the
+    401/403 auto-disable and the 429/5xx routing depend on it."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: _FakeError(429))
     pool = KeyPool(tmp_path / "unused.json")
     with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
         with pytest.raises(_FakeError):
             await pool.complete("ping")
-    assert any("attempt-fail" in r.getMessage() and "code=500" in r.getMessage()
-               for r in caplog.records)
+    assert any("code=429" in r.getMessage() for r in caplog.records)
 
 
 async def test_direct_pool_streams_and_fails_over_on_midstream_error(tmp_path, monkeypatch):
@@ -461,7 +495,8 @@ async def test_direct_pool_streams_and_fails_over_on_midstream_error(tmp_path, m
     _pin_order(monkeypatch)
 
     def behavior(key):
-        return [_chunk(content="par"), _FakeError(500)] if key == "dies" else list(_HELLO_STREAM)
+        return ([_chunk(content="par"), httpx.RemoteProtocolError("peer closed connection")]
+                if key == "dies" else list(_HELLO_STREAM))
 
     created = _install_fake_stream_client(monkeypatch, behavior)
     pool = KeyPool(f)

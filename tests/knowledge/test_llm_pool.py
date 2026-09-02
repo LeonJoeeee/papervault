@@ -552,3 +552,20 @@ async def test_reserved_stream_keys_inside_extra_body_are_stripped(tmp_path, mon
     assert created[0]["extra_body"] == {"keep": 1}
     assert created[0]["stream"] is True and created[0]["stream_options"] == {"include_usage": True}
     assert body == {"stream": False, "stream_options": {"include_usage": False}, "keep": 1}
+
+
+async def test_error_after_finish_reason_keeps_the_complete_answer(tmp_path, monkeypatch, caplog):
+    """The collector keeps reading after the finish chunk to pick up the usage chunk. A failure
+    in THAT tail (between the terminal answer chunk and usage/[DONE]) must not discard an answer
+    that is already complete — it returns the answer with usage unavailable and logs it."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [
+        _chunk(content="Hel"), _chunk(content="lo", finish="stop"),
+        httpx.RemoteProtocolError("peer closed connection before the usage chunk"),
+    ])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("INFO", logger="papervault.knowledge.store.llm"):
+        assert await pool.complete("ping") == "Hello"
+    tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
+    assert len(tok) == 1 and "ptok=? ctok=? ttok=?" in tok[0]
+    assert any("after finish_reason" in r.getMessage() for r in caplog.records)

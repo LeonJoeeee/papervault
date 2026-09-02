@@ -216,9 +216,11 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
     streams and joins the ``delta.content`` pieces (reasoning deltas are NOT the answer and are
     dropped; the trailing usage-only chunk is kept for accounting); otherwise it is the plain
     call. A caller-supplied ``stream``/``stream_options`` is overridden either way — the
-    contract returns str, never an iterator. Mid-stream errors propagate unchanged so the
-    callers' status routing (transient fail-over / attempt-fail logging) is untouched, and a
-    stream that ends with no finish_reason raises ``StreamTruncated`` for the same reason."""
+    contract returns str, never an iterator. A REQUEST-time error (raised by ``create()``
+    itself) propagates unchanged, so the callers' status routing (401/403 auto-disable,
+    transient fail-over, attempt-fail logging) is untouched; an error while ITERATING, or a
+    stream that ends with no finish_reason, is normalised to ``StreamTruncated`` — except after
+    the finish chunk, where the complete answer is kept and only the usage is lost."""
     kwargs = {k: v for k, v in openai_kwargs.items() if k not in _RESERVED_TRANSPORT_KEYS}
     # The SDK merges extra_body OVER the request fields, so the reserved keys are stripped there
     # too (from a copy — the caller's dict is not mutated) to keep the override unconditional.
@@ -255,10 +257,16 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
         # failures (httpx.ReadTimeout / RemoteProtocolError) and streamed error events (a
         # status-less APIError) through as-is — only request setup is normalised to
         # APIConnectionError. Normalise them here to the one transient type the callers'
-        # classifiers know, with the cause chained for the log.
-        raise StreamTruncated(
-            f"stream broke after {len(parts)} content pieces: {type(e).__name__}: {e}"
-        ) from e
+        # classifiers know, with the cause chained for the log — UNLESS the answer was already
+        # complete: the loop keeps reading past the finish chunk only to pick up the usage
+        # chunk, and a failure in that tail must not discard (and re-bill via retry) a finished
+        # answer. Then keep the answer and just lose the token counts (LLMTOK logs "?").
+        if finish is None:
+            raise StreamTruncated(
+                f"stream broke after {len(parts)} content pieces: {type(e).__name__}: {e}"
+            ) from e
+        logger.warning("stream error after finish_reason=%s (%s: %s) — answer kept, usage unavailable",
+                       finish, type(e).__name__, e)
     finally:
         # Release the HTTP connection promptly on error/cancellation (the SDK's AsyncStream
         # exposes an async close(); a plain async iterator has nothing to close).

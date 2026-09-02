@@ -73,6 +73,12 @@ def _install_fake_client(monkeypatch, behavior):
             out = behavior(self._key)
             if isinstance(out, Exception):
                 raise out
+            if kw.get("stream"):
+                # Mirror the real SDK: stream=True hands back an async iterator of chunks
+                # (the pool streams by default since issue #100 and joins the deltas).
+                async def _gen():
+                    yield _chunk(content=out, finish="stop")
+                return _gen()
             return _FakeResp(out)
 
     class _Chat:
@@ -315,3 +321,149 @@ def test_active_endpoint_count_and_pool_model(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_mod, "_pool", None)
     assert llm_mod.active_endpoint_count() == 2
     assert llm_mod.pool_model() == "test-model"   # litellm prefix stripped
+
+
+# ---- streaming (issue #100): long generations must not die at the relay's 120 s idle cut ----
+#
+# The relay behind the gateway closes any request that sends no bytes for ~120 s. A streamed
+# completion keeps bytes flowing, so the pool streams by default and joins the deltas back into
+# the str the LightRAG contract expects. ALL HTTP is faked — the fake `create` returns an async
+# iterator of chunk objects when called with stream=True.
+
+def _chunk(content=None, reasoning=None, finish=None, usage=None):
+    """A minimal chat-completion CHUNK: `.choices[0].delta.content` (+ optional
+    `reasoning_content`), `.choices[0].finish_reason`, and `.usage` (None except on the
+    trailing usage-only chunk, which carries EMPTY choices like the real API)."""
+    if usage is not None:
+        return type("Chunk", (), {"choices": [], "usage": type("U", (), usage)()})()
+    delta = type("Delta", (), {"content": content, "reasoning_content": reasoning})()
+    choice = type("Choice", (), {"delta": delta, "finish_reason": finish})()
+    return type("Chunk", (), {"choices": [choice], "usage": None})()
+
+
+def _install_fake_stream_client(monkeypatch, behavior):
+    """Like _install_fake_client, but `behavior(api_key)` returns either a plain str (served for
+    a NON-stream create) or a list of chunk objects / exceptions (served, in order, from an async
+    iterator for a stream=True create; an Exception element is raised mid-stream). Records every
+    create() kwargs dict in ``created``."""
+    created: list[dict] = []
+
+    class _Completions:
+        def __init__(self, key):
+            self._key = key
+
+        async def create(self, *, model, messages, **kw):
+            created.append(dict(model=model, **kw))
+            out = behavior(self._key)
+            if isinstance(out, Exception):
+                raise out
+            if not kw.get("stream"):
+                return _FakeResp(out if isinstance(out, str) else "".join(
+                    c.choices[0].delta.content or "" for c in out if c.choices))
+
+            async def _gen():
+                for item in out:
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            return _gen()
+
+    class _Chat:
+        def __init__(self, key):
+            self.completions = _Completions(key)
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, *, api_key, base_url, timeout=None, max_retries=None):
+            self.chat = _Chat(api_key)
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _FakeAsyncOpenAI)
+    return created
+
+
+def _gateway_mode(monkeypatch):
+    monkeypatch.setattr(config, "USE_GATEWAY", True)
+    monkeypatch.setattr(config, "GATEWAY_URL", "http://gw.example/v1")
+    monkeypatch.setattr(config, "GATEWAY_KEY", "gw-key")
+    monkeypatch.setattr(config, "SYNTH_MODEL", "standard")
+    monkeypatch.setattr(config, "BUILD_MODEL", "flash")
+
+
+_HELLO_STREAM = [
+    _chunk(reasoning="let me think"),          # reasoning delta: NOT part of the answer
+    _chunk(content="Hel"),
+    _chunk(content=None),                      # keep-alive / role-only delta
+    _chunk(content="lo", finish="stop"),
+    _chunk(usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}),
+]
+
+
+async def test_gateway_path_streams_and_joins_content_deltas(tmp_path, monkeypatch):
+    _gateway_mode(monkeypatch)
+    created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(tmp_path / "unused.json")
+    out = await pool.complete("ping")
+    assert out == "Hello"
+    assert len(created) == 1
+    assert created[0]["stream"] is True
+    assert created[0]["stream_options"] == {"include_usage": True}
+
+
+async def test_gateway_stream_usage_chunk_reaches_llmtok(tmp_path, monkeypatch, caplog):
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("INFO", logger="papervault.knowledge.store.llm"):
+        await pool.complete("ping")
+    tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
+    assert len(tok) == 1
+    assert "ptok=10 ctok=2 ttok=12" in tok[0]
+
+
+async def test_stream_kill_switch_falls_back_to_plain_completion(tmp_path, monkeypatch):
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_STREAM", False)
+    created = _install_fake_stream_client(monkeypatch, lambda key: "plain-ok")
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping") == "plain-ok"
+    assert "stream" not in created[0] and "stream_options" not in created[0]
+
+
+async def test_caller_stream_kwarg_never_leaks_a_stream_object(tmp_path, monkeypatch):
+    """The contract returns str. A caller-supplied stream=False must not switch the wrapper
+    back to the 120 s-vulnerable plain call, and stream=True must not hand back an iterator."""
+    _gateway_mode(monkeypatch)
+    created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping", stream=False) == "Hello"
+    assert await pool.complete("ping", stream=True) == "Hello"
+    assert all(c["stream"] is True for c in created)
+
+
+async def test_gateway_stream_error_midway_raises_and_logs_attempt_fail(tmp_path, monkeypatch, caplog):
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(
+        monkeypatch, lambda key: [_chunk(content="par"), _FakeError(500)])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
+        with pytest.raises(_FakeError):
+            await pool.complete("ping")
+    assert any("attempt-fail" in r.getMessage() and "code=500" in r.getMessage()
+               for r in caplog.records)
+
+
+async def test_direct_pool_streams_and_fails_over_on_midstream_error(tmp_path, monkeypatch):
+    """The direct KeyPool path streams too, and a stream that dies mid-way is a TRANSIENT
+    failure: fail over to the next key, write nothing."""
+    monkeypatch.setattr(config, "USE_GATEWAY", False)
+    f = tmp_path / "keys.json"
+    _write(f, [_group("dies"), _group("good")])
+    _pin_order(monkeypatch)
+
+    def behavior(key):
+        return [_chunk(content="par"), _FakeError(500)] if key == "dies" else list(_HELLO_STREAM)
+
+    created = _install_fake_stream_client(monkeypatch, behavior)
+    pool = KeyPool(f)
+    assert await pool.complete("ping") == "Hello"
+    assert [c["stream"] for c in created] == [True, True]
+    assert all("disabled" not in g for g in json.loads(f.read_text()))

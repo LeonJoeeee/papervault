@@ -26,6 +26,12 @@ keys + failover/retry/cooldown/401-disable, so there is NO shuffle / _MAX_ROUNDS
 call, bounded by the caller's outer deadline. The default (unset / "0") path is BYTE-FOR-BYTE the
 KeyPool behavior below; gateway mode is a thin, reversible branch (unset env + restart to fall back).
 
+Streaming (issue #100, 2026-09-02): BOTH paths stream the completion and join the deltas back into
+the returned str (``_create_completion``) — the relay behind the gateway kills any request that is
+silent for ~120 s, which a long extraction chunk routinely is; a stream is never silent. Accounting
+(LLMTOK) still gets real token counts via ``stream_options.include_usage``. ``KS_LLM_STREAM=0`` is
+the boot-time kill switch back to the plain call.
+
 Interface compatible with LightRAG's llm_model_func signature (DO NOT CHANGE):
     async def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str
 """
@@ -104,6 +110,16 @@ _BACKOFF_JITTER = float(os.getenv("KS_LLM_BACKOFF_JITTER", "0.75"))
 # Distinct from no-retry-on-slow-key: only APIConnectionError triggers this; timeout/4xx/5xx still surface.
 _GW_CONN_MAX_RETRIES = int(os.getenv("KS_GATEWAY_CONN_RETRIES", "6"))
 _GW_CONN_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_CONN_BACKOFF_CAP", "15"))
+# STREAM every completion and join the deltas back into the str the contract returns (issue #100,
+# 2026-09-02). The relay behind the gateway closes any request that sends NO BYTES for ~120 s
+# (measured: a plain call dies at 120 s direct, 367 s via the gateway after its 2 retries; a
+# streamed call was still alive at 200 s on both paths). Extraction chunks routinely need
+# 60–250 s, so a plain call fails ~13 % of the time and every retry re-bills the generation.
+# Streaming keeps bytes flowing, so the same call completes. `stream_options.include_usage`
+# asks for the trailing usage chunk so LLMTOK accounting keeps real token counts. Kill switch
+# (boot-time, `KS_LLM_STREAM=0`) restores the plain call; callers cannot pick — the wrapper's
+# return type is str either way.
+_STREAM = os.getenv("KS_LLM_STREAM", "1") != "0"
 
 
 def _endpoint_label(g: dict) -> str:
@@ -169,6 +185,58 @@ def _sdk_model(model: str | None) -> str:
     if "/" in m:
         m = m.split("/", 1)[1]
     return m
+
+
+class _Collected:
+    """A streamed completion joined back into the NON-stream response shape the two call
+    paths already consume: ``.choices[0].message.content`` and ``.usage`` (for log_usage)."""
+
+    def __init__(self, content: str, usage: Any, finish_reason: str | None):
+        message = type("Message", (), {"content": content})()
+        self.choices = [type("Choice", (), {"message": message, "finish_reason": finish_reason})()]
+        self.usage = usage
+
+
+async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dict[str, str]],
+                             openai_kwargs: dict[str, Any]) -> Any:
+    """ONE chokepoint for the actual ``chat.completions.create``. With ``_STREAM`` (default) it
+    streams and joins the ``delta.content`` pieces (reasoning deltas are NOT the answer and are
+    dropped; the trailing usage-only chunk is kept for accounting); otherwise it is the plain
+    call. A caller-supplied ``stream``/``stream_options`` is overridden either way — the
+    contract returns str, never an iterator. Mid-stream errors propagate unchanged so the
+    callers' status routing (transient fail-over / attempt-fail logging) is untouched."""
+    kwargs = {k: v for k, v in openai_kwargs.items() if k not in ("stream", "stream_options")}
+    if not _STREAM:
+        return await client.chat.completions.create(model=model, messages=messages, **kwargs)
+    stream = await client.chat.completions.create(
+        model=model, messages=messages, stream=True,
+        stream_options={"include_usage": True}, **kwargs,
+    )
+    parts: list[str] = []
+    usage: Any = None
+    finish: str | None = None
+    try:
+        async for chunk in stream:
+            u = getattr(chunk, "usage", None)
+            if u is not None:
+                usage = u
+            for choice in getattr(chunk, "choices", None) or []:
+                piece = getattr(getattr(choice, "delta", None), "content", None)
+                if piece:
+                    parts.append(piece)
+                fr = getattr(choice, "finish_reason", None)
+                if fr:
+                    finish = fr
+    finally:
+        # Release the HTTP connection promptly on error/cancellation (the SDK's AsyncStream
+        # exposes an async close(); a plain async iterator has nothing to close).
+        close = getattr(stream, "close", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                res = close()
+                if asyncio.iscoroutine(res):
+                    await res
+    return _Collected("".join(parts), usage, finish)
 
 
 def _error_code(exc: Exception) -> int | None:
@@ -342,11 +410,7 @@ class KeyPool:
                 t0 = time.monotonic()
                 try:
                     client = self._client(g)
-                    resp = await client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        **openai_kwargs,
-                    )
+                    resp = await _create_completion(client, model, messages, openai_kwargs)
                     dt = time.monotonic() - t0
                     if dt >= _SLOW_CALL_S:
                         # Slow but OK — the call we want to see before an outer worker timeout kills it.
@@ -447,11 +511,7 @@ class KeyPool:
             t0 = time.monotonic()
             try:
                 client = self._gateway_client()
-                resp = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    **openai_kwargs,
-                )
+                resp = await _create_completion(client, model, messages, openai_kwargs)
                 dt = time.monotonic() - t0
                 if dt >= _SLOW_CALL_S:
                     # Slow but OK — the call we want to see before an outer worker timeout kills it.

@@ -120,6 +120,8 @@ _GW_CONN_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_CONN_BACKOFF_CAP", "15"))
 # (boot-time, `KS_LLM_STREAM=0`) restores the plain call; callers cannot pick — the wrapper's
 # return type is str either way.
 _STREAM = os.getenv("KS_LLM_STREAM", "1") != "0"
+# Transport keys the wrapper owns: stripped from the caller's kwargs AND from extra_body.
+_RESERVED_TRANSPORT_KEYS = frozenset({"stream", "stream_options"})
 
 
 def _endpoint_label(g: dict) -> str:
@@ -215,7 +217,12 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
     contract returns str, never an iterator. Mid-stream errors propagate unchanged so the
     callers' status routing (transient fail-over / attempt-fail logging) is untouched, and a
     stream that ends with no finish_reason raises ``StreamTruncated`` for the same reason."""
-    kwargs = {k: v for k, v in openai_kwargs.items() if k not in ("stream", "stream_options")}
+    kwargs = {k: v for k, v in openai_kwargs.items() if k not in _RESERVED_TRANSPORT_KEYS}
+    # The SDK merges extra_body OVER the request fields, so the reserved keys are stripped there
+    # too (from a copy — the caller's dict is not mutated) to keep the override unconditional.
+    if isinstance(kwargs.get("extra_body"), dict):
+        kwargs["extra_body"] = {k: v for k, v in kwargs["extra_body"].items()
+                                if k not in _RESERVED_TRANSPORT_KEYS}
     if not _STREAM:
         return await client.chat.completions.create(model=model, messages=messages, **kwargs)
     stream = await client.chat.completions.create(
@@ -231,6 +238,10 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
             if u is not None:
                 usage = u
             for choice in getattr(chunk, "choices", None) or []:
+                # Only the first alternative — the plain path returns choices[0]; with n>1 a
+                # stream interleaves the alternatives' chunks and they must not be concatenated.
+                if (getattr(choice, "index", 0) or 0) != 0:
+                    continue
                 piece = getattr(getattr(choice, "delta", None), "content", None)
                 if piece:
                     parts.append(piece)

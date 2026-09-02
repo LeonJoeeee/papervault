@@ -330,14 +330,15 @@ def test_active_endpoint_count_and_pool_model(tmp_path, monkeypatch):
 # the str the LightRAG contract expects. ALL HTTP is faked — the fake `create` returns an async
 # iterator of chunk objects when called with stream=True.
 
-def _chunk(content=None, reasoning=None, finish=None, usage=None):
+def _chunk(content=None, reasoning=None, finish=None, usage=None, index=0):
     """A minimal chat-completion CHUNK: `.choices[0].delta.content` (+ optional
-    `reasoning_content`), `.choices[0].finish_reason`, and `.usage` (None except on the
-    trailing usage-only chunk, which carries EMPTY choices like the real API)."""
+    `reasoning_content`), `.choices[0].finish_reason`, `.choices[0].index` (the real API's
+    choice index, non-zero only with n>1) and `.usage` (None except on the trailing usage-only
+    chunk, which carries EMPTY choices like the real API)."""
     if usage is not None:
         return type("Chunk", (), {"choices": [], "usage": type("U", (), usage)()})()
     delta = type("Delta", (), {"content": content, "reasoning_content": reasoning})()
-    choice = type("Choice", (), {"delta": delta, "finish_reason": finish})()
+    choice = type("Choice", (), {"delta": delta, "finish_reason": finish, "index": index})()
     return type("Chunk", (), {"choices": [choice], "usage": None})()
 
 
@@ -489,3 +490,30 @@ async def test_stream_that_finishes_with_empty_content_is_a_legit_empty_answer(t
     _install_fake_stream_client(monkeypatch, lambda key: [_chunk(reasoning="hmm"), _chunk(content=None, finish="stop")])
     pool = KeyPool(tmp_path / "unused.json")
     assert await pool.complete("ping") == ""
+
+
+async def test_stream_collects_only_choice_index_0_when_n_gt_1(tmp_path, monkeypatch):
+    """The plain path returns choices[0] only; with n>1 a stream interleaves the alternatives'
+    chunks, so the join must keep index 0 and drop the rest instead of concatenating them."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [
+        _chunk(content="A1", index=0), _chunk(content="B1", index=1),
+        _chunk(content="A2", index=0, finish="stop"), _chunk(content="B2", index=1, finish="stop"),
+        _chunk(usage={"prompt_tokens": 1, "completion_tokens": 4, "total_tokens": 5}),
+    ])
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping", n=2) == "A1A2"
+
+
+async def test_reserved_stream_keys_inside_extra_body_are_stripped(tmp_path, monkeypatch):
+    """The SDK merges extra_body OVER the request fields, so a caller could re-enable the plain
+    call (or drop the usage chunk) through it. The override is unconditional: reserved keys are
+    removed from a COPY of extra_body; the caller's other keys and dict are untouched."""
+    _gateway_mode(monkeypatch)
+    created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(tmp_path / "unused.json")
+    body = {"stream": False, "stream_options": {"include_usage": False}, "keep": 1}
+    assert await pool.complete("ping", extra_body=body) == "Hello"
+    assert created[0]["extra_body"] == {"keep": 1}
+    assert created[0]["stream"] is True and created[0]["stream_options"] == {"include_usage": True}
+    assert body == {"stream": False, "stream_options": {"include_usage": False}, "keep": 1}

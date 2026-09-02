@@ -14,7 +14,8 @@ import asyncio
 import pytest
 
 from papervault.knowledge.query import synth as synth_mod
-from papervault.knowledge.query.synth import SYNTH_FAILED_PREFIX, synth_answer
+from papervault.knowledge.query.synth import SYNTH_FAILED_PREFIX, _is_transient_synth_error, synth_answer
+from papervault.knowledge.store.llm import StreamTruncated
 
 # Minimal aquery_data subgraph — one paper chunk is enough for _build_prompt.
 _DATA = {"chunks": [{"content": "SEP flux drops during Forbush decreases.", "file_path": "paper/X2023"}]}
@@ -109,3 +110,19 @@ async def test_empty_200_exhausts_retries_then_falls_back(monkeypatch):
     out = await synth_answer(_DATA, _INTENT)
     assert out.startswith(SYNTH_FAILED_PREFIX)
     assert len(calls) == 3
+
+
+# ---- transient: a stream cut before its finish_reason (issue #100) ---------------
+
+def test_stream_truncated_is_classified_transient():
+    # No HTTP status, not an APIConnectionError — it must be recognised by type, or a cut
+    # synthesis stream would fall back immediately instead of using the bounded retry.
+    assert _is_transient_synth_error(StreamTruncated("stream ended without a finish_reason")) is True
+
+
+async def test_stream_truncated_retried_then_succeeds(monkeypatch):
+    calls = _install(monkeypatch, [StreamTruncated("stream ended without a finish_reason"),
+                                   "answer after the cut [X2023]"])
+    out = await synth_answer(_DATA, _INTENT)
+    assert out == "answer after the cut [X2023]"
+    assert len(calls) == 2

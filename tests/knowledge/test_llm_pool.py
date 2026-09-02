@@ -19,6 +19,8 @@ import os
 import time
 from pathlib import Path
 
+import httpx
+import openai
 import pytest
 
 import papervault.knowledge.store.llm as llm_mod
@@ -52,6 +54,13 @@ class _FakeError(Exception):
         self.status_code = status_code
 
 
+@pytest.fixture(autouse=True)
+def _stream_on(monkeypatch):
+    """Pin the documented default (streaming ON) regardless of the developer's / deployment's
+    .env, so the streaming tests exercise the streaming branch; the kill-switch test overrides."""
+    monkeypatch.setattr(llm_mod, "_STREAM", True)
+
+
 def _pin_order(monkeypatch):
     """Make random.shuffle a no-op so the pool tries groups in file order — lets the disable
     tests deterministically exercise a specific (bad-then-good) order. (The genuine per-request
@@ -73,6 +82,12 @@ def _install_fake_client(monkeypatch, behavior):
             out = behavior(self._key)
             if isinstance(out, Exception):
                 raise out
+            if kw.get("stream"):
+                # Mirror the real SDK: stream=True hands back an async iterator of chunks
+                # (the pool streams by default since issue #100 and joins the deltas).
+                async def _gen():
+                    yield _chunk(content=out, finish="stop")
+                return _gen()
             return _FakeResp(out)
 
     class _Chat:
@@ -315,3 +330,242 @@ def test_active_endpoint_count_and_pool_model(tmp_path, monkeypatch):
     monkeypatch.setattr(llm_mod, "_pool", None)
     assert llm_mod.active_endpoint_count() == 2
     assert llm_mod.pool_model() == "test-model"   # litellm prefix stripped
+
+
+# ---- streaming (issue #100): long generations must not die at the relay's 120 s idle cut ----
+#
+# The relay behind the gateway closes any request that sends no bytes for ~120 s. A streamed
+# completion keeps bytes flowing, so the pool streams by default and joins the deltas back into
+# the str the LightRAG contract expects. ALL HTTP is faked — the fake `create` returns an async
+# iterator of chunk objects when called with stream=True.
+
+def _chunk(content=None, reasoning=None, finish=None, usage=None, index=0):
+    """A minimal chat-completion CHUNK: `.choices[0].delta.content` (+ optional
+    `reasoning_content`), `.choices[0].finish_reason`, `.choices[0].index` (the real API's
+    choice index, non-zero only with n>1) and `.usage` (None except on the trailing usage-only
+    chunk, which carries EMPTY choices like the real API)."""
+    if usage is not None:
+        return type("Chunk", (), {"choices": [], "usage": type("U", (), usage)()})()
+    delta = type("Delta", (), {"content": content, "reasoning_content": reasoning})()
+    choice = type("Choice", (), {"delta": delta, "finish_reason": finish, "index": index})()
+    return type("Chunk", (), {"choices": [choice], "usage": None})()
+
+
+def _install_fake_stream_client(monkeypatch, behavior):
+    """Like _install_fake_client, but `behavior(api_key)` returns either a plain str (served for
+    a NON-stream create) or a list of chunk objects / exceptions (served, in order, from an async
+    iterator for a stream=True create; an Exception element is raised mid-stream). Records every
+    create() kwargs dict in ``created``."""
+    created: list[dict] = []
+
+    class _Completions:
+        def __init__(self, key):
+            self._key = key
+
+        async def create(self, *, model, messages, **kw):
+            created.append(dict(model=model, **kw))
+            out = behavior(self._key)
+            if isinstance(out, Exception):
+                raise out
+            if not kw.get("stream"):
+                return _FakeResp(out if isinstance(out, str) else "".join(
+                    c.choices[0].delta.content or "" for c in out if c.choices))
+
+            async def _gen():
+                for item in out:
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            return _gen()
+
+    class _Chat:
+        def __init__(self, key):
+            self.completions = _Completions(key)
+
+    class _FakeAsyncOpenAI:
+        def __init__(self, *, api_key, base_url, timeout=None, max_retries=None):
+            self.chat = _Chat(api_key)
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _FakeAsyncOpenAI)
+    return created
+
+
+def _gateway_mode(monkeypatch):
+    monkeypatch.setattr(config, "USE_GATEWAY", True)
+    monkeypatch.setattr(config, "GATEWAY_URL", "http://gw.example/v1")
+    monkeypatch.setattr(config, "GATEWAY_KEY", "gw-key")
+    monkeypatch.setattr(config, "SYNTH_MODEL", "standard")
+    monkeypatch.setattr(config, "BUILD_MODEL", "flash")
+
+
+_HELLO_STREAM = [
+    _chunk(reasoning="let me think"),          # reasoning delta: NOT part of the answer
+    _chunk(content="Hel"),
+    _chunk(content=None),                      # keep-alive / role-only delta
+    _chunk(content="lo", finish="stop"),
+    _chunk(usage={"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12}),
+]
+
+
+async def test_gateway_path_streams_and_joins_content_deltas(tmp_path, monkeypatch):
+    _gateway_mode(monkeypatch)
+    created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(tmp_path / "unused.json")
+    out = await pool.complete("ping")
+    assert out == "Hello"
+    assert len(created) == 1
+    assert created[0]["stream"] is True
+    assert created[0]["stream_options"] == {"include_usage": True}
+
+
+async def test_gateway_stream_usage_chunk_reaches_llmtok(tmp_path, monkeypatch, caplog):
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("INFO", logger="papervault.knowledge.store.llm"):
+        await pool.complete("ping")
+    tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
+    assert len(tok) == 1
+    assert "ptok=10 ctok=2 ttok=12" in tok[0]
+
+
+async def test_stream_kill_switch_falls_back_to_plain_completion(tmp_path, monkeypatch):
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_STREAM", False)
+    created = _install_fake_stream_client(monkeypatch, lambda key: "plain-ok")
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping") == "plain-ok"
+    assert "stream" not in created[0] and "stream_options" not in created[0]
+
+
+async def test_caller_stream_kwarg_never_leaks_a_stream_object(tmp_path, monkeypatch):
+    """The contract returns str. A caller-supplied stream=False must not switch the wrapper
+    back to the 120 s-vulnerable plain call, and stream=True must not hand back an iterator."""
+    _gateway_mode(monkeypatch)
+    created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping", stream=False) == "Hello"
+    assert await pool.complete("ping", stream=True) == "Hello"
+    assert all(c["stream"] is True for c in created)
+
+
+_MIDSTREAM_ERRORS = [
+    # What openai's AsyncStream actually raises while ITERATING (it reads response.aiter_bytes()
+    # directly; only request setup is normalised to APIConnectionError/APITimeoutError):
+    httpx.RemoteProtocolError("peer closed connection without sending complete message body"),
+    httpx.ReadTimeout("timed out"),
+    openai.APIError("upstream error event", httpx.Request("POST", "http://gw.example/v1/chat/completions"), body=None),
+]
+
+
+@pytest.mark.parametrize("err", _MIDSTREAM_ERRORS, ids=lambda e: type(e).__name__)
+async def test_gateway_midstream_failure_becomes_stream_truncated(tmp_path, monkeypatch, caplog, err):
+    """A failure while iterating the stream is normalised to StreamTruncated (cause chained) so
+    every caller's classifier sees ONE transient type instead of status-less httpx/APIError
+    instances; the gateway path still logs the attempt-fail before re-raising."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [_chunk(content="par"), err])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
+        with pytest.raises(llm_mod.StreamTruncated) as ei:
+            await pool.complete("ping")
+    assert ei.value.__cause__ is err
+    assert any("attempt-fail" in r.getMessage() and "err=StreamTruncated" in r.getMessage()
+               for r in caplog.records)
+
+
+async def test_request_time_error_is_not_wrapped(tmp_path, monkeypatch, caplog):
+    """An error raised by create() itself (before any chunk) keeps its type and status — the
+    401/403 auto-disable and the 429/5xx routing depend on it."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: _FakeError(429))
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
+        with pytest.raises(_FakeError):
+            await pool.complete("ping")
+    assert any("code=429" in r.getMessage() for r in caplog.records)
+
+
+async def test_direct_pool_streams_and_fails_over_on_midstream_error(tmp_path, monkeypatch):
+    """The direct KeyPool path streams too, and a stream that dies mid-way is a TRANSIENT
+    failure: fail over to the next key, write nothing."""
+    monkeypatch.setattr(config, "USE_GATEWAY", False)
+    f = tmp_path / "keys.json"
+    _write(f, [_group("dies"), _group("good")])
+    _pin_order(monkeypatch)
+
+    def behavior(key):
+        return ([_chunk(content="par"), httpx.RemoteProtocolError("peer closed connection")]
+                if key == "dies" else list(_HELLO_STREAM))
+
+    created = _install_fake_stream_client(monkeypatch, behavior)
+    pool = KeyPool(f)
+    assert await pool.complete("ping") == "Hello"
+    assert [c["stream"] for c in created] == [True, True]
+    assert all("disabled" not in g for g in json.loads(f.read_text()))
+
+
+async def test_stream_cut_before_finish_is_an_error_not_an_empty_answer(tmp_path, monkeypatch, caplog):
+    """A stream that ends WITHOUT any finish_reason was truncated upstream (the relay's cut, a
+    dropped connection). Returning "" would be a silent success that the callers' retry /
+    fail-over can never see — it must raise like any other failed attempt."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [_chunk(reasoning="hmm"), _chunk(content="par")])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
+        with pytest.raises(llm_mod.StreamTruncated):
+            await pool.complete("ping")
+    assert any("attempt-fail" in r.getMessage() for r in caplog.records)
+
+
+async def test_stream_that_finishes_with_empty_content_is_a_legit_empty_answer(tmp_path, monkeypatch):
+    """finish_reason present + no content = the model genuinely answered nothing (same as the plain
+    call's `content: None` → ""); NOT a truncation."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [_chunk(reasoning="hmm"), _chunk(content=None, finish="stop")])
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping") == ""
+
+
+async def test_stream_collects_only_choice_index_0_when_n_gt_1(tmp_path, monkeypatch):
+    """The plain path returns choices[0] only; with n>1 a stream interleaves the alternatives'
+    chunks, so the join must keep index 0 and drop the rest instead of concatenating them."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [
+        _chunk(content="A1", index=0), _chunk(content="B1", index=1),
+        _chunk(content="A2", index=0, finish="stop"), _chunk(content="B2", index=1, finish="stop"),
+        _chunk(usage={"prompt_tokens": 1, "completion_tokens": 4, "total_tokens": 5}),
+    ])
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping", n=2) == "A1A2"
+
+
+async def test_reserved_stream_keys_inside_extra_body_are_stripped(tmp_path, monkeypatch):
+    """The SDK merges extra_body OVER the request fields, so a caller could re-enable the plain
+    call (or drop the usage chunk) through it. The override is unconditional: reserved keys are
+    removed from a COPY of extra_body; the caller's other keys and dict are untouched."""
+    _gateway_mode(monkeypatch)
+    created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(tmp_path / "unused.json")
+    body = {"stream": False, "stream_options": {"include_usage": False}, "keep": 1}
+    assert await pool.complete("ping", extra_body=body) == "Hello"
+    assert created[0]["extra_body"] == {"keep": 1}
+    assert created[0]["stream"] is True and created[0]["stream_options"] == {"include_usage": True}
+    assert body == {"stream": False, "stream_options": {"include_usage": False}, "keep": 1}
+
+
+async def test_error_after_finish_reason_keeps_the_complete_answer(tmp_path, monkeypatch, caplog):
+    """The collector keeps reading after the finish chunk to pick up the usage chunk. A failure
+    in THAT tail (between the terminal answer chunk and usage/[DONE]) must not discard an answer
+    that is already complete — it returns the answer with usage unavailable and logs it."""
+    _gateway_mode(monkeypatch)
+    _install_fake_stream_client(monkeypatch, lambda key: [
+        _chunk(content="Hel"), _chunk(content="lo", finish="stop"),
+        httpx.RemoteProtocolError("peer closed connection before the usage chunk"),
+    ])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("INFO", logger="papervault.knowledge.store.llm"):
+        assert await pool.complete("ping") == "Hello"
+    tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
+    assert len(tok) == 1 and "ptok=? ctok=? ttok=?" in tok[0]
+    assert any("after finish_reason" in r.getMessage() for r in caplog.records)

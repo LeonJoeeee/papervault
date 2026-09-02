@@ -26,7 +26,7 @@ from typing import Any
 from openai import APIConnectionError
 
 from papervault.knowledge.ingest.operator_docs import strip_section_suffix
-from papervault.knowledge.store.llm import _error_code, mimo_complete
+from papervault.knowledge.store.llm import StreamTruncated, _error_code, mimo_complete
 from papervault.llm_routing import route
 
 logger = logging.getLogger("ks.query.synth")
@@ -274,7 +274,8 @@ def _is_transient_synth_error(exc: Exception) -> bool:
     """True iff a synth MiMo failure is a TRANSIENT hiccup worth a bounded internal retry.
 
     Transient (RETRY): a timeout (synth's own business-deadline ``wait_for``, or a transport-level
-    ``APITimeoutError``), a connection reset / gateway-unreachable (``APIConnectionError``), or an
+    ``APITimeoutError``), a connection reset / gateway-unreachable (``APIConnectionError``), a
+    streamed completion cut before its finish_reason (``StreamTruncated``), or an
     HTTP 429 / 5xx from the gateway. Deterministic (FAIL FAST): a 4xx validation/auth error (400 /
     401 / 403 / 404 / 422), and anything else — notably the KeyPool's terminal ``RuntimeError("All
     configured LLM keys failed …")``, which already represents EXHAUSTED internal failover (its
@@ -286,6 +287,10 @@ def _is_transient_synth_error(exc: Exception) -> bool:
         return True
     # Connection reset / gateway unreachable (also catches APITimeoutError).
     if isinstance(exc, APIConnectionError):
+        return True
+    # A streamed completion cut before its finish_reason (issue #100): no HTTP status, not a
+    # connection error type — the relay's idle cut / a dropped stream. Same class as a reset.
+    if isinstance(exc, StreamTruncated):
         return True
     # HTTP-status-bearing errors: reuse the store layer's best-effort status extraction so the
     # transient/permanent classification convention lives in ONE place.

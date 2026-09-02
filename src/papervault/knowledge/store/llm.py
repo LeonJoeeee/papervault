@@ -26,6 +26,12 @@ keys + failover/retry/cooldown/401-disable, so there is NO shuffle / _MAX_ROUNDS
 call, bounded by the caller's outer deadline. The default (unset / "0") path is BYTE-FOR-BYTE the
 KeyPool behavior below; gateway mode is a thin, reversible branch (unset env + restart to fall back).
 
+Streaming (issue #100, 2026-09-02): BOTH paths stream the completion and join the deltas back into
+the returned str (``_create_completion``) — the relay behind the gateway kills any request that is
+silent for ~120 s, which a long extraction chunk routinely is; a stream is never silent. Accounting
+(LLMTOK) still gets real token counts via ``stream_options.include_usage``. ``KS_LLM_STREAM=0`` is
+the boot-time kill switch back to the plain call.
+
 Interface compatible with LightRAG's llm_model_func signature (DO NOT CHANGE):
     async def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str
 """
@@ -104,6 +110,18 @@ _BACKOFF_JITTER = float(os.getenv("KS_LLM_BACKOFF_JITTER", "0.75"))
 # Distinct from no-retry-on-slow-key: only APIConnectionError triggers this; timeout/4xx/5xx still surface.
 _GW_CONN_MAX_RETRIES = int(os.getenv("KS_GATEWAY_CONN_RETRIES", "6"))
 _GW_CONN_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_CONN_BACKOFF_CAP", "15"))
+# STREAM every completion and join the deltas back into the str the contract returns (issue #100,
+# 2026-09-02). The relay behind the gateway closes any request that sends NO BYTES for ~120 s
+# (measured: a plain call dies at 120 s direct, 367 s via the gateway after its 2 retries; a
+# streamed call was still alive at 200 s on both paths). Extraction chunks routinely need
+# 60–250 s, so a plain call fails ~13 % of the time and every retry re-bills the generation.
+# Streaming keeps bytes flowing, so the same call completes. `stream_options.include_usage`
+# asks for the trailing usage chunk so LLMTOK accounting keeps real token counts. Kill switch
+# (boot-time, `KS_LLM_STREAM=0`) restores the plain call; callers cannot pick — the wrapper's
+# return type is str either way.
+_STREAM = os.getenv("KS_LLM_STREAM", "1") != "0"
+# Transport keys the wrapper owns: stripped from the caller's kwargs AND from extra_body.
+_RESERVED_TRANSPORT_KEYS = frozenset({"stream", "stream_options"})
 
 
 def _endpoint_label(g: dict) -> str:
@@ -169,6 +187,103 @@ def _sdk_model(model: str | None) -> str:
     if "/" in m:
         m = m.split("/", 1)[1]
     return m
+
+
+class StreamTruncated(RuntimeError):
+    """The stream ended or broke before any chunk carried a ``finish_reason``: the relay's cut,
+    a dropped connection (``httpx.ReadTimeout`` / ``RemoteProtocolError`` while iterating — the
+    SDK does not normalise those), or a streamed error event. Raised instead of returning a
+    partial / empty str, so the callers' existing failure routing (transient fail-over on the
+    direct path, attempt-fail + re-raise on the gateway path, synth's bounded retry, LightRAG's
+    own retry) sees ONE transient type. The original exception, when there is one, is chained as
+    ``__cause__``. Measured 2026-09-02: a cut stream is otherwise indistinguishable from a
+    normal end — no error event, just no more chunks."""
+
+
+class _Collected:
+    """A streamed completion joined back into the NON-stream response shape the two call
+    paths already consume: ``.choices[0].message.content`` and ``.usage`` (for log_usage)."""
+
+    def __init__(self, content: str, usage: Any, finish_reason: str | None):
+        message = type("Message", (), {"content": content})()
+        self.choices = [type("Choice", (), {"message": message, "finish_reason": finish_reason})()]
+        self.usage = usage
+
+
+async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dict[str, str]],
+                             openai_kwargs: dict[str, Any]) -> Any:
+    """ONE chokepoint for the actual ``chat.completions.create``. With ``_STREAM`` (default) it
+    streams and joins the ``delta.content`` pieces (reasoning deltas are NOT the answer and are
+    dropped; the trailing usage-only chunk is kept for accounting); otherwise it is the plain
+    call. A caller-supplied ``stream``/``stream_options`` is overridden either way — the
+    contract returns str, never an iterator. A REQUEST-time error (raised by ``create()``
+    itself) propagates unchanged, so the callers' status routing (401/403 auto-disable,
+    transient fail-over, attempt-fail logging) is untouched; an error while ITERATING, or a
+    stream that ends with no finish_reason, is normalised to ``StreamTruncated`` — except after
+    the finish chunk, where the complete answer is kept and only the usage is lost."""
+    kwargs = {k: v for k, v in openai_kwargs.items() if k not in _RESERVED_TRANSPORT_KEYS}
+    # The SDK merges extra_body OVER the request fields, so the reserved keys are stripped there
+    # too (from a copy — the caller's dict is not mutated) to keep the override unconditional.
+    if isinstance(kwargs.get("extra_body"), dict):
+        kwargs["extra_body"] = {k: v for k, v in kwargs["extra_body"].items()
+                                if k not in _RESERVED_TRANSPORT_KEYS}
+    if not _STREAM:
+        return await client.chat.completions.create(model=model, messages=messages, **kwargs)
+    stream = await client.chat.completions.create(
+        model=model, messages=messages, stream=True,
+        stream_options={"include_usage": True}, **kwargs,
+    )
+    parts: list[str] = []
+    usage: Any = None
+    finish: str | None = None
+    try:
+        async for chunk in stream:
+            u = getattr(chunk, "usage", None)
+            if u is not None:
+                usage = u
+            for choice in getattr(chunk, "choices", None) or []:
+                # Only the first alternative — the plain path returns choices[0]; with n>1 a
+                # stream interleaves the alternatives' chunks and they must not be concatenated.
+                if (getattr(choice, "index", 0) or 0) != 0:
+                    continue
+                piece = getattr(getattr(choice, "delta", None), "content", None)
+                if piece:
+                    parts.append(piece)
+                fr = getattr(choice, "finish_reason", None)
+                if fr:
+                    finish = fr
+    except Exception as e:  # noqa: BLE001 — CancelledError is BaseException, never caught here
+        # While ITERATING, openai's AsyncStream reads the body directly and lets transport
+        # failures (httpx.ReadTimeout / RemoteProtocolError) and streamed error events (a
+        # status-less APIError) through as-is — only request setup is normalised to
+        # APIConnectionError. Normalise them here to the one transient type the callers'
+        # classifiers know, with the cause chained for the log — UNLESS the answer was already
+        # complete: the loop keeps reading past the finish chunk only to pick up the usage
+        # chunk, and a failure in that tail must not discard (and re-bill via retry) a finished
+        # answer. Then keep the answer and just lose the token counts (LLMTOK logs "?").
+        if finish is None:
+            raise StreamTruncated(
+                f"stream broke after {len(parts)} content pieces: {type(e).__name__}: {e}"
+            ) from e
+        logger.warning("stream error after finish_reason=%s (%s: %s) — answer kept, usage unavailable",
+                       finish, type(e).__name__, e)
+    finally:
+        # Release the HTTP connection promptly on error/cancellation (the SDK's AsyncStream
+        # exposes an async close(); a plain async iterator has nothing to close).
+        close = getattr(stream, "close", None)
+        if close is not None:
+            with contextlib.suppress(Exception):
+                res = close()
+                if asyncio.iscoroutine(res):
+                    await res
+    if finish is None:
+        # Every completed OpenAI-style stream carries a finish_reason on its last content
+        # chunk; none at all means the stream was cut. "" here would be a silent success.
+        raise StreamTruncated(
+            f"stream ended without a finish_reason after {len(parts)} content pieces "
+            f"({sum(len(p) for p in parts)} chars)"
+        )
+    return _Collected("".join(parts), usage, finish)
 
 
 def _error_code(exc: Exception) -> int | None:
@@ -342,11 +457,7 @@ class KeyPool:
                 t0 = time.monotonic()
                 try:
                     client = self._client(g)
-                    resp = await client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        **openai_kwargs,
-                    )
+                    resp = await _create_completion(client, model, messages, openai_kwargs)
                     dt = time.monotonic() - t0
                     if dt >= _SLOW_CALL_S:
                         # Slow but OK — the call we want to see before an outer worker timeout kills it.
@@ -447,11 +558,7 @@ class KeyPool:
             t0 = time.monotonic()
             try:
                 client = self._gateway_client()
-                resp = await client.chat.completions.create(
-                    model=model,
-                    messages=messages,
-                    **openai_kwargs,
-                )
+                resp = await _create_completion(client, model, messages, openai_kwargs)
                 dt = time.monotonic() - t0
                 if dt >= _SLOW_CALL_S:
                     # Slow but OK — the call we want to see before an outer worker timeout kills it.

@@ -30,7 +30,10 @@ Streaming (issue #100, 2026-09-02): BOTH paths stream the completion and join th
 the returned str (``_create_completion``) — the relay behind the gateway kills any request that is
 silent for ~120 s, which a long extraction chunk routinely is; a stream is never silent. Accounting
 (LLMTOK) still gets real token counts via ``stream_options.include_usage``. ``KS_LLM_STREAM=0`` is
-the boot-time kill switch back to the plain call.
+the boot-time kill switch back to the plain call. Since issue #102 the gateway path also retries
+TRANSIENT failures a bounded number of times inside a wall-clock budget, and gives up on a stream
+whose first chunk does not arrive within ``KS_LLM_FIRST_CHUNK_S`` (the relay's idle timer also
+runs before the first token).
 
 Interface compatible with LightRAG's llm_model_func signature (DO NOT CHANGE):
     async def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str
@@ -122,6 +125,21 @@ _GW_CONN_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_CONN_BACKOFF_CAP", "15"))
 _STREAM = os.getenv("KS_LLM_STREAM", "1") != "0"
 # Transport keys the wrapper owns: stripped from the caller's kwargs AND from extra_body.
 _RESERVED_TRANSPORT_KEYS = frozenset({"stream", "stream_options"})
+# GATEWAY-path bounded retry of TRANSIENT failures (issue #102). The proxy's own retries cover a
+# connection that never opens; what they cannot cover is one bad minute of the relay: a stream
+# cut before its first byte, a 5xx / 429, a streamed error event. Measured 2026-09-02: 5 such
+# attempts out of 1442 each failed a whole document at the merge stage. Retry those a few times
+# with jittered backoff — but only while the whole call can still finish inside the caller's
+# cap (`_GW_RETRY_BUDGET_S`, default = KS_LLM_TIMEOUT's 900 s; LightRAG's worker cap is 2x that).
+# Deterministic 4xx are never retried; a slow-but-alive call (APITimeoutError) is not either.
+_GW_TRANSIENT_RETRIES = int(os.getenv("KS_GATEWAY_TRANSIENT_RETRIES", "2"))      # -> 3 attempts
+_GW_TRANSIENT_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_TRANSIENT_BACKOFF_CAP", "15"))
+_GW_RETRY_BUDGET_S = float(os.getenv("KS_GATEWAY_RETRY_BUDGET_S", os.getenv("KS_LLM_TIMEOUT", "900")))
+# The relay's ~120 s idle timer also runs BEFORE the first token. Waiting it out costs 120 s per
+# attempt (365 s after the proxy's two retries) for nothing; give up on the first chunk earlier
+# so the retry above starts while the relay may already be less busy. 0 disables the deadline.
+_FIRST_CHUNK_S = float(os.getenv("KS_LLM_FIRST_CHUNK_S", "100"))
+_TRANSIENT_STATUSES = frozenset({408, 429})
 
 
 def _endpoint_label(g: dict) -> str:
@@ -237,7 +255,23 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
     usage: Any = None
     finish: str | None = None
     try:
-        async for chunk in stream:
+        it = stream.__aiter__()
+        waiting_first = _FIRST_CHUNK_S > 0
+        while True:
+            try:
+                if waiting_first:
+                    chunk = await asyncio.wait_for(it.__anext__(), timeout=_FIRST_CHUNK_S)
+                else:
+                    chunk = await it.__anext__()
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError as e:
+                # Only the FIRST chunk is deadline-bound (see _FIRST_CHUNK_S); once bytes flow
+                # the relay's idle timer is no longer the risk and the caller's cap governs.
+                raise StreamTruncated(
+                    f"no first chunk within {_FIRST_CHUNK_S:.0f}s (relay queue / first-token wait)"
+                ) from e
+            waiting_first = False
             u = getattr(chunk, "usage", None)
             if u is not None:
                 usage = u
@@ -252,6 +286,8 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
                 fr = getattr(choice, "finish_reason", None)
                 if fr:
                     finish = fr
+    except StreamTruncated:
+        raise
     except Exception as e:  # noqa: BLE001 — CancelledError is BaseException, never caught here
         # While ITERATING, openai's AsyncStream reads the body directly and lets transport
         # failures (httpx.ReadTimeout / RemoteProtocolError) and streamed error events (a
@@ -507,10 +543,13 @@ class KeyPool:
         **kwargs: Any,
     ) -> str:
         """Thin path: build the SAME messages + apply the SAME kwarg whitelist / extra_body
-        routing / silent-drop as ``complete()``, then make a SINGLE ``chat.completions.create``
-        against the proxy. The PROXY does failover/retry/cooldown, so there is NO shuffle and NO
-        ``_MAX_ROUNDS`` here — the caller's outer deadline (LightRAG worker / synth ``wait_for``)
-        governs. Preserves the contract: ``CancelledError`` re-raised, str return (None→"")."""
+        routing / silent-drop as ``complete()``, then ``chat.completions.create`` against the
+        proxy. The PROXY does key failover/cooldown, so there is NO shuffle and NO ``_MAX_ROUNDS``
+        here; what KS adds (issue #102) is a bounded, wall-clock-budgeted retry of TRANSIENT
+        failures — a stream cut before or while answering, 408/429, 5xx — because the proxy's
+        own retries only cover a connection that never opens. The caller's outer deadline
+        (LightRAG worker / synth ``wait_for``) still governs. Preserves the contract:
+        ``CancelledError`` re-raised, str return (None→"")."""
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -554,6 +593,8 @@ class KeyPool:
 
         ep = f"gateway:{model}"
         conn_try = 0
+        transient_try = 0
+        t_call = time.monotonic()         # the wall-clock budget spans ALL attempts
         while True:
             t0 = time.monotonic()
             try:
@@ -600,6 +641,22 @@ class KeyPool:
                 code = _error_code(e)
                 logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s",
                                dt, ep, code, type(e).__name__)
+                # Issue #102: a TRANSIENT failure (a stream cut before/while answering, 408/429,
+                # 5xx) gets a bounded, budgeted retry so one bad minute of the relay does not
+                # fail the document. Deterministic 4xx (400 validation / 401 / 403 / 404 / 422)
+                # surface at once. APITimeoutError never reaches here (re-raised above).
+                transient = isinstance(e, StreamTruncated) or (
+                    code is not None and (code in _TRANSIENT_STATUSES or 500 <= code <= 599))
+                elapsed = time.monotonic() - t_call
+                if transient and transient_try < _GW_TRANSIENT_RETRIES and elapsed < _GW_RETRY_BUDGET_S:
+                    transient_try += 1
+                    delay = min(2.0 ** (transient_try - 1), _GW_TRANSIENT_BACKOFF_CAP) * (0.5 + random.random())
+                    logger.warning("mimo gateway transient failure (%s) endpoint=%s — retrying in %.1fs "
+                                   "(try %d/%d, %.0fs of %.0fs budget used)",
+                                   type(e).__name__, ep, delay, transient_try, _GW_TRANSIENT_RETRIES,
+                                   elapsed, _GW_RETRY_BUDGET_S)
+                    await asyncio.sleep(delay)
+                    continue
                 raise
 
     # ---- 401/403 auto-disable: the only persistent state, written to the shared file ----

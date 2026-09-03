@@ -14,6 +14,7 @@ monkeypatch, never the real research/llm_keys.json (which the suite must not cor
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
@@ -57,8 +58,11 @@ class _FakeError(Exception):
 @pytest.fixture(autouse=True)
 def _stream_on(monkeypatch):
     """Pin the documented default (streaming ON) regardless of the developer's / deployment's
-    .env, so the streaming tests exercise the streaming branch; the kill-switch test overrides."""
+    .env, so the streaming tests exercise the streaming branch; the kill-switch test overrides.
+    Also zero the gateway-path retry backoff so no test sleeps (retry COUNTS stay at their
+    defaults; the #102 tests pin what they assert)."""
     monkeypatch.setattr(llm_mod, "_STREAM", True)
+    monkeypatch.setattr(llm_mod, "_GW_TRANSIENT_BACKOFF_CAP", 0.0)
 
 
 def _pin_order(monkeypatch):
@@ -569,3 +573,104 @@ async def test_error_after_finish_reason_keeps_the_complete_answer(tmp_path, mon
     tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
     assert len(tok) == 1 and "ptok=? ctok=? ttok=?" in tok[0]
     assert any("after finish_reason" in r.getMessage() for r in caplog.records)
+
+
+# ---- issue #102: bounded retry of TRANSIENT gateway failures on the gateway path -------------
+#
+# One bad minute of the relay (a stream cut before its first byte, a 5xx, a streamed error event)
+# must not fail a whole document: the gateway path retries transient failures a bounded number of
+# times with backoff, inside a wall-clock budget, and never retries deterministic 4xx.
+
+@pytest.fixture
+def _instant_gateway_backoff(monkeypatch):
+    monkeypatch.setattr(llm_mod, "_GW_TRANSIENT_RETRIES", 2)        # -> up to 3 attempts
+    monkeypatch.setattr(llm_mod, "_GW_TRANSIENT_BACKOFF_CAP", 0.0)  # no real sleeps
+    monkeypatch.setattr(llm_mod, "_GW_RETRY_BUDGET_S", 600.0)
+
+
+def _install_sequenced_stream_client(monkeypatch, outcomes):
+    """Like _install_fake_stream_client but consumes ``outcomes`` IN ORDER, one per create():
+    each is a str (plain answer), a list of chunks / exceptions (a stream), or an Exception raised
+    by create() itself. Returns the list of create() kwargs (one per attempt)."""
+    seq = iter(outcomes)
+    return _install_fake_stream_client(monkeypatch, lambda key: next(seq))
+
+
+async def test_gateway_retries_stream_truncated_then_succeeds(tmp_path, monkeypatch, caplog, _instant_gateway_backoff):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(monkeypatch, [
+        [_chunk(content="par"), httpx.RemoteProtocolError("peer closed")],   # attempt 1: cut
+        list(_HELLO_STREAM),                                                 # attempt 2: fine
+    ])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
+        assert await pool.complete("ping") == "Hello"
+    assert len(created) == 2
+    assert any("transient" in r.getMessage() and "retrying" in r.getMessage() for r in caplog.records)
+
+
+async def test_gateway_retries_5xx_then_succeeds(tmp_path, monkeypatch, _instant_gateway_backoff):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(monkeypatch, [_FakeError(502), list(_HELLO_STREAM)])
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping") == "Hello"
+    assert len(created) == 2
+
+
+async def test_gateway_does_not_retry_4xx(tmp_path, monkeypatch, _instant_gateway_backoff):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(monkeypatch, [_FakeError(400), list(_HELLO_STREAM)])
+    pool = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(_FakeError):
+        await pool.complete("ping")
+    assert len(created) == 1
+
+
+async def test_gateway_transient_retries_exhaust_then_raise(tmp_path, monkeypatch, _instant_gateway_backoff):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(monkeypatch, [
+        [httpx.ReadTimeout("t")], [httpx.ReadTimeout("t")], [httpx.ReadTimeout("t")], list(_HELLO_STREAM)])
+    pool = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(llm_mod.StreamTruncated):
+        await pool.complete("ping")
+    assert len(created) == 3          # retries(2) + 1, the 4th (good) outcome is never reached
+
+
+async def test_gateway_retry_stays_inside_the_wall_clock_budget(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """A retry is only worth it if the whole call can still finish under the caller's cap: with
+    the budget already spent, a transient failure surfaces instead of starting attempt 2."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_GW_RETRY_BUDGET_S", 0.0)
+    created = _install_sequenced_stream_client(monkeypatch, [_FakeError(503), list(_HELLO_STREAM)])
+    pool = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(_FakeError):
+        await pool.complete("ping")
+    assert len(created) == 1
+
+
+async def test_no_first_chunk_within_deadline_is_stream_truncated(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """The relay's idle timer also runs BEFORE the first token; waiting the full 120 s (x3 gateway
+    retries = 365 s) for it is the residual failure of #100. A first-chunk deadline turns that
+    into an early StreamTruncated, which the retry loop can act on."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_FIRST_CHUNK_S", 0.05)
+    monkeypatch.setattr(llm_mod, "_GW_TRANSIENT_RETRIES", 0)
+
+    async def _never():
+        await asyncio.sleep(5)
+        yield _chunk(content="late", finish="stop")
+
+    class _Completions:
+        async def create(self, *, model, messages, **kw):
+            return _never()
+
+    class _Fake:
+        def __init__(self, *, api_key, base_url, timeout=None, max_retries=None):
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
+    pool = KeyPool(tmp_path / "unused.json")
+    t0 = time.monotonic()
+    with pytest.raises(llm_mod.StreamTruncated, match="first chunk"):
+        await pool.complete("ping")
+    assert time.monotonic() - t0 < 2.0

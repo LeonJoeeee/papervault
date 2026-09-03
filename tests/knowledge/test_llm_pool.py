@@ -808,3 +808,43 @@ async def test_unreachable_retry_needs_room_for_a_first_chunk(tmp_path, monkeypa
     with pytest.raises(openai.APIConnectionError):
         await KeyPool(tmp_path / "unused.json").complete("ping")
     assert len(created) == 2
+
+
+# ---- #102 merge check 1, round 3: a transport timeout that USED its interval is still retriable --
+
+def test_retry_budget_defaults_to_the_worker_cap():
+    """LightRAG's per-worker cap is 2 x KS_LLM_TIMEOUT (graph.py); the retry budget follows it so
+    a retry can still be started after a transport timeout that consumed a full attempt."""
+    assert llm_mod._retry_budget_default({}) == 2 * llm_mod.DEFAULT_LLM_TIMEOUT_S      # 480
+    assert llm_mod._retry_budget_default({"KS_LLM_TIMEOUT": "900"}) == 1800.0
+    assert llm_mod._retry_budget_default({"KS_LLM_TIMEOUT": "900", "KS_GATEWAY_RETRY_BUDGET_S": "300"}) == 300.0
+
+
+async def test_gateway_retries_a_transport_timeout_that_consumed_its_interval(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """The timeout arrives only after the transport waited its whole interval; with the interval
+    below (budget - first-chunk room) there is still room and the retry succeeds."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_FIRST_CHUNK_S", 0.5)
+    monkeypatch.setattr(llm_mod, "_GW_RETRY_BUDGET_S", 10.0)
+    created: list[int] = []
+    err = openai.APITimeoutError(request=httpx.Request("POST", "http://gw.example/v1/chat/completions"))
+
+    class _Completions:
+        async def create(self, *, model, messages, **kw):
+            created.append(1)
+            if len(created) == 1:
+                await asyncio.sleep(0.3)      # the transport interval elapses before the timeout
+                raise err
+
+            async def _gen():
+                for c in _HELLO_STREAM:
+                    yield c
+            return _gen()
+
+    class _Fake:
+        def __init__(self, *, api_key, base_url, timeout=None, max_retries=None):
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
+    assert await KeyPool(tmp_path / "unused.json").complete("ping") == "Hello"
+    assert len(created) == 2

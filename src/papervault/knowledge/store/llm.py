@@ -131,8 +131,8 @@ _RESERVED_TRANSPORT_KEYS = frozenset({"stream", "stream_options"})
 # cut before its first byte, a 5xx / 429, a streamed error event. Measured 2026-09-02: 5 such
 # attempts out of 1442 each failed a whole document at the merge stage. Retry those a few times
 # with jittered backoff — but only while the whole call can still finish inside the caller's
-# cap (`_GW_RETRY_BUDGET_S`, default = KS_LLM_TIMEOUT, 240 s unless set; LightRAG's worker cap is
-# 2x that). Deterministic 4xx are never retried; a transport timeout (APITimeoutError) is transient.
+# cap (`_GW_RETRY_BUDGET_S`, default = LightRAG's worker cap = 2 x KS_LLM_TIMEOUT, 480 s unless
+# set). Deterministic 4xx are never retried; a transport timeout (APITimeoutError) is transient.
 # ONE default for the per-extraction-call deadline (KS_LLM_TIMEOUT): graph.py derives LightRAG's
 # per-worker cap as 2x it, and the retry budget below inherits it — so a clean install (env unset)
 # retries only inside the 240 s the worker cap of 480 s leaves room for.
@@ -140,11 +140,22 @@ DEFAULT_LLM_TIMEOUT_S = 240
 _GW_TRANSIENT_RETRIES = int(os.getenv("KS_GATEWAY_TRANSIENT_RETRIES", "2"))      # -> 3 attempts
 _GW_TRANSIENT_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_TRANSIENT_BACKOFF_CAP", "15"))
 # ABSOLUTE deadline, measured from the first attempt, within which a retry may still be STARTED
-# (with room for its first chunk): elapsed + backoff + _FIRST_CHUNK_S must fit. The attempt itself
-# then runs under the caller's cap like any other; sleeps are clipped to the remaining time; the
-# gateway-unreachable loop below honours the same deadline.
-_GW_RETRY_BUDGET_S = float(os.getenv("KS_GATEWAY_RETRY_BUDGET_S",
-                                     os.getenv("KS_LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT_S))))
+# (with room for its first chunk): elapsed + backoff + _FIRST_CHUNK_S must fit. It defaults to
+# LightRAG's per-worker cap (2 x KS_LLM_TIMEOUT, the same derivation graph.py uses), so a retry
+# can still start after a transport timeout that consumed a whole attempt — provided
+# KS_LLM_CLIENT_TIMEOUT sits below that cap minus the first-chunk room (production: cap 1800,
+# client timeout 1500, room 100). The attempt itself runs under the caller's cap like any other;
+# sleeps are clipped to the remaining time; the gateway-unreachable loop honours the same deadline.
+
+
+def _retry_budget_default(env) -> float:
+    """KS_GATEWAY_RETRY_BUDGET_S, else 2 x KS_LLM_TIMEOUT (LightRAG's per-worker cap)."""
+    if env.get("KS_GATEWAY_RETRY_BUDGET_S"):
+        return float(env["KS_GATEWAY_RETRY_BUDGET_S"])
+    return 2.0 * float(env.get("KS_LLM_TIMEOUT") or DEFAULT_LLM_TIMEOUT_S)
+
+
+_GW_RETRY_BUDGET_S = _retry_budget_default(os.environ)
 # The relay's ~120 s idle timer also runs BEFORE the first token, and the proxy only sends the
 # response headers once the upstream answers — so the deadline spans create() AND the first chunk.
 # Waiting the relay out costs 120 s per attempt (365 s after the proxy's two retries) for nothing;
@@ -432,8 +443,8 @@ class KeyPool:
 
     def _gateway_client(self) -> AsyncOpenAI:
         # Gateway mode (KS_USE_GATEWAY=1): ONE cached client pointing at the LiteLLM proxy. The
-        # proxy holds the real keys + does failover/retry/cooldown/401-disable, so KS just talks
-        # to it with a virtual key. base_url/key are read on first use (env-overridable); same
+        # proxy holds the real keys + does key failover/cooldown/401-disable; KS talks to it with
+        # a virtual key and adds only the bounded transient retry of issue #102. base_url/key are read on first use (env-overridable); same
         # _CLIENT_TIMEOUT transport backstop as the direct path. Read AsyncOpenAI off the module
         # (not the import binding) so a monkeypatch of ``store.llm.AsyncOpenAI`` is honored.
         import papervault.knowledge.store.llm as _self_mod
@@ -469,9 +480,10 @@ class KeyPool:
         # which uses the RAW mimo_complete (LightRAG's llm_model_kwargs only reaches the query path).
         kwargs.setdefault("max_tokens", _DEFAULT_MAX_TOKENS)
         # Phase 1B (KS_USE_GATEWAY=1, default OFF — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md §9b): route to
-        # the LiteLLM proxy instead of the in-process KeyPool. The proxy owns failover/retry/
-        # cooldown/401-disable, so gateway mode is a SINGLE call — no shuffle, no _MAX_ROUNDS. The
-        # default (OFF) path below is UNCHANGED. Reversible: unset the env + restart to fall back.
+        # the LiteLLM proxy instead of the in-process KeyPool. The proxy owns key failover/
+        # cooldown/401-disable, so gateway mode has no shuffle and no _MAX_ROUNDS — one endpoint,
+        # with the bounded transient retry of issue #102. The default (OFF) path below is
+        # UNCHANGED. Reversible: unset the env + restart to fall back.
         if config.USE_GATEWAY:
             return await self._complete_via_gateway(
                 prompt, system_prompt=system_prompt,
@@ -561,7 +573,7 @@ class KeyPool:
             f"Last error: {type(last_error).__name__}: {last_error}"
         )
 
-    # ---- gateway mode (KS_USE_GATEWAY=1): ONE call to the LiteLLM proxy, no shuffle/rounds ----
+    # ---- gateway mode (KS_USE_GATEWAY=1): one proxy endpoint, no shuffle/rounds; bounded transient retry ----
     async def _complete_via_gateway(
         self,
         prompt: str,
@@ -778,8 +790,9 @@ async def mimo_complete(
     tries them in order, returning the first success; 401/403 auto-disables a key in the
     shared file; 429/timeout/5xx just fail over. Raises only if every active key fails.
 
-    If ``KS_USE_GATEWAY=1`` (default off), routes a SINGLE call to the LiteLLM proxy instead
-    (the proxy owns failover/retry/cooldown); same signature, whitelist, and str return.
+    If ``KS_USE_GATEWAY=1`` (default off), routes the call to the LiteLLM proxy instead (the
+    proxy owns key failover/cooldown; KS retries transient failures a bounded number of times,
+    issue #102); same signature, whitelist, and str return.
     """
     return await get_pool().complete(
         prompt,

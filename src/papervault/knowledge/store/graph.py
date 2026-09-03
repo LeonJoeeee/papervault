@@ -41,7 +41,7 @@ from papervault.knowledge.config import CONFIG
 from papervault.knowledge.ingest.chunking import chunking_by_sentence_boundary
 from papervault.knowledge.store.extraction_prompt import apply_ks_extraction_prompt
 from papervault.knowledge.store.lightrag_init import _bge_embed, _bge_rerank
-from papervault.knowledge.store.llm import mimo_complete
+from papervault.knowledge.store.llm import DEFAULT_LLM_TIMEOUT_S, mimo_complete
 from papervault.llm_routing import route
 
 log = logging.getLogger("ks.store.graph")
@@ -170,7 +170,7 @@ async def get_graph() -> LightRAG:
         # leave headroom — env-tunable (KS_LLM_TIMEOUT) so a build can raise it without a code
         # change. 240 → 480s worker (default); a high-concurrency build should raise both this
         # and lower KS_LLM_MAX_ASYNC. See experiments/retry_test100.py.
-        default_llm_timeout=int(os.getenv("KS_LLM_TIMEOUT", "240")),
+        default_llm_timeout=int(os.getenv("KS_LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT_S))),
         enable_llm_cache_for_entity_extract=True,
         force_llm_summary_on_merge=8,
         # LightRAG 1.5.x: 'entity_types' (a list) is DEAD — the ontology travels as ONE

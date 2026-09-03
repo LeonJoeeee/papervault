@@ -674,3 +674,104 @@ async def test_no_first_chunk_within_deadline_is_stream_truncated(tmp_path, monk
     with pytest.raises(llm_mod.StreamTruncated, match="first chunk"):
         await pool.complete("ping")
     assert time.monotonic() - t0 < 2.0
+
+
+# ---- #102 merge check 1, round 1: the deadline and the budget are absolute ----------------------
+
+def _stalling_client(monkeypatch, create_delay=None, create_raises=None):
+    """A fake client whose create() itself stalls for ``create_delay`` s (never yielding a stream
+    before the deadline) or raises ``create_raises`` every time. Returns the attempt counter."""
+    created: list[int] = []
+
+    class _Completions:
+        async def create(self, *, model, messages, **kw):
+            created.append(1)
+            if create_raises is not None:
+                raise create_raises
+            await asyncio.sleep(create_delay)
+
+            async def _gen():
+                yield _chunk(content="late", finish="stop")
+            return _gen()
+
+    class _Fake:
+        def __init__(self, *, api_key, base_url, timeout=None, max_retries=None):
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
+    return created
+
+
+async def test_first_chunk_deadline_covers_create_itself(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """Response headers are only sent once the upstream answers, so a stalled create() is the
+    same 120 s wait as a stalled first chunk — the deadline must span both."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_FIRST_CHUNK_S", 0.05)
+    monkeypatch.setattr(llm_mod, "_GW_TRANSIENT_RETRIES", 0)
+    _stalling_client(monkeypatch, create_delay=5)
+    pool = KeyPool(tmp_path / "unused.json")
+    t0 = time.monotonic()
+    with pytest.raises(llm_mod.StreamTruncated, match="first chunk"):
+        await pool.complete("ping")
+    assert time.monotonic() - t0 < 2.0
+
+
+async def test_retry_not_started_when_the_budget_is_nearly_spent(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """A transient failure just past the budget (not only one that started after it) gets no
+    retry: the budget is an absolute deadline measured from the first attempt."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_GW_RETRY_BUDGET_S", 0.3)
+    monkeypatch.setattr(llm_mod, "_FIRST_CHUNK_S", 0)
+    created: list[int] = []
+
+    class _Completions:
+        async def create(self, *, model, messages, **kw):
+            created.append(1)
+            await asyncio.sleep(0.4)          # the failing attempt itself outlives the budget
+            raise _FakeError(503)
+
+    class _Fake:
+        def __init__(self, *, api_key, base_url, timeout=None, max_retries=None):
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
+    pool = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(_FakeError):
+        await pool.complete("ping")
+    assert len(created) == 1
+
+
+def test_retry_delay_never_exceeds_the_cap():
+    for cap in (0.0, 1.0, 15.0):
+        for attempt in range(1, 8):
+            for _ in range(20):
+                assert 0.0 <= llm_mod._retry_delay(attempt, cap) <= cap
+
+
+async def test_unreachable_gateway_loop_respects_the_budget(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """The gateway-unreachable backoff loop is bounded by the same absolute deadline: with the
+    budget spent it gives up after the attempt instead of six more reconnects."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_GW_RETRY_BUDGET_S", 0.0)
+    monkeypatch.setattr(llm_mod, "_GW_CONN_BACKOFF_CAP", 0.0)
+    err = openai.APIConnectionError(request=httpx.Request("POST", "http://gw.example/v1/chat/completions"))
+    created = _stalling_client(monkeypatch, create_raises=err)
+    pool = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(openai.APIConnectionError):
+        await pool.complete("ping")
+    assert len(created) == 1
+
+
+async def test_mimo_complete_merge_stage_call_survives_one_cut(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """LightRAG's merge stage calls the public mimo_complete with the graph's kwargs; one cut
+    stream must not surface to it (that is what failed 4 documents on 2026-09-02)."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_KEYS_FILE", tmp_path / "unused.json")
+    monkeypatch.setattr(llm_mod, "_pool", None)
+    created = _install_sequenced_stream_client(monkeypatch, [
+        [_chunk(content="par"), httpx.RemoteProtocolError("peer closed")], list(_HELLO_STREAM)])
+    out = await mimo_complete("Summarize entity `Energy`", system_prompt="merge", model="flash",
+                              enable_thinking=True, max_tokens=131072)
+    assert out == "Hello"
+    assert len(created) == 2
+    assert created[1]["extra_body"] == {"enable_thinking": True} and created[1]["max_tokens"] == 131072

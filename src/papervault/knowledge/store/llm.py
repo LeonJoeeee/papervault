@@ -20,10 +20,11 @@ pl ALSO writes this file: we use the SAME lock filename (``<file>.lock``) and th
 ``disabled`` schema so concurrent writes from both processes are safe + mutually understood.
 
 Gateway mode (Phase 1B, ``KS_USE_GATEWAY=1``, DEFAULT OFF — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md §9b):
-when set, ``mimo_complete`` instead makes a SINGLE call to the running LiteLLM proxy (``KS_GATEWAY_URL``,
+when set, ``mimo_complete`` instead calls the running LiteLLM proxy (``KS_GATEWAY_URL``,
 default ``http://127.0.0.1:4000/v1``, with virtual key ``KS_VIRTUAL_KEY``). The proxy owns the real
-keys + failover/retry/cooldown/401-disable, so there is NO shuffle / _MAX_ROUNDS — just one proxy
-call, bounded by the caller's outer deadline. The default (unset / "0") path is BYTE-FOR-BYTE the
+keys + key failover/cooldown/401-disable, so there is NO shuffle / _MAX_ROUNDS; KS adds only a
+bounded, budgeted retry of TRANSIENT failures (issue #102) and the gateway-unreachable backoff,
+all inside the caller's outer deadline. The default (unset / "0") path is BYTE-FOR-BYTE the
 KeyPool behavior below; gateway mode is a thin, reversible branch (unset env + restart to fall back).
 
 Streaming (issue #100, 2026-09-02): BOTH paths stream the completion and join the deltas back into
@@ -132,14 +133,30 @@ _RESERVED_TRANSPORT_KEYS = frozenset({"stream", "stream_options"})
 # with jittered backoff — but only while the whole call can still finish inside the caller's
 # cap (`_GW_RETRY_BUDGET_S`, default = KS_LLM_TIMEOUT's 900 s; LightRAG's worker cap is 2x that).
 # Deterministic 4xx are never retried; a slow-but-alive call (APITimeoutError) is not either.
+# ONE default for the per-extraction-call deadline (KS_LLM_TIMEOUT): graph.py derives LightRAG's
+# per-worker cap as 2x it, and the retry budget below inherits it — so a clean install (env unset)
+# retries only inside the 240 s the worker cap of 480 s leaves room for.
+DEFAULT_LLM_TIMEOUT_S = 240
 _GW_TRANSIENT_RETRIES = int(os.getenv("KS_GATEWAY_TRANSIENT_RETRIES", "2"))      # -> 3 attempts
 _GW_TRANSIENT_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_TRANSIENT_BACKOFF_CAP", "15"))
-_GW_RETRY_BUDGET_S = float(os.getenv("KS_GATEWAY_RETRY_BUDGET_S", os.getenv("KS_LLM_TIMEOUT", "900")))
-# The relay's ~120 s idle timer also runs BEFORE the first token. Waiting it out costs 120 s per
-# attempt (365 s after the proxy's two retries) for nothing; give up on the first chunk earlier
-# so the retry above starts while the relay may already be less busy. 0 disables the deadline.
+# ABSOLUTE deadline, measured from the first attempt, within which a retry may still be STARTED
+# (with room for its first chunk): elapsed + backoff + _FIRST_CHUNK_S must fit. The attempt itself
+# then runs under the caller's cap like any other; sleeps are clipped to the remaining time; the
+# gateway-unreachable loop below honours the same deadline.
+_GW_RETRY_BUDGET_S = float(os.getenv("KS_GATEWAY_RETRY_BUDGET_S",
+                                     os.getenv("KS_LLM_TIMEOUT", str(DEFAULT_LLM_TIMEOUT_S))))
+# The relay's ~120 s idle timer also runs BEFORE the first token, and the proxy only sends the
+# response headers once the upstream answers — so the deadline spans create() AND the first chunk.
+# Waiting the relay out costs 120 s per attempt (365 s after the proxy's two retries) for nothing;
+# give up earlier so a retry starts while the relay may already be less busy. Applies to BOTH
+# paths through _create_completion (direct KeyPool too); 0 disables it.
 _FIRST_CHUNK_S = float(os.getenv("KS_LLM_FIRST_CHUNK_S", "100"))
 _TRANSIENT_STATUSES = frozenset({408, 429})
+
+
+def _retry_delay(attempt: int, cap: float) -> float:
+    """Jittered exponential backoff for retry ``attempt`` (1-based), never above ``cap``."""
+    return min((2.0 ** (attempt - 1)) * (0.5 + random.random()), cap)
 
 
 def _endpoint_label(g: dict) -> str:
@@ -247,20 +264,30 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
                                 if k not in _RESERVED_TRANSPORT_KEYS}
     if not _STREAM:
         return await client.chat.completions.create(model=model, messages=messages, **kwargs)
-    stream = await client.chat.completions.create(
+    # One ABSOLUTE deadline for "the first chunk exists": it spans create() (the proxy sends the
+    # response headers only once the upstream answers) and the first __anext__().
+    t_first = time.monotonic() + _FIRST_CHUNK_S if _FIRST_CHUNK_S > 0 else None
+    create = client.chat.completions.create(
         model=model, messages=messages, stream=True,
         stream_options={"include_usage": True}, **kwargs,
     )
+    try:
+        stream = await (asyncio.wait_for(create, timeout=_FIRST_CHUNK_S) if t_first else create)
+    except asyncio.TimeoutError as e:
+        raise StreamTruncated(
+            f"no first chunk within {_FIRST_CHUNK_S:.0f}s (request not answered)"
+        ) from e
     parts: list[str] = []
     usage: Any = None
     finish: str | None = None
     try:
         it = stream.__aiter__()
-        waiting_first = _FIRST_CHUNK_S > 0
+        waiting_first = t_first is not None
         while True:
             try:
                 if waiting_first:
-                    chunk = await asyncio.wait_for(it.__anext__(), timeout=_FIRST_CHUNK_S)
+                    chunk = await asyncio.wait_for(it.__anext__(),
+                                                   timeout=max(0.0, t_first - time.monotonic()))
                 else:
                     chunk = await it.__anext__()
             except StopAsyncIteration:
@@ -594,7 +621,8 @@ class KeyPool:
         ep = f"gateway:{model}"
         conn_try = 0
         transient_try = 0
-        t_call = time.monotonic()         # the wall-clock budget spans ALL attempts
+        t_call = time.monotonic()
+        deadline = t_call + _GW_RETRY_BUDGET_S   # ABSOLUTE: spans every attempt and every backoff
         while True:
             t0 = time.monotonic()
             try:
@@ -627,11 +655,13 @@ class KeyPool:
                 # surfaces below (preserve no-retry-on-slow-key). Jittered exp backoff so the workers
                 # don't all reconnect in lockstep the instant the gateway is back.
                 conn_try += 1
-                if conn_try > _GW_CONN_MAX_RETRIES:
-                    logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s — giving up",
-                                   conn_try - 1, ep)
+                remaining = deadline - time.monotonic()
+                if conn_try > _GW_CONN_MAX_RETRIES or remaining <= 0:
+                    logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s "
+                                   "(%.0fs of %.0fs budget left) — giving up",
+                                   conn_try - 1, ep, max(0.0, remaining), _GW_RETRY_BUDGET_S)
                     raise
-                delay = min(2.0 ** (conn_try - 1), _GW_CONN_BACKOFF_CAP) * (0.5 + random.random())
+                delay = min(_retry_delay(conn_try, _GW_CONN_BACKOFF_CAP), remaining)
                 logger.warning("mimo gateway unreachable (conn err) endpoint=%s — backoff %.1fs (try %d/%d)",
                                ep, delay, conn_try, _GW_CONN_MAX_RETRIES)
                 await asyncio.sleep(delay)
@@ -647,14 +677,17 @@ class KeyPool:
                 # surface at once. APITimeoutError never reaches here (re-raised above).
                 transient = isinstance(e, StreamTruncated) or (
                     code is not None and (code in _TRANSIENT_STATUSES or 500 <= code <= 599))
-                elapsed = time.monotonic() - t_call
-                if transient and transient_try < _GW_TRANSIENT_RETRIES and elapsed < _GW_RETRY_BUDGET_S:
+                remaining = deadline - time.monotonic()
+                delay = _retry_delay(transient_try + 1, _GW_TRANSIENT_BACKOFF_CAP)
+                # a retry is started only if, after the backoff, there is still room for its first
+                # chunk inside the budget — otherwise it would just eat the caller's cap
+                if (transient and transient_try < _GW_TRANSIENT_RETRIES
+                        and remaining - delay >= _FIRST_CHUNK_S):
                     transient_try += 1
-                    delay = min(2.0 ** (transient_try - 1), _GW_TRANSIENT_BACKOFF_CAP) * (0.5 + random.random())
                     logger.warning("mimo gateway transient failure (%s) endpoint=%s — retrying in %.1fs "
-                                   "(try %d/%d, %.0fs of %.0fs budget used)",
+                                   "(try %d/%d, %.0fs of %.0fs budget left)",
                                    type(e).__name__, ep, delay, transient_try, _GW_TRANSIENT_RETRIES,
-                                   elapsed, _GW_RETRY_BUDGET_S)
+                                   remaining, _GW_RETRY_BUDGET_S)
                     await asyncio.sleep(delay)
                     continue
                 raise

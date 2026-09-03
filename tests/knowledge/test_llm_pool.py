@@ -775,3 +775,36 @@ async def test_mimo_complete_merge_stage_call_survives_one_cut(tmp_path, monkeyp
     assert out == "Hello"
     assert len(created) == 2
     assert created[1]["extra_body"] == {"enable_thinking": True} and created[1]["max_tokens"] == 131072
+
+
+# ---- #102 merge check 1, round 2: transport timeouts are transient; the unreachable loop needs room --
+
+async def test_gateway_retries_a_transport_timeout_then_succeeds(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """APITimeoutError is the transport saying nothing arrived in time — the same transient class
+    synth already retries; on the gateway path it takes the bounded retry, not an instant fail."""
+    _gateway_mode(monkeypatch)
+    err = openai.APITimeoutError(request=httpx.Request("POST", "http://gw.example/v1/chat/completions"))
+    created = _install_sequenced_stream_client(monkeypatch, [err, list(_HELLO_STREAM)])
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping") == "Hello"
+    assert len(created) == 2
+
+
+async def test_unreachable_retry_needs_room_for_a_first_chunk(tmp_path, monkeypatch, _instant_gateway_backoff):
+    """Near the deadline the unreachable loop must not start another request that could only run
+    past the budget: with less than a first-chunk interval left it gives up; with room, it retries."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_GW_CONN_BACKOFF_CAP", 0.0)
+    monkeypatch.setattr(llm_mod, "_GW_CONN_MAX_RETRIES", 1)
+    monkeypatch.setattr(llm_mod, "_FIRST_CHUNK_S", 0.5)
+    err = openai.APIConnectionError(request=httpx.Request("POST", "http://gw.example/v1/chat/completions"))
+    monkeypatch.setattr(llm_mod, "_GW_RETRY_BUDGET_S", 0.3)      # budget alive, but < first-chunk room
+    created = _stalling_client(monkeypatch, create_raises=err)
+    with pytest.raises(openai.APIConnectionError):
+        await KeyPool(tmp_path / "unused.json").complete("ping")
+    assert len(created) == 1
+    monkeypatch.setattr(llm_mod, "_GW_RETRY_BUDGET_S", 10.0)     # room: one reconnect, then give up
+    created = _stalling_client(monkeypatch, create_raises=err)
+    with pytest.raises(openai.APIConnectionError):
+        await KeyPool(tmp_path / "unused.json").complete("ping")
+    assert len(created) == 2

@@ -131,8 +131,8 @@ _RESERVED_TRANSPORT_KEYS = frozenset({"stream", "stream_options"})
 # cut before its first byte, a 5xx / 429, a streamed error event. Measured 2026-09-02: 5 such
 # attempts out of 1442 each failed a whole document at the merge stage. Retry those a few times
 # with jittered backoff — but only while the whole call can still finish inside the caller's
-# cap (`_GW_RETRY_BUDGET_S`, default = KS_LLM_TIMEOUT's 900 s; LightRAG's worker cap is 2x that).
-# Deterministic 4xx are never retried; a slow-but-alive call (APITimeoutError) is not either.
+# cap (`_GW_RETRY_BUDGET_S`, default = KS_LLM_TIMEOUT, 240 s unless set; LightRAG's worker cap is
+# 2x that). Deterministic 4xx are never retried; a transport timeout (APITimeoutError) is transient.
 # ONE default for the per-extraction-call deadline (KS_LLM_TIMEOUT): graph.py derives LightRAG's
 # per-worker cap as 2x it, and the retry budget below inherits it — so a clean install (env unset)
 # retries only inside the 240 s the worker cap of 480 s leaves room for.
@@ -620,7 +620,7 @@ class KeyPool:
 
         ep = f"gateway:{model}"
         conn_try = 0
-        transient_try = 0
+        retry_state = {"tries": 0, "sleep": 0.0}   # the bounded transient retries (issue #102)
         t_call = time.monotonic()
         deadline = t_call + _GW_RETRY_BUDGET_S   # ABSOLUTE: spans every attempt and every backoff
         while True:
@@ -642,55 +642,63 @@ class KeyPool:
                                time.monotonic() - t0, ep)
                 raise
             except APIConnectionError as e:
-                # APITimeoutError SUBCLASSES APIConnectionError (openai/_exceptions.py): a per-request/
-                # transport timeout = a slow/stuck call (gateway stuck > client timeout), NOT the gateway
-                # being unreachable. Re-raise it — conn-backoff is ONLY for "can't connect", else we'd
-                # retry a slow call 6× and break no-retry-on-slow-key.
+                # APITimeoutError SUBCLASSES APIConnectionError (openai/_exceptions.py): a transport
+                # timeout is "nothing arrived in time" — a transient like a cut stream, and synth
+                # already treats it so; it takes the bounded transient retry below (issue #102),
+                # not the unreachable loop. A plain APIConnectionError = the GATEWAY ITSELF is
+                # unreachable (down/restarting): back off and WAIT for it instead of fast-failing —
+                # without this a brief gateway restart is a thundering herd (every worker
+                # instant-fails, churning hundreds of docs). Jittered exp backoff so the workers
+                # don't all reconnect in lockstep the instant the gateway is back; the same
+                # absolute deadline + first-chunk room rule as the transient retry bounds it.
                 if isinstance(e, APITimeoutError):
-                    raise
-                # The GATEWAY ITSELF is unreachable (down/restarting) — NOT a slow key. Back off and
-                # WAIT for it to return instead of fast-failing. Without this, a brief gateway restart
-                # is a thundering herd: every worker instant-fails (conn refused, 0s) and churns docs,
-                # nuking hundreds. Only APIConnectionError triggers this; a timeout/4xx/5xx still
-                # surfaces below (preserve no-retry-on-slow-key). Jittered exp backoff so the workers
-                # don't all reconnect in lockstep the instant the gateway is back.
+                    if not self._gateway_retry(e, ep, t0, deadline, retry_state):
+                        raise
+                    await asyncio.sleep(retry_state["sleep"])
+                    continue
                 conn_try += 1
                 remaining = deadline - time.monotonic()
-                if conn_try > _GW_CONN_MAX_RETRIES or remaining <= 0:
+                delay = _retry_delay(conn_try, _GW_CONN_BACKOFF_CAP)
+                if conn_try > _GW_CONN_MAX_RETRIES or remaining - delay <= max(_FIRST_CHUNK_S, 0.0):
                     logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s "
                                    "(%.0fs of %.0fs budget left) — giving up",
                                    conn_try - 1, ep, max(0.0, remaining), _GW_RETRY_BUDGET_S)
                     raise
-                delay = min(_retry_delay(conn_try, _GW_CONN_BACKOFF_CAP), remaining)
                 logger.warning("mimo gateway unreachable (conn err) endpoint=%s — backoff %.1fs (try %d/%d)",
                                ep, delay, conn_try, _GW_CONN_MAX_RETRIES)
                 await asyncio.sleep(delay)
                 continue
             except Exception as e:  # noqa: BLE001 — proxy owns failover; surface its final error
-                dt = time.monotonic() - t0
-                code = _error_code(e)
-                logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s",
-                               dt, ep, code, type(e).__name__)
-                # Issue #102: a TRANSIENT failure (a stream cut before/while answering, 408/429,
-                # 5xx) gets a bounded, budgeted retry so one bad minute of the relay does not
-                # fail the document. Deterministic 4xx (400 validation / 401 / 403 / 404 / 422)
-                # surface at once. APITimeoutError never reaches here (re-raised above).
-                transient = isinstance(e, StreamTruncated) or (
-                    code is not None and (code in _TRANSIENT_STATUSES or 500 <= code <= 599))
-                remaining = deadline - time.monotonic()
-                delay = _retry_delay(transient_try + 1, _GW_TRANSIENT_BACKOFF_CAP)
-                # a retry is started only if, after the backoff, there is still room for its first
-                # chunk inside the budget — otherwise it would just eat the caller's cap
-                if (transient and transient_try < _GW_TRANSIENT_RETRIES
-                        and remaining - delay >= _FIRST_CHUNK_S):
-                    transient_try += 1
-                    logger.warning("mimo gateway transient failure (%s) endpoint=%s — retrying in %.1fs "
-                                   "(try %d/%d, %.0fs of %.0fs budget left)",
-                                   type(e).__name__, ep, delay, transient_try, _GW_TRANSIENT_RETRIES,
-                                   remaining, _GW_RETRY_BUDGET_S)
-                    await asyncio.sleep(delay)
-                    continue
-                raise
+                if not self._gateway_retry(e, ep, t0, deadline, retry_state):
+                    raise
+                await asyncio.sleep(retry_state["sleep"])
+                continue
+
+    def _gateway_retry(self, e: Exception, ep: str, t0: float, deadline: float, state: dict) -> bool:
+        """Log the failed attempt; decide whether it gets one of the bounded TRANSIENT retries
+        (issue #102): a stream cut before/while answering (``StreamTruncated``), a transport
+        timeout (``APITimeoutError``), 408/429, 5xx. Deterministic 4xx (400 validation / 401 /
+        403 / 404 / 422) never do. A retry is granted only if, after the backoff, there is still
+        room for its first chunk inside the absolute budget — otherwise it would just eat the
+        caller's cap. On True, ``state["sleep"]`` carries the backoff to wait before retrying."""
+        dt = time.monotonic() - t0
+        code = _error_code(e)
+        logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s",
+                       dt, ep, code, type(e).__name__)
+        transient = isinstance(e, (StreamTruncated, APITimeoutError)) or (
+            code is not None and (code in _TRANSIENT_STATUSES or 500 <= code <= 599))
+        remaining = deadline - time.monotonic()
+        delay = _retry_delay(state["tries"] + 1, _GW_TRANSIENT_BACKOFF_CAP)
+        if not (transient and state["tries"] < _GW_TRANSIENT_RETRIES
+                and remaining - delay > max(_FIRST_CHUNK_S, 0.0)):
+            return False
+        state["tries"] += 1
+        state["sleep"] = delay
+        logger.warning("mimo gateway transient failure (%s) endpoint=%s — retrying in %.1fs "
+                       "(try %d/%d, %.0fs of %.0fs budget left)",
+                       type(e).__name__, ep, delay, state["tries"], _GW_TRANSIENT_RETRIES,
+                       remaining, _GW_RETRY_BUDGET_S)
+        return True
 
     # ---- 401/403 auto-disable: the only persistent state, written to the shared file ----
     async def _disable_key(self, api_key: str, code: int, reason: str) -> None:

@@ -20,17 +20,21 @@ pl ALSO writes this file: we use the SAME lock filename (``<file>.lock``) and th
 ``disabled`` schema so concurrent writes from both processes are safe + mutually understood.
 
 Gateway mode (Phase 1B, ``KS_USE_GATEWAY=1``, DEFAULT OFF — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md §9b):
-when set, ``mimo_complete`` instead makes a SINGLE call to the running LiteLLM proxy (``KS_GATEWAY_URL``,
+when set, ``mimo_complete`` instead calls the running LiteLLM proxy (``KS_GATEWAY_URL``,
 default ``http://127.0.0.1:4000/v1``, with virtual key ``KS_VIRTUAL_KEY``). The proxy owns the real
-keys + failover/retry/cooldown/401-disable, so there is NO shuffle / _MAX_ROUNDS — just one proxy
-call, bounded by the caller's outer deadline. The default (unset / "0") path is BYTE-FOR-BYTE the
+keys + key failover/cooldown/401-disable, so there is NO shuffle / _MAX_ROUNDS; KS adds only a
+bounded, budgeted retry of TRANSIENT failures (issue #102) and the gateway-unreachable backoff,
+all inside the caller's outer deadline. The default (unset / "0") path is BYTE-FOR-BYTE the
 KeyPool behavior below; gateway mode is a thin, reversible branch (unset env + restart to fall back).
 
 Streaming (issue #100, 2026-09-02): BOTH paths stream the completion and join the deltas back into
 the returned str (``_create_completion``) — the relay behind the gateway kills any request that is
 silent for ~120 s, which a long extraction chunk routinely is; a stream is never silent. Accounting
 (LLMTOK) still gets real token counts via ``stream_options.include_usage``. ``KS_LLM_STREAM=0`` is
-the boot-time kill switch back to the plain call.
+the boot-time kill switch back to the plain call. Since issue #102 the gateway path also retries
+TRANSIENT failures a bounded number of times inside a wall-clock budget, and gives up on a stream
+whose first chunk does not arrive within ``KS_LLM_FIRST_CHUNK_S`` (the relay's idle timer also
+runs before the first token).
 
 Interface compatible with LightRAG's llm_model_func signature (DO NOT CHANGE):
     async def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str
@@ -122,6 +126,48 @@ _GW_CONN_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_CONN_BACKOFF_CAP", "15"))
 _STREAM = os.getenv("KS_LLM_STREAM", "1") != "0"
 # Transport keys the wrapper owns: stripped from the caller's kwargs AND from extra_body.
 _RESERVED_TRANSPORT_KEYS = frozenset({"stream", "stream_options"})
+# GATEWAY-path bounded retry of TRANSIENT failures (issue #102). The proxy's own retries cover a
+# connection that never opens; what they cannot cover is one bad minute of the relay: a stream
+# cut before its first byte, a 5xx / 429, a streamed error event. Measured 2026-09-02: 5 such
+# attempts out of 1442 each failed a whole document at the merge stage. Retry those a few times
+# with jittered backoff — but only while the whole call can still finish inside the caller's
+# cap (`_GW_RETRY_BUDGET_S`, default = LightRAG's worker cap = 2 x KS_LLM_TIMEOUT, 480 s unless
+# set). Deterministic 4xx are never retried; a transport timeout (APITimeoutError) is transient.
+# ONE default for the per-extraction-call deadline (KS_LLM_TIMEOUT): graph.py derives LightRAG's
+# per-worker cap as 2x it, and the retry budget below inherits it — so a clean install (env unset)
+# retries only inside the 240 s the worker cap of 480 s leaves room for.
+DEFAULT_LLM_TIMEOUT_S = 240
+_GW_TRANSIENT_RETRIES = int(os.getenv("KS_GATEWAY_TRANSIENT_RETRIES", "2"))      # -> 3 attempts
+_GW_TRANSIENT_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_TRANSIENT_BACKOFF_CAP", "15"))
+# ABSOLUTE deadline, measured from the first attempt, within which a retry may still be STARTED
+# (with room for its first chunk): elapsed + backoff + _FIRST_CHUNK_S must fit. It defaults to
+# LightRAG's per-worker cap (2 x KS_LLM_TIMEOUT, the same derivation graph.py uses), so a retry
+# can still start after a transport timeout that consumed a whole attempt — provided
+# KS_LLM_CLIENT_TIMEOUT sits below that cap minus the first-chunk room (production: cap 1800,
+# client timeout 1500, room 100). The attempt itself runs under the caller's cap like any other;
+# sleeps are clipped to the remaining time; the gateway-unreachable loop honours the same deadline.
+
+
+def _retry_budget_default(env) -> float:
+    """KS_GATEWAY_RETRY_BUDGET_S, else 2 x KS_LLM_TIMEOUT (LightRAG's per-worker cap)."""
+    if env.get("KS_GATEWAY_RETRY_BUDGET_S"):
+        return float(env["KS_GATEWAY_RETRY_BUDGET_S"])
+    return 2.0 * float(env.get("KS_LLM_TIMEOUT") or DEFAULT_LLM_TIMEOUT_S)
+
+
+_GW_RETRY_BUDGET_S = _retry_budget_default(os.environ)
+# The relay's ~120 s idle timer also runs BEFORE the first token, and the proxy only sends the
+# response headers once the upstream answers — so the deadline spans create() AND the first chunk.
+# Waiting the relay out costs 120 s per attempt (365 s after the proxy's two retries) for nothing;
+# give up earlier so a retry starts while the relay may already be less busy. Applies to BOTH
+# paths through _create_completion (direct KeyPool too); 0 disables it.
+_FIRST_CHUNK_S = float(os.getenv("KS_LLM_FIRST_CHUNK_S", "100"))
+_TRANSIENT_STATUSES = frozenset({408, 429})
+
+
+def _retry_delay(attempt: int, cap: float) -> float:
+    """Jittered exponential backoff for retry ``attempt`` (1-based), never above ``cap``."""
+    return min((2.0 ** (attempt - 1)) * (0.5 + random.random()), cap)
 
 
 def _endpoint_label(g: dict) -> str:
@@ -229,15 +275,41 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
                                 if k not in _RESERVED_TRANSPORT_KEYS}
     if not _STREAM:
         return await client.chat.completions.create(model=model, messages=messages, **kwargs)
-    stream = await client.chat.completions.create(
+    # One ABSOLUTE deadline for "the first chunk exists": it spans create() (the proxy sends the
+    # response headers only once the upstream answers) and the first __anext__().
+    t_first = time.monotonic() + _FIRST_CHUNK_S if _FIRST_CHUNK_S > 0 else None
+    create = client.chat.completions.create(
         model=model, messages=messages, stream=True,
         stream_options={"include_usage": True}, **kwargs,
     )
+    try:
+        stream = await (asyncio.wait_for(create, timeout=_FIRST_CHUNK_S) if t_first else create)
+    except asyncio.TimeoutError as e:
+        raise StreamTruncated(
+            f"no first chunk within {_FIRST_CHUNK_S:.0f}s (request not answered)"
+        ) from e
     parts: list[str] = []
     usage: Any = None
     finish: str | None = None
     try:
-        async for chunk in stream:
+        it = stream.__aiter__()
+        waiting_first = t_first is not None
+        while True:
+            try:
+                if waiting_first:
+                    chunk = await asyncio.wait_for(it.__anext__(),
+                                                   timeout=max(0.0, t_first - time.monotonic()))
+                else:
+                    chunk = await it.__anext__()
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError as e:
+                # Only the FIRST chunk is deadline-bound (see _FIRST_CHUNK_S); once bytes flow
+                # the relay's idle timer is no longer the risk and the caller's cap governs.
+                raise StreamTruncated(
+                    f"no first chunk within {_FIRST_CHUNK_S:.0f}s (relay queue / first-token wait)"
+                ) from e
+            waiting_first = False
             u = getattr(chunk, "usage", None)
             if u is not None:
                 usage = u
@@ -252,6 +324,8 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
                 fr = getattr(choice, "finish_reason", None)
                 if fr:
                     finish = fr
+    except StreamTruncated:
+        raise
     except Exception as e:  # noqa: BLE001 — CancelledError is BaseException, never caught here
         # While ITERATING, openai's AsyncStream reads the body directly and lets transport
         # failures (httpx.ReadTimeout / RemoteProtocolError) and streamed error events (a
@@ -369,8 +443,8 @@ class KeyPool:
 
     def _gateway_client(self) -> AsyncOpenAI:
         # Gateway mode (KS_USE_GATEWAY=1): ONE cached client pointing at the LiteLLM proxy. The
-        # proxy holds the real keys + does failover/retry/cooldown/401-disable, so KS just talks
-        # to it with a virtual key. base_url/key are read on first use (env-overridable); same
+        # proxy holds the real keys + does key failover/cooldown/401-disable; KS talks to it with
+        # a virtual key and adds only the bounded transient retry of issue #102. base_url/key are read on first use (env-overridable); same
         # _CLIENT_TIMEOUT transport backstop as the direct path. Read AsyncOpenAI off the module
         # (not the import binding) so a monkeypatch of ``store.llm.AsyncOpenAI`` is honored.
         import papervault.knowledge.store.llm as _self_mod
@@ -406,9 +480,10 @@ class KeyPool:
         # which uses the RAW mimo_complete (LightRAG's llm_model_kwargs only reaches the query path).
         kwargs.setdefault("max_tokens", _DEFAULT_MAX_TOKENS)
         # Phase 1B (KS_USE_GATEWAY=1, default OFF — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md §9b): route to
-        # the LiteLLM proxy instead of the in-process KeyPool. The proxy owns failover/retry/
-        # cooldown/401-disable, so gateway mode is a SINGLE call — no shuffle, no _MAX_ROUNDS. The
-        # default (OFF) path below is UNCHANGED. Reversible: unset the env + restart to fall back.
+        # the LiteLLM proxy instead of the in-process KeyPool. The proxy owns key failover/
+        # cooldown/401-disable, so gateway mode has no shuffle and no _MAX_ROUNDS — one endpoint,
+        # with the bounded transient retry of issue #102. The default (OFF) path below is
+        # UNCHANGED. Reversible: unset the env + restart to fall back.
         if config.USE_GATEWAY:
             return await self._complete_via_gateway(
                 prompt, system_prompt=system_prompt,
@@ -498,7 +573,7 @@ class KeyPool:
             f"Last error: {type(last_error).__name__}: {last_error}"
         )
 
-    # ---- gateway mode (KS_USE_GATEWAY=1): ONE call to the LiteLLM proxy, no shuffle/rounds ----
+    # ---- gateway mode (KS_USE_GATEWAY=1): one proxy endpoint, no shuffle/rounds; bounded transient retry ----
     async def _complete_via_gateway(
         self,
         prompt: str,
@@ -507,10 +582,13 @@ class KeyPool:
         **kwargs: Any,
     ) -> str:
         """Thin path: build the SAME messages + apply the SAME kwarg whitelist / extra_body
-        routing / silent-drop as ``complete()``, then make a SINGLE ``chat.completions.create``
-        against the proxy. The PROXY does failover/retry/cooldown, so there is NO shuffle and NO
-        ``_MAX_ROUNDS`` here — the caller's outer deadline (LightRAG worker / synth ``wait_for``)
-        governs. Preserves the contract: ``CancelledError`` re-raised, str return (None→"")."""
+        routing / silent-drop as ``complete()``, then ``chat.completions.create`` against the
+        proxy. The PROXY does key failover/cooldown, so there is NO shuffle and NO ``_MAX_ROUNDS``
+        here; what KS adds (issue #102) is a bounded, wall-clock-budgeted retry of TRANSIENT
+        failures — a stream cut before or while answering, 408/429, 5xx — because the proxy's
+        own retries only cover a connection that never opens. The caller's outer deadline
+        (LightRAG worker / synth ``wait_for``) still governs. Preserves the contract:
+        ``CancelledError`` re-raised, str return (None→"")."""
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -554,6 +632,9 @@ class KeyPool:
 
         ep = f"gateway:{model}"
         conn_try = 0
+        retry_state = {"tries": 0, "sleep": 0.0}   # the bounded transient retries (issue #102)
+        t_call = time.monotonic()
+        deadline = t_call + _GW_RETRY_BUDGET_S   # ABSOLUTE: spans every attempt and every backoff
         while True:
             t0 = time.monotonic()
             try:
@@ -573,34 +654,63 @@ class KeyPool:
                                time.monotonic() - t0, ep)
                 raise
             except APIConnectionError as e:
-                # APITimeoutError SUBCLASSES APIConnectionError (openai/_exceptions.py): a per-request/
-                # transport timeout = a slow/stuck call (gateway stuck > client timeout), NOT the gateway
-                # being unreachable. Re-raise it — conn-backoff is ONLY for "can't connect", else we'd
-                # retry a slow call 6× and break no-retry-on-slow-key.
+                # APITimeoutError SUBCLASSES APIConnectionError (openai/_exceptions.py): a transport
+                # timeout is "nothing arrived in time" — a transient like a cut stream, and synth
+                # already treats it so; it takes the bounded transient retry below (issue #102),
+                # not the unreachable loop. A plain APIConnectionError = the GATEWAY ITSELF is
+                # unreachable (down/restarting): back off and WAIT for it instead of fast-failing —
+                # without this a brief gateway restart is a thundering herd (every worker
+                # instant-fails, churning hundreds of docs). Jittered exp backoff so the workers
+                # don't all reconnect in lockstep the instant the gateway is back; the same
+                # absolute deadline + first-chunk room rule as the transient retry bounds it.
                 if isinstance(e, APITimeoutError):
-                    raise
-                # The GATEWAY ITSELF is unreachable (down/restarting) — NOT a slow key. Back off and
-                # WAIT for it to return instead of fast-failing. Without this, a brief gateway restart
-                # is a thundering herd: every worker instant-fails (conn refused, 0s) and churns docs,
-                # nuking hundreds. Only APIConnectionError triggers this; a timeout/4xx/5xx still
-                # surfaces below (preserve no-retry-on-slow-key). Jittered exp backoff so the workers
-                # don't all reconnect in lockstep the instant the gateway is back.
+                    if not self._gateway_retry(e, ep, t0, deadline, retry_state):
+                        raise
+                    await asyncio.sleep(retry_state["sleep"])
+                    continue
                 conn_try += 1
-                if conn_try > _GW_CONN_MAX_RETRIES:
-                    logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s — giving up",
-                                   conn_try - 1, ep)
+                remaining = deadline - time.monotonic()
+                delay = _retry_delay(conn_try, _GW_CONN_BACKOFF_CAP)
+                if conn_try > _GW_CONN_MAX_RETRIES or remaining - delay <= max(_FIRST_CHUNK_S, 0.0):
+                    logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s "
+                                   "(%.0fs of %.0fs budget left) — giving up",
+                                   conn_try - 1, ep, max(0.0, remaining), _GW_RETRY_BUDGET_S)
                     raise
-                delay = min(2.0 ** (conn_try - 1), _GW_CONN_BACKOFF_CAP) * (0.5 + random.random())
                 logger.warning("mimo gateway unreachable (conn err) endpoint=%s — backoff %.1fs (try %d/%d)",
                                ep, delay, conn_try, _GW_CONN_MAX_RETRIES)
                 await asyncio.sleep(delay)
                 continue
             except Exception as e:  # noqa: BLE001 — proxy owns failover; surface its final error
-                dt = time.monotonic() - t0
-                code = _error_code(e)
-                logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s",
-                               dt, ep, code, type(e).__name__)
-                raise
+                if not self._gateway_retry(e, ep, t0, deadline, retry_state):
+                    raise
+                await asyncio.sleep(retry_state["sleep"])
+                continue
+
+    def _gateway_retry(self, e: Exception, ep: str, t0: float, deadline: float, state: dict) -> bool:
+        """Log the failed attempt; decide whether it gets one of the bounded TRANSIENT retries
+        (issue #102): a stream cut before/while answering (``StreamTruncated``), a transport
+        timeout (``APITimeoutError``), 408/429, 5xx. Deterministic 4xx (400 validation / 401 /
+        403 / 404 / 422) never do. A retry is granted only if, after the backoff, there is still
+        room for its first chunk inside the absolute budget — otherwise it would just eat the
+        caller's cap. On True, ``state["sleep"]`` carries the backoff to wait before retrying."""
+        dt = time.monotonic() - t0
+        code = _error_code(e)
+        logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s",
+                       dt, ep, code, type(e).__name__)
+        transient = isinstance(e, (StreamTruncated, APITimeoutError)) or (
+            code is not None and (code in _TRANSIENT_STATUSES or 500 <= code <= 599))
+        remaining = deadline - time.monotonic()
+        delay = _retry_delay(state["tries"] + 1, _GW_TRANSIENT_BACKOFF_CAP)
+        if not (transient and state["tries"] < _GW_TRANSIENT_RETRIES
+                and remaining - delay > max(_FIRST_CHUNK_S, 0.0)):
+            return False
+        state["tries"] += 1
+        state["sleep"] = delay
+        logger.warning("mimo gateway transient failure (%s) endpoint=%s — retrying in %.1fs "
+                       "(try %d/%d, %.0fs of %.0fs budget left)",
+                       type(e).__name__, ep, delay, state["tries"], _GW_TRANSIENT_RETRIES,
+                       remaining, _GW_RETRY_BUDGET_S)
+        return True
 
     # ---- 401/403 auto-disable: the only persistent state, written to the shared file ----
     async def _disable_key(self, api_key: str, code: int, reason: str) -> None:
@@ -680,8 +790,9 @@ async def mimo_complete(
     tries them in order, returning the first success; 401/403 auto-disables a key in the
     shared file; 429/timeout/5xx just fail over. Raises only if every active key fails.
 
-    If ``KS_USE_GATEWAY=1`` (default off), routes a SINGLE call to the LiteLLM proxy instead
-    (the proxy owns failover/retry/cooldown); same signature, whitelist, and str return.
+    If ``KS_USE_GATEWAY=1`` (default off), routes the call to the LiteLLM proxy instead (the
+    proxy owns key failover/cooldown; KS retries transient failures a bounded number of times,
+    issue #102); same signature, whitelist, and str return.
     """
     return await get_pool().complete(
         prompt,

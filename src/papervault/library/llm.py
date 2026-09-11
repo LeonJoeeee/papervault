@@ -15,19 +15,146 @@ KS — a JSON array of ``{model, api_key, base_url}`` groups. Each ``.call()``:
 If the key file is missing/broken it falls back to the old ``XIAOMI_API_KEY*`` env.
 """
 
+import contextlib
+import contextvars
 import json
 import logging
 import os
 import random
 import threading
 import time
+from concurrent.futures import Future, InvalidStateError
 from pathlib import Path
+from types import SimpleNamespace
 
 from papervault import config
 from papervault.llm_routing import route
 from papervault.llm_usage import log_usage
 
 logger = logging.getLogger(__name__)
+
+
+# Same transport policy as knowledge.store.llm: first-byte room below the relay's
+# ~120s idle cut, then let an active generation finish. The absolute retry budget
+# admits a retry only when its backoff AND first-chunk allowance still fit.
+_FIRST_CHUNK_S = float(os.getenv("PAPERVAULT_LIB_FIRST_CHUNK_S", "100"))
+_RETRY_BUDGET_S = float(os.getenv("PAPERVAULT_LIB_RETRY_BUDGET_S", "480"))
+_CLIENT_TIMEOUT_S = 900.0
+
+
+class StreamTruncated(RuntimeError):
+    """The provider did not finish its streamed answer."""
+
+
+def _close_stream(stream):
+    # LiteLLM's wrapper has no synchronous close; its underlying SDK stream does.
+    target = getattr(stream, "completion_stream", stream)
+    close = getattr(target, "close", None)
+    if close is not None:
+        with contextlib.suppress(Exception):
+            close()
+
+
+def _open_stream(kwargs):
+    """Bound completion creation plus first next() by ONE wall-clock deadline.
+
+    A sync SDK call cannot be cancelled in Python. A daemon owns that first read
+    until it hands the stream to this caller; an abandoned read closes its late
+    stream itself. No executor shutdown can block the timeout or the retry.
+    The SDK transport timeout remains a backstop for an abandoned network read.
+    """
+    import litellm
+
+    ready = Future()
+
+    def open_first():
+        stream = None
+        try:
+            stream = litellm.completion(**kwargs)
+            iterator = iter(stream)
+            first = next(iterator, None)
+        except BaseException as exc:
+            _close_stream(stream)
+            with contextlib.suppress(InvalidStateError):
+                ready.set_exception(exc)
+        else:
+            try:
+                ready.set_result((stream, iterator, first))
+            except InvalidStateError:
+                _close_stream(stream)
+
+    deadline = time.monotonic() + _FIRST_CHUNK_S
+    context = contextvars.copy_context()
+    threading.Thread(target=context.run, args=(open_first,), daemon=True).start()
+    handed_off = False
+    try:
+        result = ready.result(timeout=max(0.0, deadline - time.monotonic()))
+        handed_off = True
+        return result
+    except TimeoutError as exc:
+        if ready.done():  # A timeout raised by the SDK itself keeps its type.
+            raise
+        raise StreamTruncated(f"no first chunk within {_FIRST_CHUNK_S:g}s") from exc
+    finally:
+        if not handed_off and not ready.cancel() and ready.exception() is None:
+            # The worker won the race with cancellation: this caller owns cleanup.
+            _close_stream(ready.result()[0])
+
+
+def _create_completion(**kwargs):
+    """Join answer deltas and usage, rejecting an EOF without a provider finish."""
+    stream, iterator, chunk = _open_stream({
+        **kwargs, "stream": True, "stream_options": {"include_usage": True},
+        "num_retries": 0, "timeout": _CLIENT_TIMEOUT_S,
+    })
+    parts = []
+    usage = None
+    finish = None
+    try:
+        while chunk is not None:
+            if getattr(chunk, "usage", None) is not None:
+                usage = chunk.usage
+            for choice in getattr(chunk, "choices", None) or []:
+                if (getattr(choice, "index", 0) or 0) != 0:
+                    continue
+                piece = getattr(getattr(choice, "delta", None), "content", None)
+                if piece:
+                    parts.append(piece)
+                reason = getattr(choice, "finish_reason", None)
+                # CustomStreamWrapper invents stop at EOF. Only its received marker
+                # proves the provider finished; raw SDK iterators use the chunk.
+                if reason and getattr(stream, "received_finish_reason", reason):
+                    finish = reason
+            chunk = next(iterator, None)
+    except Exception as exc:  # noqa: BLE001 — normalize transport/stream errors only
+        code = _error_code(exc)
+        if code is not None and 400 <= code < 500 and code not in {408, 429}:
+            raise
+        if finish is None:
+            raise StreamTruncated(
+                f"stream broke after {len(parts)} content pieces ({type(exc).__name__})"
+            ) from exc
+        logger.warning("library stream error after finish_reason=%s (%s); answer kept",
+                       finish, type(exc).__name__)
+    finally:
+        _close_stream(stream)
+    if finish is None:
+        raise StreamTruncated(f"stream ended without a provider finish after {len(parts)} pieces")
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="".join(parts)),
+                                 finish_reason=finish)], usage=usage,
+    )
+
+
+def _is_transient(exc):
+    import httpx
+    import litellm
+
+    code = _error_code(exc)
+    if code is not None:
+        return code in {408, 429} or 500 <= code <= 599
+    return isinstance(exc, (StreamTruncated, TimeoutError, litellm.Timeout,
+                            litellm.APIConnectionError, httpx.TransportError))
 
 
 def _litellm_model(model: str) -> str:
@@ -51,6 +178,8 @@ class LLM:
     litellm raises typed exceptions that carry ``.status_code`` (e.g.
     ``AuthenticationError`` → 401), so the pool's 401/403 auto-disable + transient
     (429/5xx/timeout) failover in :meth:`KeyPool.call` are byte-unchanged.
+    Calls stream internally and retry transient failures once within a retry
+    admission budget; the legacy num_retries argument cannot multiply SDK retries.
     """
 
     def __init__(self, model, *, base_url=None, api_key=None, max_tokens=None,
@@ -62,18 +191,26 @@ class LLM:
         self.num_retries = num_retries
 
     def call(self, messages, **_ignored):
-        import litellm
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
         t0 = time.monotonic()
-        resp = litellm.completion(
-            model=self.model,
-            messages=messages,
-            base_url=self.base_url,
-            api_key=self.api_key,
-            max_tokens=self.max_tokens,
-            num_retries=self.num_retries,
-        )
+        deadline = t0 + _RETRY_BUDGET_S
+        for attempt in range(2):
+            try:
+                resp = _create_completion(
+                    model=self.model, messages=messages, base_url=self.base_url,
+                    api_key=self.api_key, max_tokens=self.max_tokens,
+                )
+                break
+            except Exception as exc:  # noqa: BLE001 — retain pool status handling
+                delay = 0.5 + random.random()
+                remaining = deadline - time.monotonic()
+                if (attempt == 1 or not _is_transient(exc)
+                        or remaining - delay <= _FIRST_CHUNK_S):
+                    raise
+                logger.warning("library transient failure (%s); retrying once in %.1fs "
+                               "(%.1fs budget left)", type(exc).__name__, delay, remaining)
+                time.sleep(delay)
         # Bare model name (strip the litellm provider prefix) so pl and ks lines
         # aggregate under one label in per-model roll-ups.
         log_usage(logger, "pl", self.model.rsplit("/", 1)[-1], time.monotonic() - t0, resp)

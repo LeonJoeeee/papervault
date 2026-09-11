@@ -27,6 +27,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The PR merge commit plus its two parents, so the binding step can read them.
+          fetch-depth: 2
+      - name: Bind this checkout to the advertised PR merge result
+        if: github.event_name == 'pull_request'
+        env:
+          EXPECTED_BASE: ${{ github.event.pull_request.base.sha }}
+          EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          test "$(git rev-parse HEAD^1)" = "$EXPECTED_BASE"
+          test "$(git rev-parse HEAD^2)" = "$EXPECTED_HEAD"
       - name: Install uv
         uses: astral-sh/setup-uv@v5
         with:
@@ -53,3 +64,11 @@ jobs:
       - name: Build sdist + wheel
         run: |
           uv build
+
+  merged-result:
+    name: merged-result / ${{ github.event.pull_request.base.sha }} / ${{ github.event.pull_request.head.sha }}
+    if: github.event_name == 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "this exact merge of base and head passed the test job"

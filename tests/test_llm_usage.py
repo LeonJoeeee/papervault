@@ -52,10 +52,11 @@ def test_library_call_site_wired(caplog, monkeypatch):
     from papervault.library.llm import LLM
 
     fake_resp = SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content="hi"))],
+        choices=[SimpleNamespace(index=0, delta=SimpleNamespace(content="hi"),
+                                 finish_reason="stop")],
         usage=SimpleNamespace(prompt_tokens=7, completion_tokens=3, total_tokens=10),
     )
-    monkeypatch.setattr(litellm, "completion", lambda **kw: fake_resp)
+    monkeypatch.setattr(litellm, "completion", lambda **kw: iter([fake_resp]))
     client = LLM("openai/mimo-v2.5-pro")
     with caplog.at_level(logging.INFO, logger="papervault.library.llm"):
         out = client.call("ping")

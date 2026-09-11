@@ -171,9 +171,13 @@ def test_any_endpoint_ready_passes_if_one_up(monkeypatch):
 def test_endpoint_health_ok_down_is_false_fast():
     """The real async probe against a closed localhost port returns False
     quickly (connection-refused) without raising — the loop-safe fast path."""
+    import socket
     import time
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
     t0 = time.monotonic()
-    ok = asyncio.run(mc._endpoint_health_ok("http://127.0.0.1:30000", 2.5))
+    ok = asyncio.run(mc._endpoint_health_ok(f"http://127.0.0.1:{port}", 2.5))
     assert ok is False
     assert time.monotonic() - t0 < 2.5  # refused resolves well under the timeout
 

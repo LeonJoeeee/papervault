@@ -159,8 +159,8 @@ def _source_label(file_path: str) -> tuple[str, str]:
     """(citeable_key_label, credibility) from a chunk/entity file_path.
 
     Two provenance conventions coexist:
-      - paper distill:        '<ingest_source>/<source_id>' (paper/<key> → key is the
-        citeable token, credibility=empirical).
+      - paper distill: 'paper/<key>' (1.4) or the bare '<key>' basename (1.5);
+        both expose the same citeable token with credibility=empirical.
       - operator docs (#45/#47): the COLON provenance key itself ('textbook:AuthorYear',
         'notebook:idea-scope') — slash-free so it survives LightRAG 1.5 basenaming. The
         source class in the prefix sets the credibility band (textbook→established); the
@@ -168,7 +168,7 @@ def _source_label(file_path: str) -> tuple[str, str]:
         doc carries a per-section file_path (`<key>#s<N>`, issue #79) — strip the `#s<N>` so
         the label attributes to the WHOLE book/notebook, not one section.
     """
-    if not file_path:
+    if not file_path.strip() or file_path in {"unknown", "unknown_source", "paper/"}:
         return ("unknown", "preliminary")
     # Operator-doc colon key: '<source>:<id>' with no slash (e.g. 'textbook:Schlickeiser2002').
     if "/" not in file_path and ":" in file_path:
@@ -176,12 +176,17 @@ def _source_label(file_path: str) -> tuple[str, str]:
         if source in _CRED_BY_SOURCE:
             # #79: drop the per-section suffix so the cite is the book-level key.
             return (strip_section_suffix(file_path), _CRED_BY_SOURCE[source])
+    # Match aquery._cited_papers: operator sources first, then both paper eras.
+    if file_path.startswith("paper/"):
+        return (file_path.split("/", 1)[1], _CRED_BY_SOURCE["paper"])
     if "/" not in file_path:
-        return ("unknown", "preliminary")
+        if ":" in file_path:
+            return ("unknown", "preliminary")
+        # Distill owns these basenames; do not impose an author/year key regex.
+        return (file_path, _CRED_BY_SOURCE["paper"])
     source, _, sid = file_path.partition("/")
     cred = _CRED_BY_SOURCE.get(source, "preliminary")
-    label = sid if source == "paper" else f"{source}:{sid}"
-    return (label, cred)
+    return (f"{source}:{sid}", cred)
 
 
 def _build_prompt(data: dict[str, Any], intent: str) -> str:
@@ -219,9 +224,13 @@ def _build_prompt(data: dict[str, Any], intent: str) -> str:
         for c in chunks:
             label, cred = _source_label(c.get("file_path") or "")
             content = (c.get("content") or "").strip()
-            chunk_blocks.append(f"(source key: {label} | credibility: {cred})\n{content}")
+            if label == "unknown":
+                header = f"(no citeable source key; do not invent a citation | credibility: {cred})"
+            else:
+                header = f"(source key: {label} | credibility: {cred})"
+            chunk_blocks.append(f"{header}\n{content}")
         blocks.append(
-            "Source chunks (each chunk below is headed by its source key and credibility; to "
+            "Source chunks (each chunk below has a source key or an explicit no-citation marker; to "
             "cite it, wrap ONLY the key in square brackets, e.g. [Reames2023] — never write the "
             "word paper_key, the credibility tag, or any colon inside the brackets):\n"
             + "\n\n---\n\n".join(chunk_blocks)

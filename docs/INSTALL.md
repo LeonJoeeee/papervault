@@ -95,10 +95,19 @@ MCP server):
 `http://127.0.0.1:8080/mcp` (or your host/port) as an MCP server. The three tools
 (`search_papers`, `get_paper`, `query`) appear automatically.
 
-> Note: this endpoint URL is hardcoded (see `plugin/.mcp.json`), not derived
-> from your `serve` config. If you run `papervault serve --port`/`--host` on a different
-> address, update the URL in `plugin/.mcp.json` and in any MCP client registration to match, or
-> clients will point at the wrong address.
+The plugin defaults to `http://127.0.0.1:8080/mcp`. To use a different address,
+set `PAPERVAULT_MCP_URL` in the **client's environment before starting Claude Code**:
+
+```bash
+export PAPERVAULT_MCP_URL="http://127.0.0.1:9090/mcp"
+claude
+```
+
+Use the full endpoint URL, including `/mcp`. Claude Code expands the variable in
+`plugin/.mcp.json`; no installed-plugin edit is needed. Unset the variable to use
+the loopback default. The URL is not derived from the server's `serve` config or
+`.env`; if you change its host/port, update the client environment and any direct
+MCP registrations to match. Start a new Claude Code session after changing it.
 
 > **Bind loopback only (or set a token).** `papervault serve` binds `127.0.0.1`
 > by default and has no auth unless you set one — passing `--host 0.0.0.0` (or any
@@ -132,9 +141,24 @@ explicit port but does **not** match a port-less `Host`. On the default HTTPS po
 443, write the bare hostname. Configured entries also allow their corresponding
 HTTP and HTTPS origins; unrelated hosts and origins remain refused.
 
-On **each client device**, connect to the same tailnet and register the HTTPS URL:
+On **each client device**, connect to the same tailnet and configure the HTTPS URL:
 
-**Claude Code** — user scope makes it available in every project on that device:
+**Claude Code with the bundled plugin** — install it as above, then start Claude
+Code with the tailnet endpoint in its environment:
+
+```bash
+export PAPERVAULT_MCP_URL="https://<node>.<tailnet>.ts.net:8080/mcp"
+claude mcp list
+claude
+```
+
+Confirm `claude mcp list` shows `plugin:papervault:papervault` at that HTTPS URL
+and reports it connected. For subsequent sessions, keep the variable in the
+environment used to launch Claude Code (for example, export it in your shell
+startup file). Setting it only in the server's `.env` does not configure clients.
+
+**Claude Code without the plugin** — direct registration is also available;
+user scope makes it available in every project on that device:
 
 ```bash
 claude mcp add --transport http --scope user papervault https://<node>.<tailnet>.ts.net:8080/mcp
@@ -182,10 +206,6 @@ tool_timeout_sec = 900
 
 For both Codex clients, verify on the device with `codex mcp list`, then start a
 new client session and confirm the three tools are available.
-
-The bundled Claude Code plugin (`plugin/.mcp.json`) hardcodes the loopback URL,
-so it is only for clients on the server box; on a remote device register the
-tailnet URL directly.
 
 Follow the **“Bind loopback only (or set a token)”** security blockquote above.
 Without `PAPERVAULT_MCP_ALLOWED_HOSTS`, a non-loopback `Host` is refused with 421

@@ -36,3 +36,4 @@ eval/judge/
 # eval results carry verbatim paper chunks — never tracked (PRD DoD #7)
 src/papervault/eval/results/
 src/papervault/eval/judge/
+/.claude/worktrees/

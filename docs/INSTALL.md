@@ -108,6 +108,93 @@ MCP server):
 > without `Authorization: Bearer <secret>` (401 JSON). Unset ⇒ current behavior,
 > unchanged; the `--stdio` transport is unaffected either way.
 
+### From another device on your tailnet (Claude Code, Codex CLI, Codex app)
+
+On the **server box**, leave papervault listening on `127.0.0.1:8080` and
+run [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve):
+
+```bash
+tailscale serve --bg --https=8080 http://127.0.0.1:8080
+```
+
+Replace `<node>.<tailnet>.ts.net` below with the server's tailnet DNS name. Add
+this line to the server checkout's `.env`, then **restart the service**:
+
+```dotenv
+PAPERVAULT_MCP_ALLOWED_HOSTS=<node>.<tailnet>.ts.net:8080
+```
+
+To remove this proxy mapping, run `tailscale serve --https=8080 off`.
+The setting accepts comma-separated `Host` values, ignores surrounding whitespace
+and empty entries, and always retains loopback access. An exact `host:port` allows
+only that port; a bare `host` allows only a port-less `Host`; `host:*` allows any
+explicit port but does **not** match a port-less `Host`. On the default HTTPS port
+443, write the bare hostname. Configured entries also allow their corresponding
+HTTP and HTTPS origins; unrelated hosts and origins remain refused.
+
+On **each client device**, connect to the same tailnet and register the HTTPS URL:
+
+**Claude Code** — user scope makes it available in every project on that device:
+
+```bash
+claude mcp add --transport http --scope user papervault https://<node>.<tailnet>.ts.net:8080/mcp
+```
+
+Claude Code's handshake timeout is `MCP_TIMEOUT` (milliseconds, default 30000);
+its per-call timeout is `MCP_TOOL_TIMEOUT`. The lab registration works with the
+defaults; adjust these only if needed. See the
+[Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
+
+**Codex CLI** — add this block to `~/.codex/config.toml` on the client device
+(configuration used with codex-cli 0.153.4):
+
+```toml
+[mcp_servers.papervault]
+url = "https://<node>.<tailnet>.ts.net:8080/mcp"
+startup_timeout_sec = 120
+tool_timeout_sec = 900
+```
+
+Papervault's handshake can take 30–60 seconds under load. The default roughly
+10-second Codex startup timeout can silently drop the tools; keep the explicit
+timeouts above (see [#29](https://github.com/LeonJoeeee/papervault/issues/29) and
+[Codex MCP settings](https://developers.openai.com/codex/mcp)). For a
+**non-interactive Codex agent**, also add the following line inside that same
+`[mcp_servers.papervault]` block:
+
+```toml
+default_tools_approval_mode = "approve"
+```
+
+This approves calls to this server without prompting; otherwise non-interactive
+agents can have every tool call auto-rejected
+([#116](https://github.com/LeonJoeeee/papervault/issues/116)).
+
+**Codex app** — the desktop app is expected to read the same
+`~/.codex/config.toml` on that device. Use the same block:
+
+```toml
+[mcp_servers.papervault]
+url = "https://<node>.<tailnet>.ts.net:8080/mcp"
+startup_timeout_sec = 120
+tool_timeout_sec = 900
+```
+
+For both Codex clients, verify on the device with `codex mcp list`, then start a
+new client session and confirm the three tools are available.
+
+The bundled Claude Code plugin (`plugin/.mcp.json`) hardcodes the loopback URL,
+so it is only for clients on the server box; on a remote device register the
+tailnet URL directly.
+
+Follow the **“Bind loopback only (or set a token)”** security blockquote above.
+Without `PAPERVAULT_MCP_ALLOWED_HOSTS`, a non-loopback `Host` is refused with 421
+even when the server is bound to `0.0.0.0`. With the variable, papervault still has
+**no authentication unless `PAPERVAULT_MCP_TOKEN` is set**, so the tailnet's device
+identity is the whole perimeter. `PAPERVAULT_MCP_TOKEN` gates **every** HTTP
+request, including loopback ones: enabling it means reconfiguring every local
+client too (Claude Code, Codex reviewers, and any script).
+
 ## Choosing a domain
 
 papervault ships tuned for space physics + AI4Science. To adapt it to another

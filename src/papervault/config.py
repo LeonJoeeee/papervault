@@ -68,6 +68,12 @@ CITATION_MAP = _path("PAPERVAULT_CITATION_MAP", str(DATA_DIR / "citation_map.jso
 # --- contact e-mail for scholarly-API polite pools (Crossref/OpenAlex User-Agent) ---
 CONTACT_EMAIL = os.environ.get("PAPERVAULT_CONTACT_EMAIL", "papervault@example.invalid")
 
+# --- MCP HTTP transport ---
+MCP_ALLOWED_HOSTS: list[str] = [
+    host.strip() for host in os.environ.get("PAPERVAULT_MCP_ALLOWED_HOSTS", "").split(",")
+    if host.strip()
+]
+
 # --- LLM provider (OpenAI-compatible) ---
 # Single-endpoint fallback when no key-pool file is present:
 LLM_API_KEY = os.environ.get("PAPERVAULT_LLM_API_KEY", "")

@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import os
 import time
 from typing import Optional
 
@@ -273,6 +274,134 @@ async def _pace(backend: str, min_interval: float) -> None:
         _LAST_CALL[backend] = time.monotonic()
 
 
+# ---------------- per-backend circuit breaker (#115) ----------------
+# A backend that is rate-limiting THIS BOX (keyless S2 429s on the very first
+# request) costs a full bounded-retry backoff chain per (term, backend) pair on
+# EVERY search — 5 terms x <=3 backoffs of wall-clock spent on a source known to
+# be dead. The breaker stops paying: N CONSECUTIVE degraded outcomes open a
+# backend's circuit; while open every pair for that backend is skipped WITHOUT
+# calling it (and without its pacing wait); after a cooldown window the next
+# fan-out calls it again, and one success closes the circuit.
+#
+# A skipped pair is STILL counted into ``degraded_map``: §8's ``sources_degraded``
+# is derived as "configured AND all T of its pairs degraded", so under-counting
+# the skipped pairs would silently drop the dead backend out of the health report.
+# The caller keeps seeing the backend as degraded — that is the honest answer —
+# and the ONE per-fan-out log line names the open circuits, which is how an
+# operator tells "circuit open" from "tried and failed".
+#
+# The same rule applies to EVERY backend in ``CAPS``; arXiv under fan-out load
+# trips it too (#115 Bounds: no per-backend special cases).
+#
+# State is PROCESS-LIFETIME and keyed by backend name — the same scope as the
+# ``_pace`` limiters, because the upstream rate limit is a property of this box,
+# not of one ``search_papers`` call. It is mutated ONLY on the loop thread (in
+# the async body of ``_fetch_one_backend``, no ``await`` mid-update), so it is
+# race-safe under the concurrent ``gather`` — the same discipline as the
+# ``degraded_map`` increments (R3-F5).
+BREAKER_TRIPS_DEFAULT = 3
+BREAKER_COOLDOWN_DEFAULT_S = 3600.0
+
+
+def _env_nonneg(name: str, default, cast):
+    """Read a NON-NEGATIVE number from the environment, falling back to
+    ``default`` for an absent / blank / unparseable / negative value — a typo in
+    the knob must never silently disable the breaker or hair-trigger it. Only an
+    explicit ``0`` is honored (the operator's off-switch). Called ONCE at import
+    (below), so a bad value logs one warning, not one per fetch."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = cast(raw)
+    except ValueError:
+        logger.warning("search: ignoring unparseable %s=%r; using %s", name, raw, default)
+        return default
+    if value < 0:
+        logger.warning("search: ignoring negative %s=%r; using %s", name, raw, default)
+        return default
+    return value
+
+
+# Consecutive degraded outcomes that open a circuit (0 = breaker disabled) and
+# how long it stays open. Read at import — the service loads its .env before
+# importing this module; tests monkeypatch the module attributes.
+BREAKER_TRIPS = _env_nonneg("PAPERVAULT_SEARCH_BREAKER_TRIPS", BREAKER_TRIPS_DEFAULT, int)
+BREAKER_COOLDOWN_S = _env_nonneg(
+    "PAPERVAULT_SEARCH_BREAKER_COOLDOWN_S", BREAKER_COOLDOWN_DEFAULT_S, float,
+)
+
+_BREAKER_FAILS: dict[str, int] = {}          # backend -> CONSECUTIVE degraded outcomes
+_BREAKER_OPEN_UNTIL: dict[str, float] = {}   # backend -> monotonic deadline while open
+
+
+def _breaker_now() -> float:
+    """The breaker's clock. A named seam so tests can inject time instead of
+    sleeping through a one-hour cooldown (``_pace`` keeps its own ``time``
+    calls — the two mechanisms are independent)."""
+    return time.monotonic()
+
+
+def _breaker_is_open(backend: str) -> bool:
+    """True iff ``backend``'s circuit is open RIGHT NOW (so: skip the pair).
+
+    Once the deadline has passed the circuit is in PROBATION: this returns False
+    (the next fan-out calls the backend again) but the open state is NOT cleared
+    here — only a success clears it (``_breaker_record_success``), and a failed
+    probe re-arms the cooldown (``_breaker_record_degraded``). Nothing is logged:
+    this runs once per (term, backend) pair, and a per-term line is exactly the
+    noise the breaker exists to remove.
+    """
+    deadline = _BREAKER_OPEN_UNTIL.get(backend)
+    return deadline is not None and _breaker_now() < deadline
+
+
+def _breaker_open_backends() -> list[str]:
+    """The backends whose circuits are open right now — for the ONE per-fan-out
+    log line (and the thing tests assert on)."""
+    return sorted(b for b in _BREAKER_OPEN_UNTIL if _breaker_is_open(b))
+
+
+def _breaker_record_degraded(backend: str) -> None:
+    """Count one DEGRADED outcome (any of the three classes) and open the
+    circuit when the threshold is reached. Logs exactly ONE INFO line per
+    open/re-arm transition."""
+    if BREAKER_TRIPS <= 0:
+        return                                      # breaker disabled by configuration
+    fails = _BREAKER_FAILS[backend] = _BREAKER_FAILS.get(backend, 0) + 1
+    deadline = _BREAKER_OPEN_UNTIL.get(backend)
+    now = _breaker_now()
+    if deadline is None and fails < BREAKER_TRIPS:
+        return                                      # still below the threshold
+    if deadline is not None and deadline > now:
+        # Already open — reachable only when SEVERAL probation pairs of the same
+        # fan-out fail: the first re-armed the cooldown below, the rest land here
+        # and only count (no second log line).
+        return
+    _BREAKER_OPEN_UNTIL[backend] = now + BREAKER_COOLDOWN_S
+    logger.info(
+        "search: circuit OPEN for backend %s after %d consecutive degraded "
+        "outcome(s) — skipping it for %.0fs",
+        backend, fails, BREAKER_COOLDOWN_S,
+    )
+
+
+def _breaker_record_success(backend: str) -> None:
+    """A successful fetch (including a genuine 0-hit) resets the consecutive
+    counter and closes an open/probation circuit — ONE INFO line, emitted by the
+    first pair of the fan-out to close it."""
+    _BREAKER_FAILS.pop(backend, None)
+    if _BREAKER_OPEN_UNTIL.pop(backend, None) is not None:
+        logger.info("search: circuit CLOSED for backend %s — a retry succeeded", backend)
+
+
+def _breaker_reset() -> None:
+    """Drop all breaker state. Test seam: process-lifetime state must not leak
+    from one test into the next."""
+    _BREAKER_FAILS.clear()
+    _BREAKER_OPEN_UNTIL.clear()
+
+
 def _year_drop(paper: dict, year_min, year_max) -> bool:
     """The ONE real filter (§1 YEAR_DROP) — applied client-side here in the
     external arm because no backend signature accepts a year bound.
@@ -335,7 +464,22 @@ async def _fetch_one_backend(
     subscript (so ``monkeypatch.setattr`` in tests intercepts correctly; the
     import-time wiring check at module bottom makes the ``KeyError`` impossible
     for a wired backend).
+
+    Circuit breaker (#115): an OPEN circuit short-circuits this pair BEFORE the
+    lookup, the pacing wait and the thread hop — the backend is not called at
+    all — while still recording the pair as DEGRADED. Otherwise the outcome
+    feeds the breaker: any of the three failure classes counts one consecutive
+    degrade, a completed fetch resets the counter.
     """
+    if _breaker_is_open(backend_name):
+        # Skipped, not tried. Still one DEGRADED pair: §8 derives
+        # ``sources_degraded`` from ``degraded_map[b] == T``, so the skip must
+        # keep counting or the dead backend drops out of the health report.
+        # Deliberately NOT logged per pair — the fan-out logs the open circuits
+        # once (see ``search_external_async``).
+        if degraded_map is not None:
+            degraded_map[backend_name] += 1
+        return []
     backend_fn = globals()[f"search_{backend_name}"]   # call-time (monkeypatch-friendly)
     # arXiv is the ONLY backend that takes a sort-hint (no citations → never an
     # importance sort); thread the recency hint only to it, keeping the uniform
@@ -355,6 +499,7 @@ async def _fetch_one_backend(
         )
         if degraded_map is not None:
             degraded_map[backend_name] += 1   # increment on the LOOP thread (R3-F5)
+        _breaker_record_degraded(backend_name)
         return []
     except asyncio.TimeoutError:
         logger.warning(
@@ -363,6 +508,7 @@ async def _fetch_one_backend(
         )
         if degraded_map is not None:
             degraded_map[backend_name] += 1
+        _breaker_record_degraded(backend_name)
         return []
     except Exception as e:
         logger.warning(
@@ -371,7 +517,11 @@ async def _fetch_one_backend(
         )
         if degraded_map is not None:
             degraded_map[backend_name] += 1   # also a raw non-429 HTTPError
+        _breaker_record_degraded(backend_name)
         return []
+    # The fetch completed (a genuine 0-hit included): the backend is alive, so
+    # the CONSECUTIVE-degrade counter resets and an open circuit closes.
+    _breaker_record_success(backend_name)
     results = [_normalize_paper(p, backend_name) for p in raw]   # year int|None (int 0→None already)
     for i, d in enumerate(results):                              # _source_origin + NATIVE rank, FIRST
         d["_source_origin"] = "external"
@@ -392,8 +542,11 @@ async def search_external_async(
     UN-deduped, UN-sorted concatenation of every pair's results (``ext_raw``)
     PLUS the ``degraded_map`` (the §3 channel back to §8's ``sources_degraded``).
 
-    Every (term, backend) pair fires unconditionally via ``asyncio.gather`` +
-    ``asyncio.to_thread`` (backends are synchronous). Per-(term, backend) caps
+    Every (term, backend) pair fires via ``asyncio.gather`` +
+    ``asyncio.to_thread`` (backends are synchronous) — EXCEPT a backend whose
+    circuit breaker is open (#115), whose pairs are skipped without a call and
+    counted straight into ``degraded_map`` (so the per-backend pairs-COUNTED
+    total is still exactly T and §8's ``sources_degraded`` keeps its shape). Per-(term, backend) caps
     come from the flat ``CAPS`` dict. Each surviving result carries its
     provenance tags ``{_source_origin="external", term_idx, rank (native)}``
     and has passed the client-side year cut (``_year_drop``, stamped BEFORE the
@@ -432,9 +585,13 @@ async def search_external_async(
         for (name, n) in CAPS.items()
     ]
 
+    # ONE line per fan-out naming the open circuits (#115) — this is how an
+    # operator reading the journal tells "skipped, circuit open" from "tried and
+    # failed"; the skipped pairs themselves log nothing.
     logger.info(
-        "search_external_async: %d terms x %d backends = %d concurrent fetches",
-        len(queries), len(CAPS), len(tasks),
+        "search_external_async: %d terms x %d backends = %d concurrent fetches "
+        "(circuit open, skipped: %s)",
+        len(queries), len(CAPS), len(tasks), _breaker_open_backends() or "none",
     )
 
     # All (term, backend) pairs in parallel. One dead backend = one empty list.

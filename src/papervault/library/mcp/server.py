@@ -1043,9 +1043,12 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
               - ``search_terms`` / ``filters_applied`` (year_min, year_max,
                 citation_pref, review_pref) / ``limit_resolved``: the parsed plan.
               - ``reasoning``: the parser's one-line read of your intent.
-              - ``sources_degraded``: backends that were configured but failed on
-                EVERY term this run (a transient outage signal) — fewer sources
-                searched, so recall is reduced; worth a retry.
+              - ``sources_degraded``: backends that were configured but returned
+                nothing usable on EVERY term this run — fewer sources searched, so
+                recall is reduced. Either they failed (a transient outage; worth a
+                retry) or they are being SKIPPED because repeated failures opened
+                their circuit breaker, in which case a retry changes nothing until
+                the cooldown elapses (the server log names the open circuits).
               - ``sources_unconfigured``: backends with no API key (a permanent
                 config gap, not an outage) — not searched this run.
               - ``judge_batches_dropped``: ``{ingest, return}`` counts of LLM-gate

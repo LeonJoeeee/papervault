@@ -9,11 +9,25 @@ now ``search_external_async`` (async + parallel backends).
 from __future__ import annotations
 
 import asyncio
+import logging
 
 import pytest
 import responses
 
 from papervault.library import search
+from papervault.library.sources.exceptions import BackendDegraded
+
+
+@pytest.fixture(autouse=True)
+def _reset_search_breaker():
+    """The #115 per-backend circuit breaker keeps PROCESS-LIFETIME state keyed by
+    backend name. Without a reset it leaks across tests: three tests in a row
+    degrading ``semantic_scholar`` would open its circuit, and the NEXT test's
+    monkeypatched backend would silently never be called. Reset before AND after
+    so neither this module's tests nor another module's inherit the state."""
+    search._breaker_reset()
+    yield
+    search._breaker_reset()
 
 
 # ----------- _looks_like_review --------------------------------------------
@@ -360,3 +374,306 @@ def test_search_external_async_records_backend_degraded(monkeypatch):
     assert degraded.get("semantic_scholar") == 2
     assert degraded.get("core") == 2
     assert degraded.get("arxiv", 0) == 0    # genuine empty is NOT a degrade
+
+
+# ----------- per-backend circuit breaker (#115) ------------------------------
+# A backend that is rate-limiting this box (keyless S2 429s on the FIRST request)
+# costs one full retry-backoff chain per (term, backend) pair on EVERY search.
+# After N consecutive degraded outcomes its circuit opens: the fan-out skips it
+# for a cooldown window WITHOUT calling it, still counting the pair into
+# ``degraded_map`` so §8's ``sources_degraded`` keeps its shape. Time is injected
+# through ``search._breaker_now`` — these tests never sleep.
+
+
+def _stub_backends(monkeypatch, **overrides):
+    """Point every ``CAPS`` backend at a stub. Default stub = a genuine empty
+    list (NOT a degrade). ``overrides`` replaces individual backends by CAPS
+    name, e.g. ``_stub_backends(monkeypatch, semantic_scholar=dead)``.
+
+    Also zeroes the per-backend min-interval pacing: ``_LAST_CALL`` is
+    process-global, so each of these fan-outs would otherwise really sleep up to
+    6s (CORE) before dispatching. Pacing is a separate mechanism and is not
+    under test here — these breaker tests must not sleep at all."""
+    monkeypatch.setattr(search, "_interval_for", lambda backend: 0.0)
+    for name in search.CAPS:
+        fn = overrides.get(name) or (lambda *a, **k: [])
+        monkeypatch.setattr(f"papervault.library.search.search_{name}", fn)
+
+
+def _paper(title):
+    return {"title": title, "authors": ["A"], "year": 2020, "doi": "",
+            "arxiv_id": "", "citation_count": 0, "url": ""}
+
+
+def _freeze_clock(monkeypatch, start=1000.0):
+    """Install an injected breaker clock; returns the mutable time holder."""
+    clock = {"t": start}
+    monkeypatch.setattr(search, "_breaker_now", lambda: clock["t"])
+    return clock
+
+
+def test_breaker_defaults_match_the_documented_contract():
+    """Defaults are 3 consecutive degraded outcomes and a 3600s cooldown
+    (#115 Bounds) — an operator reads these off ``.env.example``."""
+    assert search.BREAKER_TRIPS_DEFAULT == 3
+    assert search.BREAKER_COOLDOWN_DEFAULT_S == 3600.0
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None,     3),      # unset            -> default
+    ("",       3),      # blank            -> default
+    ("   ",    3),      # whitespace       -> default
+    ("5",      5),      # honest override
+    ("0",      0),      # explicit off-switch (0 = breaker disabled)
+    ("-2",     3),      # negative         -> default
+    ("banana", 3),      # unparseable      -> default (never a silent 0)
+])
+def test_breaker_threshold_env_is_parsed_defensively(monkeypatch, raw, expected):
+    """A typo in ``PAPERVAULT_SEARCH_BREAKER_TRIPS`` must fall back to the
+    default, never to a value that silently disables or hair-triggers the
+    breaker. Only an explicit ``0`` turns it off."""
+    name = "PAPERVAULT_SEARCH_BREAKER_TRIPS"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+    assert search._env_nonneg(name, search.BREAKER_TRIPS_DEFAULT, int) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None,     3600.0),
+    ("90",       90.0),
+    ("1.5",       1.5),
+    ("-1",     3600.0),
+    ("banana", 3600.0),
+])
+def test_breaker_cooldown_env_is_parsed_defensively(monkeypatch, raw, expected):
+    name = "PAPERVAULT_SEARCH_BREAKER_COOLDOWN_S"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+    assert search._env_nonneg(name, search.BREAKER_COOLDOWN_DEFAULT_S, float) == expected
+
+
+@pytest.mark.parametrize("exc", [
+    BackendDegraded("S2 429 exhausted"),   # the typed degrade (the #115 case)
+    RuntimeError("boom"),                  # the catch-all degrade
+])
+def test_n_consecutive_degraded_outcomes_open_the_circuit_and_the_next_fanout_skips(
+        monkeypatch, exc):
+    """(#115 done-check a) N consecutive DEGRADED outcomes open the circuit, and
+    the next fan-out skips that backend WITHOUT calling its ``search_*``."""
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 2)
+    monkeypatch.setattr(search, "BREAKER_COOLDOWN_S", 3600.0)
+    _freeze_clock(monkeypatch)
+
+    calls = []
+
+    def dead(query, **kwargs):
+        calls.append(query)
+        raise exc
+
+    _stub_backends(monkeypatch, semantic_scholar=dead)
+
+    asyncio.run(search.search_external_async(["a"]))       # degrade 1 of 2
+    assert search._breaker_open_backends() == []           # one strike is not enough
+    asyncio.run(search.search_external_async(["b"]))       # degrade 2 of 2 -> OPEN
+    assert search._breaker_open_backends() == ["semantic_scholar"]
+    assert calls == ["a", "b"]
+
+    asyncio.run(search.search_external_async(["c"]))       # skipped, NOT called
+    assert calls == ["a", "b"]
+
+
+def test_open_circuit_still_counts_degraded_and_other_backends_run_normally(monkeypatch):
+    """(#115 done-check b) While the circuit is open the skipped backend still
+    increments ``degraded_map`` ONCE PER TERM — §8 derives ``sources_degraded``
+    from ``degraded_map[b] == T``, so an under-count would silently drop the dead
+    backend out of the report — and every other backend runs normally."""
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 1)
+    monkeypatch.setattr(search, "BREAKER_COOLDOWN_S", 3600.0)
+    _freeze_clock(monkeypatch)
+
+    calls = []
+
+    def dead(query, **kwargs):
+        calls.append(query)
+        raise BackendDegraded("S2 429 exhausted")
+
+    _stub_backends(
+        monkeypatch,
+        semantic_scholar=dead,
+        arxiv=lambda query, max_results=30, **k: [_paper(f"arxiv for {query}")],
+    )
+
+    asyncio.run(search.search_external_async(["open-it"]))   # one degrade -> OPEN
+    assert calls == ["open-it"]
+
+    out, degraded = asyncio.run(search.search_external_async(["a", "b", "c"]))
+
+    assert calls == ["open-it"]                       # skipped on all three terms
+    assert degraded["semantic_scholar"] == 3          # == T, so §8 still reports it
+    assert sorted(p["title"] for p in out) == [
+        "arxiv for a", "arxiv for b", "arxiv for c",  # the healthy backend is untouched
+    ]
+    assert degraded.get("arxiv", 0) == 0
+
+
+def test_cooldown_elapse_retries_the_backend_and_a_success_closes_the_circuit(monkeypatch):
+    """(#115 done-check c) The circuit stays open for the cooldown window; once
+    it elapses the next fan-out calls the backend again, and a success closes the
+    circuit (no real sleep — the clock is injected)."""
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 1)
+    monkeypatch.setattr(search, "BREAKER_COOLDOWN_S", 3600.0)
+    clock = _freeze_clock(monkeypatch, start=1000.0)
+
+    calls = []
+    healthy = {"yes": False}
+
+    def flaky(query, **kwargs):
+        calls.append(query)
+        if healthy["yes"]:
+            return [_paper("back from the dead")]
+        raise BackendDegraded("S2 429 exhausted")
+
+    _stub_backends(monkeypatch, semantic_scholar=flaky)
+
+    asyncio.run(search.search_external_async(["open-it"]))       # -> OPEN until 4600
+    assert search._breaker_open_backends() == ["semantic_scholar"]
+
+    clock["t"] = 4599.0                                          # one second short
+    asyncio.run(search.search_external_async(["too-soon"]))
+    assert calls == ["open-it"]                                  # still skipped
+
+    clock["t"] = 4600.0                                          # cooldown elapsed
+    healthy["yes"] = True
+    out, _degraded = asyncio.run(search.search_external_async(["retry"]))
+
+    assert calls == ["open-it", "retry"]                         # called again
+    assert [p["title"] for p in out] == ["back from the dead"]
+    assert search._breaker_open_backends() == []                 # success closed it
+
+    asyncio.run(search.search_external_async(["after"]))         # and it stays closed
+    assert calls == ["open-it", "retry", "after"]
+
+
+def test_a_failed_probe_after_the_cooldown_re_arms_the_circuit(monkeypatch):
+    """A backend that is still dead when the cooldown elapses must not be
+    retried on every subsequent fan-out: the failed probe re-arms the cooldown."""
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 1)
+    monkeypatch.setattr(search, "BREAKER_COOLDOWN_S", 100.0)
+    clock = _freeze_clock(monkeypatch, start=0.0)
+
+    calls = []
+
+    def dead(query, **kwargs):
+        calls.append(query)
+        raise BackendDegraded("S2 429 exhausted")
+
+    _stub_backends(monkeypatch, semantic_scholar=dead)
+
+    asyncio.run(search.search_external_async(["open-it"]))   # OPEN until t=100
+    clock["t"] = 100.0
+    asyncio.run(search.search_external_async(["probe"]))     # probe runs, fails
+    assert calls == ["open-it", "probe"]
+    assert search._breaker_open_backends() == ["semantic_scholar"]   # re-armed
+
+    clock["t"] = 150.0
+    asyncio.run(search.search_external_async(["skipped"]))   # inside the new window
+    assert calls == ["open-it", "probe"]
+
+
+def test_a_success_before_the_threshold_resets_the_counter(monkeypatch):
+    """(#115 done-check d) The trip counter counts CONSECUTIVE degraded outcomes:
+    a success in between resets it, so an occasionally-flaky backend never opens."""
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 3)
+    monkeypatch.setattr(search, "BREAKER_COOLDOWN_S", 3600.0)
+    _freeze_clock(monkeypatch)
+
+    calls = []
+    script = ["degrade", "degrade", "ok", "degrade", "degrade"]
+
+    def flaky(query, **kwargs):
+        calls.append(query)
+        if script.pop(0) == "degrade":
+            raise BackendDegraded("S2 429 exhausted")
+        return [_paper("fine")]
+
+    _stub_backends(monkeypatch, semantic_scholar=flaky)
+
+    for term in ("t1", "t2", "t3", "t4", "t5"):
+        asyncio.run(search.search_external_async([term]))
+
+    # 2 degrades, a success (counter back to 0), then 2 more degrades -> never 3
+    # in a row, so the circuit never opened and every fan-out called the backend.
+    assert search._breaker_open_backends() == []
+    assert calls == ["t1", "t2", "t3", "t4", "t5"]
+
+
+def test_breaker_is_disabled_when_the_threshold_is_zero(monkeypatch):
+    """``PAPERVAULT_SEARCH_BREAKER_TRIPS=0`` is the operator's off-switch: the
+    backend is called on every fan-out no matter how many times it degrades."""
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 0)
+    _freeze_clock(monkeypatch)
+
+    calls = []
+
+    def dead(query, **kwargs):
+        calls.append(query)
+        raise BackendDegraded("S2 429 exhausted")
+
+    _stub_backends(monkeypatch, semantic_scholar=dead)
+
+    for term in ("t1", "t2", "t3", "t4"):
+        asyncio.run(search.search_external_async([term]))
+
+    assert search._breaker_open_backends() == []
+    assert calls == ["t1", "t2", "t3", "t4"]
+
+
+def test_breaker_logs_one_open_and_one_close_line_not_one_per_skipped_term(
+        monkeypatch, caplog):
+    """(#115 Bounds) ONE INFO line when the circuit opens and ONE when it closes —
+    never one per skipped (term, backend) pair, which is exactly the log noise the
+    breaker exists to remove. The per-fan-out summary line names the open circuits
+    so an operator can tell 'circuit open' from 'tried and failed'."""
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 1)
+    monkeypatch.setattr(search, "BREAKER_COOLDOWN_S", 100.0)
+    clock = _freeze_clock(monkeypatch, start=0.0)
+
+    healthy = {"yes": False}
+
+    def flaky(query, **kwargs):
+        if healthy["yes"]:
+            return [_paper("ok")]
+        raise BackendDegraded("S2 429 exhausted")
+
+    _stub_backends(monkeypatch, semantic_scholar=flaky)
+
+    caplog.set_level(logging.INFO, logger="papervault.library.search")
+
+    # Three terms degrade in ONE fan-out -> exactly one OPEN line.
+    asyncio.run(search.search_external_async(["a", "b", "c"]))
+    opens = [r for r in caplog.records if "circuit OPEN" in r.getMessage()]
+    assert len(opens) == 1
+    assert "semantic_scholar" in opens[0].getMessage()
+
+    # A fan-out that SKIPS three pairs adds no new OPEN lines, and its one
+    # summary line reports the open circuit.
+    caplog.clear()
+    asyncio.run(search.search_external_async(["d", "e", "f"]))
+    assert [r for r in caplog.records if "circuit OPEN" in r.getMessage()] == []
+    fanout = [r.getMessage() for r in caplog.records
+              if "concurrent fetches" in r.getMessage()]
+    assert len(fanout) == 1
+    assert "semantic_scholar" in fanout[0]
+
+    # Cooldown elapses and three pairs succeed -> exactly one CLOSED line.
+    caplog.clear()
+    clock["t"] = 100.0
+    healthy["yes"] = True
+    asyncio.run(search.search_external_async(["g", "h", "i"]))
+    closes = [r for r in caplog.records if "circuit CLOSED" in r.getMessage()]
+    assert len(closes) == 1
+    assert "semantic_scholar" in closes[0].getMessage()

@@ -84,17 +84,22 @@ LLM required (`papervault smoke --skip-db` skips the DB connectivity checks).
 
 This is an operator action after separate approval. Merging the code changes no
 running service: both switches default off. On the measured installation the OCR
-unit is the legacy `paper-library-mineru.service`; the repo template is named
-`papervault-mineru.service`. Confirm the installed unit name before editing the
-service checkout's `.env`, and use that exact name in `PAPER_LIBRARY_MINERU_UNIT`.
+unit is the legacy `paper-library-mineru.service` with `TimeoutStartSec=5min`;
+`papervault-mineru.service` does not exist on that host. The repo template uses
+the latter name. A read-only check of `papervault.service`'s process environment
+confirmed it runs as a user unit with `XDG_RUNTIME_DIR=/run/user/1000` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`, and that socket exists.
+Its controller can therefore reach `systemctl --user`. Confirm these facts on
+the target host before editing the service checkout's `.env`.
 
 1. As the Unix user running `papervault.service`, check the user bus and unit:
    `systemctl --user show paper-library-mineru.service -p LoadState -p TimeoutStartUSec`.
    Also run `systemd-run --user --wait --pipe /usr/bin/systemctl --user show
    paper-library-mineru.service -p LoadState` to check bus access inside a user
    service, where the controller will run.
-   The repo unit template has `TimeoutStartSec=300`; the controller's default
-   readiness budget is 330 seconds. Check that `curl -fsS
+   The installed unit and repo template both have `TimeoutStartSec=300` seconds;
+   keep `PAPER_LIBRARY_MINERU_READY_TIMEOUT` at 300 seconds or more (330 below
+   leaves margin). Check that `curl -fsS
    http://127.0.0.1:30000/health` succeeds and `/v1/models` returns a nonempty
    `data` list when the OCR model is loaded. The controller requires both.
 2. Add these exact lines to the service checkout's `.env` (use the actual unit

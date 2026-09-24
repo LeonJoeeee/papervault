@@ -22,8 +22,8 @@ Key review-driven invariants baked in here:
     slow cold start isn't abandoned mid-flight (review fix #4).
   * idle = ``queue.qsize()==0`` AND no ``ex:``-prefixed key in
     ``concurrency.in_flight_keys()`` (a function, ``ex:``-prefixed — review fix #2).
-  * a lockless ``ensure_ready`` fast-path is gated on ``not _stopping`` to close
-    the teardown TOCTOU (review fix #6).
+  * a lockless ``ensure_ready`` fast-path checks ``_stopping`` after its
+    readiness await, so a concurrent teardown cannot admit OCR.
   * a failed/timeout start enters an exponential cooldown so OOM (e.g. a GPU
     co-tenant grabbed the VRAM) doesn't burn ``READY_TIMEOUT`` every sweep
     forever (review fix #7).
@@ -146,8 +146,10 @@ class MineruServerController:
         if not self._ondemand:
             return
         self.note_activity()
-        # Fast path (no lock) — but NOT while a stop is in flight (teardown TOCTOU, fix #6).
-        if not self._stopping and await self._ready():
+        # The probe awaits I/O: a stop can begin while it is suspended. Check
+        # _stopping again after the await before admitting OCR without the lock.
+        ready = not self._stopping and await self._ready()
+        if ready and not self._stopping:
             return
         async with self._lock:
             if await self._ready():
@@ -208,11 +210,15 @@ class MineruServerController:
                     # Re-check everything UNDER the lock (the fast outer check may
                     # be stale by the time we acquired it).
                     if self._past_idle(extract_queue) and await self._ready():
-                        self._stopping = True
-                        try:
-                            await self._systemctl("stop")
-                        finally:
-                            self._stopping = False
+                        # _ready awaited I/O, during which a worker may have
+                        # entered. No await separates this final check from
+                        # setting _stopping, while the controller lock is held.
+                        if self._past_idle(extract_queue):
+                            self._stopping = True
+                            try:
+                                await self._systemctl("stop")
+                            finally:
+                                self._stopping = False
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — a monitor hiccup must never kill the loop

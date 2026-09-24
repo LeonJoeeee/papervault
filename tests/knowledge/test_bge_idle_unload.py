@@ -91,6 +91,32 @@ def test_call_during_unload_waits_and_reloads(idle_models, monkeypatch):
     assert loads["embed"] == 2
 
 
+def test_async_rerank_waits_for_unload_before_reloading(idle_models, monkeypatch):
+    loads, _ = idle_models
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_empty_cache():
+        entered.set()
+        assert release.wait(2)
+
+    monkeypatch.setattr(torch.cuda, "empty_cache", slow_empty_cache)
+    assert asyncio.run(models._bge_rerank("first", ["doc"]))[0]["index"] == 0
+    assert entered.wait(2), "idle unload did not begin"
+
+    async def drive():
+        task = asyncio.create_task(models._bge_rerank("second", ["doc"]))
+        try:
+            await asyncio.sleep(0.02)
+            assert not task.done(), "rerank used a model during CUDA cache release"
+        finally:
+            release.set()
+        return await asyncio.wait_for(task, 2)
+
+    assert asyncio.run(drive())[0]["index"] == 0
+    assert loads["rerank"] == 2
+
+
 def test_default_off_keeps_models_resident(monkeypatch, idle_models):
     loads, emptied = idle_models
     monkeypatch.setattr(models, "_IDLE_UNLOAD_ENABLED", False)

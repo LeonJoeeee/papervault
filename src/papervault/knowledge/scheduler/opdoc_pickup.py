@@ -119,6 +119,7 @@ from papervault.library.mineru_client import (
     endpoints_from_env,
     extract_mineru,
 )
+from papervault.library.services.mineru_server import get_server_controller
 
 log = logging.getLogger("ks.scheduler.opdoc_pickup")
 
@@ -241,10 +242,11 @@ async def _ocr_to_staged_md(pdf_path: Path) -> Path:
     pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
     timeout = _ocr_timeout_seconds()
     deadline = time.time() + timeout if timeout > 0 else None
-    md_text = await extract_mineru(
-        pdf_bytes, endpoints_from_env(), stem=pdf_path.stem,
-        wall_clock_deadline=deadline,
-    )
+    async with get_server_controller().ocr_session():
+        md_text = await extract_mineru(
+            pdf_bytes, endpoints_from_env(), stem=pdf_path.stem,
+            wall_clock_deadline=deadline,
+        )
 
     def _write() -> Path:
         staging = pdf_path.parent / _OCR_STAGING_SUBDIR

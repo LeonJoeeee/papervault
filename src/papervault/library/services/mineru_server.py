@@ -1,7 +1,7 @@
 """On-demand lifecycle for the persistent MinerU vLLM server unit.
 
 The MinerU server (``papervault-mineru.service``; legacy ``paper-library-mineru.service``
-still selectable via ``PAPER_LIBRARY_MINERU_UNIT``) holds ~14 GB on the 3090 for
+still selectable via ``PAPER_LIBRARY_MINERU_UNIT``) holds ~9 GB on the 3090 for
 its whole lifetime (vLLM pre-allocates the KV-cache pool and never releases it
 while running). In steady state the vault is fully extracted and the extract
 queue is idle almost always, so a 24/7-resident server wastes the card. This
@@ -12,7 +12,6 @@ right before an extract, and stopped after the queue has been idle for
 **OPT-IN** via ``PAPER_LIBRARY_MINERU_ONDEMAND=1``. Default OFF ⇒ every method is
 a strict no-op and the persistent always-on deploy is byte-unchanged.
 
-Design + 3-lens adversarial review: ``docs/adr/0005-mineru-ondemand-lifecycle.md`` (repo root).
 Key review-driven invariants baked in here:
   * ``ensure_ready`` raises :class:`MineruServerUnavailable` — a subclass of
     ``MineruTransportError`` — so ``extract_md``'s existing C1 handler catches it,
@@ -30,15 +29,15 @@ Key review-driven invariants baked in here:
     forever (review fix #7).
   * if ``systemctl --user`` has no D-Bus (non-systemd host), on-demand force-OFFs
     to persistent rather than stalling every extract (review fix #8).
-The in-process ``asyncio.Lock`` serializes only the daemon's OWN transitions; it
-does NOT guard a manual ``systemctl`` or the backfill (a separate process). The
-backfill stops the daemon first (so the controller is down) — keep on-demand OFF
-for any manual server juggling (review note).
+The in-process ``asyncio.Lock`` serializes only this daemon's transitions; it
+does not guard a manual ``systemctl`` or a separate OCR process. Keep on-demand
+OFF for independent OCR scripts that use the same server.
 """
 
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
 import time
@@ -105,6 +104,7 @@ class MineruServerController:
         self._cooldown = 0.0          # current backoff length (doubles on each failed start)
         self._cooldown_until = 0.0    # monotonic deadline; ensure_ready short-circuits before it
         self._bus_ok: Optional[bool] = None  # None=unprobed
+        self._active_ocr = 0
 
     @property
     def ondemand(self) -> bool:
@@ -116,6 +116,22 @@ class MineruServerController:
         on worker pull, and on ensure_ready entry so the idle timer measures time
         since real activity, not time since enqueue (review fix #5)."""
         self._last_activity = time.monotonic()
+
+    @asynccontextmanager
+    async def ocr_session(self):
+        """Keep MinerU resident for OCR outside the library extract queue."""
+        if not self._ondemand:
+            yield
+            return
+        async with self._lock:
+            self._active_ocr += 1
+            self.note_activity()
+        try:
+            await self.ensure_ready()
+            yield
+        finally:
+            self._active_ocr -= 1
+            self.note_activity()
 
     # --------------------- readiness gate (worker path) -----------------------
     async def ensure_ready(self) -> None:
@@ -144,20 +160,30 @@ class MineruServerController:
             if not await self._bus_available():
                 raise MineruServerUnavailable(
                     "systemctl --user unavailable (no D-Bus); cannot start mineru server")
-            await self._systemctl("start")
+            started = time.perf_counter()
+            start_rc = await self._systemctl("start")
+            if start_rc != 0:
+                self._arm_cooldown()
+                raise MineruServerUnavailable(
+                    f"mineru systemctl start failed (rc={start_rc}; "
+                    f"start-failure cooldown {self._cooldown:.0f}s)")
             deadline = time.monotonic() + _READY_TIMEOUT
             while time.monotonic() < deadline:
                 if await self._ready():
                     self._cooldown = 0.0          # success resets the backoff
                     self._cooldown_until = 0.0
+                    log.info("mineru model-ready after %.3fs", time.perf_counter() - started)
                     return
                 await asyncio.sleep(_HEALTH_POLL)
             # Timed out → exponential cooldown, then transport (no charge → reconcile retries).
-            self._cooldown = min(max(self._cooldown * 2.0, _COOLDOWN_MIN), _COOLDOWN_CAP)
-            self._cooldown_until = time.monotonic() + self._cooldown
+            self._arm_cooldown()
             raise MineruServerUnavailable(
                 f"mineru server not model-ready within {_READY_TIMEOUT:.0f}s "
                 f"(start-failure cooldown {self._cooldown:.0f}s)")
+
+    def _arm_cooldown(self) -> None:
+        self._cooldown = min(max(self._cooldown * 2.0, _COOLDOWN_MIN), _COOLDOWN_CAP)
+        self._cooldown_until = time.monotonic() + self._cooldown
 
     # ------------------------ idle monitor (background) -----------------------
     async def monitor_loop(self, extract_queue) -> None:
@@ -198,12 +224,10 @@ class MineruServerController:
             and (time.monotonic() - self._last_activity) > _IDLE_TIMEOUT
         )
 
-    @staticmethod
-    def _idle(extract_queue) -> bool:
-        """True iff no extract work is queued OR in flight (review fix #2:
-        ``in_flight_keys`` is a function returning ``ex:``-prefixed keys)."""
+    def _idle(self, extract_queue) -> bool:
+        """True when no library or operator OCR is queued or in flight."""
         from . import concurrency
-        if extract_queue.qsize() != 0:
+        if extract_queue.qsize() != 0 or self._active_ocr:
             return False
         return not any(k.startswith(_EXTRACT_PREFIX) for k in concurrency.in_flight_keys())
 

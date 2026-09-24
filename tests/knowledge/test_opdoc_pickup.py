@@ -10,6 +10,7 @@ propagating, leave-in-place-log-once on a disabled source).
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import time
 
@@ -25,6 +26,35 @@ from papervault.library.mineru_client import (
     MineruExtractionError,
     MineruTransportError,
 )
+
+
+def test_operator_pdf_ocr_uses_server_session(tmp_path, monkeypatch):
+    pdf = tmp_path / "textbook-Foo2020.pdf"
+    pdf.write_bytes(b"pdf bytes")
+    states = []
+    active = False
+
+    class FakeController:
+        @asynccontextmanager
+        async def ocr_session(self):
+            nonlocal active
+            active = True
+            try:
+                yield
+            finally:
+                active = False
+
+    async def fake_extract(*args, **kwargs):
+        states.append(active)
+        return "# OCR body"
+
+    monkeypatch.setattr(op, "get_server_controller", lambda: FakeController(), raising=False)
+    monkeypatch.setattr(op, "extract_mineru", fake_extract)
+    monkeypatch.setattr(op, "endpoints_from_env", lambda: ["ep0"])
+    staged = asyncio.run(op._ocr_to_staged_md(pdf))
+    assert states == [True]
+    assert active is False
+    assert staged.read_text() == "# OCR body"
 
 
 def _run(coro):

@@ -2492,7 +2492,7 @@ wheels = [
 
 [[package]]
 name = "papervault"
-version = "0.1.0"
+version = "0.1.1"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
@@ -2555,7 +2555,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27" },
     { name = "lightrag-hku", specifier = ">=1.5,<1.6" },
     { name = "litellm", specifier = ">=1.70" },
-    { name = "mcp", specifier = ">=1.27.1" },
+    { name = "mcp", specifier = ">=1.27.1,<2" },
     { name = "mineru", extras = ["core"], marker = "extra == 'mineru'", specifier = ">=3.2" },
     { name = "neo4j", specifier = ">=6.2.0" },
     { name = "openai", specifier = ">=1.50" },

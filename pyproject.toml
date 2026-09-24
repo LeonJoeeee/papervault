@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "papervault"
-version = "0.1.0"
+version = "0.1.1"
 description = "Self-hosted literature + knowledge layer for coding agents — one MCP server: discover papers, read full text, query a graph-RAG knowledge base with cited answers."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -29,7 +29,7 @@ dependencies = [
     "requests>=2.31",
     "click>=8.1",
     "filelock>=3.13",
-    "mcp>=1.27.1",
+    "mcp>=1.27.1,<2",
     "uvicorn>=0.30",           # the streamable-http `papervault serve` path imports it directly
     # --- knowledge (graph-RAG) ---
     # Framework spine, ported to the 1.5.x line (2026-07-17 port map): ontology + exclusions

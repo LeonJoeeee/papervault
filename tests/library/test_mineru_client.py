@@ -575,3 +575,107 @@ def test_image_decode_text_on_non_400_is_not_reclassified():
         "Unexpected status code: [422], response body: Failed to load image"))
     assert not mc._is_server_image_decode_fail(Exception(
         "Unexpected status code: [400], response body: bad prompt"))
+
+
+# ============ issue #96: bounded request fan-out + socket ceiling ============
+# Each parse fanned out to mineru's default 100 concurrent requests with an
+# uncapped httpx pool (8 slots x 100 = 747 sockets observed). The client now
+# passes max_concurrency (default 32 = the unit's --max-num-seqs 32) and a
+# max_connections ceiling. mineru 3.4.4's ModelSingleton forwards
+# max_concurrency but DROPS max_connections, so the ceiling is also applied to
+# the singleton's HTTP client before the parse creates its per-loop pool.
+
+
+class _CapClient:
+    def __init__(self):
+        self.max_connections = None
+        self.max_concurrency = 100
+
+
+class _CapPredictor:
+    def __init__(self):
+        self.client = _CapClient()
+        self.max_concurrency = 100
+
+
+def _install_fake_capping_singleton(monkeypatch, order):
+    predictor = _CapPredictor()
+    seen = {}
+
+    class _Singleton:
+        def get_model(self, backend, model_path, server_url, **kwargs):
+            order.append("get_model")
+            seen.update(backend=backend, model_path=model_path,
+                        server_url=server_url, kwargs=kwargs)
+            return predictor
+
+    mod = types.ModuleType("mineru.backend.vlm.vlm_analyze")
+    mod.ModelSingleton = _Singleton
+    monkeypatch.setitem(sys.modules, "mineru.backend.vlm.vlm_analyze", mod)
+    return predictor, seen
+
+
+def _recording_parse(order, captured):
+    async def _parse(**kw):
+        order.append("aio_do_parse")
+        captured.update(kw)
+        from pathlib import Path
+        out = Path(kw["output_dir"]) / kw["pdf_file_names"][0] / "vlm"
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"{kw['pdf_file_names'][0]}.md").write_text("# body")
+    return _parse
+
+
+def test_client_limits_defaults(monkeypatch):
+    monkeypatch.delenv("PAPER_LIBRARY_MINERU_MAX_CONCURRENCY", raising=False)
+    monkeypatch.delenv("PAPER_LIBRARY_MINERU_MAX_CONNECTIONS", raising=False)
+    assert mc.client_limits() == (32, 64)
+
+
+def test_client_limits_env_override(monkeypatch):
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONCURRENCY", "12")
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONNECTIONS", "24")
+    assert mc.client_limits() == (12, 24)
+
+
+def test_client_limits_ignore_invalid_env(monkeypatch):
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONCURRENCY", "zero")
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONNECTIONS", "0")
+    assert mc.client_limits() == (32, 64)
+
+
+def test_parse_passes_caps_to_mineru_client(monkeypatch):
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONCURRENCY", "16")
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONNECTIONS", "40")
+    order: list = []
+    captured: dict = {}
+    _install_fake_mineru(monkeypatch, _recording_parse(order, captured))
+    predictor, seen = _install_fake_capping_singleton(monkeypatch, order)
+
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
+    # Passed through aio_do_parse (mineru forwards max_concurrency) ...
+    assert captured["max_concurrency"] == 16
+    assert captured["max_connections"] == 40
+    # ... and the singleton predictor is built with the same kwargs for the same
+    # (backend, model_path, server_url) key, then capped, BEFORE the parse runs.
+    assert order == ["get_model", "aio_do_parse"]
+    assert (seen["backend"], seen["model_path"], seen["server_url"]) == (
+        "http-client", None, "http://a:30000")
+    assert seen["kwargs"]["max_concurrency"] == 16
+    assert predictor.client.max_connections == 40
+    assert predictor.client.max_concurrency == 16
+    assert predictor.max_concurrency == 16
+
+
+def test_parse_without_mineru_singleton_still_passes_caps(monkeypatch):
+    """A mineru build without the singleton internals degrades to the kwargs
+    alone — never an error."""
+    order: list = []
+    captured: dict = {}
+    _install_fake_mineru(monkeypatch, _recording_parse(order, captured))
+    monkeypatch.delitem(sys.modules, "mineru.backend.vlm.vlm_analyze", raising=False)
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
+    assert order == ["aio_do_parse"]
+    assert captured["max_concurrency"] == mc.client_limits()[0]

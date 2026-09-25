@@ -137,6 +137,40 @@ _MINERU_INLINE_NATIVE_RETRIES = int(
 _MINERU_NATIVE_BACKOFF_FACTOR = float(
     os.environ.get("PAPER_LIBRARY_MINERU_NATIVE_BACKOFF", "0.5"))
 
+# ── Request fan-out + socket ceiling (issue #96) ────────────────────────────
+# mineru's http-client defaults to max_concurrency=100 requests in flight PER
+# PARSE and an UNCAPPED httpx pool, so 8 concurrent OCR slots reached ~800
+# sockets to the server (747 observed). ``max_concurrency`` bounds the requests
+# one parse keeps in flight; the default 32 equals the MinerU unit's
+# ``--max-num-seqs 32`` — the server never serves more at once, so more only
+# queue there. ``max_connections`` caps the per-event-loop pool that ALL
+# concurrent parses against one endpoint share; httpx queues requests beyond it
+# (no error). Read at call time so an env override needs no reload.
+_DEFAULT_MAX_CONCURRENCY = 32
+_DEFAULT_MAX_CONNECTIONS = 64
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    try:
+        value = int((os.environ.get(name, "") or "").strip() or default)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def client_limits() -> tuple[int, int]:
+    """``(max_concurrency, max_connections)`` for the mineru http-client, from
+    ``PAPER_LIBRARY_MINERU_MAX_CONCURRENCY`` (default 32) and
+    ``PAPER_LIBRARY_MINERU_MAX_CONNECTIONS`` (default 64). A missing, invalid or
+    non-positive value falls back to the default."""
+    return (
+        _positive_int_env("PAPER_LIBRARY_MINERU_MAX_CONCURRENCY",
+                          _DEFAULT_MAX_CONCURRENCY),
+        _positive_int_env("PAPER_LIBRARY_MINERU_MAX_CONNECTIONS",
+                          _DEFAULT_MAX_CONNECTIONS),
+    )
+
+
 # OUTER endpoint-failover retry budget (in-MEMORY loop counter, NOT
 # extract_attempts). Each iteration may switch endpoints round-robin.
 _INLINE_RETRIES = int(
@@ -399,6 +433,50 @@ async def _close_mineru_client_for_loop(loop) -> None:
             pass
 
 
+# ------------------ client limits on mineru's singleton (#96) ---------------
+#
+# ``aio_do_parse`` forwards its kwargs to ``ModelSingleton().get_model``, which
+# builds ONE predictor per (backend, model_path, server_url) the first time and
+# reuses it. mineru 3.4.4 reads ``max_concurrency`` from those kwargs but never
+# passes ``max_connections`` to the client, so the socket ceiling would be
+# silently lost. Before each parse we therefore obtain the SAME singleton
+# predictor (same key, same kwargs, off the loop exactly as mineru's own
+# ``_get_model_async`` does) and set both limits on it and its HTTP client. The
+# per-loop ``httpx.AsyncClient`` is built lazily from ``client.max_connections``
+# during the parse, so it is created capped. Guarded like the #93 close hook: a
+# mineru without these internals (or a stubbed test) just skips this step.
+
+
+def _apply_client_limits(predictor, max_concurrency: int, max_connections: int) -> None:
+    client = getattr(predictor, "client", None)
+    if client is not None:
+        if hasattr(client, "max_connections"):
+            client.max_connections = max_connections
+        if hasattr(client, "max_concurrency"):
+            client.max_concurrency = max_concurrency
+    if hasattr(predictor, "max_concurrency"):
+        predictor.max_concurrency = max_concurrency
+
+
+async def _prepare_capped_predictor(server_url: str, client_kwargs: dict) -> None:
+    """Build (or fetch) mineru's singleton predictor for ``server_url`` and cap it.
+
+    Errors from the construction itself (e.g. the model-name probe against a
+    down server) propagate: ``aio_do_parse`` would have raised the same error
+    from the same call, and the caller classifies it identically."""
+    mod = sys.modules.get("mineru.backend.vlm.vlm_analyze")
+    singleton_cls = getattr(mod, "ModelSingleton", None) if mod is not None else None
+    if singleton_cls is None:
+        return
+    get_model = getattr(singleton_cls(), "get_model", None)
+    if get_model is None:  # pragma: no cover - defensive, unknown mineru build
+        return
+    predictor = await asyncio.to_thread(
+        get_model, "http-client", None, server_url, **client_kwargs)
+    _apply_client_limits(predictor, client_kwargs["max_concurrency"],
+                         client_kwargs["max_connections"])
+
+
 # ------------------------- fd-watermark guard (#93) ------------------------
 
 _FD_WARN_FRACTION = float(os.environ.get("PAPER_LIBRARY_FD_WARN_FRACTION", "0.6"))
@@ -572,7 +650,16 @@ async def _extract_mineru_impl(
                         raise MineruExtractionError("wall_clock_cap_server_alive")
                     raise MineruTransportError("wall_clock_cap_dead_server")
                 call_timeout = max(1.0, min(http_timeout, remaining))
+            max_concurrency, max_connections = client_limits()
+            client_kwargs = {
+                "http_timeout": call_timeout,
+                "max_retries": _MINERU_INLINE_NATIVE_RETRIES,
+                "retry_backoff_factor": _MINERU_NATIVE_BACKOFF_FACTOR,
+                "max_concurrency": max_concurrency,
+                "max_connections": max_connections,
+            }
             try:
+                await _prepare_capped_predictor(ep.url, client_kwargs)
                 await aio_do_parse(
                     output_dir=str(outdir),
                     pdf_file_names=[stem],
@@ -593,10 +680,10 @@ async def _extract_mineru_impl(
                     start_page_id=0,
                     end_page_id=None,
                     # ── http-client kwargs (consumed via **kwargs, §3.3) ──
-                    http_timeout=call_timeout,
-                    max_retries=_MINERU_INLINE_NATIVE_RETRIES,
-                    retry_backoff_factor=_MINERU_NATIVE_BACKOFF_FACTOR,
+                    # http_timeout / max_retries / retry_backoff_factor, plus the
+                    # #96 max_concurrency / max_connections caps.
                     # NOTE: NO connect_timeout — not plumbed through aio_do_parse.
+                    **client_kwargs,
                 )
                 return _read_md_from_outdir(outdir, stem)
 

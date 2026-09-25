@@ -344,8 +344,24 @@ BREAKER_COOLDOWN_S = _env_nonneg(
 # (the same rule as the ``_pace`` wait): a healthy backend that merely waited for
 # a free thread must not be recorded DEGRADED or feed the #115 breaker. The
 # timeout starts when the thread starts running the backend.
+#
+# The queue wait has its OWN outer deadline (#137). ``requests``' ``timeout=30``
+# bounds each socket read, not the whole call, so hung backends can hold every
+# pool thread far longer than the fetch timeout (``wait_for`` abandons the
+# await, not the thread). Without a deadline a pair still queued behind them
+# waited forever and ``search_papers`` stalled. Past the deadline the pair is
+# withdrawn (never called) and recorded DEGRADED like a timeout — but it does
+# NOT feed the breaker: the backend was never tried, and the hung backend that
+# holds the threads trips its own breaker through its own fetch timeouts.
 FETCH_WORKERS_DEFAULT = 16
 FETCH_THREAD_PREFIX = "pv-search-fetch"
+FETCH_QUEUE_TIMEOUT_DEFAULT_S = 120.0
+
+
+class FetchQueueTimeout(asyncio.TimeoutError):
+    """No search-fetch thread became free within ``FETCH_QUEUE_TIMEOUT_S``; the
+    backend was never called. A ``TimeoutError``, so it degrades the pair like
+    any fetch timeout."""
 
 
 def _fetch_workers_from_env() -> int:
@@ -356,8 +372,19 @@ def _fetch_workers_from_env() -> int:
             or FETCH_WORKERS_DEFAULT)
 
 
+def _fetch_queue_timeout_from_env() -> float:
+    """``PAPERVAULT_SEARCH_FETCH_QUEUE_TIMEOUT_S``: the outer deadline on the wait
+    for a pool thread. Parsed like the breaker knobs; ``0`` also falls back to
+    the default (a zero deadline would refuse every fetch that has to queue, and
+    no deadline at all is the stall this knob exists to prevent)."""
+    return (_env_nonneg("PAPERVAULT_SEARCH_FETCH_QUEUE_TIMEOUT_S",
+                        FETCH_QUEUE_TIMEOUT_DEFAULT_S, float)
+            or FETCH_QUEUE_TIMEOUT_DEFAULT_S)
+
+
 # Read at import, like the breaker knobs; tests monkeypatch the attributes.
 FETCH_WORKERS = _fetch_workers_from_env()
+FETCH_QUEUE_TIMEOUT_S = _fetch_queue_timeout_from_env()
 _FETCH_EXECUTOR: ThreadPoolExecutor | None = None
 
 
@@ -375,11 +402,13 @@ def _fetch_executor() -> ThreadPoolExecutor:
 async def _run_fetch(backend_fn, query: str, fn_kwargs: dict, timeout: float):
     """Run ``backend_fn(query, **fn_kwargs)`` on the search-fetch pool.
 
-    Waits without a deadline for a pool thread, then applies ``timeout`` to the
-    backend call itself. Raises ``asyncio.TimeoutError`` or the backend's own
-    exception, like the ``wait_for(to_thread(...))`` it replaces (contextvars are
-    carried into the thread, as ``to_thread`` does). A cancellation while still
-    queued withdraws the job, so the backend is never called.
+    Waits at most ``FETCH_QUEUE_TIMEOUT_S`` for a pool thread, then applies
+    ``timeout`` to the backend call itself. Raises ``FetchQueueTimeout`` when no
+    thread came free in time, ``asyncio.TimeoutError`` when the call overran, or
+    the backend's own exception, like the ``wait_for(to_thread(...))`` it
+    replaces (contextvars are carried into the thread, as ``to_thread`` does). A
+    cancellation or queue timeout while still queued withdraws the job, so the
+    backend is never called.
     """
     loop = asyncio.get_running_loop()
     started = asyncio.Event()
@@ -390,8 +419,15 @@ async def _run_fetch(backend_fn, query: str, fn_kwargs: dict, timeout: float):
         return ctx.run(backend_fn, query, **fn_kwargs)
 
     fut = loop.run_in_executor(_fetch_executor(), job)
+    queue_timeout = FETCH_QUEUE_TIMEOUT_S
     try:
-        await started.wait()
+        await asyncio.wait_for(started.wait(), timeout=queue_timeout)
+    except asyncio.TimeoutError:
+        if not started.is_set():      # else it started at the deadline: let it run
+            fut.cancel()
+            raise FetchQueueTimeout(
+                f"no search-fetch thread free within {queue_timeout:.0f}s"
+            ) from None
     except asyncio.CancelledError:
         fut.cancel()
         raise
@@ -506,6 +542,9 @@ async def _fetch_one_backend(
     the whole ``asyncio.gather`` — a dead/slow/blocked backend is one EMPTY
     list for that pair, never a retry-to-abort. It starts when a pool thread
     starts the call: the wait for a free thread is not charged (``_run_fetch``).
+    That wait has its own outer deadline (``FETCH_QUEUE_TIMEOUT_S``, #137): past
+    it the pair is withdrawn uncalled and recorded DEGRADED like a timeout, but
+    it does not feed the breaker (the backend was never tried).
 
     Three failure classes are recorded as DEGRADED into ``degraded_map`` (a
     ``collections.Counter`` keyed by backend; ``backend -> #DEGRADED pairs``):
@@ -566,6 +605,15 @@ async def _fetch_one_backend(
         if degraded_map is not None:
             degraded_map[backend_name] += 1   # increment on the LOOP thread (R3-F5)
         _breaker_record_degraded(backend_name)
+        return []
+    except FetchQueueTimeout as e:
+        # Pool starvation, not this backend's failure: DEGRADED for this run, but
+        # it was never called, so the breaker is not fed (see the pool notes).
+        logger.warning(
+            "search: backend %s skipped for query %r: %s", backend_name, query, e,
+        )
+        if degraded_map is not None:
+            degraded_map[backend_name] += 1
         return []
     except asyncio.TimeoutError:
         logger.warning(

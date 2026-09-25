@@ -82,6 +82,18 @@ def test_monitor_loop_offmode_returns_immediately():
     assert calls == []
 
 
+def test_operator_ocr_session_offmode_is_noop():
+    c = _controller(ondemand=False)
+    calls = _stub_systemctl(c)
+
+    async def drive():
+        async with c.ocr_session():
+            assert c._active_ocr == 0
+
+    _run(drive())
+    assert calls == []
+
+
 # ----------------------------- ensure_ready --------------------------------
 
 
@@ -144,26 +156,41 @@ def test_ensure_ready_no_bus_raises_transport(monkeypatch):
         _run(c.ensure_ready())             # bus absent → can't start → transport
 
 
+def test_failed_systemctl_start_enters_cooldown_immediately(monkeypatch):
+    monkeypatch.setattr(ms, "_READY_TIMEOUT", 0.05)
+    monkeypatch.setattr(ms, "_HEALTH_POLL", 0.0)
+    c = _controller()
+    _stub_ready(c, [False])
+
+    async def failed_start(verb):
+        return (5 if verb == "start" else 3, "unit not found" if verb == "start" else "")
+
+    c._run_systemctl = failed_start
+    with pytest.raises(MineruServerUnavailable, match="systemctl start failed"):
+        _run(c.ensure_ready())
+    assert c._cooldown_until > 0
+
+
 # ------------------------------- idle logic --------------------------------
 
 
 def test_idle_true_when_empty_and_no_extract_in_flight(monkeypatch):
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys",
                         lambda: ["dl:Foo2020"])           # a DOWNLOAD, not extract
-    assert MineruServerController._idle(_FakeQueue(0)) is True
+    assert _controller()._idle(_FakeQueue(0)) is True
 
 
 def test_not_idle_when_queue_nonempty(monkeypatch):
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys",
                         lambda: [])
-    assert MineruServerController._idle(_FakeQueue(3)) is False
+    assert _controller()._idle(_FakeQueue(3)) is False
 
 
 def test_not_idle_when_extract_in_flight(monkeypatch):
     # review fix #2: in_flight_keys is a FUNCTION returning ex:-prefixed keys.
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys",
                         lambda: ["ex:Bar2021"])
-    assert MineruServerController._idle(_FakeQueue(0)) is False
+    assert _controller()._idle(_FakeQueue(0)) is False
 
 
 # ----------------------- monitor stop decision -----------------------------
@@ -215,6 +242,59 @@ def test_monitor_does_not_stop_while_extract_in_flight(monkeypatch):
     assert "stop" not in calls                            # never stops under live work
 
 
+def test_monitor_rechecks_idle_after_readiness_probe(monkeypatch):
+    """An extract admitted during the monitor's probe must keep MinerU alive."""
+    in_flight = []
+    monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys",
+                        lambda: in_flight.copy())
+    monkeypatch.setattr(ms, "_IDLE_TIMEOUT", 0.0)
+    monkeypatch.setattr(ms, "_CHECK_INTERVAL", 0.0)
+    c = _controller()
+    c._bus_ok = True
+    c._last_activity = 0.0
+    calls = _stub_systemctl(c)
+    probe_entered = asyncio.Event()
+    release_probe = asyncio.Event()
+    next_cycle = asyncio.Event()
+    real_sleep = asyncio.sleep
+    cycles = 0
+
+    async def sleep(delay):
+        nonlocal cycles
+        if delay == 0.0:
+            cycles += 1
+            if cycles > 1:
+                next_cycle.set()
+                await asyncio.Event().wait()
+                return
+        await real_sleep(delay)
+
+    async def ready():
+        if not probe_entered.is_set():
+            probe_entered.set()
+            await release_probe.wait()
+        return True
+
+    monkeypatch.setattr(ms.asyncio, "sleep", sleep)
+    c._ready = ready
+
+    async def drive():
+        monitor = asyncio.create_task(c.monitor_loop(_FakeQueue(0)))
+        try:
+            await asyncio.wait_for(probe_entered.wait(), 1)
+            in_flight.append("ex:NewPaper")
+            await asyncio.wait_for(c.ensure_ready(), 1)
+            release_probe.set()
+            await asyncio.wait_for(next_cycle.wait(), 1)
+        finally:
+            monitor.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await monitor
+
+    _run(drive())
+    assert "stop" not in calls
+
+
 def test_monitor_forces_off_when_no_bus():
     c = _controller()
 
@@ -241,3 +321,57 @@ def test_stopping_flag_blocks_fast_path(monkeypatch):
     _stub_ready(c, [True])
     _run(c.ensure_ready())
     assert "start" not in calls
+
+
+def test_fast_path_waits_when_stop_begins_during_probe():
+    """A probe result from before teardown cannot admit a new OCR call."""
+    c = _controller()
+    entered = asyncio.Event()
+    release_probe = asyncio.Event()
+
+    async def ready():
+        if not entered.is_set():
+            entered.set()
+            await release_probe.wait()
+        return True
+
+    c._ready = ready
+
+    async def drive():
+        task = asyncio.create_task(c.ensure_ready())
+        await asyncio.wait_for(entered.wait(), 1)
+        await c._lock.acquire()  # model a monitor that has started stopping
+        c._stopping = True
+        try:
+            release_probe.set()
+            await asyncio.sleep(0)
+            assert not task.done(), "readiness escaped during teardown"
+        finally:
+            c._stopping = False
+            c._lock.release()
+        await asyncio.wait_for(task, 1)
+
+    _run(drive())
+
+
+def test_operator_ocr_session_keeps_server_active_until_ocr_finishes(monkeypatch):
+    monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys", lambda: [])
+    monkeypatch.setattr(ms, "_IDLE_TIMEOUT", 0.0)
+    c = _controller()
+    probes = []
+
+    async def ready():
+        probes.append(True)
+        return True
+
+    c._ready = ready
+
+    async def drive():
+        async with c.ocr_session():
+            c._last_activity = 0.0
+            assert c._past_idle(_FakeQueue(0)) is False
+        c._last_activity = 0.0
+        assert c._past_idle(_FakeQueue(0)) is True
+
+    _run(drive())
+    assert probes == [True]

@@ -80,6 +80,66 @@ For a deeper check, `papervault smoke` runs doctor, boots the MCP server over
 stdio, and round-trips its tools (`list_tools` + a read-only `get_paper`) — no
 LLM required (`papervault smoke --skip-db` skips the DB connectivity checks).
 
+## RTX 3090 idle-release deployment runbook
+
+This is an operator action after separate approval. Merging the code changes no
+running service: both switches default off. On the measured installation the OCR
+unit is the legacy `paper-library-mineru.service` with `TimeoutStartSec=5min`;
+`papervault-mineru.service` does not exist on that host. The repo template uses
+the latter name. A read-only check of `papervault.service`'s process environment
+confirmed it runs as a user unit with `XDG_RUNTIME_DIR=/run/user/1000` and
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`, and that socket exists.
+Its controller can therefore reach `systemctl --user`. Confirm these facts on
+the target host before editing the service checkout's `.env`.
+
+1. As the Unix user running `papervault.service`, check the user bus and unit:
+   `systemctl --user show paper-library-mineru.service -p LoadState -p TimeoutStartUSec`.
+   Also run `systemd-run --user --wait --pipe /usr/bin/systemctl --user show
+   paper-library-mineru.service -p LoadState` to check bus access inside a user
+   service, where the controller will run.
+   The installed unit and repo template both have `TimeoutStartSec=300` seconds;
+   keep `PAPER_LIBRARY_MINERU_READY_TIMEOUT` at 300 seconds or more (330 below
+   leaves margin). Check that `curl -fsS
+   http://127.0.0.1:30000/health` succeeds and `/v1/models` returns a nonempty
+   `data` list when the OCR model is loaded. The controller requires both.
+2. Add these exact lines to the service checkout's `.env` (use the actual unit
+   name if it differs):
+
+   ```dotenv
+   PAPER_LIBRARY_MINERU_ONDEMAND=1
+   PAPER_LIBRARY_MINERU_UNIT=paper-library-mineru.service
+   PAPER_LIBRARY_MINERU_READY_TIMEOUT=330
+   PAPER_LIBRARY_MINERU_IDLE_TIMEOUT=600
+   KS_BGE_IDLE_UNLOAD=1
+   KS_BGE_IDLE_TIMEOUT=600
+   ```
+
+3. Restart `papervault.service` to load the settings. **This drops connected MCP
+   clients**; reconnect them after the service is healthy. Do not disable the
+   MinerU unit merely to enable on-demand mode: the controller stops it after the
+   idle interval and starts it on the next OCR call. The library extract queue and
+   operator PDF pickup use the controller. A separate manual OCR process (including
+   `scripts/probe_mineru_socket_leak.py`) does not; keep on-demand off while running
+   such a process or use a separately managed OCR server.
+4. Record `nvidia-smi -i 1 --query-compute-apps=pid,used_gpu_memory --format=csv`
+   before and after the 600-second idle period (adjust `-i` to the physical RTX
+   3090 index). Confirm the MinerU process exits and the papervault process falls
+   toward zero GPU memory. Other processes on the card must be accounted for.
+5. Measure cold start at deployment: after MinerU has stopped on idle, queue a
+   PDF extraction and read the `mineru model-ready after ...s` line from
+   `journalctl --user -u papervault.service`. The duration includes the unit
+   start and both readiness probes. Inspect `journalctl --user -u
+   paper-library-mineru.service` if the start fails or exceeds 330 seconds.
+   After both BGE models unload, invoke a normal `query` or `search_papers` and
+   read the `bge embedder loaded in ...s` and `bge reranker loaded in ...s` log
+   entries. Record query latency as well as model-load durations; these timings
+   require the actual 3090 and are not measured by CI.
+
+Rollback: remove or set `PAPER_LIBRARY_MINERU_ONDEMAND=0` and
+`KS_BGE_IDLE_UNLOAD=0`, then restart `papervault.service` (clients disconnect
+again). Start the configured MinerU user unit so OCR remains resident. Verify
+`/health`, `/v1/models`, and a normal MCP call before closing the change.
+
 ## Connecting an agent
 
 **Claude Code** — install the bundled plugin (points Claude Code at the running

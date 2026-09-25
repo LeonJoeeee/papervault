@@ -32,9 +32,11 @@ store/graph.get_graph() singleton. The real v3 instance is built in store/graph.
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import logging
 import os
 import threading
+import time
 
 from papervault.knowledge.config import CONFIG
 
@@ -47,6 +49,62 @@ _BGE_RERANKER: object = None
 # threads (embed sem may be >1; rerank sem defaults 2). Double-checked locking keeps the load
 # single-flight without adding any steady-state cost (the None fast-path skips the lock).
 _MODEL_LOAD_LOCK = threading.Lock()
+
+# One idle clock covers both models. Activity is counted around synchronous inference,
+# including lazy load, so the timer cannot discard a model while a worker uses it.
+_IDLE_UNLOAD_ENABLED = os.getenv("KS_BGE_IDLE_UNLOAD", "0") == "1"
+_IDLE_UNLOAD_TIMEOUT = float(os.getenv("KS_BGE_IDLE_TIMEOUT", "600"))
+_IDLE_UNLOAD_LOCK = threading.Lock()
+_IDLE_UNLOAD_TIMER: threading.Timer | None = None
+_IDLE_UNLOAD_GENERATION = 0
+_IDLE_UNLOAD_ACTIVE = 0
+
+
+def _unload_idle_models(generation: int) -> None:
+    global _BGE_MODEL, _BGE_RERANKER, _IDLE_UNLOAD_TIMER
+    with _IDLE_UNLOAD_LOCK:
+        if generation != _IDLE_UNLOAD_GENERATION or _IDLE_UNLOAD_ACTIVE:
+            return
+        _IDLE_UNLOAD_TIMER = None
+        if _BGE_MODEL is None and _BGE_RERANKER is None:
+            return
+        started = time.perf_counter()
+        _BGE_MODEL = None
+        _BGE_RERANKER = None
+        try:
+            import torch
+            torch.cuda.empty_cache()
+        except Exception:
+            log.exception("bge idle unload: CUDA cache release failed")
+        log.info("bge embedder and reranker unloaded after idle in %.3fs",
+                 time.perf_counter() - started)
+
+
+@contextmanager
+def _model_activity():
+    global _IDLE_UNLOAD_ACTIVE, _IDLE_UNLOAD_GENERATION, _IDLE_UNLOAD_TIMER
+    if not _IDLE_UNLOAD_ENABLED:
+        yield
+        return
+    with _IDLE_UNLOAD_LOCK:
+        _IDLE_UNLOAD_GENERATION += 1
+        if _IDLE_UNLOAD_TIMER is not None:
+            _IDLE_UNLOAD_TIMER.cancel()
+            _IDLE_UNLOAD_TIMER = None
+        _IDLE_UNLOAD_ACTIVE += 1
+    try:
+        yield
+    finally:
+        with _IDLE_UNLOAD_LOCK:
+            _IDLE_UNLOAD_ACTIVE -= 1
+            if _IDLE_UNLOAD_ACTIVE == 0:
+                _IDLE_UNLOAD_GENERATION += 1
+                _IDLE_UNLOAD_TIMER = threading.Timer(
+                    _IDLE_UNLOAD_TIMEOUT, _unload_idle_models,
+                    args=(_IDLE_UNLOAD_GENERATION,),
+                )
+                _IDLE_UNLOAD_TIMER.daemon = True
+                _IDLE_UNLOAD_TIMER.start()
 
 # Rerank concurrency gate + integrity counter (2026-06-07, eval-trust drill).
 # Unlike embedding (embedding_func_max_async=16 in graph.py), LightRAG calls rerank_model_func
@@ -102,11 +160,14 @@ def _get_bge_model() -> object:
             if _BGE_MODEL is None:
                 from FlagEmbedding import BGEM3FlagModel
 
+                started = time.perf_counter()
                 _BGE_MODEL = BGEM3FlagModel(
                     CONFIG.bge_m3.model_path,
                     use_fp16=True,
                     devices=[CONFIG.bge_m3.device],
                 )
+                if _IDLE_UNLOAD_ENABLED:
+                    log.info("bge embedder loaded in %.3fs", time.perf_counter() - started)
     return _BGE_MODEL
 
 
@@ -149,12 +210,13 @@ def _bge_encode_sync(texts: list[str]):
 
     # Load INSIDE the worker thread (issue #31): the first-use model load is a multi-second
     # synchronous CUDA op — keeping it off the event loop is the whole point of the offload.
-    model = _get_bge_model()
-    # BGE-M3 supports 8192; the live chunker feeds chunk_token_size=2400 (tiktoken) chunks
-    # (BGE-M3 tokenizer counts them ~2617 mean / ~3485 max). max_length=512 silently truncated
-    # most of every chunk before embedding (fixed 2026-05-30 per the harden audit); 8192 covers them.
-    result = model.encode(texts, batch_size=32, max_length=8192)
-    return np.array(result["dense_vecs"])
+    with _model_activity():
+        model = _get_bge_model()
+        # BGE-M3 supports 8192; the live chunker feeds chunk_token_size=2400 (tiktoken) chunks
+        # (BGE-M3 tokenizer counts them ~2617 mean / ~3485 max). max_length=512 silently truncated
+        # most of every chunk before embedding (fixed 2026-05-30 per the harden audit); 8192 covers them.
+        result = model.encode(texts, batch_size=32, max_length=8192)
+        return np.array(result["dense_vecs"])
 
 
 async def _bge_embed(texts: list[str]):
@@ -194,6 +256,7 @@ def _get_bge_reranker() -> object:
             return _BGE_RERANKER
         import torch
         from sentence_transformers import CrossEncoder
+        started = time.perf_counter()
 
         # ★ KS_RERANK_DTYPE (2026-07-16 latency survey, issue #3): the checkpoint declares
         # float32 and this ctor historically passed no dtype, so the reranker — the query
@@ -223,6 +286,8 @@ def _get_bge_reranker() -> object:
             float(score[0]),
         )
         _BGE_RERANKER = model
+        if _IDLE_UNLOAD_ENABLED:
+            log.info("bge reranker loaded in %.3fs", time.perf_counter() - started)
     return _BGE_RERANKER
 
 
@@ -325,7 +390,8 @@ async def _bge_rerank(
     # loop, keeps the handshake path live at cold start. A load/preflight failure surfaces via
     # the except below (counted + logged loud), preserving the F21 fail-loud contract.
     def _load_and_predict(_pairs):
-        return _predict_with_oom_retry(_get_bge_reranker(), _pairs)
+        with _model_activity():
+            return _predict_with_oom_retry(_get_bge_reranker(), _pairs)
 
     async with _get_rerank_sem():
         try:

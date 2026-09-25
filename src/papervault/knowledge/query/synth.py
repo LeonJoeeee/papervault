@@ -2,7 +2,7 @@
 
 KS-written exit-LLM stage. Takes the structured `data` dict from `aquery_data`
 (entities / relationships / chunks — NOT pre-LLM'd) + the NL intent, and emits
-prose with inline [paper_key] cites.
+prose with inline [paper_key] cites (operator sources cite as [textbook:Key], issue #122).
 
 DECOUPLED from the out-feed's source-of-truth: this module only produces the
 PROSE. `cited_papers` is aggregated separately in aquery.py from
@@ -73,13 +73,9 @@ Hard requirements (these are the only constraints):
 1. Cite EVERY substantive claim inline — every sentence that asserts a fact, number,
    mechanism, or comparison must carry at least one [paper_key]; a factual sentence with
    no inline cite is a defect. Frame/transition sentences need no cite. The cite is the
-   bare paper_key wrapped in square brackets (e.g. "[Reames2023]"), no author names, no
-   separate years. Use the paper_key shown in each chunk's source label.
-   Square-bracket cites are for PAPER keys only (e.g. [Reames2023]). For a textbook or web
-   source (its key contains a colon, e.g. textbook:Griffiths or web:nasa-srag), do NOT put
-   it in square brackets — attribute it inline in prose instead (e.g. "a standard plasma-
-   physics text notes…", "per NASA's space-radiation page…") and present web content as
-   tentative per requirement 6.
+   source key shown in each chunk's source label, unchanged, wrapped in square brackets
+   (e.g. "[Reames2023]"; a textbook/notebook/web key keeps its colon, e.g.
+   "[textbook:Griffiths]"), no author names, no separate years.
 2. Use ALL the relevant retrieved material, not just the single most-relevant chunk. When
    several papers bear on the intent, SYNTHESIZE across them — corroborate where they agree
    (cite each, e.g. "[A2021][B2022]"), and surface disagreements or complementary angles
@@ -164,7 +160,7 @@ def _source_label(file_path: str) -> tuple[str, str]:
       - operator docs (#45/#47): the COLON provenance key itself ('textbook:AuthorYear',
         'notebook:idea-scope') — slash-free so it survives LightRAG 1.5 basenaming. The
         source class in the prefix sets the credibility band (textbook→established); the
-        whole key is the label (attributed inline in prose, not [bracketed]). A multi-section
+        whole key is the label, cited bracketed with its colon ([textbook:Key], #122). A multi-section
         doc carries a per-section file_path (`<key>#s<N>`, issue #79) — strip the `#s<N>` so
         the label attributes to the WHOLE book/notebook, not one section.
     """
@@ -231,8 +227,9 @@ def _build_prompt(data: dict[str, Any], intent: str) -> str:
             chunk_blocks.append(f"{header}\n{content}")
         blocks.append(
             "Source chunks (each chunk below has a source key or an explicit no-citation marker; to "
-            "cite it, wrap ONLY the key in square brackets, e.g. [Reames2023] — never write the "
-            "word paper_key, the credibility tag, or any colon inside the brackets):\n"
+            "cite it, wrap ONLY the key, unchanged, in square brackets, e.g. [Reames2023] for a "
+            "paper or [textbook:Baumjohann2012] for a textbook/notebook/web source (keep its "
+            "colon) — never write the word paper_key or the credibility tag inside the brackets):\n"
             + "\n\n---\n\n".join(chunk_blocks)
         )
 
@@ -247,8 +244,7 @@ Retrieved knowledge:
 ====
 
 Answer the intent using the retrieved knowledge above. Cite EVERY substantive claim
-inline with [paper_key] using the paper_key shown in each chunk's source label (papers
-only; attribute textbook:/notebook:/web: sources inline in prose, not in square brackets).
+inline with the bracketed source key shown in each chunk's source label.
 Use ALL the relevant material and synthesize ACROSS sources — don't collapse a multi-paper body
 of evidence into a single-paper summary. Pick whatever structure (prose / bullets /
 sections / table) and length best fits the question + the depth of coverage. If the

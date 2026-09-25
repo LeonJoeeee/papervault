@@ -1,6 +1,6 @@
 {
   "name": "papervault",
-  "version": "0.1.6",
+  "version": "0.4.3",
   "description": "Literature + knowledge layer for coding agents: discover papers, read full text, and query a graph-RAG knowledge base with cited answers. Connects to a running papervault MCP server.",
   "author": {
     "name": "papervault contributors"

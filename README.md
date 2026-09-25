@@ -57,9 +57,18 @@ operator's responsibility.
 ## Releases
 
 papervault is consumed **by pin** (ADR-0001): deployments track an annotated git tag
-(`vX.Y.Z[-stage]`), never `main`. A release IS a tag — CI's build job produces the
-wheel/sdist for every commit, so tagging is the whole ceremony, plus one bump: set the version field in BOTH `plugin/.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` to the tag (minus the `-beta` suffix) in the release commit. Current: `v0.1.6-beta`
-(closed beta).
+(`vX.Y.Z[-stage]`), never `main`.
+
+The repo carries **one version**, and every change PR bumps it per the semver call stated in
+its description. The declared version fields move together in that PR: `pyproject.toml`
+`[project].version` plus the `papervault` entry in `uv.lock` (refresh with `uv lock`),
+`plugin/.claude-plugin/plugin.json` `version`, and the `papervault` entry's `version` in
+`.claude-plugin/marketplace.json`; `tests/test_plugin_version_sync.py` fails when they drift.
+
+A release IS a tag — CI's build job produces the wheel/sdist for every commit, so tagging is
+the whole ceremony: the tag names the version already on `main` (`vX.Y.Z`, plus an optional
+`-stage` suffix), and a release commit changes no version field. Latest tag: `v0.1.6-beta`
+(closed beta), cut before the one-version rule, so its number predates the package version.
 
 ## License
 

@@ -12,4 +12,4 @@ The plugin does NOT bundle the server. Install and start the server first — fu
 /plugin install papervault
 ```
 
-Version policy: the version field here and in the repo's `.claude-plugin/marketplace.json` is bumped with every release tag (stated in the repo README's Releases section).
+Version policy: the version field here follows the repo's single package version and is bumped in every change PR, together with `.claude-plugin/marketplace.json` and `pyproject.toml` (stated in the repo README's Releases section).

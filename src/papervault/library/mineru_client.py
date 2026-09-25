@@ -477,6 +477,65 @@ async def _prepare_capped_predictor(server_url: str, client_kwargs: dict) -> Non
                          client_kwargs["max_connections"])
 
 
+# --------------------- heap trim after each parse (#133) --------------------
+#
+# A whole-doc parse renders page windows (64 pages at 200 DPI by default) and
+# PNG/base64-encodes them in ``to_thread`` workers. glibc keeps the freed memory
+# in per-thread malloc arenas instead of returning it: an offline replay of an
+# 8-way burst retained +5.5 GB after every object was freed, and the service
+# ratcheted to ~15 GB RSS. ``malloc_trim(0)`` after each parse returned it
+# (+0.13 GB retained). glibc only — musl/macOS lack the symbol, so this is a
+# no-op there. The unit's ``MALLOC_MMAP_THRESHOLD_`` is the primary fix;
+# this is the in-code backstop. ``PAPER_LIBRARY_MINERU_MALLOC_TRIM=0`` disables it.
+
+_MALLOC_TRIM_ENABLED = os.environ.get(
+    "PAPER_LIBRARY_MINERU_MALLOC_TRIM", "1").strip().lower() in ("1", "true", "yes")
+_UNLOADED = object()
+_malloc_trim_fn = _UNLOADED   # resolved on first use; None = unavailable here
+
+
+def _load_malloc_trim():
+    """glibc's ``malloc_trim`` as a ctypes function, or None off glibc."""
+    try:
+        if not os.confstr("CS_GNU_LIBC_VERSION"):
+            return None
+    except (AttributeError, ValueError, OSError):
+        return None
+    try:
+        import ctypes
+        fn = ctypes.CDLL(None).malloc_trim   # the libc already in this process
+    except (OSError, AttributeError):
+        return None
+    fn.argtypes = [ctypes.c_size_t]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def trim_heap() -> bool:
+    """Return freed heap memory to the OS with ``malloc_trim(0)``.
+
+    True when the trim ran; False when disabled or not on glibc. Never raises
+    for an unavailable symbol; the caller still guards against surprises."""
+    global _malloc_trim_fn
+    if not _MALLOC_TRIM_ENABLED:
+        return False
+    if _malloc_trim_fn is _UNLOADED:
+        _malloc_trim_fn = _load_malloc_trim()
+    if _malloc_trim_fn is None:
+        return False
+    _malloc_trim_fn(0)
+    return True
+
+
+async def _trim_after_parse() -> None:
+    """Run ``trim_heap`` off the event loop (a trim walks every arena and can
+    take a noticeable time on a multi-GB heap). Best-effort: never fails a parse."""
+    try:
+        await asyncio.to_thread(trim_heap)
+    except Exception:  # noqa: BLE001 - memory hygiene must never break an extract
+        log.debug("malloc_trim after MinerU parse failed", exc_info=True)
+
+
 # ------------------------- fd-watermark guard (#93) ------------------------
 
 _FD_WARN_FRACTION = float(os.environ.get("PAPER_LIBRARY_FD_WARN_FRACTION", "0.6"))
@@ -534,7 +593,8 @@ async def extract_mineru(
     Thin transport-lifecycle wrapper (issue #93) around :func:`_extract_mineru_impl`:
     it reference-counts in-flight parses PER EVENT LOOP and, when the last parse
     on this loop finishes, aclose()s + evicts this loop's cached mineru async
-    client so its pooled sockets never leak on a later loop switch. The parse
+    client so its pooled sockets never leak on a later loop switch. After every
+    parse (success or error) it runs ``malloc_trim(0)`` off the loop (#133). The parse
     logic, error model, timeouts and retries are entirely in the impl below —
     UNCHANGED. See the "transport lifecycle" block above for the mechanism.
     """
@@ -551,6 +611,7 @@ async def extract_mineru(
         )
     finally:
         await _decref_current_loop_and_maybe_close()
+        await _trim_after_parse()
 
 
 async def _extract_mineru_impl(

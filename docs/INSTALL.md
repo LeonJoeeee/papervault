@@ -300,3 +300,6 @@ Before the repo flips public, this shipped default reverts to OFF — see
 `deploy/papervault.service` is a user-level systemd unit for the server. Its
 `WorkingDirectory`/`ExecStart` assume the clone lives at `~/projects/dev/papervault` —
 edit both paths to your clone location before `systemctl --user enable --now papervault`.
+Keep its `Environment=MALLOC_MMAP_THRESHOLD_=1048576` line (or the same setting in a
+drop-in) when you adapt it: glibc reads it only at process start, so it cannot live in
+`.env`, and without it memory freed after an OCR burst stays in the process.

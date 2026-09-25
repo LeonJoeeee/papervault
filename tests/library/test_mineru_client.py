@@ -679,3 +679,98 @@ def test_parse_without_mineru_singleton_still_passes_caps(monkeypatch):
     assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
     assert order == ["aio_do_parse"]
     assert captured["max_concurrency"] == mc.client_limits()[0]
+
+
+# ============ issue #133: return freed parse memory to the OS ============
+# A whole-doc parse renders + base64-encodes page windows in worker threads;
+# glibc keeps the freed memory in per-thread arenas (+5.5 GB retained after an
+# 8-way burst). After each parse the client calls malloc_trim(0) — glibc only,
+# a no-op elsewhere, never an error.
+
+
+def _count_trims(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mc, "trim_heap", lambda: calls.append(1) or True)
+    monkeypatch.setattr(mc, "_close_mineru_client_for_loop",
+                        lambda _loop: asyncio.sleep(0))
+    return calls
+
+
+def test_trim_runs_once_per_successful_parse(monkeypatch):
+    calls = _count_trims(monkeypatch)
+
+    async def _impl(*_a, **_k):
+        assert calls == []                    # not before the parse
+        return "MD"
+
+    monkeypatch.setattr(mc, "_extract_mineru_impl", _impl)
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    assert asyncio.run(mc.extract_mineru(b"%PDF", eps, stem="x")) == "MD"
+    assert calls == [1]
+
+
+def test_trim_runs_once_per_failed_parse(monkeypatch):
+    calls = _count_trims(monkeypatch)
+
+    async def _impl(*_a, **_k):
+        raise mc.MineruExtractionError("thin")
+
+    monkeypatch.setattr(mc, "_extract_mineru_impl", _impl)
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    with pytest.raises(mc.MineruExtractionError):
+        asyncio.run(mc.extract_mineru(b"%PDF", eps, stem="x"))
+    assert calls == [1]
+
+
+def test_trim_failure_never_fails_the_parse(monkeypatch):
+    def _boom():
+        raise RuntimeError("trim exploded")
+
+    monkeypatch.setattr(mc, "trim_heap", _boom)
+    monkeypatch.setattr(mc, "_close_mineru_client_for_loop",
+                        lambda _loop: asyncio.sleep(0))
+
+    async def _impl(*_a, **_k):
+        return "MD"
+
+    monkeypatch.setattr(mc, "_extract_mineru_impl", _impl)
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    assert asyncio.run(mc.extract_mineru(b"%PDF", eps, stem="x")) == "MD"
+
+
+def test_trim_heap_is_noop_off_glibc(monkeypatch):
+    def _no_glibc(_name):
+        raise ValueError("unrecognized configuration name")
+
+    monkeypatch.setattr(mc.os, "confstr", _no_glibc)
+    monkeypatch.setattr(mc, "_malloc_trim_fn", mc._UNLOADED)
+    assert mc.trim_heap() is False
+    assert mc._malloc_trim_fn is None         # resolved once, cached as absent
+
+
+def test_trim_heap_calls_malloc_trim_zero(monkeypatch):
+    seen = []
+    monkeypatch.setattr(mc, "_malloc_trim_fn", lambda pad: seen.append(pad) or 1)
+    monkeypatch.setattr(mc, "_MALLOC_TRIM_ENABLED", True)
+    assert mc.trim_heap() is True
+    assert seen == [0]
+
+
+def test_trim_heap_disabled_by_flag(monkeypatch):
+    seen = []
+    monkeypatch.setattr(mc, "_malloc_trim_fn", lambda pad: seen.append(pad) or 1)
+    monkeypatch.setattr(mc, "_MALLOC_TRIM_ENABLED", False)
+    assert mc.trim_heap() is False
+    assert seen == []
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="glibc host only")
+def test_trim_heap_resolves_real_glibc_symbol(monkeypatch):
+    try:
+        if not os.confstr("CS_GNU_LIBC_VERSION"):
+            pytest.skip("not glibc")
+    except (AttributeError, ValueError, OSError):
+        pytest.skip("not glibc")
+    monkeypatch.setattr(mc, "_malloc_trim_fn", mc._UNLOADED)
+    monkeypatch.setattr(mc, "_MALLOC_TRIM_ENABLED", True)
+    assert mc.trim_heap() is True

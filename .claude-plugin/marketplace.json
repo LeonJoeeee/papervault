@@ -8,7 +8,7 @@
     {
       "name": "papervault",
       "description": "Literature + knowledge layer for coding agents: discover papers, read full text, and query a graph-RAG knowledge base with cited answers.",
-      "version": "0.1.6",
+      "version": "0.4.3",
       "source": "./plugin",
       "author": {
         "name": "papervault contributors"

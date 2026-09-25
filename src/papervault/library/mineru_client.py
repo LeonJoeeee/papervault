@@ -13,9 +13,11 @@ bucket of the old cascade is split into TWO typed exceptions so the caller
 
   - ``MineruTransportError`` — the server is unreachable / a connection died /
     the request never produced a usable response, OR an AMBIGUOUS bare-500 we
-    choose not to charge (§2.3). The PAPER is fine; the SERVER (or net) is the
-    problem. The caller MUST NOT charge an ``extract_attempt`` and MUST NOT
-    terminalize — non-mutation lets classify re-route the paper next sweep.
+    choose not to charge (§2.3), OR a 400 ``Failed to load image`` (the server
+    cannot decode the PNGs the client itself rendered — issue #134). The PAPER
+    is fine; the SERVER (or net) is the problem. The caller MUST NOT charge an
+    ``extract_attempt`` and MUST NOT terminalize — non-mutation lets classify
+    re-route the paper next sweep.
   - ``MineruExtractionError`` — the server WAS reached and RESPONDED with a
     DISCRIMINABLE per-doc error verdict (400/422/structured-500/truncation),
     OR produced output the client judges unusable (thin/missing md). The PAPER
@@ -64,6 +66,19 @@ class MineruTransportError(Exception):
     The PAPER is fine; the SERVER (or net) is the problem. The caller MUST NOT
     charge an attempt, MUST NOT terminalize — non-mutation is the C1 mechanism
     that lets classify re-route the paper to EXTRACT on the next sweep.
+    """
+
+
+class MineruImageDecodeError(MineruTransportError):
+    """The server answered HTTP 400 ``Failed to load image`` (issue #134).
+
+    The client renders every page PNG itself, so a server that cannot decode them
+    is broken, never the paper. The observed cause was a vLLM server process left
+    running on a deleted venv: Pillow loads its format plugins lazily, the import
+    failed, and every ``Image.open`` from then on raised. A ``MineruTransportError``
+    subclass so ``extract_md``'s C1 transport arm parks the paper with NO attempt
+    charged; the distinct type lets the caller count consecutive occurrences and
+    trigger the server self-heal (``services.mineru_server``).
     """
 
 
@@ -231,6 +246,15 @@ def _is_zero_byte_timeout(exc: Exception) -> bool:
     msg = str(exc).lower()
     return ("timeout" in msg or "timed out" in msg
             or "read timed out" in msg)
+
+
+def _is_server_image_decode_fail(exc: Exception) -> bool:
+    """A 400 whose body says the SERVER could not decode an image (issue #134).
+
+    vLLM's ``load_bytes`` answers ``400 Failed to load image: cannot identify image
+    file`` when its Pillow cannot open a PNG. The client generated that PNG, so the
+    fault is server-side: transport-class, not a per-doc 400 verdict."""
+    return _status_of(exc) == 400 and "failed to load image" in str(exc).lower()
 
 
 def _is_structured_500(exc: Exception) -> bool:
@@ -468,8 +492,10 @@ async def _extract_mineru_impl(
 
     Raises:
       ``MineruTransportError`` — server unreachable / connect-fail / bare-500 /
-        502/503/504/429 / zero-byte timeout / inline budget exhausted. The
-        caller does NOT charge an attempt and does NOT terminalize (C1).
+        502/503/504/429 / zero-byte timeout / inline budget exhausted, or its
+        ``MineruImageDecodeError`` subclass (400 ``Failed to load image``: the
+        server cannot decode the client's own PNGs, issue #134). The caller does
+        NOT charge an attempt and does NOT terminalize (C1).
       ``MineruExtractionError`` — 400/422 / structured-500 / truncation /
         unexpected finish_reason / thin-or-missing md / the daemon wall-clock
         cap firing while the server is alive. The caller charges toward budget.
@@ -576,6 +602,12 @@ async def _extract_mineru_impl(
 
             except ServerError as exc:
                 code = _status_of(exc)
+                # ── server cannot decode the client's own PNGs (issue #134) ──
+                # Checked BEFORE the 400 → extraction test: the server is broken,
+                # not the paper. Raise at once (every page fails the same way, so an
+                # inline retry only burns time); the caller parks it uncharged.
+                if _is_server_image_decode_fail(exc):
+                    raise MineruImageDecodeError(str(exc)) from exc
                 # ── EXTRACTION-class (per-doc defect) → NO retry, charge ──
                 if code in (400, 422) or _is_structured_500(exc):
                     raise MineruExtractionError(str(exc)) from exc

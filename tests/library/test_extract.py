@@ -18,6 +18,7 @@ that makes ONE whole-PDF ``mineru_client.extract_mineru`` call. These tests stub
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -862,3 +863,141 @@ def test_confirmed_gate_failopen_second_pass_does_not_overturn():
     assert out["complete"] is False                   # reject STANDS
     assert "no_second_opinion" in out["reason"]
     assert "paywall stub (genuine)" in out["reason"]  # pass-1 reason kept
+
+
+# ----- issue #134: a server that cannot decode images never condemns a paper -----
+#
+# The 09-20..09-25 incident: a stale MinerU server answered every page with HTTP
+# 400 "Failed to load image"; the client charged it as a per-doc defect and 5,828
+# healthy papers went terminal. It is now transport-class (no charge, status kept)
+# and each occurrence is reported to the server controller's self-heal counter.
+
+_IMAGE_DECODE_400 = (
+    'Unexpected status code: [400], response body: {"error":{"message":'
+    '"Failed to load image: cannot identify image file <_io.BytesIO object>",'
+    '"type":"BadRequestError","param":null,"code":400}}')
+
+
+def _install_fake_mineru_raising(monkeypatch, message):
+    """Fake the lazily-imported mineru modules so the REAL ``extract_mineru``
+    runs its classification against an ``aio_do_parse`` that raises ServerError."""
+    import sys
+    import types
+
+    from papervault.library import mineru_client as mc
+
+    class ServerError(RuntimeError):
+        pass
+
+    class RequestError(ValueError):
+        pass
+
+    async def aio_do_parse(**_kw):
+        raise ServerError(message)
+
+    common = types.ModuleType("mineru.cli.common")
+    common.aio_do_parse = aio_do_parse
+    base = types.ModuleType("mineru_vl_utils.vlm_client.base_client")
+    base.ServerError = ServerError
+    base.RequestError = RequestError
+    for name, mod in (
+        ("mineru", types.ModuleType("mineru")),
+        ("mineru.cli", types.ModuleType("mineru.cli")),
+        ("mineru.cli.common", common),
+        ("mineru_vl_utils", types.ModuleType("mineru_vl_utils")),
+        ("mineru_vl_utils.vlm_client", types.ModuleType("mineru_vl_utils.vlm_client")),
+        ("mineru_vl_utils.vlm_client.base_client", base),
+    ):
+        monkeypatch.setitem(sys.modules, name, mod)
+
+    async def _reachable(*_a, **_k):
+        return True
+    monkeypatch.setattr(mc, "_any_endpoint_ready", _reachable)
+    monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0)
+
+
+class _RecordingController:
+    def __init__(self):
+        self.events = []
+
+    async def ensure_ready(self):
+        return None
+
+    def note_image_decode_failure(self):
+        self.events.append("image_decode")
+
+    def note_parse_success(self):
+        self.events.append("success")
+
+
+@pytest.mark.parametrize("status", ["ok", "pending"])
+def test_image_decode_400_parks_paper_uncharged(tmp_path, monkeypatch, status):
+    """Done-check 1: the real client turns the 400 into a transport error, so
+    ``extract_md`` charges no attempt and leaves the status unchanged."""
+    from papervault.library.models import MAX_EXTRACT_ATTEMPTS
+    lib, p = _pdf_paper(tmp_path)
+    p.download_status = status
+    p.extract_attempts = MAX_EXTRACT_ATTEMPTS - 1     # one charge from terminal
+    _stub_good_probe(monkeypatch)
+    _install_fake_mineru_raising(monkeypatch, _IMAGE_DECODE_400)
+    monkeypatch.setattr(extract, "get_server_controller", _RecordingController)
+
+    out = asyncio.run(extract.extract_md(p, lib, llm=object()))
+    assert out is None
+    assert p.extract_attempts == MAX_EXTRACT_ATTEMPTS - 1   # NOT charged
+    assert p.download_status == status                       # NOT terminal
+    assert p.extract_deferred_sig is not None                # parked (#43 defer)
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()
+              if line.strip()]
+    assert any(e.get("event") == "extract_md_transport_retry" and e.get("key") == p.key
+               for e in events)
+    assert not any(e.get("event") == "extract_md_engine_failed" for e in events)
+
+
+def test_plain_400_still_charges_through_real_client(tmp_path, monkeypatch):
+    lib, p = _pdf_paper(tmp_path)
+    p.download_status = "ok"
+    _stub_good_probe(monkeypatch)
+    _install_fake_mineru_raising(
+        monkeypatch, "Unexpected status code: [400], response body: bad request")
+    monkeypatch.setattr(extract, "get_server_controller", _RecordingController)
+
+    out = asyncio.run(extract.extract_md(p, lib, llm=object()))
+    assert out is None
+    assert p.extract_attempts == 1
+
+
+def test_image_decode_failure_is_reported_to_controller(tmp_path, monkeypatch):
+    from papervault.library.mineru_client import MineruImageDecodeError
+    lib, p = _pdf_paper(tmp_path)
+    ctl = _RecordingController()
+    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, raises=MineruImageDecodeError(_IMAGE_DECODE_400))
+
+    asyncio.run(extract.extract_md(p, lib, llm=object()))
+    assert ctl.events == ["image_decode"]
+
+
+def test_other_transport_error_is_not_counted_as_image_decode(tmp_path, monkeypatch):
+    from papervault.library.mineru_client import MineruTransportError
+    lib, p = _pdf_paper(tmp_path)
+    ctl = _RecordingController()
+    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, raises=MineruTransportError("connection refused"))
+
+    asyncio.run(extract.extract_md(p, lib, llm=object()))
+    assert ctl.events == []
+
+
+def test_successful_parse_is_reported_to_controller(tmp_path, monkeypatch):
+    lib, p = _pdf_paper(tmp_path)
+    ctl = _RecordingController()
+    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, returns="REAL ASSEMBLED BODY of the paper. " * 30)
+    _stub_judges_pass(monkeypatch)
+
+    asyncio.run(extract.extract_md(p, lib, llm=object()))
+    assert ctl.events == ["success"]

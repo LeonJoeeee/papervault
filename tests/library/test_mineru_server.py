@@ -375,3 +375,132 @@ def test_operator_ocr_session_keeps_server_active_until_ocr_finishes(monkeypatch
 
     _run(drive())
     assert probes == [True]
+
+
+# ------------- issue #134: self-heal on server-side image decode -------------
+# A stale MinerU server (still running from a deleted venv) answers every page
+# with 400 "Failed to load image". The client parks those papers uncharged; the
+# controller restarts the unit once after N consecutive occurrences (on-demand
+# ON) or logs one ERROR naming the cause and the unit (on-demand OFF).
+
+
+def _record_systemctl(c):
+    """Record (verb, _stopping-at-call-time); rc=0, bus OK."""
+    calls = []
+
+    async def fake(verb):
+        calls.append((verb, c._stopping))
+        return (0, "")
+
+    c._run_systemctl = fake
+    return calls
+
+
+def _fail_n(c, n):
+    """Report n image-decode failures from inside a loop; await any heal task."""
+    async def drive():
+        tasks = [c.note_image_decode_failure() for _ in range(n)]
+        for t in {t for t in tasks if t is not None}:
+            await t
+    _run(drive())
+
+
+def test_image_decode_self_heal_on_restarts_once_after_threshold(monkeypatch):
+    monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 3)
+    monkeypatch.setattr(ms, "_HEALTH_POLL", 0.0)
+    c = _controller()
+    calls = _record_systemctl(c)
+    _stub_ready(c, [True])
+
+    _fail_n(c, 2)
+    assert [v for v, _ in calls if v == "restart"] == []     # below threshold
+    _fail_n(c, 1)
+    restarts = [(v, stopping) for v, stopping in calls if v == "restart"]
+    assert restarts == [("restart", True)]    # once, with the fast path closed
+    assert c._stopping is False               # reopened after systemctl returned
+
+
+def test_image_decode_self_heal_does_not_restart_again_without_a_success(
+        monkeypatch, caplog):
+    """The restart is attempted ONCE per unhealthy stretch: if the failures keep
+    coming with no successful parse in between, log instead of a restart loop."""
+    monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 3)
+    monkeypatch.setattr(ms, "_HEALTH_POLL", 0.0)
+    c = _controller()
+    calls = _record_systemctl(c)
+    _stub_ready(c, [True])
+
+    _fail_n(c, 3)
+    with caplog.at_level("ERROR", logger=ms.log.name):
+        _fail_n(c, 6)
+    assert [v for v, _ in calls].count("restart") == 1
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "x.service" in errors[0].getMessage()
+
+
+def test_image_decode_success_resets_streak_and_rearms_heal(monkeypatch):
+    monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 3)
+    monkeypatch.setattr(ms, "_HEALTH_POLL", 0.0)
+    c = _controller()
+    calls = _record_systemctl(c)
+    _stub_ready(c, [True])
+
+    _fail_n(c, 2)
+    c.note_parse_success()                    # a success breaks the streak
+    _fail_n(c, 2)
+    assert "restart" not in [v for v, _ in calls]
+    _fail_n(c, 1)                             # 3 consecutive → restart
+    c.note_parse_success()                    # healthy again → heal re-armed
+    _fail_n(c, 3)
+    assert [v for v, _ in calls].count("restart") == 2
+
+
+def test_image_decode_self_heal_respects_start_failure_cooldown(monkeypatch):
+    monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 3)
+    c = _controller()
+    calls = _record_systemctl(c)
+    _stub_ready(c, [True])
+    c._cooldown_until = ms.time.monotonic() + 600.0
+
+    _fail_n(c, 3)
+    assert "restart" not in [v for v, _ in calls]
+
+
+def test_image_decode_self_heal_failed_restart_arms_cooldown(monkeypatch):
+    monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 3)
+    c = _controller()
+    _stub_ready(c, [False])
+
+    async def failing(verb):
+        return (1 if verb == "restart" else 0, "")
+
+    c._run_systemctl = failing
+    _fail_n(c, 3)
+    assert c._cooldown_until > ms.time.monotonic()
+
+
+def test_image_decode_self_heal_waits_for_model_ready(monkeypatch):
+    """After the restart the controller holds the lock until the model is ready,
+    so ensure_ready callers wait instead of hitting a half-started server."""
+    monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 1)
+    monkeypatch.setattr(ms, "_HEALTH_POLL", 0.0)
+    c = _controller()
+    _record_systemctl(c)
+    _stub_ready(c, [False, False, True])
+    _fail_n(c, 1)
+    assert c._cooldown_until == 0.0           # became ready → no cooldown
+
+
+def test_image_decode_offmode_logs_one_error_and_never_restarts(monkeypatch, caplog):
+    monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 3)
+    c = _controller(ondemand=False)
+    calls = _record_systemctl(c)
+    with caplog.at_level("ERROR", logger=ms.log.name):
+        _fail_n(c, 2)
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]
+        _fail_n(c, 7)
+    assert calls == []                        # OFF never touches systemctl
+    errors = [r for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1
+    msg = errors[0].getMessage()
+    assert "stale" in msg and "x.service" in msg and "restart" in msg

@@ -511,3 +511,67 @@ def test_fd_watermark_never_raises_on_proc_error(monkeypatch):
     logger = Mock()
     mc.check_fd_watermark(logger)   # must swallow, no raise
     assert logger.warning.call_count == 0
+
+
+# ========= issue #134: server-side image decode failure is TRANSPORT =========
+# A MinerU vLLM server whose Pillow plugins could not load (a stale process on a
+# deleted venv) answers EVERY page with HTTP 400 "Failed to load image". The client
+# renders the PNGs itself, so this is never the paper's fault: it must be a
+# transport-class error (no attempt charged), not a per-doc extraction verdict.
+
+_IMAGE_DECODE_400 = (
+    'Unexpected status code: [400], response body: {"error":{"message":'
+    '"Failed to load image: cannot identify image file <_io.BytesIO object>",'
+    '"type":"BadRequestError","param":null,"code":400}}')
+
+
+def _raising_parse(ServerError_holder, message, calls):
+    async def _parse(**_kw):
+        calls.append(1)
+        raise ServerError_holder[0](message)
+    return _parse
+
+
+def test_image_decode_400_is_transport_not_extraction(monkeypatch):
+    holder: list = [None]
+    calls: list = []
+    holder[0] = _install_fake_mineru(
+        monkeypatch, _raising_parse(holder, _IMAGE_DECODE_400, calls))
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    with pytest.raises(mc.MineruTransportError) as ei:
+        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
+    assert not isinstance(ei.value, mc.MineruExtractionError)
+    assert isinstance(ei.value, mc.MineruImageDecodeError)
+    assert "Failed to load image" in str(ei.value)
+    # No inline retry: a broken server fails every page the same way.
+    assert len(calls) == 1
+
+
+def test_plain_400_is_still_extraction(monkeypatch):
+    holder: list = [None]
+    calls: list = []
+    holder[0] = _install_fake_mineru(monkeypatch, _raising_parse(
+        holder, 'Unexpected status code: [400], response body: {"error":'
+                '{"message":"prompt too long","code":400}}', calls))
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    with pytest.raises(mc.MineruExtractionError):
+        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
+
+
+def test_plain_422_is_still_extraction(monkeypatch):
+    holder: list = [None]
+    calls: list = []
+    holder[0] = _install_fake_mineru(monkeypatch, _raising_parse(
+        holder, "Unexpected status code: [422], response body: unprocessable", calls))
+    eps = [mc.Endpoint("a", "http://a:30000")]
+    with pytest.raises(mc.MineruExtractionError):
+        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
+
+
+def test_image_decode_text_on_non_400_is_not_reclassified():
+    """Only the 400 + 'Failed to load image' pair is the stale-server signature."""
+    assert mc._is_server_image_decode_fail(Exception(_IMAGE_DECODE_400))
+    assert not mc._is_server_image_decode_fail(Exception(
+        "Unexpected status code: [422], response body: Failed to load image"))
+    assert not mc._is_server_image_decode_fail(Exception(
+        "Unexpected status code: [400], response body: bad prompt"))

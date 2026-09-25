@@ -29,6 +29,12 @@ Key review-driven invariants baked in here:
     forever (review fix #7).
   * if ``systemctl --user`` has no D-Bus (non-systemd host), on-demand force-OFFs
     to persistent rather than stalling every extract (review fix #8).
+  * self-heal (issue #134): N consecutive ``MineruImageDecodeError`` parses (the
+    server answers 400 ``Failed to load image`` for the client's own PNGs — a
+    stale server process) trigger ONE ``systemctl --user restart`` under the same
+    lock / ``_stopping`` / cooldown rules as start and stop. It is not repeated
+    until a parse succeeds again. With on-demand OFF the controller never touches
+    systemd: it logs one ERROR naming the cause and the unit to restart.
 The in-process ``asyncio.Lock`` serializes only this daemon's transitions; it
 does not guard a manual ``systemctl`` or a separate OCR process. Keep on-demand
 OFF for independent OCR scripts that use the same server.
@@ -59,6 +65,13 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except (TypeError, ValueError):
+        return default
+
+
 # Readiness wait ≥ unit TimeoutStartSec=300 + margin (review fix #4).
 _READY_TIMEOUT = _env_float("PAPER_LIBRARY_MINERU_READY_TIMEOUT", 330.0)
 _CHECK_INTERVAL = _env_float("PAPER_LIBRARY_MINERU_IDLE_CHECK", 60.0)
@@ -70,6 +83,10 @@ _COOLDOWN_CAP = 600.0
 _START_TIMEOUT = 320.0   # ≥ unit TimeoutStartSec=300
 _STOP_TIMEOUT = 70.0     # ≥ unit TimeoutStopSec=60
 _EXTRACT_PREFIX = "ex:"  # concurrency.with_dedup stage key for extraction
+# Consecutive server-side image-decode failures (no success between them) that
+# trigger the self-heal restart (on-demand ON) or the one ERROR (OFF). Issue #134.
+_IMAGE_DECODE_RESTART_AFTER = max(1, _env_int(
+    "PAPER_LIBRARY_MINERU_IMAGE_DECODE_RESTART_AFTER", 3))
 
 
 class MineruServerUnavailable(MineruTransportError):
@@ -105,6 +122,13 @@ class MineruServerController:
         self._cooldown_until = 0.0    # monotonic deadline; ensure_ready short-circuits before it
         self._bus_ok: Optional[bool] = None  # None=unprobed
         self._active_ocr = 0
+        # Issue #134 self-heal state. The streak counts image-decode failures
+        # since the last successful parse; ``_heal_spent`` allows ONE restart per
+        # unhealthy stretch; ``_heal_alerted`` keeps the ERROR to one line.
+        self._image_decode_streak = 0
+        self._heal_spent = False
+        self._heal_alerted = False
+        self._heal_task: Optional[asyncio.Task] = None
 
     @property
     def ondemand(self) -> bool:
@@ -182,6 +206,102 @@ class MineruServerController:
             raise MineruServerUnavailable(
                 f"mineru server not model-ready within {_READY_TIMEOUT:.0f}s "
                 f"(start-failure cooldown {self._cooldown:.0f}s)")
+
+    # ------------------ self-heal: stale server (issue #134) -------------------
+    def note_parse_success(self) -> None:
+        """A MinerU parse returned output: the server decodes images again. Clears
+        the streak and re-arms the one-restart budget and the one-line alert."""
+        self._image_decode_streak = 0
+        self._heal_spent = False
+        self._heal_alerted = False
+
+    def note_image_decode_failure(self) -> Optional[asyncio.Task]:
+        """Count one ``MineruImageDecodeError`` parse (a 400 ``Failed to load
+        image`` the server returned for the client's own PNG).
+
+        After ``_IMAGE_DECODE_RESTART_AFTER`` consecutive ones: with on-demand ON,
+        schedule ONE background restart of the unit (returned, so a caller or test
+        may await it; the extract worker does not wait on it); with on-demand OFF,
+        or when the restart was already spent this stretch, log one ERROR. Must be
+        called from a running event loop (``extract_md`` is async)."""
+        self._image_decode_streak += 1
+        if self._image_decode_streak < _IMAGE_DECODE_RESTART_AFTER:
+            return None
+        if self._heal_task is not None and not self._heal_task.done():
+            return self._heal_task
+        if not self._ondemand:
+            self._alert_stale_server("on-demand is OFF, so papervault will not restart it")
+            return None
+        if self._heal_spent:
+            self._alert_stale_server("the one self-heal restart did not help")
+            return None
+        self._heal_spent = True
+        self._heal_task = asyncio.get_running_loop().create_task(
+            self._restart_for_image_decode())
+        return self._heal_task
+
+    def _alert_stale_server(self, why: str) -> None:
+        if self._heal_alerted:
+            return
+        self._heal_alerted = True
+        log.error(
+            "MinerU server %s answered %d consecutive parses with HTTP 400 "
+            "'Failed to load image' for PNGs the client rendered itself. The server "
+            "process is likely stale (e.g. still running from a moved or deleted "
+            "venv whose Pillow image plugins can no longer load). Papers are parked "
+            "without an attempt charged; %s. Restart the unit: "
+            "systemctl --user restart %s",
+            self._base, self._image_decode_streak, why, self._unit)
+
+    async def _restart_for_image_decode(self) -> None:
+        """Restart the unit once and wait for model-readiness, under the lock.
+
+        Same rules as ``ensure_ready``'s start: skipped during the start-failure
+        cooldown or without a user bus; a failed restart or a ready timeout arms
+        the cooldown. ``_stopping`` is held across the ``systemctl restart`` call
+        so the lockless ``ensure_ready`` fast path cannot admit OCR against a
+        server that is going down; later callers wait on the lock until ready."""
+        async with self._lock:
+            now = time.monotonic()
+            if now < self._cooldown_until:
+                # Not spent: a later failure may retry once the cooldown lapses.
+                self._heal_spent = False
+                log.warning(
+                    "mineru self-heal: restart of %s skipped — start-failure "
+                    "cooldown (%.0fs left)", self._unit, self._cooldown_until - now)
+                return
+            if not await self._bus_available():
+                self._alert_stale_server("systemctl --user is unavailable (no D-Bus)")
+                return
+            log.warning(
+                "mineru self-heal: %d consecutive 'Failed to load image' parses — "
+                "restarting %s (likely a stale server process)",
+                self._image_decode_streak, self._unit)
+            started = time.perf_counter()
+            self._stopping = True
+            try:
+                rc = await self._systemctl("restart")
+            finally:
+                self._stopping = False
+            self._image_decode_streak = 0
+            if rc != 0:
+                self._arm_cooldown()
+                log.error("mineru self-heal: systemctl restart %s failed (rc=%s; "
+                          "cooldown %.0fs)", self._unit, rc, self._cooldown)
+                return
+            deadline = time.monotonic() + _READY_TIMEOUT
+            while time.monotonic() < deadline:
+                if await self._ready():
+                    self._cooldown = 0.0
+                    self._cooldown_until = 0.0
+                    log.info("mineru self-heal: %s model-ready after %.3fs",
+                             self._unit, time.perf_counter() - started)
+                    return
+                await asyncio.sleep(_HEALTH_POLL)
+            self._arm_cooldown()
+            log.error("mineru self-heal: %s not model-ready within %.0fs after "
+                      "restart (cooldown %.0fs)", self._unit, _READY_TIMEOUT,
+                      self._cooldown)
 
     def _arm_cooldown(self) -> None:
         self._cooldown = min(max(self._cooldown * 2.0, _COOLDOWN_MIN), _COOLDOWN_CAP)
@@ -272,7 +392,8 @@ class MineruServerController:
     async def _run_systemctl(self, verb: str) -> tuple[Optional[int], str]:
         """Run ``systemctl --user <verb> <unit>`` off the event loop with a
         timeout. Returns (rc, stderr); rc None ⇒ systemctl missing or timed out."""
-        timeout = _START_TIMEOUT if verb == "start" else _STOP_TIMEOUT
+        timeout = {"start": _START_TIMEOUT,
+                   "restart": _STOP_TIMEOUT + _START_TIMEOUT}.get(verb, _STOP_TIMEOUT)
         try:
             proc = await asyncio.create_subprocess_exec(
                 "systemctl", "--user", verb, self._unit,

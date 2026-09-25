@@ -85,9 +85,10 @@ def _busy_answer(tool: str, depth: int, expected_wait_s: float) -> dict[str, Any
         "status": "busy",
         "busy": True,
         "reason": (
-            f"{tool} is load-limited right now: {depth} calls are in line and the "
+            f"{tool} is load-limited right now: {depth - 1} calls are already running and the "
             f"projected wait (~{int(expected_wait_s // 60)} min) exceeds the service's "
-            "honest-wait threshold. Nothing is wrong — do other work and retry."
+            "honest-wait threshold. Nothing is wrong — do other work and retry after "
+            f"retry_after_s ({retry}) seconds."
         ),
         "queue_depth": depth,
         "expected_wait_s": int(expected_wait_s),

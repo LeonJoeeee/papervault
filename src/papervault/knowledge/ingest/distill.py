@@ -14,6 +14,11 @@
   with no content. So an existing `paper:<key>` is adopted (PROCESSED → done, in flight →
   processing), stale `dup-*` markers on the paper's file_path are purged first, and any other
   row still holding that file_path blocks the insert (ledger error) instead of minting a marker.
+- Abstract-only docs (#144): an `ABSTRACT:` fingerprint inserts ONE doc built from the paper's
+  metadata + abstract (ingest/abstract_doc.py) instead of reading an extract. Adoption of an
+  existing `paper:<key>` is limited to a doc of the WANTED class (abstract vs full text): a doc
+  of the other class is deleted and replaced, so an abstract doc never stands in for full text.
+- rollback_abstract_docs(): the one-step undo — delete every abstract-only doc, ledger → done_meta.
 """
 from __future__ import annotations
 
@@ -26,6 +31,12 @@ from lightrag.base import DocStatus
 from lightrag.utils import sanitize_text_for_encoding
 from lightrag.utils_pipeline import normalize_document_file_path
 
+from papervault.knowledge.ingest.abstract_doc import (
+    build_abstract_doc,
+    done_status_for,
+    is_abstract_fp,
+    is_abstract_text,
+)
 from papervault.knowledge.ingest.fingerprint import META
 from papervault.knowledge.ingest.paper_library_client import _strip_references
 from papervault.knowledge.ingest.vault import PaperRecord, read_extract_raw
@@ -271,6 +282,17 @@ def _dedup_key(cleaned_text: str) -> str:
     return hashlib.sha256(sanitize_text_for_encoding(cleaned_text).encode("utf-8")).hexdigest()
 
 
+async def _existing_is_abstract(rag, did: str, st) -> bool:
+    """Is the existing `did` doc an abstract-only doc (#144)? Read from its full_docs content (the
+    text it was inserted with), falling back to doc_status content_summary. Anything that is not
+    positively an abstract doc counts as full text — every doc built before #144 is full text."""
+    doc = await rag.full_docs.get_by_id(did)
+    content = doc.get("content") if isinstance(doc, dict) else None
+    if content is None and isinstance(st, dict):
+        content = st.get("content_summary")
+    return is_abstract_text(content)
+
+
 async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
     """items = [(rec, fp)]. 两段式:批量 enqueue → 单次 process(§6.1)。"""
     inputs: list[str] = []
@@ -279,7 +301,8 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
     queued: list[tuple[str, str]] = []     # (key, fp) — 批级异常回写 error 用(保留各自指纹,F17)
     seen_clean: dict[str, str] = {}        # dedup_key → 已入队的 key(F16 内容去重)
     counters = {"queued": 0, "meta": 0, "no_text": 0, "dup": 0, "errored": 0,
-                "existing": 0, "blocked": 0, "purged_markers": 0}
+                "existing": 0, "blocked": 0, "purged_markers": 0,
+                "abstract": 0, "replaced": 0, "replace_failed": 0}
 
     # #131 Bound 1: a doc_id doc_status already holds is never enqueued again (LightRAG would only
     # reject it and record a `dup-*` marker). One batched lookup for every would-be insert.
@@ -291,23 +314,49 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
             await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
             counters["meta"] += 1
             continue
-        ds = doc_status_of(existing.get(doc_id(rec.key)))
+        want_abstract = is_abstract_fp(fp)
+        st = existing.get(doc_id(rec.key))
+        ds = doc_status_of(st)
         if ds is not None:
-            # Adopt the existing doc: PROCESSED is done; anything else is still LightRAG's to finish
-            # (or fail), so track it as processing and let reconcile_terminal record the outcome.
-            status = "done" if ds == DocStatus.PROCESSED else "processing"
-            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status=status, fingerprint=fp)
-            counters["existing"] += 1
-            log.info("distill_batch: %s already in doc_status (%s) → ledger %s, not re-enqueued",
-                     rec.key, ds, status)
-            continue
-        text = read_extract_raw(rec)
-        if not text or not text.strip():
-            # 路径有但文件缺/空 → 当元数据态(待全文就绪)
-            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
-            counters["no_text"] += 1
-            continue
-        cleaned = clean(text)
+            if await _existing_is_abstract(rag, doc_id(rec.key), st) == want_abstract:
+                # Adopt the existing doc: PROCESSED is done; anything else is still LightRAG's to
+                # finish (or fail), so track it as processing and let reconcile_terminal record it.
+                status = done_status_for(fp) if ds == DocStatus.PROCESSED else "processing"
+                await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status=status, fingerprint=fp)
+                counters["existing"] += 1
+                log.info("distill_batch: %s already in doc_status (%s) → ledger %s, not re-enqueued",
+                         rec.key, ds, status)
+                continue
+            # #144 Bound 2: the existing doc is the OTHER class (an abstract doc where full text is
+            # wanted, or the reverse). Adopting it would record the wanted class while the graph
+            # holds the other, so delete it and insert the wanted doc below. A delete that does not
+            # land (busy pipeline / failure) leaves remove_one's pending_remove/error row → retried.
+            r = await remove_one(rag, rec.key, delete_ledger=False)
+            if r != "removed":
+                counters["replace_failed"] += 1
+                log.warning("distill_batch: %s holds a %s doc but %s is wanted; delete → %s, not enqueued",
+                            rec.key, "full-text" if want_abstract else "abstract-only",
+                            "abstract-only" if want_abstract else "full text", r)
+                continue
+            counters["replaced"] += 1
+            log.info("distill_batch: %s replaced its %s doc (#144)", rec.key,
+                     "full-text" if want_abstract else "abstract-only")
+        if want_abstract:
+            # One doc from title/authors/year/venue/ids/abstract; no extract, nothing to clean().
+            cleaned = build_abstract_doc(rec)
+            if not cleaned:
+                # The abstract vanished since fingerprint() ran → plain metadata state.
+                await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
+                counters["meta"] += 1
+                continue
+        else:
+            text = read_extract_raw(rec)
+            if not text or not text.strip():
+                # 路径有但文件缺/空 → 当元数据态(待全文就绪)
+                await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
+                counters["no_text"] += 1
+                continue
+            cleaned = clean(text)
         dk = _dedup_key(cleaned)
         if dk in seen_clean:
             # F16: 与本批先到的一篇正文(sanitize 后)字节相同 → LightRAG enqueue 会静默丢这个 doc_id。
@@ -335,6 +384,8 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
         await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="processing", fingerprint=fp)
         queued.append((rec.key, fp))
         counters["queued"] += 1
+        if want_abstract:
+            counters["abstract"] += 1
 
     if inputs:
         try:
@@ -378,3 +429,46 @@ async def remove_one(rag, key: str, *, delete_ledger: bool) -> str:
     await ledger.upsert("paper", key, doc_id=did, status="error")
     log.warning("remove %s failed: status=%s result=%r", key, status, r)
     return "error"
+
+
+async def rollback_abstract_docs(rag, *, apply: bool) -> dict:
+    """#144 Bound 4: delete every abstract-only doc and return its ledger row to done_meta.
+
+    The class is every paper ledger row whose fingerprint is `ABSTRACT:` or whose status is
+    done_abstract (any status: processing / error rows of the class are included). Dry run
+    (apply=False) only counts. On apply, each row's doc is deleted (success / not_found both
+    count) and the row written `done_meta` + `META`; a doc whose content is positively full text
+    is never deleted (skipped and reported), and a delete LightRAG refuses leaves the row as it was.
+    The caller must hold the pipeline idle — the CLI refuses while papervault.service runs.
+    """
+    led = await ledger.load("paper")
+    rows = sorted((r for r in led.values()
+                   if is_abstract_fp(r.fingerprint) or r.status == "done_abstract"),
+                  key=lambda r: r.source_id)
+    by_status: dict[str, int] = {}
+    for r in rows:
+        by_status[r.status] = by_status.get(r.status, 0) + 1
+    result = {"abstract_rows": len(rows), "by_status": by_status,
+              "keys": [r.source_id for r in rows], "reverted": 0,
+              "failed": [], "skipped_not_abstract": []}
+    if not apply:
+        return result
+    for r in rows:
+        did = r.doc_id or doc_id(r.source_id)
+        doc = await rag.full_docs.get_by_id(did)
+        content = doc.get("content") if isinstance(doc, dict) else None
+        if content and not is_abstract_text(content):
+            result["skipped_not_abstract"].append(r.source_id)
+            log.warning("rollback_abstract_docs: %s holds full text, not an abstract doc — kept",
+                        r.source_id)
+            continue
+        status = _result_status(await rag.adelete_by_doc_id(did))
+        if status not in ("success", "not_found"):
+            result["failed"].append(r.source_id)
+            log.warning("rollback_abstract_docs: delete %s → %s; ledger row kept", did, status)
+            continue
+        await ledger.upsert("paper", r.source_id, doc_id=did, status="done_meta", fingerprint=META)
+        result["reverted"] += 1
+    log.info("rollback_abstract_docs: %d reverted, %d failed, %d skipped (full text)",
+             result["reverted"], len(result["failed"]), len(result["skipped_not_abstract"]))
+    return result

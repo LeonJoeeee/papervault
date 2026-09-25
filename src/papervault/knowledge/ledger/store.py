@@ -3,7 +3,8 @@
 Replaces the dead v2 table `paper_attempts`. Per (workspace, ingest_source, source_id):
 fingerprint + doc_id + status. async psycopg pool (mirrors sidecar/crud.py).
 
-status 权威枚举(SDD §13):processing | done | done_meta | error | error_parked | pending_remove
+status 权威枚举(SDD §13):processing | done | done_meta | done_abstract | error | error_parked | pending_remove
+(done_abstract, #144: a metadata-state paper whose one abstract-only doc is processed.)
 (absent = 无行)。
 
 REDISTILL 熔断(#84):`attempts` 列记录该 key **连续** build 失败次数。每次写 status='error'
@@ -41,7 +42,10 @@ from papervault.knowledge.store.graph import assert_safe_workspace
 
 log = logging.getLogger(__name__)
 
-VALID_STATUS = {"processing", "done", "done_meta", "error", "error_parked", "pending_remove"}
+VALID_STATUS = {"processing", "done", "done_meta", "done_abstract", "error", "error_parked",
+                "pending_remove"}
+# Terminal success statuses: a write of one of these resets the #84 failure streak.
+_SUCCESS_STATUSES = ("done", "done_meta", "done_abstract")
 
 # REDISTILL circuit-breaker (#84): after this many CONSECUTIVE build failures a key is PARKED
 # (status→error_parked, terminal — reconcile.diff no longer re-distills it), instead of being
@@ -78,7 +82,7 @@ def _next_attempts_status(
       - new_status == 'error'                → attempts+1; PARK (→'error_parked') once it reaches
                                                max_attempts (>0). This is the loop that ran away
                                                in #84 (error → to_redistill → build fails → error).
-      - new_status in {done, done_meta}      → success ⇒ reset attempts to 0 (a good build clears
+      - new_status in _SUCCESS_STATUSES      → success ⇒ reset attempts to 0 (a good build clears
                                                the streak, so a later transient failure gets a
                                                fresh budget).
       - a genuinely NEW fingerprint          → content actually changed ⇒ reset to 0 (revives a
@@ -92,7 +96,7 @@ def _next_attempts_status(
         if max_attempts > 0 and n >= max_attempts:
             return n, "error_parked"
         return n, "error"
-    if new_status in ("done", "done_meta"):
+    if new_status in _SUCCESS_STATUSES:
         return 0, new_status
     if new_fingerprint is not None and new_fingerprint != prev_fingerprint:
         return 0, new_status

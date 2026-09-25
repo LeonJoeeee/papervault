@@ -8,6 +8,7 @@ full text, the META→full-text jump §6.1 REDISTILL is built to capture).
 """
 import pytest
 
+from papervault.knowledge.ingest.abstract_doc import is_abstract_fp
 from papervault.knowledge.ingest.fingerprint import META, fingerprint, is_metadata_only
 from papervault.knowledge.ingest.vault import DEFAULT_VAULT, load_clean_index
 
@@ -18,7 +19,11 @@ pytestmark = pytest.mark.skipif(not _HAS_VAULT, reason="paper-vault not present"
 def test_fingerprint_meta_vs_fulltext_and_stable():
     idx = load_clean_index()
     meta_key = next(k for k, rec in idx.items() if is_metadata_only(rec))
-    assert fingerprint(idx[meta_key]) == META
+    meta_fp = fingerprint(idx[meta_key])
+    # #144: a metadata-state paper is META without an abstract, its own ABSTRACT: class with one.
+    assert meta_fp == META or is_abstract_fp(meta_fp)
+    if not (idx[meta_key].abstract or "").strip():
+        assert meta_fp == META
 
     ft_key = next(k for k, rec in idx.items() if not is_metadata_only(rec))
     fp = fingerprint(idx[ft_key])

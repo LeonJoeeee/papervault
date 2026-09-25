@@ -13,7 +13,9 @@ and a key-format regex silently misses legit keys).
 
 credibility (SDD §12): derived from the file_path ingest_source prefix
 (textbook→established, paper→empirical/interpretive, web→preliminary). web and
-preliminary content MUST be surfaced as tentative.
+preliminary content MUST be surfaced as tentative. A paper chunk from an abstract-only doc
+(#144, ingest/abstract_doc.py) is tagged credibility=abstract-only instead, and rule 6b bounds
+what it may be cited for.
 """
 from __future__ import annotations
 
@@ -25,6 +27,7 @@ from typing import Any
 
 from openai import APIConnectionError
 
+from papervault.knowledge.ingest.abstract_doc import is_abstract_text, strip_abstract_header
 from papervault.knowledge.ingest.operator_docs import strip_section_suffix
 from papervault.knowledge.store.llm import StreamTruncated, _error_code, mimo_complete
 from papervault.llm_routing import route
@@ -92,6 +95,9 @@ Hard requirements (these are the only constraints):
    credibility=preliminary (a paper's speculation, a preprint, a web/satellite page)
    MUST be presented AS tentative — never asserted as settled. Flag it inline
    (e.g. "one preprint suggests…", "per NASA's spec page…").
+6b. A chunk tagged credibility=abstract-only is only that paper's abstract (its full
+   text is not in the knowledge base): cite it only for what its abstract states, never
+   for methods, numbers or conclusions the abstract does not contain.
 
 Format is your call: prose, bullets, sections, table — whatever fits the question +
 the depth of coverage. Length is your call too: brief if coverage is thin or the
@@ -149,6 +155,10 @@ _CRED_BY_SOURCE = {
     # Lowest band: preliminary (never let a notebook out-rank a peer-reviewed paper/textbook).
     "notebook": "preliminary",
 }
+
+
+# #144: credibility band of a chunk from an abstract-only paper doc (rule 6b).
+ABSTRACT_ONLY_CRED = "abstract-only"
 
 
 def _source_label(file_path: str) -> tuple[str, str]:
@@ -220,6 +230,11 @@ def _build_prompt(data: dict[str, Any], intent: str) -> str:
         for c in chunks:
             label, cred = _source_label(c.get("file_path") or "")
             content = (c.get("content") or "").strip()
+            if label != "unknown" and cred == _CRED_BY_SOURCE["paper"] and is_abstract_text(content):
+                # #144: the label carries the class; the header line (square brackets) is dropped so
+                # it never reads as a citation lookalike next to the one bracketed-key rule (#122).
+                cred = ABSTRACT_ONLY_CRED
+                content = strip_abstract_header(content)
             if label == "unknown":
                 header = f"(no citeable source key; do not invent a citation | credibility: {cred})"
             else:

@@ -15,6 +15,8 @@ Pipeline (verified against LightRAG 1.4.16 source):
   cited_sources= operator-supplied source keys (textbook:/notebook:/web:) from the same
                  references[], kept SEPARATE from cited_papers (issues #45/#47) so a
                  colon-prefixed provenance key is never mistaken for a pl paper key.
+  abstract_only_papers = the cited_papers whose served chunks come from an abstract-only doc
+                 (#144) — the caller knows those keys hold only an abstract, no full text.
   kb_coverage  = assess(metadata.processing_info.total_entities_found); None-safe (empty
                  on failure/empty where processing_info is absent — SDD §6.4).
 
@@ -35,8 +37,9 @@ from typing import Any
 
 from lightrag import QueryParam
 
+from papervault.knowledge.ingest.abstract_doc import is_abstract_text
 from papervault.knowledge.ingest.operator_docs import strip_section_suffix
-from papervault.knowledge.query.synth import synth_answer
+from papervault.knowledge.query.synth import _source_label, synth_answer
 
 logger = logging.getLogger("ks.query.aquery")
 
@@ -63,7 +66,8 @@ _ENABLE_RERANK = True
 # KS_MQ_SUB_CHUNK_TOP_K=60, KS_MQ_N_SUBQ=5, KS_TOP_K=100). Flag-gated deploy, never auto-on.
 _QUERY_VARIANT = os.getenv("KS_QUERY_VARIANT", "multiquery")  # #5 default-promote 2026-06-14 (was 'single'): V-MQ live
 
-_EMPTY = {"answer": "(KB 无相关知识)", "cited_papers": [], "cited_sources": [], "kb_coverage": "empty"}
+_EMPTY = {"answer": "(KB 无相关知识)", "cited_papers": [], "cited_sources": [],
+          "abstract_only_papers": [], "kb_coverage": "empty"}
 
 # Operator-supplied source classes (knowledge/ingest/operator_docs.py) carry the source
 # in a COLON prefix (`textbook:AuthorYear`, `notebook:idea-scope`) that survives LightRAG
@@ -131,6 +135,22 @@ def _cited_sources(data: dict[str, Any]) -> list[str]:
         fp = r.get("file_path") or ""
         if fp and _is_source_key(fp):
             keys.add(strip_section_suffix(fp))  # #79: book-level key, sections collapse to one
+    return sorted(keys)
+
+
+def _abstract_only_papers(data: dict[str, Any]) -> list[str]:
+    """Cited paper keys whose served chunks come from an abstract-only doc (#144). Sorted.
+
+    Read from data.chunks (the chunk text starts with the abstract-only header) with the same
+    source-key rule the synth label uses, then kept only if the key is also in cited_papers."""
+    cited = set(_cited_papers(data))
+    keys = set()
+    for c in data.get("chunks") or []:
+        if not is_abstract_text((c.get("content") or "").strip()):
+            continue
+        label, _cred = _source_label(c.get("file_path") or "")
+        if label in cited:  # cited_papers already excludes operator sources (textbook:/…)
+            keys.add(label)
     return sorted(keys)
 
 
@@ -234,11 +254,13 @@ async def query(intent: str, rag: Any = None) -> dict[str, Any]:
     answer = await synth_answer(data, intent)
     cited_papers = _cited_papers(data)
     cited_sources = _cited_sources(data)
+    abstract_only = _abstract_only_papers(data)
     kb_coverage = _assess_coverage(metadata, data)
 
     return {
         "answer": answer,
         "cited_papers": cited_papers,
         "cited_sources": cited_sources,
+        "abstract_only_papers": abstract_only,
         "kb_coverage": kb_coverage,
     }

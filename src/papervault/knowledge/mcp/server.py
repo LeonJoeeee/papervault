@@ -299,6 +299,7 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
         "answer":        "<prose answer with [paper_key] inline cites>",
         "cited_papers":  ["Reames2023", ...],   # feed these to get_paper
         "cited_sources": ["textbook:Schlickeiser2002", ...],  # operator sources (not papers)
+        "abstract_only_papers": ["Schwartz2022", ...],  # cited, but only the abstract is known
         "kb_coverage":   "strong" | "thin" | "empty",   # honesty signal
       }
     kb_coverage="empty"/"thin" → rephrase more specifically, or fall back to

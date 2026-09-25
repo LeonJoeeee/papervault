@@ -22,9 +22,10 @@ sees; each session adds at most ``PAPERVAULT_SESSION_INFLIGHT`` to it.
 Own-session queueing (issue #137): layer 2 judges only a call whose session has
 a free slot, i.e. one that would start EXECUTING and raise the depth. A call
 whose session already has ``PAPERVAULT_SESSION_INFLIGHT`` heavy calls in the
-wrapper waits behind that session and is never refused — it only takes a slot
-its own session frees, so it never raises the depth beyond what that session
-already contributes.
+wrapper waits behind that session and is never refused — it starts only when
+its own session frees a slot, so the session never holds more than its cap of
+executing calls. (The cap is shared by both heavy tools while the depth is
+per-tool, so a slot a ``search_papers`` call frees may start a queued ``query``.)
 
 An LLM caller reschedules itself well on such an answer; an opaque 20-minute
 stall it handles badly. The rolling average is fed by real completions (last

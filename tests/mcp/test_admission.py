@@ -11,6 +11,7 @@ from papervault.mcp.admission import install_admission
 @pytest.fixture(autouse=True)
 def _clean_state(monkeypatch):
     monkeypatch.setattr(admission, "_session_sems", {})
+    monkeypatch.setattr(admission, "_session_active", {})
     monkeypatch.setattr(admission, "_depth", {})
     monkeypatch.setattr(admission, "_recent", {})
 
@@ -199,3 +200,74 @@ async def test_combined_stack_busy_still_logs_mcpcall(monkeypatch, caplog):
     assert out["busy"] is True
     lines = [r.getMessage() for r in caplog.records if "MCPCALL" in r.getMessage()]
     assert len(lines) == 1 and "tool=query" in lines[0]      # busy still leaves the audit line
+
+
+# ---------------- #99: fair admission — a backlog queues behind its own session ----------------
+
+
+async def test_other_session_backlog_does_not_raise_projected_depth(monkeypatch):
+    # Session s1 fires a burst: 1 executing (cap 1) + 3 queued on its OWN semaphore.
+    # Session s2's call must see only the EXECUTING call ahead of it (depth 2), not
+    # s1's backlog (depth 5), so it is admitted — the #99 starvation.
+    monkeypatch.setattr(admission, "_SESSION_INFLIGHT", 1)
+    monkeypatch.setattr(admission, "_LANES", 1)
+    monkeypatch.setattr(admission, "_MAX_WAIT_S", 500.0)
+    admission._record("query", 300.0)   # depth 2 -> 300 s (admit); depth 3+ -> 600 s+ (refuse)
+    gate = asyncio.Event()
+    mcp, running = _build_ctx_tool(gate)
+    t = mcp._tool_manager._tools["query"]
+    s1, s2 = object(), object()
+    burst = [asyncio.create_task(t.run({"intent": f"s1-{i}"}, context=_ctx_for(mcp, s1)))
+             for i in range(4)]
+    await asyncio.sleep(0.05)
+    assert running == ["s1-0"]                                 # 1 executing, 3 queued
+    assert admission._depth.get("query", 0) == 1               # queued calls are not counted
+    other = asyncio.create_task(t.run({"intent": "s2"}, context=_ctx_for(mcp, s2)))
+    await asyncio.sleep(0.05)
+    assert "s2" in running                                     # admitted and executing
+    gate.set()
+    assert (await other) == {"answer": "s2"}
+    for task in burst:
+        assert "busy" not in (await task)
+    assert admission._depth["query"] == 0
+
+
+async def test_busy_answer_carries_status_busy(monkeypatch):
+    monkeypatch.setattr(admission, "_MAX_WAIT_S", 1.0)
+    monkeypatch.setattr(admission, "_LANES", 0)
+    mcp, _ = _build()
+    admission._record("query", 500.0)
+    out = await mcp._tool_manager._tools["query"].run({"intent": "x"})
+    assert out["status"] == "busy"
+    assert out["busy"] is True and out["retry_after_s"] == 560   # shape kept
+
+
+async def test_cancel_while_queued_leaves_depth_zero(monkeypatch):
+    # A call cancelled while still WAITING on its session semaphore never executed,
+    # so it must never have touched the depth, and the running call's accounting
+    # must still return to zero.
+    monkeypatch.setattr(admission, "_SESSION_INFLIGHT", 1)
+    gate = asyncio.Event()
+    mcp, running = _build_ctx_tool(gate)
+    t = mcp._tool_manager._tools["query"]
+    s1 = object()
+    a = asyncio.create_task(t.run({"intent": "running"}, context=_ctx_for(mcp, s1)))
+    await asyncio.sleep(0.05)
+    b = asyncio.create_task(t.run({"intent": "queued"}, context=_ctx_for(mcp, s1)))
+    await asyncio.sleep(0.05)
+    assert admission._depth["query"] == 1
+    b.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await b
+    assert admission._depth["query"] == 1                      # only the executing call
+    gate.set()
+    assert (await a) == {"answer": "running"}
+    assert running == ["running"]
+    assert admission._depth["query"] == 0
+    assert admission._session_sems == {} and admission._session_active == {}
+
+
+async def test_depth_zero_after_success():
+    mcp, _ = _build()
+    assert (await mcp._tool_manager._tools["query"].run({"intent": "ok"})) == {"answer": "ok"}
+    assert admission._depth["query"] == 0

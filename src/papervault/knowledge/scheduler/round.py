@@ -40,6 +40,7 @@ from typing import Iterable, Optional
 
 from lightrag.base import DocStatus
 
+from papervault.knowledge.ingest.abstract_doc import done_status_for
 from papervault.knowledge.ingest.distill import distill_batch, doc_status_of, remove_one
 from papervault.knowledge.ingest.fingerprint import fingerprint
 from papervault.knowledge.ingest.vault import load_clean_index
@@ -91,7 +92,8 @@ async def reconcile_terminal(
         st = statuses.get(doc_id)
         ds = doc_status_of(st)  # dict-aware (SDD §6.6 ★): aget_docs_by_ids returns plain dicts
         if ds == DocStatus.PROCESSED:
-            await ledger.upsert(PAPER, rec.source_id, doc_id=doc_id, status="done")
+            # done, or done_abstract for an abstract-only doc (#144: the class stays countable).
+            await ledger.upsert(PAPER, rec.source_id, doc_id=doc_id, status=done_status_for(rec.fingerprint))
             counters["done"] += 1
             seen_terminal.add(rec.source_id)
         elif ds == DocStatus.FAILED:
@@ -159,7 +161,8 @@ async def reconcile_healed(rag, *, only_keys: Optional[Iterable[str]] = None) ->
     statuses = await rag.aget_docs_by_ids([r.doc_id for r in rows])
     for rec in rows:
         if doc_status_of(statuses.get(rec.doc_id)) == DocStatus.PROCESSED:
-            await ledger.upsert(rec.ingest_source, rec.source_id, doc_id=rec.doc_id, status="done")
+            await ledger.upsert(rec.ingest_source, rec.source_id, doc_id=rec.doc_id,
+                                status=done_status_for(rec.fingerprint))
             counters["healed"] += 1
     if counters["healed"]:
         log.info("reconcile_healed: %d failed ledger row(s) whose doc is processed → done",

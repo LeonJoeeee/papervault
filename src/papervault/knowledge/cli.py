@@ -7,10 +7,12 @@ the MCP surface:
     python -m papervault.knowledge.cli query "STEREO SEPT 能量" --json
     python -m papervault.knowledge.cli stats                        # §6.5 step5 acceptance + ops truth view
     python -m papervault.knowledge.cli get paper:Reames2023         # by-id LightRAG doc_status row
+    python -m papervault.knowledge.cli rollback-abstracts           # #144 undo, dry-run by default
 
 All reads are workspace-gated via assert_safe_workspace() (SDD §6.0): hitting prod 'l0'
 without KS_ALLOW_PROD_WORKSPACE=1 refuses to run = explicit failure, never a silent
-cross-workspace read. Nothing here writes the DB.
+cross-workspace read. The only writer is `rollback-abstracts --apply`, which refuses while
+papervault.service is running (the live scheduler writes the same ledger + graph).
 """
 from __future__ import annotations
 
@@ -91,6 +93,10 @@ def query(intent: str, json_out: bool) -> None:
     if sources:
         click.echo(f"--- cited_sources ({len(sources)}) ---")
         click.echo(", ".join(sources))
+    abstract_only = result.get("abstract_only_papers") or []
+    if abstract_only:
+        click.echo(f"--- abstract_only_papers ({len(abstract_only)}; abstract only, no full text) ---")
+        click.echo(", ".join(abstract_only))
 
 
 @cli.command()
@@ -99,7 +105,7 @@ def stats(json_out: bool) -> None:
     """KS status truth view (SDD §6.8): KS ledger + LightRAG doc_status counts.
 
     This is the §6.5 step5 full-rebuild acceptance view: the rebuild is done when
-    ledger(done + done_meta) == |idx| and doc_status has no processing/failed残留.
+    ledger(done + done_meta + done_abstract) == |idx| and doc_status has no processing/failed残留.
     """
     async def _go() -> dict:
         from papervault.knowledge.ledger.store import close_pool, count_by_status
@@ -120,7 +126,9 @@ def stats(json_out: bool) -> None:
             "ledger": {
                 "by_status": ledger_counts,
                 "total": ledger_total,
-                "done_plus_done_meta": done,  # §6.5 step5: == |idx| when rebuild complete
+                "done_plus_done_meta": done,
+                # §6.5 step5: == |idx| when rebuild complete (#144 adds the done_abstract class)
+                "done_terminal": done + ledger_counts.get("done_abstract", 0),
             },
             "doc_status": {"by_status": doc_status_counts},
         }
@@ -136,7 +144,7 @@ def stats(json_out: bool) -> None:
     click.echo(f"\nledger (ingest_source=paper), total={led['total']}:")
     for status, n in sorted(led["by_status"].items()):
         click.echo(f"  {status:<14} {n}")
-    click.echo(f"  -> done+done_meta = {led['done_plus_done_meta']} (== |idx| when rebuilt)")
+    click.echo(f"  -> done+done_meta+done_abstract = {led['done_terminal']} (== |idx| when rebuilt)")
     ds = result["doc_status"]["by_status"]
     click.echo("\nlightrag_doc_status:")
     if not ds:
@@ -193,6 +201,85 @@ def get(doc_id: str, json_out: bool) -> None:
         click.echo(f"Not found in doc_status: {doc_id}", err=True)
         sys.exit(1)
     click.echo(json.dumps(row, indent=2, default=str, ensure_ascii=False))
+
+
+# `is-active` answers during which papervault.service may still run a scheduler round.
+_SERVICE_RUNNING_STATES = ("active", "activating", "deactivating", "reloading")
+
+
+def _active_service() -> list[str]:
+    """papervault.service when systemd reports it running, else []."""
+    from papervault.ops_guards import active_service_units
+
+    return active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES)
+
+
+@cli.command("rollback-abstracts")
+@click.option("--apply", is_flag=True,
+              help="Delete the docs and rewrite the ledger (default: dry run, nothing written)")
+@click.option("--json", "json_out", is_flag=True, help="Output raw JSON")
+def rollback_abstracts(apply: bool, json_out: bool) -> None:
+    """Undo #144: delete every abstract-only doc and return its ledger row to done_meta.
+
+    Dry run by default (counts the class from the ledger; no graph, no writes). --apply deletes
+    each abstract-only `paper:<key>` doc and writes its row done_meta/META. It refuses while
+    papervault.service is running: the live scheduler writes the same ledger + graph (a race), and
+    LightRAG refuses deletes while its pipeline is busy.
+
+    To keep the rollback, restart the service with KS_ABSTRACT_DOCS=0 — otherwise the next round
+    fingerprints these papers as abstract docs again and re-ingests them. (KS_ABSTRACT_DOCS=0 alone
+    also rolls back, gradually, through the normal scheduler rounds.)
+    """
+    from papervault.knowledge.ingest.abstract_doc import abstract_docs_enabled
+
+    if apply:
+        running = _active_service()
+        if running:
+            click.echo(f"ABORT: {', '.join(running)} is running — it writes the same ledger + graph "
+                       "and would race this rollback. Stop it first "
+                       "(systemctl --user stop papervault.service), then re-run with --apply.",
+                       err=True)
+            sys.exit(2)
+
+    async def _go() -> dict:
+        from papervault.knowledge.ingest.distill import rollback_abstract_docs
+        from papervault.knowledge.ledger.store import close_pool
+        from papervault.knowledge.store.graph import close_graph, get_graph
+
+        if not apply:
+            try:
+                return await rollback_abstract_docs(None, apply=False)
+            finally:
+                await close_pool()
+        rag = await get_graph()  # workspace-gated (refuses prod 'l0' without opt-in)
+        try:
+            return await rollback_abstract_docs(rag, apply=True)
+        finally:
+            await rag.finalize_storages()
+            await close_graph()
+            await close_pool()
+
+    result = asyncio.run(_go())
+    result["dry_run"] = not apply
+    result["abstract_docs_enabled"] = abstract_docs_enabled()
+    if json_out:
+        click.echo(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+        return
+    mode = "WRITE" if apply else "DRY-RUN (nothing written)"
+    click.echo(f"rollback-abstracts [{mode}]: {result['abstract_rows']} abstract-only ledger row(s)")
+    for status, n in sorted(result["by_status"].items()):
+        click.echo(f"  {status:<14} {n}")
+    if apply:
+        click.echo(f"reverted to done_meta: {result['reverted']}; delete failed: "
+                   f"{len(result['failed'])}; skipped (doc is full text): "
+                   f"{len(result['skipped_not_abstract'])}")
+        for key in (result["failed"] + result["skipped_not_abstract"])[:20]:
+            click.echo(f"    kept {key}")
+    else:
+        click.echo("dry-run: stop papervault.service, then re-run with --apply to write.")
+    click.echo("Set KS_ABSTRACT_DOCS=0 in the service env before restarting papervault.service, "
+               "or the scheduler re-ingests these papers as abstract docs."
+               + ("" if result["abstract_docs_enabled"] else " (KS_ABSTRACT_DOCS=0 is set here.)"))
 
 
 def main() -> None:

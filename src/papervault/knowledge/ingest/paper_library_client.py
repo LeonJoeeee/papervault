@@ -66,6 +66,9 @@ class PaperRecord:
     # at the source; load_vault_index() excludes these by default so the KS graph
     # build sees the library's clean view (no KS-side domain classifier needed).
     domain_status: Optional[str] = None
+    # paper-library download_status (#144): "metadata_only" = no PDF could be found — the class
+    # that gets an abstract-only graph doc. Empty when the index entry predates the field.
+    download_status: str = ""
 
     @classmethod
     def from_index_entry(cls, entry: dict[str, Any]) -> "PaperRecord":
@@ -90,6 +93,7 @@ class PaperRecord:
             insight_invalid_reason=entry.get("insight_invalid_reason"),
             source_type=entry.get("source_type", "research_paper"),
             domain_status=entry.get("domain_status"),
+            download_status=entry.get("download_status") or "",
         )
 
     @property

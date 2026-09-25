@@ -195,7 +195,8 @@ def test_query_failure_status_returns_empty(monkeypatch):
     monkeypatch.setattr(aq, "_QUERY_VARIANT", "single")  # exercise the aquery_data branch directly
     res = {"status": "failure", "message": "no results", "data": {}, "metadata": {"failure_reason": "no_results"}}
     out = _run(query("anything", rag=_StubRag(res)))
-    assert out == {"answer": "(KB 无相关知识)", "cited_papers": [], "cited_sources": [], "kb_coverage": "empty"}
+    assert out == {"answer": "(KB 无相关知识)", "cited_papers": [], "cited_sources": [],
+                   "abstract_only_papers": [], "kb_coverage": "empty"}
 
 
 def test_query_returns_cited_sources_field(monkeypatch):

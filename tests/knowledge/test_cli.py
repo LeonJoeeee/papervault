@@ -67,7 +67,7 @@ def test_query_json_out(monkeypatch):
 def test_stats_aggregates_ledger_and_doc_status(monkeypatch):
     async def _fake_count_by_status(source: str):
         assert source == "paper"
-        return {"done": 3000, "done_meta": 691, "processing": 5, "error": 2}
+        return {"done": 3000, "done_meta": 691, "done_abstract": 40, "processing": 5, "error": 2}
 
     async def _fake_count_doc_status(workspace: str):
         assert workspace == "l0_probe"
@@ -84,9 +84,10 @@ def test_stats_aggregates_ledger_and_doc_status(monkeypatch):
     assert res.exit_code == 0, res.output
     payload = json.loads(res.output)
     assert payload["workspace"] == "l0_probe"
-    assert payload["ledger"]["total"] == 3000 + 691 + 5 + 2
-    # §6.5 step5: done + done_meta is the acceptance number vs |idx|.
+    assert payload["ledger"]["total"] == 3000 + 691 + 40 + 5 + 2
     assert payload["ledger"]["done_plus_done_meta"] == 3000 + 691
+    # §6.5 step5: every terminal success class (#144 adds done_abstract) is the number vs |idx|.
+    assert payload["ledger"]["done_terminal"] == 3000 + 691 + 40
     assert payload["doc_status"]["by_status"] == {
         "processed": 3000, "processing": 5, "failed": 2
     }

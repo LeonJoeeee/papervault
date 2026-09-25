@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import contextvars
 import logging
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 import requests
@@ -331,6 +333,71 @@ BREAKER_COOLDOWN_S = _env_nonneg(
     "PAPERVAULT_SEARCH_BREAKER_COOLDOWN_S", BREAKER_COOLDOWN_DEFAULT_S, float,
 )
 
+# ---------------- bounded search-fetch executor (#99) ----------------
+# Backends are synchronous, so every (term, backend) pair runs in a thread. They
+# used to go through ``asyncio.to_thread`` — the loop's DEFAULT executor, shared
+# with rerank / embedding / ``get_paper`` — and one ``search_papers`` fan-out of
+# 30-48 blocking fetches could fill it and starve those calls. The fan-out now
+# runs on its OWN bounded pool, so a search burst queues behind itself.
+#
+# Time spent QUEUED for a pool thread is NOT charged to the per-fetch timeout
+# (the same rule as the ``_pace`` wait): a healthy backend that merely waited for
+# a free thread must not be recorded DEGRADED or feed the #115 breaker. The
+# timeout starts when the thread starts running the backend.
+FETCH_WORKERS_DEFAULT = 16
+FETCH_THREAD_PREFIX = "pv-search-fetch"
+
+
+def _fetch_workers_from_env() -> int:
+    """``PAPERVAULT_SEARCH_FETCH_WORKERS``: the pool size. Parsed like the
+    breaker knobs; ``0`` also falls back to the default (a pool cannot have
+    zero workers)."""
+    return (_env_nonneg("PAPERVAULT_SEARCH_FETCH_WORKERS", FETCH_WORKERS_DEFAULT, int)
+            or FETCH_WORKERS_DEFAULT)
+
+
+# Read at import, like the breaker knobs; tests monkeypatch the attributes.
+FETCH_WORKERS = _fetch_workers_from_env()
+_FETCH_EXECUTOR: ThreadPoolExecutor | None = None
+
+
+def _fetch_executor() -> ThreadPoolExecutor:
+    """The process-lifetime search-fetch pool, created on first use (on the loop
+    thread, so no creation race)."""
+    global _FETCH_EXECUTOR
+    if _FETCH_EXECUTOR is None:
+        _FETCH_EXECUTOR = ThreadPoolExecutor(
+            max_workers=FETCH_WORKERS, thread_name_prefix=FETCH_THREAD_PREFIX,
+        )
+    return _FETCH_EXECUTOR
+
+
+async def _run_fetch(backend_fn, query: str, fn_kwargs: dict, timeout: float):
+    """Run ``backend_fn(query, **fn_kwargs)`` on the search-fetch pool.
+
+    Waits without a deadline for a pool thread, then applies ``timeout`` to the
+    backend call itself. Raises ``asyncio.TimeoutError`` or the backend's own
+    exception, like the ``wait_for(to_thread(...))`` it replaces (contextvars are
+    carried into the thread, as ``to_thread`` does). A cancellation while still
+    queued withdraws the job, so the backend is never called.
+    """
+    loop = asyncio.get_running_loop()
+    started = asyncio.Event()
+    ctx = contextvars.copy_context()
+
+    def job():
+        loop.call_soon_threadsafe(started.set)
+        return ctx.run(backend_fn, query, **fn_kwargs)
+
+    fut = loop.run_in_executor(_fetch_executor(), job)
+    try:
+        await started.wait()
+    except asyncio.CancelledError:
+        fut.cancel()
+        raise
+    return await asyncio.wait_for(fut, timeout=timeout)
+
+
 _BREAKER_FAILS: dict[str, int] = {}          # backend -> CONSECUTIVE degraded outcomes
 _BREAKER_OPEN_UNTIL: dict[str, float] = {}   # backend -> monotonic deadline while open
 
@@ -432,11 +499,13 @@ async def _fetch_one_backend(
     sort_by_recency: bool = False,
     timeout: float = _BACKEND_TIMEOUT_SECONDS,
 ) -> list[dict]:
-    """Run one (term, backend) call in a thread; never raises.
+    """Run one (term, backend) call on the bounded search-fetch pool (#99); never
+    raises.
 
     Per-backend timeout (default 30s) prevents one slow backend from blocking
     the whole ``asyncio.gather`` — a dead/slow/blocked backend is one EMPTY
-    list for that pair, never a retry-to-abort.
+    list for that pair, never a retry-to-abort. It starts when a pool thread
+    starts the call: the wait for a free thread is not charged (``_run_fetch``).
 
     Three failure classes are recorded as DEGRADED into ``degraded_map`` (a
     ``collections.Counter`` keyed by backend; ``backend -> #DEGRADED pairs``):
@@ -489,10 +558,7 @@ async def _fetch_one_backend(
         fn_kwargs["sort_by_recency"] = sort_by_recency
     await _pace(backend_name, _interval_for(backend_name))   # PACING FIRST — outside wait_for
     try:
-        raw = await asyncio.wait_for(
-            asyncio.to_thread(backend_fn, query, **fn_kwargs),
-            timeout=timeout,
-        )
+        raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
     except BackendDegraded as e:
         logger.warning(
             "search: backend %s DEGRADED for query %r: %s", backend_name, query, e,
@@ -542,8 +608,8 @@ async def search_external_async(
     UN-deduped, UN-sorted concatenation of every pair's results (``ext_raw``)
     PLUS the ``degraded_map`` (the §3 channel back to §8's ``sources_degraded``).
 
-    Every (term, backend) pair fires via ``asyncio.gather`` +
-    ``asyncio.to_thread`` (backends are synchronous) — EXCEPT a backend whose
+    Every (term, backend) pair fires via ``asyncio.gather`` on the bounded
+    search-fetch pool (backends are synchronous; #99) — EXCEPT a backend whose
     circuit breaker is open (#115), whose pairs are skipped without a call and
     counted straight into ``degraded_map`` (so the per-backend pairs-COUNTED
     total is still exactly T and §8's ``sources_degraded`` keeps its shape). Per-(term, backend) caps

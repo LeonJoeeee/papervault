@@ -415,12 +415,94 @@ def _stub_filter_match(p, spec: str) -> bool:
     return s.lower() in (p.key or "").lower()
 
 
+# ``is-active`` answers during which papervault.service still holds (or is about to
+# write) its in-memory index: a stopping service runs its final save too.
+_SERVICE_RUNNING_STATES = ("active", "activating", "deactivating", "reloading")
+
+
+def _read_key_file(path: str) -> list[str]:
+    """Paper keys from ``path``, one per line; blank lines and ``#`` comments are
+    ignored. Order and duplicates are kept (the caller counts both)."""
+    keys = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        key = line.split("#", 1)[0].strip()
+        if key:
+            keys.append(key)
+    return keys
+
+
+def _retry_extract_keys(lib, keys: list[str], *, dry_run: bool) -> dict:
+    """Reset the listed keys that are ``extract_failed`` with a PDF on disk and no
+    md (issue #134): ``download_status=ok``, ``extract_attempts=0``, transport-defer
+    stamp cleared, so the extract queue's recovery scan re-runs them at the next
+    service start. Every other listed key is reported under the reason it was
+    skipped; unlisted papers are never touched. Writes only when not ``dry_run``."""
+    from .models import DOWNLOAD_STATUS_EXTRACT_FAILED, DOWNLOAD_STATUS_OK
+    from .services.extract_defer import clear_extract_deferred
+
+    unique = list(dict.fromkeys(keys))
+    skipped: dict[str, list[str]] = {
+        "not_found": [], "not_extract_failed": [], "no_pdf": [], "has_md": []}
+    eligible = []
+    for key in unique:
+        p = lib.get(key)
+        if p is None:
+            skipped["not_found"].append(key)
+        elif (p.download_status or "") != DOWNLOAD_STATUS_EXTRACT_FAILED:
+            skipped["not_extract_failed"].append(key)
+        elif not lib.has_pdf(key):
+            skipped["no_pdf"].append(key)
+        elif lib.has_extract(key, "md"):
+            skipped["has_md"].append(key)
+        else:
+            eligible.append(p)
+    if not dry_run and eligible:
+        for p in eligible:
+            p.download_status = DOWNLOAD_STATUS_OK
+            p.extract_attempts = 0
+            clear_extract_deferred(p)
+        lib.save(force=True)
+    return {
+        "dry_run": dry_run,
+        "listed": len(keys),
+        "unique": len(unique),
+        "eligible": len(eligible),
+        "reset": 0 if dry_run else len(eligible),
+        "reset_keys": [] if dry_run else [p.key for p in eligible],
+        "eligible_keys": [p.key for p in eligible],
+        "skipped": skipped,
+    }
+
+
+def _print_retry_extract_keys(result: dict) -> None:
+    mode = "DRY-RUN (no writes)" if result["dry_run"] else "WRITE"
+    sk = result["skipped"]
+    print(f"retry-extract-keys [{mode}]: {result['listed']} listed, "
+          f"{result['unique']} unique, {result['eligible']} eligible "
+          f"(extract_failed + PDF + no md), {result['reset']} reset")
+    print(f"  skipped: {len(sk['not_found'])} not found, "
+          f"{len(sk['not_extract_failed'])} not extract_failed, "
+          f"{len(sk['no_pdf'])} no PDF, {len(sk['has_md'])} md already present")
+    for reason, keys in sk.items():
+        for key in keys[:10]:
+            print(f"    {reason:<18} {key}")
+        if len(keys) > 10:
+            print(f"    {reason:<18} (+{len(keys) - 10} more)")
+    if result["dry_run"]:
+        print("dry-run: nothing written. Stop papervault.service, then re-run with "
+              "--no-dry-run to apply; the extract queue re-runs them at the next start.")
+    else:
+        print("the extract queue recovery scan re-runs them at the next "
+              "papervault-mcp start")
+
+
 def cmd_audit(args) -> int:
     """`python -m papervault.library.cli audit [--fix] [--queue] [--retry-failed] [--retry-low-quality] [--retry-metadata-only]` — index/disk + BG queue.
 
     Default (no action flag) runs the drift/dangling/orphan scan. Each of the
     action flags (``--fix``, ``--queue``, ``--retry-failed``,
-    ``--retry-low-quality``, ``--retry-metadata-only``) can be combined.
+    ``--retry-low-quality``, ``--retry-metadata-only``,
+    ``--retry-extract-keys FILE``) can be combined.
     Passing any action flag alone skips the drift scan.
     """
     from .models import (
@@ -431,11 +513,39 @@ def cmd_audit(args) -> int:
         DOWNLOAD_STATUS_PENDING,
     )
 
+    # ---- retry-extract-keys pre-flight (issue #134), BEFORE the library loads:
+    # a running papervault.service saves its whole in-memory index and would
+    # overwrite the reset, so a write refuses while the service is running. No
+    # override: the reset is only meaningful with the service stopped.
+    retry_keys: Optional[list[str]] = None
+    if args.retry_extract_keys:
+        try:
+            retry_keys = _read_key_file(args.retry_extract_keys)
+        except OSError as exc:
+            _err(f"cannot read --retry-extract-keys file {args.retry_extract_keys}: {exc}")
+            return 2
+        if not args.dry_run:
+            from papervault.ops_guards import active_service_units
+            running = active_service_units(("papervault.service",),
+                                           states=_SERVICE_RUNNING_STATES)
+            if running:
+                _err(f"{', '.join(running)} is running — it saves its whole in-memory "
+                     "index and would overwrite this reset. Stop it first "
+                     "(systemctl --user stop papervault.service), then re-run.")
+                return 2
+
     lib = Library()
     payload: dict = {}
     do_drift_scan = args.fix or not (
         args.queue or args.retry_failed or args.retry_low_quality
-        or args.retry_metadata_only or args.resolve_stub_dois)
+        or args.retry_metadata_only or args.resolve_stub_dois
+        or args.retry_extract_keys)
+
+    if retry_keys is not None:
+        result = _retry_extract_keys(lib, retry_keys, dry_run=args.dry_run)
+        payload["retry_extract_keys"] = result
+        if not args.json:
+            _print_retry_extract_keys(result)
 
     # ---- retry-failed: mutate first so --queue picks up the new pending count.
     if args.retry_failed:
@@ -448,6 +558,8 @@ def cmd_audit(args) -> int:
             lib.save()
         payload["reset_count"] = reset_count
         if not args.json:
+            if args.retry_extract_keys:
+                print()
             print(f"reset {reset_count} papers from failed → pending")
             print("they will be retried at next papervault-mcp startup")
 
@@ -470,7 +582,7 @@ def cmd_audit(args) -> int:
             lib.save()
         payload["retry_low_quality_count"] = reset_count
         if not args.json:
-            if args.retry_failed:
+            if args.retry_failed or args.retry_extract_keys:
                 print()
             print(f"reset {reset_count} papers from extract_failed → ok "
                   f"(attempts cleared)")
@@ -512,7 +624,7 @@ def cmd_audit(args) -> int:
         payload["retry_metadata_only_count"] = len(matched)
         payload["retry_metadata_only_keys"] = reset_keys
         if not args.json:
-            if args.retry_failed or args.retry_low_quality:
+            if args.retry_failed or args.retry_low_quality or args.retry_extract_keys:
                 print()
             scope = "--all (every metadata_only row)" if args.all else f"--filter {spec!r}"
             print(f"reset {len(matched)} papers from metadata_only → pending "
@@ -561,7 +673,8 @@ def cmd_audit(args) -> int:
             "matches": resolved,
         }
         if not args.json:
-            if args.retry_failed or args.retry_low_quality or args.retry_metadata_only:
+            if (args.retry_failed or args.retry_low_quality or args.retry_metadata_only
+                    or args.retry_extract_keys):
                 print()
             mode = "DRY-RUN (no writes)" if args.dry_run else "WRITE"
             scope = f"--filter {spec!r}" if spec else "all no-DOI stubs"
@@ -583,7 +696,8 @@ def cmd_audit(args) -> int:
         payload["queue"] = queue_report
         if not args.json:
             if (args.retry_failed or args.retry_low_quality
-                    or args.retry_metadata_only or args.resolve_stub_dois):
+                    or args.retry_metadata_only or args.resolve_stub_dois
+                    or args.retry_extract_keys):
                 print()  # separator between reset notice and queue table
             _print_queue_report(queue_report)
 
@@ -604,7 +718,8 @@ def cmd_audit(args) -> int:
         payload.update(drift_report)
         if not args.json:
             if (args.queue or args.retry_failed or args.retry_low_quality
-                    or args.retry_metadata_only or args.resolve_stub_dois):
+                    or args.retry_metadata_only or args.resolve_stub_dois
+                    or args.retry_extract_keys):
                 print()
             print(f"drift (file exists, index field null): {len(drift_report['drift'])}")
             print(f"dangling (index points to missing file): {len(drift_report['dangling'])}")
@@ -923,8 +1038,13 @@ def build_parser() -> argparse.ArgumentParser:
     pau.add_argument("--resolve-stub-dois", action="store_true",
                      help="resolve DOIs by title for no-DOI in-domain stubs (has abstract, no doi, no usable arxiv) "
                           "so the DOI-keyed download cascade can fetch them; DRY-RUN by default (pass --no-dry-run to write)")
+    pau.add_argument("--retry-extract-keys", metavar="FILE",
+                     help="reset ONLY the keys listed in FILE (one per line, # comments ok) that are "
+                          "'extract_failed' with a PDF on disk and no md → 'ok', attempts 0, defer stamp "
+                          "cleared; DRY-RUN by default; a write refuses while papervault.service runs")
     pau.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True,
-                     help="for --resolve-stub-dois: report matches WITHOUT writing (default). --no-dry-run applies them.")
+                     help="for --resolve-stub-dois and --retry-extract-keys: report WITHOUT writing "
+                          "(default). --no-dry-run applies them.")
     pau.add_argument("--json", action="store_true")
     pau.set_defaults(func=cmd_audit)
 

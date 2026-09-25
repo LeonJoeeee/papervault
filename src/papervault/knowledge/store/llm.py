@@ -571,10 +571,11 @@ class KeyPool:
             if round_idx < _MAX_ROUNDS - 1:
                 await asyncio.sleep(_BASE_BACKOFF * (2 ** round_idx) + random.uniform(0, _BACKOFF_JITTER))
 
+        # Chained to the last upstream error so callers can classify it (build breaker, #143).
         raise RuntimeError(
             f"All configured LLM keys failed after {_MAX_ROUNDS} rounds. "
             f"Last error: {type(last_error).__name__}: {last_error}"
-        )
+        ) from last_error
 
     # ---- gateway mode (KS_USE_GATEWAY=1): one proxy endpoint, no shuffle/rounds; bounded transient retry ----
     async def _complete_via_gateway(

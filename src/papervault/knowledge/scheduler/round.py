@@ -22,6 +22,12 @@ Round shape (SDD §13):
   → REDISTILL_DELETE(只回报删成功) → DISTILL_BATCH(只吃删成功的 redistill ∪ to_distill)
   → 末尾无条件 process 一次(自愈孤儿).
 
+Build-path breaker (#143): while the process-wide breaker (store/build_breaker.py) is OPEN — the
+upstream LLM path failed persistently — a round stops after the two reconcile steps (DB reads, no
+LLM): no diff-driven REMOVE / REDISTILL / DISTILL and no tail process, since each of them drives
+LLM calls. The main loop also defers the operator-doc pickup. After the cool-down the next round
+runs whole as the probe; the breaker logs its own transitions, a paused round logs only at DEBUG.
+
 Prod-safety: get_graph() (passed in as `rag`) already gated by assert_safe_workspace().
 This module never opens a graph itself; the caller owns the instance + workspace gate.
 """
@@ -41,6 +47,7 @@ from papervault.knowledge.ledger import store as ledger
 from papervault.knowledge.ledger.store import _max_attempts
 from papervault.knowledge.scheduler.opdoc_pickup import drain_pending
 from papervault.knowledge.scheduler.reconcile import Diff, diff
+from papervault.knowledge.store.build_breaker import get_breaker
 
 log = logging.getLogger("ks.scheduler.round")
 
@@ -187,6 +194,13 @@ async def run_round(
     # 免得 error 行被 redistill 删掉好 doc)。
     healed = await reconcile_healed(rag, only_keys=only)
 
+    # #143: upstream LLM path failing persistently → start no build work this round (the breaker
+    # already logged the transition; the reconcile writes above needed no LLM).
+    if not get_breaker().allows():
+        summary = {"terminal": term, "healed": healed, "paused": True}
+        log.debug("run_round: build paused by the build-path breaker: %s", summary)
+        return summary
+
     # 阶段1:纯 KS diff(含 status 维度,error 行重投)。subset 时 idx+led 都先裁到 only。
     idx = load_clean_index()
     led = await ledger.load(PAPER)
@@ -266,8 +280,11 @@ async def main_loop(rag, *, interval: float = DEFAULT_ROUND_INTERVAL,
             # invariant free; off-loop inherited via ingest_document). drain_pending never
             # raises (it routes a bad file to failed/), but wrap it anyway so a bug there can
             # never break the while-True loop or the paper sync.
+            # #143: an open build-path breaker defers the pickup too — ingesting now would fail
+            # fast and route a good file to failed/; it stays in pending/ for a later round.
             try:
-                await drain_pending(rag)
+                if get_breaker().allows():
+                    await drain_pending(rag)
             except Exception:  # noqa: BLE001 — 兜底之兜底:pickup 异常不杀循环、不影响 paper sync
                 log.exception("drain_pending failed; retrying next interval")
             await asyncio.sleep(interval)

@@ -504,3 +504,23 @@ def test_image_decode_offmode_logs_one_error_and_never_restarts(monkeypatch, cap
     assert len(errors) == 1
     msg = errors[0].getMessage()
     assert "stale" in msg and "x.service" in msg and "restart" in msg
+
+
+def test_image_decode_self_heal_task_error_is_logged_not_raised(monkeypatch, caplog):
+    """An unexpected error inside the background restart must not surface as an
+    unobserved task exception; it is logged and the fast path reopens."""
+    monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 1)
+    c = _controller()
+    _stub_ready(c, [True])
+
+    async def boom(verb):
+        if verb == "restart":
+            raise OSError("fork failed")
+        return (0, "")
+
+    c._run_systemctl = boom
+    with caplog.at_level("ERROR", logger=ms.log.name):
+        _fail_n(c, 1)
+    assert c._stopping is False
+    assert any("self-heal" in r.getMessage() for r in caplog.records
+               if r.levelname == "ERROR")

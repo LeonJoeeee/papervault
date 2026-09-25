@@ -237,8 +237,20 @@ class MineruServerController:
             return None
         self._heal_spent = True
         self._heal_task = asyncio.get_running_loop().create_task(
-            self._restart_for_image_decode())
+            self._guarded_restart_for_image_decode())
         return self._heal_task
+
+    async def _guarded_restart_for_image_decode(self) -> None:
+        """Background-task wrapper: nobody awaits the task in production, so an
+        unexpected error is logged here instead of surfacing as an unobserved
+        task exception."""
+        try:
+            await self._restart_for_image_decode()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the heal must never crash the daemon
+            log.exception("mineru self-heal: restart of %s failed unexpectedly",
+                          self._unit)
 
     def _alert_stale_server(self, why: str) -> None:
         if self._heal_alerted:

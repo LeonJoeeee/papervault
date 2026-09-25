@@ -141,9 +141,9 @@ _MINERU_NATIVE_BACKOFF_FACTOR = float(
 # mineru's http-client defaults to max_concurrency=100 requests in flight PER
 # PARSE and an UNCAPPED httpx pool, so 8 concurrent OCR slots reached ~800
 # sockets to the server (747 observed). ``max_concurrency`` bounds the requests
-# one parse keeps in flight; the default 32 equals the MinerU unit's
-# ``--max-num-seqs 32`` — the server never serves more at once, so more only
-# queue there. ``max_connections`` caps the per-event-loop pool that ALL
+# one parse keeps in flight; the default 32 equals the ``--max-num-seqs 32``
+# the deployed MinerU server runs with — it never serves more at once, so more
+# only queue there. ``max_connections`` caps the per-event-loop pool that ALL
 # concurrent parses against one endpoint share; httpx queues requests beyond it
 # (no error). Read at call time so an env override needs no reload.
 _DEFAULT_MAX_CONCURRENCY = 32

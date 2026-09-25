@@ -12,6 +12,9 @@ REDISTILL 熔断(#84):`attempts` 列记录该 key **连续** build 失败次数�
 error_parked 并入 to_redistill,于是 systemic build 失败(如 #84 embedding stack 断)不会每 60s
 一轮无限 redistill+remove(删图)+重投,把 churn 有界收住。泊车 key 仅由(a)显式 force re-ingest
 (ledger.delete 清行,attempts 归零)或(b)指纹变化(内容真变)复活。
+(c) #131: a parked/error row whose LightRAG doc later reaches PROCESSED (LightRAG retries
+FAILED-with-content docs itself) is written back `done` by round.reconcile_healed. After (a),
+the round never re-enqueues a doc that doc_status still holds: distill_batch adopts it instead.
 
 WORKSPACE 隔离(SDD §4.1/§6.5,blocker ① 落地):`ks_ledger` 与 LightRAG 表同库,过去
 共用单表无 workspace 维度 → l0_probe 跑 run_round 会写/删生产 l0 账本行(铁律(1))。
@@ -27,7 +30,7 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Iterable, Optional
 
 import psycopg
 from psycopg.rows import dict_row
@@ -356,6 +359,23 @@ async def load(ingest_source: str) -> dict[str, LedgerRecord]:
             )
             rows = await cur.fetchall()
     return {r["source_id"]: _to_record(r) for r in rows}
+
+
+async def load_by_status(statuses: Iterable[str]) -> list[LedgerRecord]:
+    """Every row in the current workspace whose status is one of `statuses`, ACROSS ingest
+    sources (#131: the healed-row reconcile covers paper and operator-doc rows alike).
+
+    workspace-filtered like every other entry (SDD §4.1); served by the (workspace, status) index.
+    """
+    ws = _workspace()
+    async with _conn() as conn:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(
+                "SELECT * FROM ks_ledger WHERE workspace=%s AND status = ANY(%s)",
+                (ws, list(statuses)),
+            )
+            rows = await cur.fetchall()
+    return [_to_record(r) for r in rows]
 
 
 async def count_by_status(ingest_source: str) -> dict[str, int]:

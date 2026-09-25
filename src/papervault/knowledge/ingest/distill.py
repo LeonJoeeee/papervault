@@ -8,6 +8,12 @@
   success|not_found → 收口; not_allowed(403 busy) → pending_remove; fail → error.
 - REDISTILL = remove_one(delete_ledger=False) 先删旧 doc(ainsert 按 doc_id 存在性去重,
   对已存在 id 直插会写 dup-<hash> FAILED 行,污染 doc_status + 饿池),再进 distill_batch。
+- Insert guard (#131): distill_batch never enqueues over an existing doc. LightRAG 1.5 rejects an
+  enqueue whose doc_id doc_status already holds, or whose canonical file_path basename ANY row
+  already carries (regardless of status), and records the rejection as a FAILED `dup-*` marker
+  with no content. So an existing `paper:<key>` is adopted (PROCESSED → done, in flight →
+  processing), stale `dup-*` markers on the paper's file_path are purged first, and any other
+  row still holding that file_path blocks the insert (ledger error) instead of minting a marker.
 """
 from __future__ import annotations
 
@@ -16,7 +22,9 @@ import logging
 import re
 from typing import Optional
 
+from lightrag.base import DocStatus
 from lightrag.utils import sanitize_text_for_encoding
+from lightrag.utils_pipeline import normalize_document_file_path
 
 from papervault.knowledge.ingest.fingerprint import META
 from papervault.knowledge.ingest.paper_library_client import _strip_references
@@ -32,6 +40,66 @@ def doc_id(key: str) -> str:
 
 def file_path(key: str) -> str:
     return f"paper/{key}"
+
+
+def doc_status_of(st) -> object | None:
+    """Pull `.status` out of an aget_docs_by_ids / doc_status entry (SDD §6.6 ★ contract).
+
+    LightRAG's aget_docs_by_ids is type-hinted dict[str, DocProcessingStatus] but at RUNTIME
+    returns {doc_id: plain dict}: it passes doc_status.get_by_id() straight through and both
+    configured backends return a plain dict (PGDocStatusStorage.get_by_id `return dict(...)`;
+    JsonDocStatusStorage.get_by_id `return self._data.get(id)`), whose `status` is a BARE STRING
+    ('processed'/'failed'/…), not a DocProcessingStatus. So `getattr(st, "status")` on the dict
+    is always None — which silently misclassifies every PROCESSED doc, trips stuck_guard, and
+    flips successful docs to error (breaks §6.5 closure). Use dict-subscript; fall back to
+    getattr only for an object-shaped st. DocStatus is a str-Enum, so the bare string compares
+    equal to DocStatus.PROCESSED etc. downstream.
+    """
+    if st is None:
+        return None
+    if isinstance(st, dict):
+        return st.get("status")
+    return getattr(st, "status", None)
+
+
+# LightRAG's enqueue-time duplicate-rejection rows (pipeline.py: `compute_mdhash_id(...,
+# prefix="dup-")`, status FAILED, never any full_docs content) — #131.
+_DUP_MARKER_PREFIX = "dup-"
+# Upper bound on markers purged for ONE file_path per insert: each deletes one row, so the loop
+# ends when none is left; the cap only stops a runaway if a backend delete silently no-ops.
+_MAX_MARKER_PURGE = 64
+
+
+async def _is_stale_dup_marker(rag, did: str, doc) -> bool:
+    """A `dup-*` row that is FAILED and has no full_docs content: an audit record of a rejected
+    enqueue, never a document. LightRAG never retries it (its consistency pass only *preserves*
+    FAILED rows without content — the recurring "Preserving N failed document entries" log), yet
+    its filename dedup still matches it, so it blocks every later insert of that file_path."""
+    if not did.startswith(_DUP_MARKER_PREFIX) or doc_status_of(doc) != DocStatus.FAILED:
+        return False
+    return not await rag.full_docs.get_by_id(did)
+
+
+async def _clear_insert_path(rag, key: str) -> tuple[Optional[str], int]:
+    """Purge stale `dup-*` markers holding this paper's file_path (#131 Bound 2).
+
+    Returns (blocking_doc_id, purged): blocking_doc_id is the id of a row that is NOT a stale
+    marker yet still holds the file_path (LightRAG's filename dedup would reject the insert
+    against it), or None when the path is clear. Only stale markers are ever deleted.
+    `get_doc_by_file_basename` returns the oldest match, so this re-queries after each delete.
+    """
+    basename = normalize_document_file_path(file_path(key))
+    purged = 0
+    while True:
+        match = await rag.doc_status.get_doc_by_file_basename(basename)
+        if not match:
+            return None, purged
+        mid, mdoc = match
+        if purged >= _MAX_MARKER_PURGE or not await _is_stale_dup_marker(rag, mid, mdoc):
+            return mid, purged
+        await rag.doc_status.delete([mid])
+        purged += 1
+        log.info("distill_batch: purged stale duplicate marker %s blocking %s (#131)", mid, basename)
 
 
 # V7(SDD §6.9.7 / §6.1.c)— KS-side strip of trailing acknowledgements-class sections.
@@ -210,12 +278,28 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
     fpaths: list[str] = []
     queued: list[tuple[str, str]] = []     # (key, fp) — 批级异常回写 error 用(保留各自指纹,F17)
     seen_clean: dict[str, str] = {}        # dedup_key → 已入队的 key(F16 内容去重)
-    counters = {"queued": 0, "meta": 0, "no_text": 0, "dup": 0, "errored": 0}
+    counters = {"queued": 0, "meta": 0, "no_text": 0, "dup": 0, "errored": 0,
+                "existing": 0, "blocked": 0, "purged_markers": 0}
+
+    # #131 Bound 1: a doc_id doc_status already holds is never enqueued again (LightRAG would only
+    # reject it and record a `dup-*` marker). One batched lookup for every would-be insert.
+    want = [doc_id(rec.key) for rec, fp in items if fp != META]
+    existing = await rag.aget_docs_by_ids(want) if want else {}
 
     for rec, fp in items:
         if fp == META:
             await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
             counters["meta"] += 1
+            continue
+        ds = doc_status_of(existing.get(doc_id(rec.key)))
+        if ds is not None:
+            # Adopt the existing doc: PROCESSED is done; anything else is still LightRAG's to finish
+            # (or fail), so track it as processing and let reconcile_terminal record the outcome.
+            status = "done" if ds == DocStatus.PROCESSED else "processing"
+            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status=status, fingerprint=fp)
+            counters["existing"] += 1
+            log.info("distill_batch: %s already in doc_status (%s) → ledger %s, not re-enqueued",
+                     rec.key, ds, status)
             continue
         text = read_extract_raw(rec)
         if not text or not text.strip():
@@ -233,6 +317,16 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
             await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=fp)
             counters["dup"] += 1
             log.info("distill_batch: content-dup %s == %s → done_meta(dup)", rec.key, seen_clean[dk])
+            continue
+        blocker, purged = await _clear_insert_path(rag, rec.key)
+        counters["purged_markers"] += purged
+        if blocker is not None:
+            # Another live row owns this file_path: an enqueue would be rejected as a duplicate and
+            # leave a new marker. Record the failure instead (bounded by the #84 parking).
+            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="error", fingerprint=fp)
+            counters["blocked"] += 1
+            log.warning("distill_batch: %s not enqueued — file_path %r is held by doc %s (#131)",
+                        rec.key, normalize_document_file_path(file_path(rec.key)), blocker)
             continue
         seen_clean[dk] = rec.key
         inputs.append(cleaned)

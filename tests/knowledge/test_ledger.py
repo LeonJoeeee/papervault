@@ -272,3 +272,35 @@ async def test_ledger_workspace_isolation(monkeypatch):
         # ensure no stray rows left in either probe workspace
         _set_ws("l0_probe2")
         await store.delete("paper", _WK)
+
+
+async def test_ledger_load_by_status_spans_sources_within_workspace(monkeypatch):
+    """#131: load_by_status returns every row in the given statuses across ingest sources (the
+    healed-row reconcile covers paper AND operator-doc rows), filtered to the current workspace."""
+
+    def _set_ws(ws: str) -> None:
+        monkeypatch.setenv("NEO4J_WORKSPACE", ws)
+        monkeypatch.setenv("POSTGRES_WORKSPACE", ws)
+
+    _P, _T, _D = "__LBS_PAPER_DELETE_ME__", "__LBS_BOOK_DELETE_ME__#s1", "__LBS_DONE_DELETE_ME__"
+    _set_ws("l0_probe")
+    await store.ensure_schema()
+    try:
+        await store.upsert("paper", _P, doc_id=f"paper:{_P}", status="error", fingerprint="fp")
+        await store.upsert("textbook", _T, doc_id=f"textbook:{_T}", status="error")
+        await store.upsert("paper", _D, doc_id=f"paper:{_D}", status="done", fingerprint="fp")
+
+        got = {(r.ingest_source, r.source_id): r for r in await store.load_by_status(
+            ["error", "error_parked"])}
+        assert ("paper", _P) in got and ("textbook", _T) in got
+        assert ("paper", _D) not in got
+        assert got[("textbook", _T)].doc_id == f"textbook:{_T}"
+
+        _set_ws("l0_probe2")
+        mine = {(r.ingest_source, r.source_id) for r in await store.load_by_status(["error"])}
+        assert ("paper", _P) not in mine and ("textbook", _T) not in mine
+    finally:
+        _set_ws("l0_probe")
+        await store.delete("paper", _P)
+        await store.delete("textbook", _T)
+        await store.delete("paper", _D)

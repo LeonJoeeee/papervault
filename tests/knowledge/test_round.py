@@ -46,7 +46,10 @@ class FakeLedger:
         self.rows.pop(source_id, None)
 
     async def load(self, ingest_source):
-        return {k: v for k, v in self.rows.items()}
+        return {k: v for k, v in self.rows.items() if v.ingest_source == ingest_source}
+
+    async def load_by_status(self, statuses):
+        return [r for r in self.rows.values() if r.status in set(statuses)]
 
     async def ensure_schema(self):
         pass
@@ -57,39 +60,104 @@ class FakeDocStatus:
         self.status = status
 
 
-class FakeRag:
-    """Records enqueue/process/delete calls; returns canned aget_docs_by_ids."""
+def _basename(file_path: str) -> str:
+    # LightRAG 1.5 stores/matches the canonical BASENAME: "paper/<key>" -> "<key>".
+    return file_path.rsplit("/", 1)[-1]
 
-    def __init__(self, *, doc_statuses=None, enqueue_raises=False, delete_results=None):
+
+class FakeDocStatusStore:
+    """The slice of LightRAG's doc_status storage the insert guard touches.
+
+    Rows are {doc_id: {"status": <bare str>, "file_path": str, "metadata": dict}} in insertion
+    (== created_at) order, so `get_doc_by_file_basename` returns the OLDEST exact match — the
+    PG backend's `ORDER BY created_at ASC, id ASC LIMIT 1` (postgres_impl.py)."""
+
+    def __init__(self, rag: "FakeRag"):
+        self._rag = rag
+
+    async def get_doc_by_file_basename(self, basename):
+        self._rag.calls.append(("get_doc_by_file_basename", basename))
+        for did, row in self._rag.rows.items():
+            if row["file_path"] == basename:
+                return did, dict(row)
+        return None
+
+    async def delete(self, ids):
+        self._rag.calls.append(("doc_status_delete", list(ids)))
+        for did in ids:
+            self._rag.rows.pop(did, None)
+
+
+class FakeFullDocs:
+    def __init__(self, rag: "FakeRag"):
+        self._rag = rag
+
+    async def get_by_id(self, did):
+        return {"content": "..."} if did in self._rag.full_docs_ids else None
+
+
+class FakeRag:
+    """A doc_status-backed fake LightRAG that records calls.
+
+    `doc_statuses` seeds real docs ({doc_id: DocStatus}); `markers` seeds extra doc_status rows
+    (e.g. `dup-*` duplicate-rejection markers) verbatim. Enqueue mirrors LightRAG 1.5's two
+    enqueue-time dedups (pipeline.py): an id doc_status already holds, or a canonical file_path
+    basename any row already carries, is REJECTED and leaves a new FAILED `dup-*` marker
+    (recorded in `created_markers`) instead of a doc — the exact mechanism behind #131."""
+
+    def __init__(self, *, doc_statuses=None, markers=None, full_docs_ids=None,
+                 enqueue_raises=False, delete_results=None):
         self.calls: list[tuple] = []
-        self.doc_statuses = doc_statuses or {}      # {doc_id: DocStatus}
+        self.rows: dict[str, dict] = {}
+        for did, st in (doc_statuses or {}).items():
+            self.rows[did] = {"status": getattr(st, "value", st),
+                              "file_path": _basename(did.split(":", 1)[-1]), "metadata": {}}
+        for did, row in (markers or {}).items():
+            self.rows[did] = dict(row)
+        self.full_docs_ids = set(full_docs_ids or ())
         self.enqueue_raises = enqueue_raises
         self.delete_results = delete_results or {}  # {doc_id: status str}
+        self.created_markers: list[str] = []
+        self.doc_status = FakeDocStatusStore(self)
+        self.full_docs = FakeFullDocs(self)
+
+    def set_status(self, did, status):
+        """Test hook: the LightRAG pipeline moved `did` to `status` (e.g. a build finished)."""
+        self.rows.setdefault(did, {"file_path": _basename(did.split(":", 1)[-1]), "metadata": {}})
+        self.rows[did]["status"] = getattr(status, "value", status)
 
     async def apipeline_enqueue_documents(self, *, input, ids, file_paths):
         self.calls.append(("enqueue", list(ids)))
         if self.enqueue_raises:
             raise ValueError("simulated batch-level enqueue failure")
+        for did, fp in zip(ids, file_paths):
+            base = _basename(fp)
+            if did in self.rows or any(r["file_path"] == base for r in self.rows.values()):
+                marker = f"dup-{len(self.created_markers)}-{did}"
+                self.rows[marker] = {"status": "failed", "file_path": base,
+                                     "metadata": {"is_duplicate": True}}
+                self.created_markers.append(marker)
+                continue
+            self.rows[did] = {"status": "pending", "file_path": base, "metadata": {}}
+            self.full_docs_ids.add(did)
 
     async def apipeline_process_enqueue_documents(self):
         self.calls.append(("process", None))
 
     async def adelete_by_doc_id(self, doc_id):
         self.calls.append(("delete", doc_id))
-        return FakeDocStatus(self.delete_results.get(doc_id, "success"))
+        status = self.delete_results.get(doc_id, "success")
+        if status == "success":
+            self.rows.pop(doc_id, None)
+            self.full_docs_ids.discard(doc_id)
+        return FakeDocStatus(status)
 
     async def aget_docs_by_ids(self, ids):
         self.calls.append(("get_docs_by_ids", list(ids)))
-        # Mirror LightRAG 1.4.16's RUNTIME shape: {doc_id: plain dict} with `status` a bare
+        # Mirror LightRAG's RUNTIME shape: {doc_id: plain dict} with `status` a bare
         # string — NOT a DocProcessingStatus object (SDD §6.6 ★). Returning objects here used
         # to mask the getattr-on-dict bug in reconcile_terminal / ks get.
-        out = {}
-        for i in ids:
-            if i not in self.doc_statuses:
-                continue
-            s = self.doc_statuses[i]
-            out[i] = {"status": getattr(s, "value", s), "doc_id": i}  # enum → bare string value
-        return out
+        return {i: {"status": self.rows[i]["status"], "doc_id": i} for i in ids if i in self.rows}
 
 
 @pytest.fixture
@@ -222,8 +290,10 @@ async def test_run_round_delete_before_insert_and_redistill_feedback(fake_ledger
 
     order = [k for k, _ in rag.calls]
     # all deletes happen before any enqueue (§6.6 delete-then-insert mutex)
+    # (the #131 insert guard's read-only doc_status lookups may interleave; no delete may follow)
     first_enqueue = order.index("enqueue")
-    assert all(order[i] == "delete" or order[i] == "get_docs_by_ids" for i in range(first_enqueue))
+    assert "delete" not in order[first_enqueue:]
+    assert set(order[:first_enqueue]) <= {"delete", "get_docs_by_ids", "get_doc_by_file_basename"}
     # enqueue carries A (new) + B (redistill deleted ok), NOT C (delete failed, F2)
     enqueued = [ids for kind, ids in rag.calls if kind == "enqueue"][0]
     assert set(enqueued) == {"paper:A", "paper:B"}
@@ -332,11 +402,15 @@ async def test_run_round_successful_build_resets_the_streak(fake_ledger, monkeyp
     fake_ledger.rows = {
         "A": LedgerRecord("l0_probe", "paper", "A", "fA", "paper:A", "error", 2),
     }
-    rag = FakeRag(doc_statuses={"paper:A": DocStatus.PROCESSED})  # this round's build will succeed
+    # The failed build left no processed doc (a processed doc would be healed straight to done, #131).
+    rag = FakeRag()
 
     # Round 1: error → redistill → delete ok → enqueue OK → status=processing (streak preserved at 2).
     await rnd.run_round(rag)
     assert fake_ledger.rows["A"].status == "processing" and fake_ledger.rows["A"].attempts == 2
+
+    # The LightRAG pipeline finishes this build between rounds.
+    rag.set_status("paper:A", DocStatus.PROCESSED)
 
     # Round 2: reconcile reads PROCESSED → done → streak RESET to 0.
     await rnd.run_round(rag)
@@ -345,3 +419,191 @@ async def test_run_round_successful_build_resets_the_streak(fake_ledger, monkeyp
     # A subsequent single failure lands at attempts=1 (NOT parked) — proving the streak really reset.
     await fake_ledger.upsert("paper", "A", doc_id="paper:A", status="error", fingerprint="fA")
     assert fake_ledger.rows["A"].status == "error" and fake_ledger.rows["A"].attempts == 1
+
+
+# ---------------------------------------------------------------- #131 ledger ↔ graph drift
+
+
+def _marker(file_path: str, original: str) -> dict:
+    """A LightRAG enqueue-time duplicate-rejection row (pipeline.py): FAILED, no full_docs content."""
+    return {
+        "status": "failed",
+        "file_path": file_path,
+        "metadata": {"is_duplicate": True, "duplicate_kind": "filename", "original_doc_id": original},
+    }
+
+
+@pytest.mark.asyncio
+async def test_reconcile_healed_marks_error_and_parked_rows_done_when_doc_processed(fake_ledger):
+    # LightRAG's own retry heals FAILED-with-content docs, but the ledger parked them first
+    # (1,831 such rows in #131). A row whose doc is PROCESSED is done; the rest stay put.
+    from lightrag.base import DocStatus
+
+    fake_ledger.rows = {
+        "A": LedgerRecord("l0_probe", "paper", "A", "fA", "paper:A", "error_parked", 3),
+        "B": LedgerRecord("l0_probe", "paper", "B", "fB", "paper:B", "error", 1),
+        "C": LedgerRecord("l0_probe", "paper", "C", "fC", "paper:C", "error_parked", 3),
+        "D": LedgerRecord("l0_probe", "paper", "D", "fD", "paper:D", "error_parked", 3),
+        "E": LedgerRecord("l0_probe", "paper", "E", "fE", "paper:E", "done"),
+    }
+    rag = FakeRag(doc_statuses={
+        "paper:A": DocStatus.PROCESSED,
+        "paper:B": DocStatus.PROCESSED,
+        "paper:C": DocStatus.FAILED,       # still failed → stays parked
+        "paper:E": DocStatus.PROCESSED,
+    })                                     # paper:D has no doc at all → stays parked
+
+    c = await rnd.reconcile_healed(rag)
+
+    assert (fake_ledger.rows["A"].status, fake_ledger.rows["A"].attempts) == ("done", 0)
+    assert (fake_ledger.rows["B"].status, fake_ledger.rows["B"].attempts) == ("done", 0)
+    assert fake_ledger.rows["A"].fingerprint == "fA"  # the built content's fp is kept
+    assert fake_ledger.rows["C"].status == "error_parked"
+    assert fake_ledger.rows["D"].status == "error_parked"
+    assert c == {"healed": 2}
+
+
+@pytest.mark.asyncio
+async def test_reconcile_healed_covers_operator_doc_rows(fake_ledger):
+    # 13 textbook rows sat at `error` since 07-24 although 10 of their sections are processed.
+    from lightrag.base import DocStatus
+
+    fake_ledger.rows = {
+        "Kaipio2005#s75": LedgerRecord(
+            "l0_probe", "textbook", "Kaipio2005#s75", None, "textbook:Kaipio2005#s75", "error", 1),
+        "Zienkiewicz2013#s340": LedgerRecord(
+            "l0_probe", "textbook", "Zienkiewicz2013#s340", None,
+            "textbook:Zienkiewicz2013#s340", "error", 1),
+    }
+    rag = FakeRag(doc_statuses={"textbook:Kaipio2005#s75": DocStatus.PROCESSED})
+
+    await rnd.reconcile_healed(rag)
+
+    assert fake_ledger.rows["Kaipio2005#s75"].status == "done"
+    assert fake_ledger.rows["Kaipio2005#s75"].ingest_source == "textbook"
+    assert fake_ledger.rows["Zienkiewicz2013#s340"].status == "error"
+
+
+@pytest.mark.asyncio
+async def test_reconcile_healed_respects_subset(fake_ledger):
+    from lightrag.base import DocStatus
+
+    fake_ledger.rows = {
+        "A": LedgerRecord("l0_probe", "paper", "A", "fA", "paper:A", "error_parked", 3),
+        "B": LedgerRecord("l0_probe", "paper", "B", "fB", "paper:B", "error_parked", 3),
+        "T#s1": LedgerRecord("l0_probe", "textbook", "T#s1", None, "textbook:T#s1", "error", 1),
+    }
+    rag = FakeRag(doc_statuses={
+        "paper:A": DocStatus.PROCESSED, "paper:B": DocStatus.PROCESSED,
+        "textbook:T#s1": DocStatus.PROCESSED,
+    })
+
+    await rnd.reconcile_healed(rag, only_keys={"A"})
+
+    assert fake_ledger.rows["A"].status == "done"
+    assert fake_ledger.rows["B"].status == "error_parked"   # outside the subset: untouched
+    assert fake_ledger.rows["T#s1"].status == "error"       # a subset round touches paper keys only
+
+
+@pytest.mark.asyncio
+async def test_run_round_heals_error_row_instead_of_redistilling_processed_doc(fake_ledger, monkeypatch):
+    # Before #131 an `error` row was re-distilled unconditionally: its PROCESSED doc was deleted
+    # from the graph and rebuilt. A processed doc is the truth — the row becomes done, no churn.
+    from lightrag.base import DocStatus
+
+    rnd._stuck.clear()
+    idx = {"A": _rec("A")}
+    monkeypatch.setattr(rnd, "load_clean_index", lambda *a, **k: idx)
+    monkeypatch.setattr(rnd, "fingerprint", lambda rec: "fA")
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec, *a, **k: "body of A")
+    fake_ledger.rows = {"A": LedgerRecord("l0_probe", "paper", "A", "fA", "paper:A", "error", 1)}
+    rag = FakeRag(doc_statuses={"paper:A": DocStatus.PROCESSED})
+
+    summary = await rnd.run_round(rag)
+
+    assert fake_ledger.rows["A"].status == "done"
+    assert summary["healed"] == {"healed": 1} and summary["to_redistill"] == 0
+    assert not any(kind in ("delete", "enqueue") for kind, _ in rag.calls)
+    assert rag.rows["paper:A"]["status"] == "processed"
+
+
+@pytest.mark.asyncio
+async def test_run_round_adopts_processed_doc_when_ledger_row_missing(fake_ledger, monkeypatch):
+    # The #131 caution: a ledger row deleted while its doc exists made the next round re-insert the
+    # doc, which LightRAG rejected as a duplicate and recorded as a new `dup-*` marker. The round
+    # must adopt the processed doc instead of re-inserting it.
+    from lightrag.base import DocStatus
+
+    rnd._stuck.clear()
+    idx = {"A": _rec("A")}
+    monkeypatch.setattr(rnd, "load_clean_index", lambda *a, **k: idx)
+    monkeypatch.setattr(rnd, "fingerprint", lambda rec: "fA")
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec, *a, **k: "body of A")
+    rag = FakeRag(doc_statuses={"paper:A": DocStatus.PROCESSED})   # ledger is empty
+
+    await rnd.run_round(rag)
+
+    assert fake_ledger.rows["A"].status == "done" and fake_ledger.rows["A"].fingerprint == "fA"
+    assert not any(kind == "enqueue" and "paper:A" in ids for kind, ids in rag.calls)
+    assert rag.created_markers == []
+
+
+@pytest.mark.asyncio
+async def test_distill_batch_tracks_in_flight_existing_doc_instead_of_enqueueing(fake_ledger, monkeypatch):
+    # An existing doc that LightRAG is still building (PENDING) is tracked as processing, so
+    # reconcile_terminal records its outcome; enqueueing it again would only mint a `dup-*` marker.
+    from lightrag.base import DocStatus
+
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec, *a, **k: "body of A")
+    rag = FakeRag(doc_statuses={"paper:A": DocStatus.PENDING})
+
+    counters = await distill.distill_batch(rag, [(_rec("A"), "fA")])
+
+    assert fake_ledger.rows["A"].status == "processing" and fake_ledger.rows["A"].fingerprint == "fA"
+    assert not any(kind == "enqueue" for kind, _ in rag.calls)
+    assert rag.created_markers == []
+    assert counters["existing"] == 1 and counters["queued"] == 0
+
+
+@pytest.mark.asyncio
+async def test_distill_batch_purges_stale_dup_markers_that_block_reinsert(fake_ledger, monkeypatch):
+    # The 12 blocked papers of #131: FAILED `dup-*` rows without content share the paper's
+    # file_path, and LightRAG's filename dedup matches them regardless of status — so every
+    # re-insert was rejected and left yet another marker. The insert path clears them first.
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec, *a, **k: f"body of {rec.key}")
+    rag = FakeRag(markers={
+        "dup-old": _marker("Aslam2020a", "paper:Aslam2020a"),
+        "dup-chain": _marker("Aslam2020a", "dup-old"),
+        "dup-other": _marker("McDonald2007", "paper:McDonald2007"),  # another paper's marker
+    })
+
+    counters = await distill.distill_batch(rag, [(_rec("Aslam2020a"), "fp")])
+
+    assert "dup-old" not in rag.rows and "dup-chain" not in rag.rows
+    assert "dup-other" in rag.rows                       # only markers on THIS file_path go
+    assert rag.created_markers == []                      # the insert was accepted, not rejected
+    assert rag.rows["paper:Aslam2020a"]["status"] == "pending"
+    assert fake_ledger.rows["Aslam2020a"].status == "processing"
+    assert counters["queued"] == 1 and counters["purged_markers"] == 2
+
+
+@pytest.mark.asyncio
+async def test_distill_batch_never_purges_a_live_doc_on_the_same_file_path(fake_ledger, monkeypatch):
+    # Only a stale marker (dup- id, FAILED, no content) may be deleted. A live doc or a failed doc
+    # that still holds content on the same file_path is kept, and the paper is not enqueued over it.
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec, *a, **k: "body of A")
+    rag = FakeRag(
+        markers={
+            "legacy:A": {"status": "processed", "file_path": "A", "metadata": {}},
+            "dup-with-content": _marker("B", "paper:B"),
+        },
+        full_docs_ids={"dup-with-content"},
+    )
+
+    counters = await distill.distill_batch(rag, [(_rec("A"), "fA"), (_rec("B"), "fB")])
+
+    assert "legacy:A" in rag.rows and "dup-with-content" in rag.rows
+    assert not any(kind == "enqueue" for kind, _ in rag.calls)
+    assert rag.created_markers == []
+    assert fake_ledger.rows["A"].status == "error" and fake_ledger.rows["B"].status == "error"
+    assert counters["blocked"] == 2

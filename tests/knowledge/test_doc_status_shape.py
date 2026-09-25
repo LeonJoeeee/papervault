@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 import papervault.knowledge.scheduler.round as rnd
+from papervault.knowledge.ingest.distill import doc_status_of
 from papervault.knowledge.ledger.store import LedgerRecord
 
 
@@ -50,7 +51,7 @@ class _DictRag:
         }
 
 
-# ---------------------------------------------------------------- _doc_status unit
+# ---------------------------------------------------------------- doc_status_of unit
 
 
 def test_doc_status_reads_bare_string_from_dict():
@@ -58,12 +59,12 @@ def test_doc_status_reads_bare_string_from_dict():
 
     # DocStatus is a str-Enum, so the bare string the backend hands back compares equal.
     assert "processed" == DocStatus.PROCESSED
-    assert rnd._doc_status({"status": "processed"}) == DocStatus.PROCESSED
-    assert rnd._doc_status({"status": "failed"}) == DocStatus.FAILED
-    assert rnd._doc_status({"status": "processing"}) == DocStatus.PROCESSING
+    assert doc_status_of({"status": "processed"}) == DocStatus.PROCESSED
+    assert doc_status_of({"status": "failed"}) == DocStatus.FAILED
+    assert doc_status_of({"status": "processing"}) == DocStatus.PROCESSING
     # dict with no status key, and absent row, both → None (→ stuck_guard, not a crash).
-    assert rnd._doc_status({"doc_id": "x"}) is None
-    assert rnd._doc_status(None) is None
+    assert doc_status_of({"doc_id": "x"}) is None
+    assert doc_status_of(None) is None
 
 
 def test_getattr_on_dict_is_the_bug_we_fixed():
@@ -71,7 +72,7 @@ def test_getattr_on_dict_is_the_bug_we_fixed():
     # which is why PROCESSED docs were misclassified. Pinned so nobody reintroduces it.
     real_shape = {"status": "processed"}
     assert getattr(real_shape, "status", None) is None          # the latent bug
-    assert rnd._doc_status(real_shape) == "processed"           # the fix
+    assert doc_status_of(real_shape) == "processed"           # the fix
 
 
 # ---------------------------------------------------------------- reconcile_terminal on dict shape

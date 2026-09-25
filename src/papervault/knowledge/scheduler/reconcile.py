@@ -21,6 +21,8 @@ stack 断,每篇每轮都失败)= 每 60s 一轮 redistill(删旧 doc)+重投+�
 error_parked 是**终态**:它既不等于 'error' 也不等于 'pending_remove',故落到下面所有 elif 之外 = **不再进
 to_redistill**,churn 被有界收住。仅指纹变化(下面第一支,内容真变)或显式 force re-ingest(清 ledger 行)能
 复活它 —— 这正是我们要的:人来决定是否重试,而不是无限自动重投。
+(#131: a parked row whose doc LightRAG later finishes is not a failure at all — round.reconcile_healed
+writes it back `done` before this diff runs.)
 
 ★ pending_remove 死状态修(SDD §6.1.e/F3, drill-r7):pending_remove = adelete 撞 403 busy 的中间态。
 其指纹被 ledger.upsert 的 COALESCE 保留(§4.1)。它有两类:

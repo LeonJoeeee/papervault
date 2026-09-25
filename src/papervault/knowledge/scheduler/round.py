@@ -11,9 +11,16 @@ writes back `done` (PROCESSED) / `error` (FAILED). 中途态(PROCESSING/PENDING)
 查不到 / 非预期态(PREPROCESSED, F10)计入 stuck_guard, 连续 N 轮不前进 → error
 (防 enqueue 早返 / 内容去重 F16 孤儿成为永久死状态).
 
+`reconcile_healed()` (#131) closes the other drift: LightRAG's own pipeline retries a
+FAILED-with-content doc until it is PROCESSED, but a ledger row that already reached
+`error` / `error_parked` was never revisited — the ledger kept reporting a failure (and an
+`error` row was re-distilled, deleting the good doc) while the graph held the paper. Any
+`error` / `error_parked` row whose doc is PROCESSED is written back `done`.
+
 Round shape (SDD §13):
-  reconcile_terminal → diff(含 status 维度) → REMOVE → REDISTILL_DELETE(只回报删成功)
-  → DISTILL_BATCH(只吃删成功的 redistill ∪ to_distill) → 末尾无条件 process 一次(自愈孤儿).
+  reconcile_terminal → reconcile_healed → diff(含 status 维度) → REMOVE
+  → REDISTILL_DELETE(只回报删成功) → DISTILL_BATCH(只吃删成功的 redistill ∪ to_distill)
+  → 末尾无条件 process 一次(自愈孤儿).
 
 Prod-safety: get_graph() (passed in as `rag`) already gated by assert_safe_workspace().
 This module never opens a graph itself; the caller owns the instance + workspace gate.
@@ -27,7 +34,7 @@ from typing import Iterable, Optional
 
 from lightrag.base import DocStatus
 
-from papervault.knowledge.ingest.distill import distill_batch, remove_one
+from papervault.knowledge.ingest.distill import distill_batch, doc_status_of, remove_one
 from papervault.knowledge.ingest.fingerprint import fingerprint
 from papervault.knowledge.ingest.vault import load_clean_index
 from papervault.knowledge.ledger import store as ledger
@@ -75,7 +82,7 @@ async def reconcile_terminal(
     seen_terminal: set[str] = set()
     for doc_id, rec in by_doc_id.items():
         st = statuses.get(doc_id)
-        ds = _doc_status(st)  # dict-aware (SDD §6.6 ★): aget_docs_by_ids returns plain dicts
+        ds = doc_status_of(st)  # dict-aware (SDD §6.6 ★): aget_docs_by_ids returns plain dicts
         if ds == DocStatus.PROCESSED:
             await ledger.upsert(PAPER, rec.source_id, doc_id=doc_id, status="done")
             counters["done"] += 1
@@ -117,25 +124,40 @@ async def reconcile_terminal(
     return counters
 
 
-def _doc_status(st) -> object | None:
-    """Pull `.status` out of an aget_docs_by_ids entry (SDD §6.6 ★ contract).
+# Ledger statuses that record a failed build. LightRAG may still finish the doc afterwards.
+_FAILED_LEDGER_STATUSES = ("error", "error_parked")
 
-    LightRAG 1.4.16's aget_docs_by_ids is type-hinted dict[str, DocProcessingStatus] but at
-    RUNTIME returns {doc_id: plain dict}: it passes doc_status.get_by_id() straight through
-    (lightrag.py:3192/3209) and both configured backends return a plain dict
-    (PGDocStatusStorage.get_by_id postgres_impl.py:3818 `return dict(...)`;
-    JsonDocStatusStorage.get_by_id json_doc_status_impl.py:238 `return self._data.get(id)`),
-    whose `status` is a BARE STRING ('processed'/'failed'/…), not a DocProcessingStatus.
-    So `getattr(st, "status")` on the dict is always None — which silently misclassifies every
-    PROCESSED doc, trips stuck_guard, and flips successful docs to error (breaks §6.5 closure).
-    Use dict-subscript; fall back to getattr only for an object-shaped st. DocStatus is a
-    str-Enum, so the bare string compares equal to DocStatus.PROCESSED etc. downstream.
+
+async def reconcile_healed(rag, *, only_keys: Optional[Iterable[str]] = None) -> dict:
+    """#131: an `error` / `error_parked` ledger row whose LightRAG doc is PROCESSED → `done`.
+
+    LightRAG resets FAILED-with-content docs to PENDING on every pipeline pass, so a build that
+    failed on a transient backend outage heals on its own — after the ledger had already written
+    `error` and, three failures later, parked the key. Nothing read doc_status for those rows
+    again, so `ks stats` undercounted and an `error` row was re-distilled (its good doc deleted
+    and rebuilt). The processed doc is the truth: the row becomes `done` (attempts reset, its
+    fingerprint — the one the processed build was enqueued with — kept, so a later content change
+    still re-distills through diff). Rows whose doc is absent or not yet PROCESSED are untouched.
+
+    Covers every ingest_source (operator-doc rows drift the same way). only_keys (subset entry,
+    blocker ③): limit to those paper keys, like reconcile_terminal.
     """
-    if st is None:
-        return None
-    if isinstance(st, dict):
-        return st.get("status")
-    return getattr(st, "status", None)
+    rows = await ledger.load_by_status(_FAILED_LEDGER_STATUSES)
+    if only_keys is not None:
+        ks = set(only_keys)
+        rows = [r for r in rows if r.ingest_source == PAPER and r.source_id in ks]
+    counters = {"healed": 0}
+    if not rows:
+        return counters
+    statuses = await rag.aget_docs_by_ids([r.doc_id for r in rows])
+    for rec in rows:
+        if doc_status_of(statuses.get(rec.doc_id)) == DocStatus.PROCESSED:
+            await ledger.upsert(rec.ingest_source, rec.source_id, doc_id=rec.doc_id, status="done")
+            counters["healed"] += 1
+    if counters["healed"]:
+        log.info("reconcile_healed: %d failed ledger row(s) whose doc is processed → done",
+                 counters["healed"])
+    return counters
 
 
 def _clear_stuck(source_id: str) -> None:
@@ -161,6 +183,9 @@ async def run_round(
 
     # 阶段0(b):先收口上一轮/重启遗留的 processing(subset 时只扫 subset 行)。
     term = await reconcile_terminal(rag, stuck_limit=stuck_limit, only_keys=only)
+    # #131:失败行(error/error_parked)的 doc 已被 LightRAG 自愈为 PROCESSED → done(先于 diff,
+    # 免得 error 行被 redistill 删掉好 doc)。
+    healed = await reconcile_healed(rag, only_keys=only)
 
     # 阶段1:纯 KS diff(含 status 维度,error 行重投)。subset 时 idx+led 都先裁到 only。
     idx = load_clean_index()
@@ -194,6 +219,7 @@ async def run_round(
 
     summary = {
         "terminal": term,
+        "healed": healed,
         "to_distill": len(d.to_distill),
         "to_redistill": len(d.to_redistill),
         "redistill_removed": len(redistill_removed),

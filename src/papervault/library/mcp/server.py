@@ -1060,6 +1060,12 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         count, etc.) from your intent — just say them in words ("the last 2-3
         years", "5 papers", "reviews only"). After picking from ``results``, read the paper via its
         ``text_path``, or call ``get_paper(<key>)`` to re-pull its record.
+
+        Latency: minutes, not seconds — plan other work around the call. When the
+        service is saturated the call returns a normal result
+        {"status": "busy", "busy": true, "retry_after_s": N, ...} instead of
+        ``results``: nothing is wrong — wait retry_after_s seconds, then retry,
+        rather than treating papervault as down or retrying at once.
         """
 
         # ──── Stage 0: fail CLOSED on an empty / whitespace-only query ────

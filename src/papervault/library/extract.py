@@ -44,6 +44,7 @@ from papervault.llm_routing import route
 
 from .mineru_client import (
     MineruExtractionError,
+    MineruImageDecodeError,
     MineruTransportError,
     endpoints_from_env,
     extract_mineru,
@@ -591,6 +592,9 @@ async def extract_md(paper: Paper, library: Library, *,
       - ``MineruTransportError`` → NO md, leave status ``ok``/``pending``, do
         NOT charge ``extract_attempts``, do NOT set ``extract_failed``.
         Non-mutation lets classify re-route the paper next reconcile sweep.
+        This includes ``MineruImageDecodeError`` (the server answered 400
+        ``Failed to load image`` — issue #134), which is also reported to the
+        server controller's self-heal counter.
       - ``MineruExtractionError`` (per-doc defect) and a completeness-gate
         reject charge toward ``MAX_EXTRACT_ATTEMPTS``; terminal at budget
         ONLY (there is no instant-terminal-on-first-failure — the old
@@ -688,6 +692,9 @@ async def extract_md(paper: Paper, library: Library, *,
             stem=paper.key,
             wall_clock_deadline=wall_clock_deadline,
         )
+        # The server decoded this doc's page images: reset the stale-server
+        # self-heal streak (issue #134).
+        get_server_controller().note_parse_success()
     except MineruTransportError as exc:
         # ── C1 CORE: transport → DO NOT charge, DO NOT terminalize. ──
         # status & attempts deliberately UNMUTATED → classify re-routes the
@@ -699,6 +706,11 @@ async def extract_md(paper: Paper, library: Library, *,
         # down. Still NO attempt charged, still non-terminal — the deferral
         # auto-lifts on artifact change or backend recovery (see extract_defer).
         mark_extract_deferred(paper, library)
+        if isinstance(exc, MineruImageDecodeError):
+            # Issue #134: the server could not decode the client's own PNGs (a
+            # stale server process). Count it; N in a row restart the unit once
+            # (on-demand ON) or log one ERROR naming the unit (OFF). Never waits.
+            get_server_controller().note_image_decode_failure()
         library.log({"event": "extract_md_transport_retry", "key": paper.key,
                      "error": repr(exc)[:200],
                      "attempts": paper.extract_attempts,

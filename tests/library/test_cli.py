@@ -585,3 +585,146 @@ def test_library_path_override(tmp_path, capsys, monkeypatch):
 # exercised `insight regenerate / batch / dead-letters / retry-invalid
 # / audit-meaningless` were deleted along with the implementation.
 # Schema-side coverage stays in tests/test_insight_schema.py.
+
+
+# ---- audit --retry-extract-keys (issue #134): targeted extract_failed reset ----
+#
+# Resets ONLY the listed keys that are extract_failed with a PDF on disk and no
+# md; dry-run by default; a write refuses while papervault.service is active,
+# because the running service saves its whole in-memory index and would
+# overwrite the reset. systemctl is always mocked here.
+
+
+class _FakeSystemctl:
+    """Stand-in for ``subprocess.run(["systemctl", "--user", "is-active", unit])``."""
+
+    def __init__(self, state="inactive"):
+        self.state = state
+        self.calls = []
+
+    def __call__(self, argv, **_kw):
+        import subprocess
+        self.calls.append(list(argv))
+        return subprocess.CompletedProcess(argv, 0 if self.state == "active" else 3,
+                                           stdout=f"{self.state}\n", stderr="")
+
+
+def _seed_retry_extract(lib, tmp_path):
+    """Eligible: Potgieter2013 + Aslam2020. Ineligible: md present, no PDF,
+    not extract_failed. Unlisted-but-eligible: Echo2022 (must stay untouched)."""
+    def _paper(title, author, year, doi):
+        p, _ = lib.upsert({"title": title, "authors": [author], "year": year, "doi": doi})
+        return p
+
+    for p in (lib.get("Potgieter2013"), lib.get("Aslam2020")):
+        p.download_status = "extract_failed"
+        p.extract_attempts = 3
+        p.extract_deferred_sig = "1:1"
+        p.extract_deferred_epoch = 7
+        lib.pdf_path(p.key).write_bytes(b"%PDF-1.0 fake")
+    has_md = _paper("Has markdown already paper", "Bravo", 2021, "10.1/b")
+    has_md.download_status = "extract_failed"
+    has_md.extract_attempts = 3
+    lib.pdf_path(has_md.key).write_bytes(b"%PDF-1.0 fake")
+    lib.md_path(has_md.key).write_text("# body")
+    no_pdf = _paper("No pdf on disk paper", "Charlie", 2021, "10.1/c")
+    no_pdf.download_status = "extract_failed"
+    no_pdf.extract_attempts = 3
+    ok = _paper("Healthy ok paper title", "Delta", 2024, "10.1/d")
+    ok.download_status = "ok"
+    ok.extract_attempts = 1
+    lib.pdf_path(ok.key).write_bytes(b"%PDF-1.0 fake")
+    unlisted = _paper("Unlisted failed paper", "Echo", 2022, "10.1/e")
+    unlisted.download_status = "extract_failed"
+    unlisted.extract_attempts = 3
+    lib.pdf_path(unlisted.key).write_bytes(b"%PDF-1.0 fake")
+    lib.save()
+    keys = tmp_path / "keys.txt"
+    keys.write_text("# incident keys\nPotgieter2013\n\nAslam2020\nPotgieter2013\n"
+                    "Bravo2021\nCharlie2021\nDelta2024\nGhost1999\n")
+    return keys
+
+
+def _snapshot(root):
+    return {p.key: (p.download_status, p.extract_attempts, p.extract_deferred_sig,
+                    p.extract_deferred_epoch)
+            for p in Library(root).all_papers(include_quarantined=True)}
+
+
+def test_retry_extract_keys_is_dry_run_by_default(tmp_lib_env, tmp_path, capsys,
+                                                  monkeypatch):
+    from papervault import ops_guards
+    fake = _FakeSystemctl("active")
+    monkeypatch.setattr(ops_guards.subprocess, "run", fake)
+    keys = _seed_retry_extract(tmp_lib_env, tmp_path)
+    before = _snapshot(tmp_lib_env.root)
+
+    rc = cli.main(["audit", "--retry-extract-keys", str(keys)])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "DRY-RUN" in out
+    assert "7 listed" in out and "6 unique" in out
+    assert "2 eligible" in out
+    assert _snapshot(tmp_lib_env.root) == before       # nothing written
+    assert fake.calls == []                             # dry-run needs no probe
+
+
+def test_retry_extract_keys_resets_only_eligible_listed_keys(tmp_lib_env, tmp_path,
+                                                            capsys, monkeypatch):
+    from papervault import ops_guards
+    fake = _FakeSystemctl("inactive")
+    monkeypatch.setattr(ops_guards.subprocess, "run", fake)
+    keys = _seed_retry_extract(tmp_lib_env, tmp_path)
+    before = _snapshot(tmp_lib_env.root)
+
+    rc = cli.main(["audit", "--retry-extract-keys", str(keys), "--no-dry-run", "--json"])
+    payload = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    result = payload["retry_extract_keys"]
+    assert result["dry_run"] is False
+    assert result["listed"] == 7 and result["unique"] == 6
+    assert sorted(result["reset_keys"]) == ["Aslam2020", "Potgieter2013"]
+    assert result["skipped"] == {"not_found": ["Ghost1999"],
+                                 "not_extract_failed": ["Delta2024"],
+                                 "no_pdf": ["Charlie2021"],
+                                 "has_md": ["Bravo2021"]}
+    assert ["systemctl", "--user", "is-active", "papervault.service"] in fake.calls
+
+    after = _snapshot(tmp_lib_env.root)
+    for key in ("Potgieter2013", "Aslam2020"):
+        assert after[key] == ("ok", 0, None, 0)
+    for key in ("Bravo2021", "Charlie2021", "Delta2024", "Echo2022"):
+        assert after[key] == before[key]                # untouched
+
+
+def test_retry_extract_keys_write_refuses_while_service_active(tmp_lib_env, tmp_path,
+                                                              capsys, monkeypatch):
+    from papervault import ops_guards
+    fake = _FakeSystemctl("active")
+    monkeypatch.setattr(ops_guards.subprocess, "run", fake)
+    keys = _seed_retry_extract(tmp_lib_env, tmp_path)
+    before = _snapshot(tmp_lib_env.root)
+
+    rc = cli.main(["audit", "--retry-extract-keys", str(keys), "--no-dry-run"])
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "papervault.service" in err
+    assert _snapshot(tmp_lib_env.root) == before       # refused before any write
+
+
+@pytest.mark.parametrize("state", ["activating", "deactivating", "reloading"])
+def test_retry_extract_keys_refuses_in_transitional_states(tmp_lib_env, tmp_path,
+                                                          capsys, monkeypatch, state):
+    """A stopping service still runs its final save, so it counts as running."""
+    from papervault import ops_guards
+    monkeypatch.setattr(ops_guards.subprocess, "run", _FakeSystemctl(state))
+    keys = _seed_retry_extract(tmp_lib_env, tmp_path)
+
+    rc = cli.main(["audit", "--retry-extract-keys", str(keys), "--no-dry-run"])
+    assert rc == 2
+
+
+def test_retry_extract_keys_missing_file_is_an_error(tmp_lib_env, tmp_path, capsys):
+    rc = cli.main(["audit", "--retry-extract-keys", str(tmp_path / "absent.txt")])
+    assert rc == 2
+    assert "absent.txt" in capsys.readouterr().err

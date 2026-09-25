@@ -222,7 +222,7 @@ def _parse_facets(raw: str, cap: int) -> list[dict]:
 
 # Decompose (V-MQ + STANDARD) outer deadline (Phase 0, 2026-06-04 — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md).
 # The decompose is a MiMo REASONING call (no max_tokens passed → inherits llm.py's 128K default
-# _DEFAULT_MAX_TOKENS=131072; an older comment said 8000, which was never set): its think-phase can
+# _DEFAULT_MAX_TOKENS=131000; an older comment said 8000, which was never set): its think-phase can
 # exceed the old 120s, which raised asyncio.TimeoutError → empty → SILENT single-query fallback,
 # i.e. the "standard" variant secretly degraded to single-query and the benchmark measured the
 # wrong pipeline. 300s gives the reasoning decompose room; still well under the synth/transport
@@ -297,7 +297,7 @@ async def _decompose(intent: str, n: int = _N_SUBQ) -> list[dict]:
                 # MiMo is a REASONING model: CoT tokens are billed from max_tokens BEFORE the
                 # visible JSON. A small cap risks the think-phase eating it all -> empty reply ->
                 # parse-fail -> silent single-query fallback. Use the 128K default (llm.py
-                # setdefault=131072; user 2026-06-14) so CoT never starves the output; the 300s
+                # setdefault=131000, #141; user 2026-06-14) so CoT never starves the output; the 300s
                 # decompose timeout is what bounds runaway cost. The array is short = unused free.
                 system_prompt=_DECOMPOSE_SYSTEM, temperature=0.3,
                 **_decompose_route_kwargs(),

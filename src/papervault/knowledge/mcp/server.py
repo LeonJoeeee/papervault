@@ -304,7 +304,11 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     kb_coverage="empty"/"thin" → rephrase more specifically, or fall back to
     paper-library `search_papers` for fresher external literature.
 
-    Typical latency: 30-90s.
+    Latency: minutes, not seconds — p50 ~4 min under load (p90 ~7 min); plan other
+    work around the call. When the service is saturated the call returns a
+    normal result {"status": "busy", "busy": true, "retry_after_s": N, ...}
+    instead of an answer: nothing is wrong — wait retry_after_s seconds, then
+    retry, rather than treating papervault as down or retrying at once.
     """
     if ctx:
         await ctx.info(f"query intent={intent!r}")

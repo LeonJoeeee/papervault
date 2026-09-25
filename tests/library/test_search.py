@@ -9,6 +9,7 @@ now ``search_external_async`` (async + parallel backends).
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
 
 import pytest
@@ -677,3 +678,142 @@ def test_breaker_logs_one_open_and_one_close_line_not_one_per_skipped_term(
     closes = [r for r in caplog.records if "circuit CLOSED" in r.getMessage()]
     assert len(closes) == 1
     assert "semantic_scholar" in closes[0].getMessage()
+
+
+# ----------- bounded search-fetch executor (#99) ------------------------------
+# The (term, backend) fan-out used to run on the loop's DEFAULT executor, shared
+# with rerank / embedding / get_paper — one search_papers burst of 30-48 blocking
+# fetches could starve them. The fan-out now runs on its own bounded pool.
+
+
+@pytest.fixture
+def fetch_pool(monkeypatch):
+    """A fresh search-fetch pool of a chosen size, shut down after the test."""
+    def _make(workers):
+        monkeypatch.setattr(search, "FETCH_WORKERS", workers)
+        monkeypatch.setattr(search, "_FETCH_EXECUTOR", None)
+    yield _make
+    if search._FETCH_EXECUTOR is not None:
+        search._FETCH_EXECUTOR.shutdown(wait=True)
+
+
+def test_search_fetches_run_on_the_bounded_search_executor(monkeypatch, fetch_pool):
+    import threading
+
+    fetch_pool(4)
+    threads = []
+
+    def record(*a, **k):
+        threads.append(threading.current_thread().name)
+        return []
+
+    _stub_backends(monkeypatch, **{name: record for name in search.CAPS})
+    asyncio.run(search.search_external_async(["a", "b"]))
+    assert len(threads) == 2 * len(search.CAPS)
+    assert all(n.startswith(search.FETCH_THREAD_PREFIX) for n in threads), threads
+
+
+def test_search_fetch_executor_bounds_concurrency(monkeypatch, fetch_pool):
+    import threading
+    import time as _time
+
+    fetch_pool(2)
+    lock = threading.Lock()
+    state = {"now": 0, "max": 0}
+
+    def slow(*a, **k):
+        with lock:
+            state["now"] += 1
+            state["max"] = max(state["max"], state["now"])
+        _time.sleep(0.02)
+        with lock:
+            state["now"] -= 1
+        return []
+
+    _stub_backends(monkeypatch, **{name: slow for name in search.CAPS})
+    out, degraded = asyncio.run(search.search_external_async(["a", "b"]))
+    assert out == [] and sum(degraded.values()) == 0
+    assert state["max"] <= 2
+    assert search._FETCH_EXECUTOR._max_workers == 2
+
+
+def test_executor_queue_wait_is_not_charged_to_the_fetch_timeout(monkeypatch, fetch_pool):
+    """Like the pacing wait, time spent QUEUED for a pool thread must not count
+    against the per-fetch timeout: a healthy backend that merely waited for a
+    free thread is not DEGRADED (and must not feed the #115 breaker)."""
+    import time as _time
+
+    fetch_pool(1)
+    monkeypatch.setattr(search, "_interval_for", lambda backend: 0.0)
+
+    def takes_300ms(q, **k):
+        _time.sleep(0.3)
+        return [_paper(q)]
+
+    monkeypatch.setattr("papervault.library.search.search_inspire", takes_300ms)
+
+    async def two_fetches():
+        degraded = collections.Counter()
+        res = await asyncio.gather(*[
+            search._fetch_one_backend(q, "inspire", 5, term_idx=i,
+                                      degraded_map=degraded, timeout=0.5)
+            for i, q in enumerate(["first", "second"])
+        ])
+        return res, degraded
+
+    res, degraded = asyncio.run(two_fetches())
+    # The second fetch queued ~0.3 s then ran 0.3 s: 0.6 s since submission.
+    assert [r[0]["title"] for r in res] == ["first", "second"]
+    assert sum(degraded.values()) == 0
+
+
+def test_cancelled_fetch_still_queued_never_runs(monkeypatch, fetch_pool):
+    import threading
+
+    fetch_pool(1)
+    monkeypatch.setattr(search, "_interval_for", lambda backend: 0.0)
+    release = threading.Event()
+    ran = []
+
+    def blocker(q, **k):
+        ran.append(q)
+        release.wait(5)
+        return []
+
+    monkeypatch.setattr("papervault.library.search.search_inspire", blocker)
+
+    async def scenario():
+        first = asyncio.create_task(search._fetch_one_backend("first", "inspire", 5, term_idx=0))
+        await asyncio.sleep(0.05)
+        second = asyncio.create_task(search._fetch_one_backend("second", "inspire", 5, term_idx=1))
+        await asyncio.sleep(0.05)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        release.set()
+        return await first
+
+    assert asyncio.run(scenario()) == []
+    search._FETCH_EXECUTOR.shutdown(wait=True)
+    assert ran == ["first"]                    # the cancelled, queued fetch never ran
+
+
+def test_fetch_workers_default_matches_the_documented_contract():
+    assert search.FETCH_WORKERS_DEFAULT == 16
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None,     16),     # unset       -> default
+    ("",       16),     # blank       -> default
+    ("8",       8),     # honest override
+    ("0",      16),     # a pool cannot have zero workers -> default
+    ("-3",     16),     # negative    -> default
+    ("banana", 16),     # unparseable -> default
+])
+def test_fetch_workers_env_is_parsed_defensively(monkeypatch, raw, expected):
+    name = "PAPERVAULT_SEARCH_FETCH_WORKERS"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+    assert search._fetch_workers_from_env() == expected

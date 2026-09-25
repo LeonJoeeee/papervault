@@ -10,8 +10,14 @@ wait is estimated as ``max(0, depth - lanes) * rolling_avg_service_time``.
 Above ``PAPERVAULT_ADMISSION_MAX_WAIT_S`` (default 600; ``0`` disables the
 layer) the call is NOT queued — it returns a STRUCTURED normal result::
 
-    {"busy": true, "reason": "...", "queue_depth": 7,
+    {"status": "busy", "busy": true, "reason": "...", "queue_depth": 7,
      "expected_wait_s": 780, "retry_after_s": 840}
+
+Fairness (issue #99): ``depth`` counts only calls that are EXECUTING (holding
+a session permit) plus the arriving call. A call still waiting on its own
+session's semaphore is not counted, so one client's burst queues behind that
+client and never raises the depth — or causes the refusal — another session
+sees; each session adds at most ``PAPERVAULT_SESSION_INFLIGHT`` to it.
 
 An LLM caller reschedules itself well on such an answer; an opaque 20-minute
 stall it handles badly. The rolling average is fed by real completions (last
@@ -48,7 +54,7 @@ _SEED_AVG_S = {"query": 300.0, "search_papers": 320.0}
 # search_papers share the session's permits); layer 2's depth/busy model is per-tool.
 _session_sems: dict[int, asyncio.Semaphore] = {}
 _session_active: dict[int, int] = {}             # tasks inside the wrapper per session key
-_depth: dict[str, int] = {}                      # per-tool in-flight + waiting
+_depth: dict[str, int] = {}                      # per-tool EXECUTING (queued excluded, #99)
 _recent: dict[str, deque] = {}                   # per-tool completed durations
 
 
@@ -76,11 +82,13 @@ def _record(tool: str, dur_s: float) -> None:
 def _busy_answer(tool: str, depth: int, expected_wait_s: float) -> dict[str, Any]:
     retry = int(expected_wait_s) + 60
     return {
+        "status": "busy",
         "busy": True,
         "reason": (
-            f"{tool} is load-limited right now: {depth} calls are in line and the "
+            f"{tool} is load-limited right now: {depth - 1} calls are already running and the "
             f"projected wait (~{int(expected_wait_s // 60)} min) exceeds the service's "
-            "honest-wait threshold. Nothing is wrong — do other work and retry."
+            "honest-wait threshold. Nothing is wrong — do other work and retry after "
+            f"retry_after_s ({retry}) seconds."
         ),
         "queue_depth": depth,
         "expected_wait_s": int(expected_wait_s),
@@ -90,14 +98,15 @@ def _busy_answer(tool: str, depth: int, expected_wait_s: float) -> dict[str, Any
 
 def _wrap(name: str, fn):
     async def admitted(**kwargs):
-        depth = _depth.get(name, 0) + 1
         if _MAX_WAIT_S > 0:
+            # Executing calls ahead + this one. Calls queued on a session semaphore
+            # are deliberately absent: a backlog waits behind its own session (#99).
+            depth = _depth.get(name, 0) + 1
             projected = max(0, depth - _LANES) * _avg_service_s(name)
             if projected > _MAX_WAIT_S:
                 log.warning("ADMISSION busy tool=%s depth=%d expected_wait=%.0fs",
                             name, depth, projected)
                 return _busy_answer(name, depth, projected)
-        _depth[name] = depth
         skey = _session_key(kwargs)
         _session_active[skey] = _session_active.get(skey, 0) + 1
         t_enter = time.monotonic()
@@ -107,12 +116,15 @@ def _wrap(name: str, fn):
                 waited = time.monotonic() - t_enter
                 if waited > 1.0:
                     log.info("ADMISSION wait tool=%s waited=%.0fs (session cap)", name, waited)
-                t0 = time.monotonic()
-                result = await fn(**kwargs)
-                _record(name, time.monotonic() - t0)
-                return result
+                _depth[name] = _depth.get(name, 0) + 1
+                try:
+                    t0 = time.monotonic()
+                    result = await fn(**kwargs)
+                    _record(name, time.monotonic() - t0)
+                    return result
+                finally:
+                    _depth[name] = _depth.get(name, 1) - 1
         finally:
-            _depth[name] = _depth.get(name, 1) - 1
             # Evict the session's semaphore once NOTHING (holder or waiter) references
             # its key — long-lived servers must not accumulate one entry per dead session.
             n = _session_active.get(skey, 1) - 1

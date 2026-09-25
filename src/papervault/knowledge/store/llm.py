@@ -96,7 +96,10 @@ _SLOW_CALL_S = float(os.getenv("KS_SLOW_CALL_LOG_S", "60"))
 # the caller — passed as `timeout=` (already whitelisted → forwarded to .create()) or enforced
 # by an outer asyncio.wait_for (LightRAG worker for extraction, synth_answer's timeout_s). env-tunable.
 _CLIENT_TIMEOUT = float(os.getenv("KS_LLM_CLIENT_TIMEOUT", "900"))
-# Explicit output ceiling at MiMo's max (128K = 131072; validated accepted). max_tokens is a CEILING,
+# Explicit output ceiling just under MiMo's max. 131000, not 128K = 131072: since 2026-09-25 the
+# gateway's primary is MiMo v2.6 flash, which the relay caps at max_tokens <= 131069 (pro: 131071);
+# 131072 drew a 400 "Param Incorrect" on every call and fell through to the GLM backup (#141).
+# Owner's call: the largest value MiMo accepts, not a smaller budget. max_tokens is a CEILING,
 # not a target → FREE for normal calls (a dense extraction finishes in ~hundreds of tokens, finish=
 # stop). This is a DETERMINISTIC SAFETY VALUE, not a fix for an observed bug: we did NOT observe any
 # production output-truncation — the build log has 0 `finish_reason` entries, and MiMo's unset default
@@ -105,7 +108,7 @@ _CLIENT_TIMEOUT = float(os.getenv("KS_LLM_CLIENT_TIMEOUT", "900"))
 # 0 answer, finish=length) and does NOT occur at the default. We pin the cap explicitly so it can never
 # silently bite regardless of MiMo's default; a genuine runaway would be caught by the gateway per-
 # attempt timeout (loud 408 → retry). setdefault in complete() → explicit callers (e.g. synth) win.
-_DEFAULT_MAX_TOKENS = int(os.getenv("KS_LLM_MAX_TOKENS", "131072"))
+_DEFAULT_MAX_TOKENS = int(os.getenv("KS_LLM_MAX_TOKENS", "131000"))
 # Jitter added to the inter-round backoff so concurrent workers don't retry in lockstep against
 # the same endpoints (thundering-herd / retry-storm guard — the #1 naive-retry mistake).
 _BACKOFF_JITTER = float(os.getenv("KS_LLM_BACKOFF_JITTER", "0.75"))

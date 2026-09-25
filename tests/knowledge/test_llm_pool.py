@@ -848,3 +848,21 @@ async def test_gateway_retries_a_transport_timeout_that_consumed_its_interval(tm
     monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
     assert await KeyPool(tmp_path / "unused.json").complete("ping") == "Hello"
     assert len(created) == 2
+
+
+# ---- #141: the default output ceiling must stay under MiMo v2.6's relay cap ------------------------
+
+def test_default_max_tokens_is_131000_when_env_unset(tmp_path):
+    """MiMo v2.6 flash (the gateway primary since 2026-09-25) rejects max_tokens > 131069, so the
+    old 131072 default sent every call to the GLM backup. A fresh interpreter with no
+    KS_LLM_MAX_TOKENS (and no .env in its cwd) must fall back to 131000."""
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "KS_LLM_MAX_TOKENS"}
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import papervault.knowledge.store.llm as m; print(m._DEFAULT_MAX_TOKENS)"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
+    )
+    assert int(out.stdout.strip().splitlines()[-1]) == 131000

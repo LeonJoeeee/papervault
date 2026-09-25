@@ -817,3 +817,77 @@ def test_fetch_workers_env_is_parsed_defensively(monkeypatch, raw, expected):
     else:
         monkeypatch.setenv(name, raw)
     assert search._fetch_workers_from_env() == expected
+
+
+# ----------- outer deadline on the wait for a fetch-pool thread (#137) -----------
+# ``requests``' timeout=30 is per read, not total: hung backends can hold every
+# pool thread, and a pair still QUEUED for a thread used to wait forever, so
+# ``search_papers`` stalled instead of degrading.
+
+
+def test_fetch_queued_past_the_deadline_degrades_without_calling_the_backend(
+        monkeypatch, fetch_pool, caplog):
+    import threading
+
+    fetch_pool(1)
+    monkeypatch.setattr(search, "_interval_for", lambda backend: 0.0)
+    monkeypatch.setattr(search, "FETCH_QUEUE_TIMEOUT_S", 0.05)
+    holding = threading.Event()
+    release = threading.Event()
+    called = []
+
+    def hung(q, **k):                     # a backend whose socket never gives up
+        holding.set()
+        release.wait(5)
+        return []
+
+    def healthy(q, **k):
+        called.append(q)
+        return [_paper(q)]
+
+    monkeypatch.setattr("papervault.library.search.search_ads", hung)
+    monkeypatch.setattr("papervault.library.search.search_inspire", healthy)
+
+    async def scenario():
+        degraded = collections.Counter()
+        occupier = asyncio.create_task(
+            search._fetch_one_backend("h", "ads", 5, term_idx=0, timeout=60))
+        await asyncio.to_thread(holding.wait, 5)       # the only thread is now held
+        out = await search._fetch_one_backend("q", "inspire", 5, term_idx=1,
+                                              degraded_map=degraded)
+        release.set()
+        await occupier
+        return out, degraded
+
+    with caplog.at_level(logging.WARNING, logger="papervault.library.search"):
+        out, degraded = asyncio.run(scenario())
+    search._FETCH_EXECUTOR.shutdown(wait=True)
+    assert out == []                                   # degraded like a timeout
+    assert degraded["inspire"] == 1
+    assert called == []                                # withdrawn, never called
+    # It was never called, so it is not evidence against the backend: the #115
+    # breaker is fed by the backend's own failures, not by pool starvation.
+    assert "inspire" not in search._BREAKER_FAILS
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("inspire" in m and "no search-fetch thread" in m for m in msgs), msgs
+
+
+def test_fetch_queue_timeout_default_matches_the_documented_contract():
+    assert search.FETCH_QUEUE_TIMEOUT_DEFAULT_S == 120.0
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None,     120.0),    # unset       -> default
+    ("",       120.0),    # blank       -> default
+    ("45",      45.0),    # honest override
+    ("0",      120.0),    # a zero deadline would refuse every fetch -> default
+    ("-3",     120.0),    # negative    -> default
+    ("banana", 120.0),    # unparseable -> default
+])
+def test_fetch_queue_timeout_env_is_parsed_defensively(monkeypatch, raw, expected):
+    name = "PAPERVAULT_SEARCH_FETCH_QUEUE_TIMEOUT_S"
+    if raw is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, raw)
+    assert search._fetch_queue_timeout_from_env() == expected

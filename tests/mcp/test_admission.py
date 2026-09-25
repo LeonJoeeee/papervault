@@ -271,3 +271,83 @@ async def test_depth_zero_after_success():
     mcp, _ = _build()
     assert (await mcp._tool_manager._tools["query"].run({"intent": "ok"})) == {"answer": "ok"}
     assert admission._depth["query"] == 0
+
+
+# ------- #137: a call that would only queue behind its own session is never refused -------
+
+
+async def _settle(pred, rounds: int = 50) -> None:
+    """Yield to the loop until ``pred()`` holds — event-loop turns, no wall clock."""
+    for _ in range(rounds):
+        if pred():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition never reached")
+
+
+def _loaded_setup(monkeypatch):
+    # The #137 shape at toy scale: cap 2 per session, LANES 2, avg 300 s, cap 100 s.
+    # Two executing calls fill the lanes; a third EXECUTING call would be projected
+    # (3 - 2) x 300 = 300 s > 100 s.
+    monkeypatch.setattr(admission, "_SESSION_INFLIGHT", 2)
+    monkeypatch.setattr(admission, "_LANES", 2)
+    monkeypatch.setattr(admission, "_MAX_WAIT_S", 100.0)
+    admission._record("query", 300.0)
+
+
+async def test_call_at_own_session_cap_queues_instead_of_busy(monkeypatch):
+    _loaded_setup(monkeypatch)
+    gate = asyncio.Event()
+    mcp, running = _build_ctx_tool(gate)
+    t = mcp._tool_manager._tools["query"]
+    s1 = object()
+    first = [asyncio.create_task(t.run({"intent": f"s1-{i}"}, context=_ctx_for(mcp, s1)))
+             for i in range(2)]
+    await _settle(lambda: len(running) == 2)
+    assert admission._depth["query"] == 2                     # s1 is at its cap
+    third = asyncio.create_task(t.run({"intent": "s1-2"}, context=_ctx_for(mcp, s1)))
+    await _settle(lambda: third.done() or admission._session_active.get(id(s1)) == 3)
+    assert not third.done(), third.result()                   # queued, not answered busy
+    assert "s1-2" not in running                              # waiting behind its own session
+    gate.set()
+    assert (await third) == {"answer": "s1-2"}                # served once a slot freed
+    for task in first:
+        assert (await task)["answer"].startswith("s1-")
+    assert admission._depth["query"] == 0
+
+
+async def test_session_with_free_slot_is_still_refused_when_projected_over_cap(monkeypatch):
+    _loaded_setup(monkeypatch)
+    gate = asyncio.Event()
+    mcp, running = _build_ctx_tool(gate)
+    t = mcp._tool_manager._tools["query"]
+    s1, s2 = object(), object()
+    held = [asyncio.create_task(t.run({"intent": f"s1-{i}"}, context=_ctx_for(mcp, s1)))
+            for i in range(2)]
+    await _settle(lambda: len(running) == 2)
+    out = await t.run({"intent": "s2"}, context=_ctx_for(mcp, s2))   # s2 has free slots
+    assert out["busy"] is True and out["queue_depth"] == 3
+    assert out["expected_wait_s"] == 300
+    assert "s2" not in running
+    assert id(s2) not in admission._session_active            # the refusal left no trace
+    gate.set()
+    await asyncio.gather(*held)
+    assert admission._depth["query"] == 0
+
+
+async def test_session_with_one_free_slot_is_still_refused(monkeypatch):
+    # s1 holds ONE of its two slots; its second call would EXECUTE (not queue),
+    # so layer 2 still judges it: s2 fills the lanes, depth 3 -> 300 s > 100 s.
+    _loaded_setup(monkeypatch)
+    gate = asyncio.Event()
+    mcp, running = _build_ctx_tool(gate)
+    t = mcp._tool_manager._tools["query"]
+    s1, s2 = object(), object()
+    held = [asyncio.create_task(t.run({"intent": "s1-0"}, context=_ctx_for(mcp, s1))),
+            asyncio.create_task(t.run({"intent": "s2-0"}, context=_ctx_for(mcp, s2)))]
+    await _settle(lambda: len(running) == 2)
+    out = await t.run({"intent": "s1-1"}, context=_ctx_for(mcp, s1))
+    assert out["busy"] is True
+    assert admission._session_active[id(s1)] == 1             # only the executing call
+    gate.set()
+    await asyncio.gather(*held)

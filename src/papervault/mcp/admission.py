@@ -19,6 +19,13 @@ session's semaphore is not counted, so one client's burst queues behind that
 client and never raises the depth — or causes the refusal — another session
 sees; each session adds at most ``PAPERVAULT_SESSION_INFLIGHT`` to it.
 
+Own-session queueing (issue #137): layer 2 judges only a call whose session has
+a free slot, i.e. one that would start EXECUTING and raise the depth. A call
+whose session already has ``PAPERVAULT_SESSION_INFLIGHT`` heavy calls in the
+wrapper waits behind that session and is never refused — it only takes a slot
+its own session frees, so it never raises the depth beyond what that session
+already contributes.
+
 An LLM caller reschedules itself well on such an answer; an opaque 20-minute
 stall it handles badly. The rolling average is fed by real completions (last
 20 per tool, seeded conservatively before data exists).
@@ -98,7 +105,10 @@ def _busy_answer(tool: str, depth: int, expected_wait_s: float) -> dict[str, Any
 
 def _wrap(name: str, fn):
     async def admitted(**kwargs):
-        if _MAX_WAIT_S > 0:
+        skey = _session_key(kwargs)
+        # A session already at its cap queues this call behind ITSELF (layer 1): it
+        # adds nothing to the executing depth, so layer 2 does not judge it (#137).
+        if _MAX_WAIT_S > 0 and _session_active.get(skey, 0) < _SESSION_INFLIGHT:
             # Executing calls ahead + this one. Calls queued on a session semaphore
             # are deliberately absent: a backlog waits behind its own session (#99).
             depth = _depth.get(name, 0) + 1
@@ -107,7 +117,6 @@ def _wrap(name: str, fn):
                 log.warning("ADMISSION busy tool=%s depth=%d expected_wait=%.0fs",
                             name, depth, projected)
                 return _busy_answer(name, depth, projected)
-        skey = _session_key(kwargs)
         _session_active[skey] = _session_active.get(skey, 0) + 1
         t_enter = time.monotonic()
         try:

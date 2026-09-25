@@ -195,6 +195,13 @@ def test_parse_prose_citations_excludes_numeric_footnotes():
     assert bb.parse_prose_citations(prose) == ["A2015"]
 
 
+def test_parse_prose_citations_leaves_bracketed_operator_sources_out_of_paper_tags():
+    # #122: synth now brackets operator sources with their colon key; they are not paper tags,
+    # so they must never be scored as hallucinated paper citations.
+    prose = "A [Reames2023], [textbook:Baumjohann2012], [notebook:idea-scope], [web:nasa-srag]."
+    assert bb.parse_prose_citations(prose) == ["Reames2023"]
+
+
 def test_parse_prose_citations_skips_empty_and_synthfail_sentinels():
     assert bb.parse_prose_citations(bb.EMPTY_ANSWER_SENTINEL) == []
     assert bb.parse_prose_citations(bb.SYNTH_FAILED_PREFIX + "; see cited_papers.)") == []

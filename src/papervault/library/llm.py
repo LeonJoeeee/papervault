@@ -374,8 +374,8 @@ _gw_lock = threading.Lock()
 
 
 def _gateway_group(model: str | None) -> str:
-    """Map a library call-site model to the LiteLLM proxy's GROUP name. The proxy exposes the
-    real model names as groups; the ``openai/`` provider strips the prefix and sends the bare
+    """Map a library call-site model to the LiteLLM proxy's capability-tier GROUP name.
+    The ``openai/`` provider strips the prefix and sends the bare
     group name. Routing: an explicit request for the cheaper BUILD_MODEL routes there; anything
     else (default / None) routes to the strong SYNTH_MODEL — matching the direct path's default."""
     m = (model or "").split("/")[-1]
@@ -421,7 +421,8 @@ def get_llm(*, max_tokens: int | None = None, model: str | None = None):
     Gateway mode (``PAPERVAULT_LLM_GATEWAY=1``, DEFAULT OFF — Phase 3, docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md):
     when set, return an :class:`LLM` pointed at the running LiteLLM proxy
     (``PAPERVAULT_LLM_GATEWAY_URL`` default ``http://127.0.0.1:4000/v1``, virtual key ``PAPERVAULT_LLM_GATEWAY_KEY``),
-    with the model mapped to the proxy GROUP (default/None → ``mimo-v2.5-pro``; explicit cheap → ``mimo-v2.5``). The proxy owns the
+    with the model mapped to the proxy tier (default/None → ``PAPERVAULT_MODEL``, e.g. ``standard``;
+    explicit build slot → ``PAPERVAULT_BUILD_MODEL``, e.g. ``flash``). The proxy owns the
     real keys + failover. The DEFAULT (OFF) path below is UNCHANGED."""
     mt = max_tokens or _DEFAULT_MAX_TOKENS
     # Default handle → the "judge" role (issue #8): library judges / intent parser / search all

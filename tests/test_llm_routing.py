@@ -100,8 +100,8 @@ def test_keyword_defaults_to_build_model_thinking_on():
     assert route("keyword") == (_BUILD, True)
 
 
-def test_verify_defaults_to_current_verify_model():
-    assert route("verify") == ("openai/mimo-v2.5", None)
+def test_verify_defaults_to_gateway_flash():
+    assert route("verify") == ("openai/flash", None)
 
 
 def test_synth_slot_roles_pass_through_empty_config_model(monkeypatch):

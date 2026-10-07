@@ -34,7 +34,7 @@ from openai import AsyncOpenAI
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from papervault import config  # noqa: E402
 
-JUDGE_MODEL = "mimo-v2.5-pro"
+JUDGE_MODEL = "standard"
 RELEVANT_BAR = 0.7
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
 

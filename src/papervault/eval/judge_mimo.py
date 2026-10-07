@@ -45,7 +45,7 @@ ALL_TAGS = ["fullcorpus_baseline", "fullcorpus_r2", "fullcorpus_r3",
 
 GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
 VKEY = os.getenv("KS_VIRTUAL_KEY", "")
-MODEL = os.getenv("MIMO_MODEL", "mimo-v2.5-pro")
+MODEL = os.getenv("MIMO_MODEL", "standard")
 MAX_TOKENS = int(os.getenv("JUDGE_MAX_TOKENS", "32000"))
 MAX_ATTEMPTS = int(os.getenv("JUDGE_MAX_ATTEMPTS", "2"))  # was 4; lowered so a stuck hard-Q judge fails fast → idempotent resume catches it (overnight robustness)
 

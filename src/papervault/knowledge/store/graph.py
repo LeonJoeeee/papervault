@@ -98,8 +98,8 @@ ENTITY_TYPES = get_domain().entity_types
 # query-path keyword extraction — run on the CHEAP deployment with thinking ON; pro
 # was overkill-priced for build-scale extraction. Research-plane calls (decompose +
 # synth in query/multiquery.py + query/synth.py) call mimo_complete directly and stay
-# on the pool default (mimo-v2.5-pro). Env-revertable without code:
-#   KS_BUILD_MODEL=mimo-v2.5-pro  → revert model
+# on the pool's PAPERVAULT_MODEL slot (e.g. standard on the gateway). Env-revertable without code:
+#   KS_BUILD_MODEL=standard       → use the standard gateway tier for build
 #   KS_BUILD_THINKING=0           → stop forwarding enable_thinking
 #   KS_KW_THINKING=0              → enable_thinking=False for the query-path
 #       keyword-extraction call ONLY (on LightRAG 1.5.x that call is the one carrying

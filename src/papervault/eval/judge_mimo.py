@@ -37,6 +37,7 @@ from openai import AsyncOpenAI
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))  # repo root, for `papervault.eval`
 from papervault.eval import judge_aggregate as JA  # noqa: E402
+from papervault.llm_routing import route  # noqa: E402
 
 JUDGE = EVAL / "judge"
 GOLD = EVAL / os.getenv("JUDGE_GOLD", "gold_v2.jsonl")  # env-override for new gold frames (gold_v4 / gold_newq)
@@ -45,7 +46,6 @@ ALL_TAGS = ["fullcorpus_baseline", "fullcorpus_r2", "fullcorpus_r3",
 
 GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
 VKEY = os.getenv("KS_VIRTUAL_KEY", "")
-MODEL = os.getenv("MIMO_MODEL", "standard")
 MAX_TOKENS = int(os.getenv("JUDGE_MAX_TOKENS", "32000"))
 MAX_ATTEMPTS = int(os.getenv("JUDGE_MAX_ATTEMPTS", "2"))  # was 4; lowered so a stuck hard-Q judge fails fast → idempotent resume catches it (overnight robustness)
 
@@ -187,7 +187,7 @@ async def _judge_one(client, sem, tag, qid, gold_entry, force, counters):
         try:
             async with sem:
                 resp = await client.chat.completions.create(
-                    model=MODEL,
+                    model=route("eval_judge"),
                     messages=[{"role": "system", "content": _SYSTEM},
                               {"role": "user", "content": prompt}],
                     temperature=0.1,
@@ -219,7 +219,7 @@ async def _run(tags, concurrency, force):
     sem = asyncio.Semaphore(concurrency)
     counters = {"ok": 0, "skip": 0, "fail": 0}
     print(f"judging {len(jobs)} (tag,qid) over {len(tags)} tags @ concurrency {concurrency} "
-          f"via {GATEWAY} model={MODEL} force={force}", flush=True)
+          f"via {GATEWAY} level={route('eval_judge')} force={force}", flush=True)
     tasks = [asyncio.create_task(_judge_one(client, sem, t, q, gold[q], force, counters))
              for (t, q) in jobs]
     done = 0

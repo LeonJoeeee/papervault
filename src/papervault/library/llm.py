@@ -218,7 +218,7 @@ class LLM:
 
 # Default well above litellm's small default so a long generation isn't truncated.
 _DEFAULT_MAX_TOKENS = int(os.environ.get("PAPERVAULT_LIB_MAX_TOKENS", "32000"))
-_DEFAULT_MODEL = _litellm_model(config.SYNTH_MODEL)
+_DEFAULT_MODEL = _litellm_model(route("judge"))
 _DEFAULT_BASE = config.LLM_BASE_URL
 _KEYS_FILE = config.LLM_KEYS_FILE
 
@@ -373,17 +373,6 @@ _gw_llms: dict[tuple, "LLM"] = {}
 _gw_lock = threading.Lock()
 
 
-def _gateway_group(model: str | None) -> str:
-    """Map a library call-site model to the LiteLLM proxy's capability-tier GROUP name.
-    The ``openai/`` provider strips the prefix and sends the bare
-    group name. Routing: an explicit request for the cheaper BUILD_MODEL routes there; anything
-    else (default / None) routes to the strong SYNTH_MODEL — matching the direct path's default."""
-    m = (model or "").split("/")[-1]
-    if config.BUILD_MODEL and m == config.BUILD_MODEL:
-        return _litellm_model(config.BUILD_MODEL)
-    return _litellm_model(config.SYNTH_MODEL)
-
-
 def _get_llm_via_gateway(mt: int, model: str | None):
     """PAPERVAULT_LLM_GATEWAY=1 path: an :class:`LLM` (litellm under the hood) pointed at the running LiteLLM
     proxy. The proxy holds the real MiMo keys + does failover/retry/cooldown/401-disable, so pl just
@@ -393,7 +382,7 @@ def _get_llm_via_gateway(mt: int, model: str | None):
     own retry on top of the proxy's failover (avoid double-retry)."""
     base = config.GATEWAY_URL
     key = config.GATEWAY_KEY
-    group = _gateway_group(model)
+    group = _litellm_model(model or route("judge"))
     cache_key = (mt, group, base)
     with _gw_lock:
         c = _gw_llms.get(cache_key)
@@ -404,35 +393,15 @@ def _get_llm_via_gateway(mt: int, model: str | None):
 
 
 def get_llm(*, max_tokens: int | None = None, model: str | None = None):
-    """Shared LLM handle. XIAOMI/MiMo → the central hot-reloaded :class:`KeyPool`
-    (random failover + 401 auto-disable); else OpenAI / Anthropic single client.
+    """Shared LLM handle, defaulting library judges/intent/search to standard.
 
-    ``model`` forces a specific model for this handle (e.g. a cheaper tier for a
-    simple judge) while keeping the pool's key failover; default = per-group /
-    ``_DEFAULT_MODEL``.
-
-    Fallback (no ``PAPERVAULT_LLM_*`` key or pool set): a bare ``OPENAI_API_KEY``
-    in the environment is used with ``OPENAI_MODEL`` (default ``openai/gpt-4o-mini``),
-    then a bare ``ANTHROPIC_API_KEY`` with ``ANTHROPIC_MODEL`` (default
-    ``anthropic/claude-sonnet-4-5``). NOTE: ``papervault doctor`` validates only the
-    ``PAPERVAULT_LLM_*`` surface, NOT these fallbacks — a stray ``OPENAI_API_KEY`` in
-    your shell silently routes library LLM calls to OpenAI while doctor stays green.
-
-    Gateway mode (``PAPERVAULT_LLM_GATEWAY=1``, DEFAULT OFF — Phase 3, docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md):
-    when set, return an :class:`LLM` pointed at the running LiteLLM proxy
-    (``PAPERVAULT_LLM_GATEWAY_URL`` default ``http://127.0.0.1:4000/v1``, virtual key ``PAPERVAULT_LLM_GATEWAY_KEY``),
-    with the model mapped to the proxy tier (default/None → ``PAPERVAULT_MODEL``, e.g. ``standard``;
-    explicit build slot → ``PAPERVAULT_BUILD_MODEL``, e.g. ``flash``). The proxy owns the
-    real keys + failover. The DEFAULT (OFF) path below is UNCHANGED."""
+    ``model`` is the requested level. LiteLLM's openai/ prefix is transport syntax;
+    both the gateway and direct endpoint receive the bare level unchanged. Direct
+    endpoints must serve flash/standard/pro aliases and own their model and effort.
+    The key pool retains its hot reload, failover and credential-disable behavior.
+    """
     mt = max_tokens or _DEFAULT_MAX_TOKENS
-    # Default handle → the "judge" role (issue #8): library judges / intent parser / search all
-    # ride get_llm() with no explicit model. Default routes to the SYNTH slot (today's behavior);
-    # an operator can move them to a cheaper model via PAPERVAULT_LLM_JUDGE. An explicit model=
-    # (the verify + extract-gate call sites) bypasses this. Normalize to litellm form; an empty
-    # resolution → None → the pool's per-group model, byte-identical to today when nothing is set.
-    if model is None:
-        model = route("judge")[0]
-    model = _litellm_model(model) or None
+    model = _litellm_model(model or route("judge"))
     if config.USE_GATEWAY:
         return _get_llm_via_gateway(mt, model)
     if _KEYS_FILE.exists() or config.LLM_API_KEY:
@@ -443,11 +412,6 @@ def get_llm(*, max_tokens: int | None = None, model: str | None = None):
                 pool = KeyPool(_KEYS_FILE, mt, model_override=model)
                 _pools[pkey] = pool
             return pool
-    if os.environ.get("OPENAI_API_KEY"):
-        return LLM(model=os.environ.get("OPENAI_MODEL", "openai/gpt-4o-mini"), max_tokens=mt)
-    if os.environ.get("ANTHROPIC_API_KEY"):
-        return LLM(model=os.environ.get("ANTHROPIC_MODEL", "anthropic/claude-sonnet-4-5"),
-                   max_tokens=mt)
     raise RuntimeError(
         "No LLM credentials. Set PAPERVAULT_LLM_API_KEY (+ PAPERVAULT_LLM_BASE_URL) or "
         "provide a key-pool file at PAPERVAULT_LLM_KEYS. See .env.example."

@@ -10,9 +10,10 @@ Usage:  set -a; . ./.env; set +a
 """
 import asyncio, json, os, sys
 
+from papervault.llm_routing import route
+
 GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
 VKEY = os.getenv("KS_VIRTUAL_KEY", "")
-MODEL = os.getenv("MIMO_MODEL", "standard")
 
 SYS = ("You audit one edge of a scientific knowledge graph for FAITHFULNESS. You are given the edge "
        "(head entity, tail entity, and its relationship_description) and the SOURCE TEXT chunks the edge "
@@ -41,7 +42,7 @@ async def _judge(client, sem, e):
         for _ in range(3):
             try:
                 r = await client.chat.completions.create(
-                    model=MODEL, messages=[{"role": "system", "content": SYS}, {"role": "user", "content": user}],
+                    model=route("eval_judge"), messages=[{"role": "system", "content": SYS}, {"role": "user", "content": user}],
                     max_tokens=4000, temperature=0)
                 obj = _extract_json(r.choices[0].message.content or "")
                 if obj is not None and "faithful" in obj:

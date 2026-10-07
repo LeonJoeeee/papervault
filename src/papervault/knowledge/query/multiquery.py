@@ -53,18 +53,8 @@ logger = logging.getLogger("ks.query.multiquery")
 
 
 def _decompose_route_kwargs() -> dict[str, Any]:
-    """Model/thinking routing (issue #8) for the multiquery decompose/planning calls. Default
-    routes to the SYNTH slot with no thinking param (today's behavior — these calls ride the pool
-    default); an operator can flip the whole plane via PAPERVAULT_LLM_DECOMPOSE. Model is passed
-    only when non-empty (empty = ride the pool default, byte-identical to today) and
-    enable_thinking only when the route pins it."""
-    model, thinking = route("decompose")
-    kw: dict[str, Any] = {}
-    if model:
-        kw["model"] = model
-    if thinking is not None:
-        kw["enable_thinking"] = thinking
-    return kw
+    """Level for the eval-only decomposition/planning calls."""
+    return {"model": route("decompose")}
 
 # env-tunable for the #5 optimization loop (defaults = the baselined V-MQ values; unset → byte-identical).
 _N_SUBQ = int(os.getenv("KS_MQ_N_SUBQ", "5"))          # focused sub-queries (#5 default-promote: was 4)

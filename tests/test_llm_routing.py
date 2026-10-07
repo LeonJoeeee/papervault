@@ -1,262 +1,119 @@
-"""Tests for the per-role LLM routing resolver (papervault.llm_routing, issue #8).
-
-Covers: spec-syntax parse (bare / :think / :nothink / empty-error), per-role default
-resolution (behavior-neutral defaults), the new PAPERVAULT_LLM_<ROLE> env override, and
-the legacy back-compat precedence (KS_BUILD_MODEL / KS_BUILD_THINKING / KS_KW_THINKING /
-PAPER_PIPELINE_VERIFY_MODEL win over the new var + reproduce graph.py's thinking logic).
-"""
-from __future__ import annotations
+"""Role defaults, operator overrides, and library request routing (issue #152)."""
+from types import SimpleNamespace
 
 import pytest
 
 from papervault import config
-from papervault import llm_routing
-from papervault.llm_routing import _parse_spec, route
+from papervault.llm_routing import route
 
-# Every env var the resolver reads — cleared before each test for a hermetic baseline.
-_ROUTING_ENV = (
-    "PAPERVAULT_LLM_SYNTH",
-    "PAPERVAULT_LLM_DECOMPOSE",
-    "PAPERVAULT_LLM_BUILD",
-    "PAPERVAULT_LLM_KEYWORD",
-    "PAPERVAULT_LLM_JUDGE",
-    "PAPERVAULT_LLM_GATE",
-    "PAPERVAULT_LLM_VERIFY",
-    "KS_BUILD_MODEL",
-    "KS_BUILD_THINKING",
-    "KS_KW_THINKING",
-    "PAPER_PIPELINE_VERIFY_MODEL",
-)
-
-_SYNTH = "synth-model"
-_BUILD = "build-model"
+ROLE_LEVELS = [
+    ("build", "standard"), ("keyword", "flash"), ("synth", "pro"),
+    ("gate", "flash"), ("verify", "flash"), ("judge", "standard"),
+    ("decompose", "standard"), ("eval_judge", "standard"),
+]
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch):
-    """Strip every routing env var and pin the two config model slots to known sentinels."""
-    for var in _ROUTING_ENV:
+def clean_routes(monkeypatch):
+    for role, _ in ROLE_LEVELS:
+        monkeypatch.delenv(f"PAPERVAULT_LLM_{role.upper()}", raising=False)
+    for var in ("KS_BUILD_MODEL", "PAPER_PIPELINE_VERIFY_MODEL", "MIMO_MODEL"):
         monkeypatch.delenv(var, raising=False)
-    monkeypatch.setattr(config, "SYNTH_MODEL", _SYNTH)
-    monkeypatch.setattr(config, "BUILD_MODEL", _BUILD)
 
 
-# --------------------------------------------------------------------------- spec parse
-
-def test_parse_bare_model_sends_no_thinking():
-    assert _parse_spec("mimo-v2.5-pro") == ("mimo-v2.5-pro", None)
-
-
-def test_parse_think_suffix():
-    assert _parse_spec("mimo-v2.5-pro:think") == ("mimo-v2.5-pro", True)
+@pytest.mark.parametrize("role,want", ROLE_LEVELS)
+def test_agreed_role_level(role, want):
+    assert route(role) == want
 
 
-def test_parse_nothink_suffix():
-    assert _parse_spec("mimo-v2.5:nothink") == ("mimo-v2.5", False)
+@pytest.mark.parametrize("role,_", ROLE_LEVELS)
+@pytest.mark.parametrize("level", ["flash", "standard", "pro"])
+def test_each_role_can_be_overridden(monkeypatch, role, _, level):
+    monkeypatch.setenv(f"PAPERVAULT_LLM_{role.upper()}", level)
+    assert route(role) == level
 
 
-def test_parse_is_case_insensitive_on_suffix():
-    assert _parse_spec("mimo-v2.5:NoThink") == ("mimo-v2.5", False)
-    assert _parse_spec("mimo-v2.5:THINK") == ("mimo-v2.5", True)
+@pytest.mark.parametrize("blank", ["", "   "])
+@pytest.mark.parametrize("role,want", ROLE_LEVELS)
+def test_blank_override_uses_role_default(monkeypatch, role, want, blank):
+    monkeypatch.setenv(f"PAPERVAULT_LLM_{role.upper()}", blank)
+    assert route(role) == want
 
 
-def test_parse_strips_whitespace():
-    assert _parse_spec("  mimo-v2.5-pro  ") == ("mimo-v2.5-pro", None)
-    assert _parse_spec("mimo-v2.5 :think") == ("mimo-v2.5", True)
+def test_whitespace_is_normalized(monkeypatch):
+    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", " pro ")
+    assert route(" SYNTH ") == "pro"
 
 
-def test_parse_preserves_provider_prefix():
-    # A litellm-form model (openai/<name>) has "/" not ":" — the suffix parse must leave it intact.
-    assert _parse_spec("openai/mimo-v2.5:nothink") == ("openai/mimo-v2.5", False)
-    assert _parse_spec("openai/mimo-v2.5") == ("openai/mimo-v2.5", None)
-
-
-@pytest.mark.parametrize("bad", ["", "   ", ":think", ":nothink", "  :think"])
-def test_parse_empty_model_raises(bad):
-    with pytest.raises(ValueError, match="empty model"):
-        _parse_spec(bad)
-
-
-# ------------------------------------------------------------------- default resolution
-
-@pytest.mark.parametrize("role", ["decompose", "judge", "gate"])
-def test_synth_slot_roles_default_to_synth_model_no_thinking(role):
-    assert route(role) == (_SYNTH, None)
-
-
-def test_synth_defaults_to_thinking_on():
-    # Arbitrated 2026-07-19 (issue #8): judged pair, +4.4pp citation-support
-    # precision at +1-3 s/query — shipped default for the synth role is thinking ON.
-    assert route("synth") == (_SYNTH, True)
-
-
-def test_build_defaults_to_build_model_thinking_on():
-    # graph.py default: KS_BUILD_THINKING unset ("1") → enable_thinking=True.
-    assert route("build") == (_BUILD, True)
-
-
-def test_keyword_defaults_to_build_model_thinking_on():
-    # graph.py keyword branch default (KS_KW_THINKING unset, KS_BUILD_THINKING unset "1") → True.
-    assert route("keyword") == (_BUILD, True)
-
-
-def test_verify_defaults_to_gateway_flash():
-    assert route("verify") == ("openai/flash", None)
-
-
-def test_synth_slot_roles_pass_through_empty_config_model(monkeypatch):
-    # SYNTH_MODEL empty (PAPERVAULT_MODEL unset) → the resolver returns "" so the call site
-    # rides the pool's per-group model (byte-identical to today).
-    monkeypatch.setattr(config, "SYNTH_MODEL", "")
-    assert route("synth") == ("", True)  # thinking-on default rides even the empty-model passthrough
-
-
-def test_build_passes_through_empty_config_model(monkeypatch):
-    monkeypatch.setattr(config, "BUILD_MODEL", "")
-    assert route("build") == ("", True)
-
-
-# --------------------------------------------------------------------- new-var override
-
-def test_new_var_overrides_synth_with_thinking(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", "mimo-v2.5-pro:think")
-    assert route("synth") == ("mimo-v2.5-pro", True)
-
-
-def test_synth_nothink_override_beats_thinking_default(monkeypatch):
-    # THE regression guard for the thinking-ON default: an explicit :nothink must
-    # yield False (sent as enable_thinking=False), never fall back to True.
-    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", "mimo-v2.5-pro:nothink")
-    assert route("synth") == ("mimo-v2.5-pro", False)
-
-
-def test_synth_bare_model_override_sends_no_thinking_param(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", "some-model")
-    assert route("synth") == ("some-model", None)
-
-
-def test_new_var_overrides_decompose_nothink(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_DECOMPOSE", "mimo-v2.5:nothink")
-    assert route("decompose") == ("mimo-v2.5", False)
-
-
-def test_new_var_bare_model_clears_thinking(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_JUDGE", "some-model")
-    assert route("judge") == ("some-model", None)
-
-
-def test_new_var_overrides_build(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_BUILD", "mimo-v2.5:nothink")
-    assert route("build") == ("mimo-v2.5", False)
-
-
-def test_new_var_overrides_keyword(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_KEYWORD", "mimo-v2.5:nothink")
-    assert route("keyword") == ("mimo-v2.5", False)
-
-
-def test_new_var_overrides_gate(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_GATE", "cheap:nothink")
-    assert route("gate") == ("cheap", False)
-
-
-def test_new_var_overrides_verify(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_VERIFY", "openai/mimo-v2.5:nothink")
-    assert route("verify") == ("openai/mimo-v2.5", False)
-
-
-def test_blank_new_var_falls_back_to_default(monkeypatch):
-    # A blank line is treated as "not configured" (no error) → the default resolves.
-    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", "   ")
-    assert route("synth") == (_SYNTH, True)
-
-
-def test_invalid_new_var_raises(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", ":think")
-    with pytest.raises(ValueError, match="empty model"):
+@pytest.mark.parametrize("bad", ["cheap", "openai/pro", "provider-model", "pro:suffix", "PRO"])
+def test_invalid_override_names_the_variable(monkeypatch, bad):
+    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", bad)
+    with pytest.raises(ValueError, match="PAPERVAULT_LLM_SYNTH.*flash.*standard.*pro"):
         route("synth")
 
 
-# ------------------------------------------------------------ legacy back-compat precedence
-
-def test_ks_build_model_overrides_build_model_and_new_var(monkeypatch):
-    monkeypatch.setenv("KS_BUILD_MODEL", "legacy-build")
-    monkeypatch.setenv("PAPERVAULT_LLM_BUILD", "new-build:nothink")
-    # Legacy KS_BUILD_MODEL wins the MODEL; thinking still comes from the new var (:nothink).
-    assert route("build") == ("legacy-build", False)
-
-
-def test_ks_build_model_applies_to_keyword_too(monkeypatch):
-    monkeypatch.setenv("KS_BUILD_MODEL", "legacy-build")
-    assert route("keyword")[0] == "legacy-build"
-
-
-def test_ks_build_thinking_zero_disables_build_thinking(monkeypatch):
-    monkeypatch.setenv("KS_BUILD_THINKING", "0")
-    assert route("build") == (_BUILD, None)
-
-
-def test_ks_build_thinking_one_keeps_build_thinking(monkeypatch):
-    monkeypatch.setenv("KS_BUILD_THINKING", "1")
-    assert route("build") == (_BUILD, True)
-
-
-def test_ks_build_thinking_wins_over_new_var(monkeypatch):
-    monkeypatch.setenv("KS_BUILD_THINKING", "0")
-    monkeypatch.setenv("PAPERVAULT_LLM_BUILD", "mimo:think")
-    # Legacy thinking override wins → None (thinking off); model from the new var.
-    assert route("build") == ("mimo", None)
-
-
-def test_ks_kw_thinking_zero_disables_keyword_thinking(monkeypatch):
-    monkeypatch.setenv("KS_KW_THINKING", "0")
-    assert route("keyword") == (_BUILD, False)
-
-
-def test_ks_kw_thinking_zero_wins_over_new_var_and_build_thinking(monkeypatch):
-    monkeypatch.setenv("KS_KW_THINKING", "0")
-    monkeypatch.setenv("KS_BUILD_THINKING", "1")
-    monkeypatch.setenv("PAPERVAULT_LLM_KEYWORD", "mimo:think")
-    assert route("keyword") == ("mimo", False)
-
-
-def test_ks_kw_thinking_does_not_affect_build(monkeypatch):
-    # KS_KW_THINKING is keyword-only; the build-extraction call ignores it.
-    monkeypatch.setenv("KS_KW_THINKING", "0")
-    assert route("build") == (_BUILD, True)
-
-
-def test_keyword_follows_build_thinking_when_kw_not_zero(monkeypatch):
-    # KS_KW_THINKING set but not "0" → falls through to the KS_BUILD_THINKING branch.
-    monkeypatch.setenv("KS_KW_THINKING", "1")
-    monkeypatch.setenv("KS_BUILD_THINKING", "0")
-    assert route("keyword") == (_BUILD, None)
-
-
-def test_paper_pipeline_verify_model_overrides_verify(monkeypatch):
-    monkeypatch.setenv("PAPER_PIPELINE_VERIFY_MODEL", "legacy-verify")
-    assert route("verify") == ("legacy-verify", None)
-
-
-def test_paper_pipeline_verify_model_wins_over_new_var_model(monkeypatch):
-    monkeypatch.setenv("PAPER_PIPELINE_VERIFY_MODEL", "legacy-verify")
-    monkeypatch.setenv("PAPERVAULT_LLM_VERIFY", "new-verify:nothink")
-    # Legacy wins MODEL; thinking still tracks the new var.
-    assert route("verify") == ("legacy-verify", False)
-
-
-# ------------------------------------------------------------------------- role validation
-
-def test_unknown_role_raises():
+def test_unknown_role_rejected():
     with pytest.raises(ValueError, match="unknown LLM role"):
-        route("nonsense")
+        route("unknown")
 
 
-def test_role_is_case_insensitive():
-    assert route("SYNTH") == (_SYNTH, True)
-    assert route("Build") == (_BUILD, True)
+def test_retired_model_overrides_cannot_replace_levels(monkeypatch):
+    for var in ("PAPERVAULT_MODEL", "PAPERVAULT_BUILD_MODEL", "KS_BUILD_MODEL",
+                "PAPER_PIPELINE_VERIFY_MODEL", "MIMO_MODEL"):
+        monkeypatch.setenv(var, "provider-model")
+    assert route("build") == "standard"
+    assert route("keyword") == "flash"
+    assert route("verify") == "flash"
+    assert route("eval_judge") == "standard"
 
 
-def test_roles_tuple_is_complete():
-    for r in llm_routing.ROLES:
-        assert isinstance(route(r), tuple) and len(route(r)) == 2
+@pytest.mark.parametrize("gateway", [False, True])
+@pytest.mark.parametrize("level", ["flash", "standard", "pro"])
+def test_library_request_preserves_each_level(tmp_path, monkeypatch, gateway, level):
+    from papervault.library import llm
+
+    monkeypatch.setattr(config, "USE_GATEWAY", gateway)
+    monkeypatch.setattr(config, "LLM_API_KEY", "test-key")
+    monkeypatch.setattr(config, "LLM_BASE_URL", "https://direct.example/v1")
+    monkeypatch.setattr(config, "GATEWAY_KEY", "test-key")
+    monkeypatch.setattr(config, "GATEWAY_URL", "https://gateway.example/v1")
+    monkeypatch.setattr(llm, "_KEYS_FILE", tmp_path / "absent.json")
+    monkeypatch.setattr(llm, "_pools", {})
+    monkeypatch.setattr(llm, "_gw_llms", {})
+    monkeypatch.setenv("PAPERVAULT_LLM_JUDGE", level)
+    requests = []
+
+    def complete(**kwargs):
+        requests.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    monkeypatch.setattr(llm, "_create_completion", complete)
+    assert llm.get_llm().call("judge") == "ok"
+    assert requests == [{
+        "model": f"openai/{level}", "messages": [{"role": "user", "content": "judge"}],
+        "base_url": "https://gateway.example/v1" if gateway else "https://direct.example/v1",
+        "api_key": "test-key", "max_tokens": llm._DEFAULT_MAX_TOKENS,
+    }]
+
+
+def test_doctor_accepts_level_defaults_without_model_slots(tmp_path, monkeypatch, capsys):
+    from papervault import cli
+
+    monkeypatch.setattr(config, "LLM_KEYS_FILE", tmp_path / "absent.json")
+    monkeypatch.setattr(config, "LLM_API_KEY", "test-key")
+    report = cli._Report()
+    cli._check_config(report)
+    assert report.failures == 0
+    assert "synth=pro" in capsys.readouterr().out
+
+
+def test_doctor_reports_invalid_role_override(tmp_path, monkeypatch, capsys):
+    from papervault import cli
+
+    monkeypatch.setattr(config, "LLM_KEYS_FILE", tmp_path / "absent.json")
+    monkeypatch.setattr(config, "LLM_API_KEY", "test-key")
+    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", "provider-model")
+    report = cli._Report()
+    cli._check_config(report)
+    assert report.failures == 1
+    assert "PAPERVAULT_LLM_SYNTH" in capsys.readouterr().out

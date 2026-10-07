@@ -422,3 +422,14 @@ async def test_main_loop_defers_operator_doc_pickup_while_open(breaker, fake_led
     with pytest.raises(asyncio.CancelledError):
         await rnd.main_loop(object())
     assert seen == {"rounds": 2, "drains": 1}
+
+
+@pytest.mark.parametrize("keyword,want", [(False, "standard"), (True, "flash")])
+async def test_graph_uses_role_level_over_inherited_model(breaker, monkeypatch, keyword, want):
+    for role in ("BUILD", "KEYWORD"):
+        monkeypatch.delenv(f"PAPERVAULT_LLM_{role}", raising=False)
+    fake = FakeComplete()
+    monkeypatch.setattr(graph, "mimo_complete", fake)
+    kwargs = {"response_format": {"type": "json_object"}} if keyword else {}
+    assert await graph.build_llm("prompt", model="pro", **kwargs) == "ok"
+    assert fake.calls == [{"model": want, **kwargs}]

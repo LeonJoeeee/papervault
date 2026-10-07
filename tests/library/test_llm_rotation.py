@@ -160,37 +160,21 @@ def test_gateway_off_is_default_keypool(tmp_path, monkeypatch):
     assert isinstance(L.get_llm(), L.KeyPool)
 
 
-def test_gateway_group_routing(monkeypatch):
-    """Gateway maps a call-site model to the proxy's REAL model groups: default/None and an explicit
-    synth request → the strong SYNTH_MODEL group; only an explicit BUILD_MODEL request → the build
-    group. Default matches the direct path (_DEFAULT_MODEL is the synth model). config is
-    import-frozen → patch the config attrs directly (_gateway_group reads them live)."""
-    monkeypatch.setattr(config, "SYNTH_MODEL", "big")
-    monkeypatch.setattr(config, "BUILD_MODEL", "small")
-    monkeypatch.setattr(L, "_DEFAULT_MODEL", "openai/big")
-    assert L._gateway_group(None) == "openai/big"                 # default → synth
-    assert L._gateway_group("openai/small") == "openai/small"     # explicit build model
-    assert L._gateway_group("small") == "openai/small"
-    assert L._gateway_group("openai/big") == "openai/big"         # explicit synth tier
-    assert L._gateway_group(L._DEFAULT_MODEL) == "openai/big"     # _DEFAULT_MODEL is the synth model
-
-
 def test_gateway_on_returns_proxy_llm(monkeypatch):
     """config.USE_GATEWAY=True → an LLM pointed at the proxy: group model, config base_url/key,
     max_tokens passthrough, num_retries=0 (no double-retry), cached per (max_tokens, group)."""
     monkeypatch.setattr(config, "USE_GATEWAY", True)
     monkeypatch.setattr(config, "GATEWAY_URL", "http://proxy:4000/v1")
     monkeypatch.setattr(config, "GATEWAY_KEY", "sk-test")
-    monkeypatch.setattr(config, "SYNTH_MODEL", "big")
-    monkeypatch.setattr(config, "BUILD_MODEL", "small")
+    monkeypatch.delenv("PAPERVAULT_LLM_JUDGE", raising=False)
     monkeypatch.setattr(L, "_gw_llms", {})
-    got = L.get_llm()                       # default site → synth group
+    got = L.get_llm()                       # default library role → standard
     assert isinstance(got, FakeLLM)         # L.LLM is monkeypatched to FakeLLM by _reset
-    assert got.kw == {"model": "openai/big", "base_url": "http://proxy:4000/v1",
+    assert got.kw == {"model": "openai/standard", "base_url": "http://proxy:4000/v1",
                       "api_key": "sk-test", "max_tokens": L._DEFAULT_MAX_TOKENS, "num_retries": 0}
-    # an explicit build-model request lands on the build group, with max_tokens preserved
-    cheap = L.get_llm(model="openai/small", max_tokens=4096)
-    assert cheap.kw["model"] == "openai/small" and cheap.kw["max_tokens"] == 4096
+    # An explicit flash level preserves its output ceiling.
+    cheap = L.get_llm(model="flash", max_tokens=4096)
+    assert cheap.kw["model"] == "openai/flash" and cheap.kw["max_tokens"] == 4096
     # cached: same (max_tokens, group) → same object
     assert L.get_llm() is got
 
@@ -202,8 +186,7 @@ def test_gateway_on_default_url_and_raises_on_failure(monkeypatch):
     monkeypatch.setattr(config, "USE_GATEWAY", True)
     monkeypatch.setattr(config, "GATEWAY_URL", "http://127.0.0.1:4000/v1")   # documented default
     monkeypatch.setattr(config, "GATEWAY_KEY", "sk-test")
-    monkeypatch.setattr(config, "SYNTH_MODEL", "big")
-    monkeypatch.setattr(config, "BUILD_MODEL", "small")
+    monkeypatch.delenv("PAPERVAULT_LLM_JUDGE", raising=False)
     monkeypatch.setattr(L, "_gw_llms", {})
     got = L.get_llm()
     assert got.kw["base_url"] == "http://127.0.0.1:4000/v1"

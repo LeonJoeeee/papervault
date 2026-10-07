@@ -19,7 +19,7 @@ git clone <repo-url> papervault && cd papervault
 
 # 2. Configure — copy the template and fill in your LLM endpoint/key + data dir
 cp .env.example .env
-$EDITOR .env          # set PAPERVAULT_LLM_*, PAPERVAULT_MODEL, POSTGRES/NEO4J passwords,
+$EDITOR .env          # set PAPERVAULT_LLM_*, POSTGRES/NEO4J passwords,
                       # PAPERVAULT_CONTACT_EMAIL
 
 # 3. Backing stores (Postgres + Neo4j). --env-file is REQUIRED: with `-f
@@ -79,6 +79,41 @@ weights, and Postgres + Neo4j connectivity:
 For a deeper check, `papervault smoke` runs doctor, boots the MCP server over
 stdio, and round-trips its tools (`list_tools` + a read-only `get_paper`) — no
 LLM required (`papervault smoke --skip-db` skips the DB connectivity checks).
+
+## LLM routing and migration
+
+Every text LLM request sends a gateway level: `flash`, `standard`, or `pro`.
+The endpoint resolves its model and effort per key. Defaults are:
+
+| Role | Level | Override |
+| --- | --- | --- |
+| Graph extraction/merge | standard | `PAPERVAULT_LLM_BUILD` |
+| Query keyword extraction | flash | `PAPERVAULT_LLM_KEYWORD` |
+| Answer synthesis | pro | `PAPERVAULT_LLM_SYNTH` |
+| Extract clarity/completeness gates | flash | `PAPERVAULT_LLM_GATE` |
+| PDF metadata verification | flash | `PAPERVAULT_LLM_VERIFY` |
+| Library intent/judges/resolver/re-rank | standard | `PAPERVAULT_LLM_JUDGE` |
+| Decomposition (eval-only variant) | standard | `PAPERVAULT_LLM_DECOMPOSE` |
+| Eval judges | standard | `PAPERVAULT_LLM_EVAL_JUDGE` |
+
+For example, `PAPERVAULT_LLM_SYNTH=standard` overrides synthesis. Values must be
+bare levels; unset/blank uses the table. Provider model names and suffixes are
+rejected with the variable name in the error. `doctor` validates and reports these
+routes. Speech (`mimo-v2.5-asr`) and local BGE embedding/rerank are unchanged.
+
+`PAPERVAULT_MODEL`, `PAPERVAULT_BUILD_MODEL`, `KS_BUILD_MODEL`,
+`PAPER_PIPELINE_VERIFY_MODEL`, and the eval scripts' `MIMO_MODEL` are retired.
+Replace old model/mode settings with the role variables above. Caller effort
+settings have been removed; configure effort on the endpoint instead.
+
+The optional gateway transport (`PAPERVAULT_LLM_GATEWAY=1`) forwards each level
+unchanged to `PAPERVAULT_LLM_GATEWAY_URL` using `PAPERVAULT_LLM_GATEWAY_KEY`.
+Without that flag, the single endpoint/key or key pool also receives the same
+bare levels: the direct endpoint must serve these aliases and own their model
+and effort. Pool entries supply credentials/endpoints; their model field does
+not override a call site's role level. There is no caller-side provider-model
+mapping. Bare `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` model fallbacks are retired;
+use the documented `PAPERVAULT_LLM_*` endpoint/key configuration.
 
 ## RTX 3090 idle-release deployment runbook
 

@@ -13,6 +13,7 @@ from pathlib import Path
 import click
 
 from papervault import config
+from papervault.llm_routing import ROLES, route
 
 
 @click.group()
@@ -54,10 +55,11 @@ def _check_config(r: _Report) -> None:
         r.ok("LLM single key", "PAPERVAULT_LLM_API_KEY set")
     else:
         r.fail("LLM credentials", "set PAPERVAULT_LLM_API_KEY or PAPERVAULT_LLM_KEYS")
-    if config.SYNTH_MODEL:
-        r.ok("model slots", f"synth={config.SYNTH_MODEL} build={config.BUILD_MODEL}")
-    else:
-        r.fail("model slots", "set PAPERVAULT_MODEL (and optionally PAPERVAULT_BUILD_MODEL)")
+    try:
+        levels = " ".join(f"{role}={route(role)}" for role in ROLES)
+        r.ok("LLM levels", levels)
+    except ValueError as exc:
+        r.fail("LLM levels", str(exc))
     if not config.LLM_BASE_URL and not has_pool:
         r.warn("LLM base URL", "PAPERVAULT_LLM_BASE_URL empty (ok if the key-pool file sets base_url)")
 

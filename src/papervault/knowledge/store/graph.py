@@ -93,34 +93,15 @@ def assert_safe_workspace() -> str:
 # space_physics factory pack reproduces the 11-type list verbatim.
 ENTITY_TYPES = get_domain().entity_types
 
-# Build-plane LLM (2026-07-16, user call): LightRAG-internal calls — entity/relation
-# extraction at ainsert (the token sink: 2 calls/chunk × ~10-13k tok) plus its small
-# query-path keyword extraction — run on the CHEAP deployment with thinking ON; pro
-# was overkill-priced for build-scale extraction. Research-plane calls (decompose +
-# synth in query/multiquery.py + query/synth.py) call mimo_complete directly and stay
-# on the pool's PAPERVAULT_MODEL slot (e.g. standard on the gateway). Env-revertable without code:
-#   KS_BUILD_MODEL=standard       → use the standard gateway tier for build
-#   KS_BUILD_THINKING=0           → stop forwarding enable_thinking
-#   KS_KW_THINKING=0              → enable_thinking=False for the query-path
-#       keyword-extraction call ONLY (on LightRAG 1.5.x that call is the one carrying
-#       response_format — see the branch below). It is a mechanical task measured
-#       burning ~67s of reasoning CoT (2026-07-16). Default 1 = today's behavior; the
-#       knob exists so a FAST recall A/B can arbitrate before any flip.
+# Graph extraction/merge use standard; query keywords use flash. The endpoint owns effort.
 async def build_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
     """LightRAG's ``llm_model_func``: route by role, and gate the BUILD role on the build-path
     breaker (#143) — while it is open a build call fails fast with ``BuildPausedError`` without
     contacting the gateway. The query-path keyword call never touches the breaker."""
-    # Model/thinking routing (issue #8): route the call by ROLE. LightRAG 1.5.x no longer
-    # tags the query-path keyword-extraction call with keyword_extraction=True; it now passes
-    # response_format={"type":"json_object"} (operate.py query kw path) — and in papervault's
-    # text-mode config that is the ONLY call carrying response_format, so it uniquely marks
-    # keyword extraction. route() folds in the legacy KS_BUILD_MODEL / KS_BUILD_THINKING /
-    # KS_KW_THINKING knobs (back-compat) so this is behavior-neutral at the current defaults.
+    # In the pinned LightRAG text-mode config, only query keyword extraction
+    # carries response_format. Override any inherited model with this role's level.
     role = "keyword" if kwargs.get("response_format") else "build"
-    model, thinking = route(role)
-    kwargs.setdefault("model", model)
-    if thinking is not None:
-        kwargs.setdefault("enable_thinking", thinking)
+    kwargs["model"] = route(role)
     if role != "build":
         return await mimo_complete(
             prompt, system_prompt=system_prompt, history_messages=history_messages, **kwargs
@@ -169,7 +150,7 @@ async def get_graph() -> LightRAG:
     rag = LightRAG(
         working_dir=working_dir,
         llm_model_func=build_llm,
-        llm_model_name=route("build")[0],
+        llm_model_name=route("build"),
         llm_model_max_async=int(os.getenv("KS_LLM_MAX_ASYNC", "32")),        # 硬 LLM 天花板。默认 32(2026-06-04):6-key 时代 conc16 把 2400-chunk 抽取拖过 480s worker(59/100 error)→曾锁 8;补到 24 key 后 conc_probe 实测 conc12/24/36/48 全 0 error、max ≤83s«480s(争抢消失,~1.3 调用/key)。env 可调,应大致随活 key 数走(§7)
         max_parallel_insert=int(os.getenv("KS_MAX_PARALLEL_INSERT", "16")),  # 文档在飞数(默认 2 = 隐藏瓶颈)
         embedding_func_max_async=int(os.getenv("KS_EMBED_MAX_ASYNC", "16")), # embedding 并发(默认 8 = 隐藏瓶颈);三旋钮缺一不可(§7)

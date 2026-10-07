@@ -55,7 +55,7 @@ class Insight(BaseModel):
     """ISO 8601 UTC timestamp when this insight was successfully written."""
 
     model: str
-    """LLM model identifier (e.g., ``openai/mimo-v2.5-pro``). Read from
+    """LLM model identifier (e.g., gateway tier ``openai/standard``). Read from
     ``llm.model`` attribute at ingest time."""
 
     academic_knowledge_hash: str

@@ -12,7 +12,7 @@ import asyncio, json, os, sys
 
 GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
 VKEY = os.getenv("KS_VIRTUAL_KEY", "")
-MODEL = os.getenv("MIMO_MODEL", "mimo-v2.5-pro")
+MODEL = os.getenv("MIMO_MODEL", "standard")
 
 SYS = ("You audit one edge of a scientific knowledge graph for FAITHFULNESS. You are given the edge "
        "(head entity, tail entity, and its relationship_description) and the SOURCE TEXT chunks the edge "

@@ -230,8 +230,8 @@ def _env_fallback_groups() -> list[dict]:
 
 
 def _sdk_model(model: str | None) -> str:
-    """Map a shared-file ``model`` (litellm form ``openai/mimo-v2.5-pro``) to the bare model
-    name the raw OpenAI SDK / MiMo gateway expects (``mimo-v2.5-pro``)."""
+    """Map a shared-file ``model`` (litellm form ``openai/standard``) to the bare name
+    the raw OpenAI SDK / gateway expects (``standard``)."""
     m = model or _DEFAULT_MODEL
     if "/" in m:
         m = m.split("/", 1)[1]
@@ -617,13 +617,12 @@ class KeyPool:
                 openai_kwargs["extra_body"] = existing
             else:
                 openai_kwargs["extra_body"] = extra_body
-        # The model is the gateway GROUP name, which (locked design) is the REAL model name:
-        # default "mimo-v2.5-pro"; send the cheap group "mimo-v2.5" ONLY when a caller explicitly
-        # asked cheap (model="mimo-v2.5" or the legacy alias "mimo-cheap"). Ignore the per-key
-        # _sdk_model map — the proxy owns key→deployment selection.
+        # Gateway groups are capability tiers, selected by the deployment's two model slots:
+        # SYNTH_MODEL (e.g. "standard") by default; BUILD_MODEL (e.g. "flash") when a caller
+        # requests that slot or the "cheap" alias. The proxy owns key→deployment selection.
         requested = openai_kwargs.pop("model", None)
         # Strip any provider prefix (openai/<name>) before hitting the proxy: the gateway's
-        # model GROUP is the bare real name, and PAPERVAULT_MODEL may legitimately carry a
+        # model GROUP is the bare tier name, and PAPERVAULT_MODEL may legitimately carry a
         # litellm-form prefix (the library plane builds one). Mirrors the direct path's _sdk_model.
         model = _sdk_model(config.BUILD_MODEL if requested in (config.BUILD_MODEL, "cheap") else config.SYNTH_MODEL)
 

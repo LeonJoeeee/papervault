@@ -21,7 +21,7 @@ sets a new var):
     ``knowledge/store/graph.py``'s ``KS_BUILD_THINKING`` / ``KS_KW_THINKING`` logic
     (build-extraction defaults thinking ON; the query-path keyword call — the one
     carrying ``response_format`` — defaults ON too but flips OFF under ``KS_KW_THINKING=0``);
-  * verify → its current model (``PAPER_PIPELINE_VERIFY_MODEL`` or ``openai/mimo-v2.5``).
+  * verify → ``PAPER_PIPELINE_VERIFY_MODEL`` or the gateway's ``openai/flash`` tier.
 
 LEGACY vars remain as back-compat overrides (the experiment layer eval arms use) and
 WIN over the new ``PAPERVAULT_LLM_*`` line where they apply:
@@ -43,7 +43,7 @@ ROLES = ("synth", "decompose", "build", "keyword", "judge", "gate", "verify")
 # from ``None`` (a bare model spec, which DOES say "send no thinking param").
 _UNSET = object()
 
-_VERIFY_DEFAULT_MODEL = "openai/mimo-v2.5"
+_VERIFY_DEFAULT_MODEL = "openai/flash"
 
 
 def _parse_spec(spec: str) -> tuple[str, bool | None]:
@@ -141,7 +141,7 @@ def _resolve_keyword() -> tuple[str, bool | None]:
 
 
 def _resolve_verify() -> tuple[str, bool | None]:
-    """verify: legacy PAPER_PIPELINE_VERIFY_MODEL > new var > openai/mimo-v2.5. The library
+    """verify: legacy PAPER_PIPELINE_VERIFY_MODEL > new var > openai/flash. The library
     plane sends no thinking param today, so thinking follows the new var (default None)."""
     new_model, new_thinking = _new_line("verify")
     model = os.getenv("PAPER_PIPELINE_VERIFY_MODEL") or new_model or _VERIFY_DEFAULT_MODEL

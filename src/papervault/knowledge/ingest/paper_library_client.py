@@ -66,8 +66,8 @@ class PaperRecord:
     # at the source; load_vault_index() excludes these by default so the KS graph
     # build sees the library's clean view (no KS-side domain classifier needed).
     domain_status: Optional[str] = None
-    # paper-library download_status (#144): "metadata_only" = no PDF could be found — the class
-    # that gets an abstract-only graph doc. Empty when the index entry predates the field.
+    # Library terminal acquisition status (#144, #148): metadata_only / extract_failed / failed
+    # can supply an abstract-only graph doc without an extract. Empty on legacy entries.
     download_status: str = ""
 
     @classmethod

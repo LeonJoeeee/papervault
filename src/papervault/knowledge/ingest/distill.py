@@ -29,7 +29,7 @@ from typing import Optional
 
 from lightrag.base import DocStatus
 from lightrag.utils import sanitize_text_for_encoding
-from lightrag.utils_pipeline import normalize_document_file_path
+from lightrag.utils_pipeline import compute_text_content_hash, normalize_document_file_path
 
 from papervault.knowledge.ingest.abstract_doc import (
     build_abstract_doc,
@@ -41,6 +41,7 @@ from papervault.knowledge.ingest.fingerprint import META
 from papervault.knowledge.ingest.paper_library_client import _strip_references
 from papervault.knowledge.ingest.vault import PaperRecord, read_extract_raw
 from papervault.knowledge.ledger import store as ledger
+from papervault.knowledge.store.build_breaker import BuildPausedError
 
 log = logging.getLogger("ks.ingest.distill")
 
@@ -293,6 +294,18 @@ async def _existing_is_abstract(rag, did: str, st) -> bool:
     return is_abstract_text(content)
 
 
+async def record_duplicate(ingest_source: str, source_id: str, own_doc_id: str,
+                           twin_doc_id: str, content_hash: str, fingerprint: Optional[str]) -> None:
+    """One duplicate outcome: done_meta with the surviving twin and its content snapshot.
+
+    Retain the source's own doc_id: removal/force-ingest must never delete its twin.
+    The snapshot lets reconcile notice when that twin has been rebuilt with different content.
+    """
+    await ledger.upsert(ingest_source, source_id, doc_id=own_doc_id,
+                        status="done_meta", fingerprint=fingerprint,
+                        duplicate_of=twin_doc_id, duplicate_content_hash=content_hash)
+
+
 async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
     """items = [(rec, fp)]. 两段式:批量 enqueue → 单次 process(§6.1)。"""
     inputs: list[str] = []
@@ -363,7 +376,8 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
             # 不留 processing(否则永卡):标 done_meta(dup),指向同内容已入队那篇。
             # ★指纹写 *真实 fp*(不是 META):本篇有全文,fingerprint(rec) 下轮恒返真实 hash;
             #   若这里写 META,下轮 diff(fp != META)会判 to_redistill 永久 churn(SDD §6.1 line 221 口径)。
-            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=fp)
+            await record_duplicate("paper", rec.key, doc_id(rec.key), doc_id(seen_clean[dk]),
+                                   compute_text_content_hash(sanitize_text_for_encoding(cleaned)), fp)
             counters["dup"] += 1
             log.info("distill_batch: content-dup %s == %s → done_meta(dup)", rec.key, seen_clean[dk])
             continue
@@ -393,6 +407,9 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
             # ★前提: 调用点 pipeline idle(§6.6 删插互斥保证);否则 busy → request_pending 早返,本批仍 PENDING。
             await rag.apipeline_enqueue_documents(input=inputs, ids=ids, file_paths=fpaths)
             await rag.apipeline_process_enqueue_documents()
+        except BuildPausedError:
+            # Enqueued documents and processing ledger rows stay available for the next round.
+            counters["deferred"] = len(queued)
         except Exception as e:  # noqa: BLE001 — F17 批级兜底:不许击穿整 round
             # 批级 setup/校验/连接异常(enqueue 校验 ValueError、PG/Neo4j blip、pipeline 未 init):
             # 异常常发生在写 doc_status 之前,本批 key 会永卡 processing → 回写 error,下轮 diff(status) 重投。

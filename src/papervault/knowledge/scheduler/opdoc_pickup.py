@@ -84,12 +84,12 @@ WITHOUT raising), so a non-exception return is inspected — not assumed to be s
                                      instead of being marked done and lost.
   AlreadyIngestedError             → move to `processed/` (push-once: it's already done)
   SourceDisabledError              → LEAVE in place, log ONCE (source flag OFF; a re-enable picks it up)
+  BuildPausedError (#148)           → LEAVE in pending; queued sections resume in a later round
   any other error                  → move to `failed/` + log LOUD (malformed key, enqueue blip, …)
 
-RESTART RECOVERY (issue #81 known gap): an in-flight ingest interrupted by a restart leaves a
-`processing` ledger row the paper `reconcile_terminal` (scans only `ingest_source="paper"`)
-won't clean. MVP recovery = re-drop the file with a `.force` sidecar: force purges the stuck
-rows then re-ingests clean. A boot-time operator-doc reconcile pass is durable follow-up.
+RESTART RECOVERY (#148): reconcile_healed closes operator `processing` rows whose queued
+documents finish in a later round. A processing row with no queued document still needs a
+`.force` re-drop to purge and re-ingest; paper reconcile_terminal does not scan that source.
 """
 from __future__ import annotations
 
@@ -99,6 +99,8 @@ import os
 import shutil
 import time
 from pathlib import Path
+
+from papervault.knowledge.store.build_breaker import BuildPausedError
 
 from papervault.knowledge.ingest.operator_docs import (
     KINDS,
@@ -440,6 +442,11 @@ async def drain_pending(rag) -> dict:
                     key, path.name, e,
                 )
             counts["disabled"] += 1
+        except BuildPausedError:
+            # A paused build is queued work, not a defective input. Leave its source pending.
+            log.debug("opdoc pickup: %s build paused; input remains pending", key)
+            counts["deferred"] += 1
+            break
         except Exception as e:  # noqa: BLE001 — one bad file must NOT crash the scheduler loop
             log.exception("opdoc pickup: %s FAILED to ingest → failed/ (%r)", key, e)
             _move(path, failed_dir)

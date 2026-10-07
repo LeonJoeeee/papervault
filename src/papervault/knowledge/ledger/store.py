@@ -5,6 +5,8 @@ fingerprint + doc_id + status. async psycopg pool (mirrors sidecar/crud.py).
 
 status 权威枚举(SDD §13):processing | done | done_meta | done_abstract | error | error_parked | pending_remove
 (done_abstract, #144: a metadata-state paper whose one abstract-only doc is processed.)
+(done_meta with duplicate_of + duplicate_content_hash, #148: represented by a surviving twin;
+ doc_id stays the source's OWN id, so purge/force-ingest cannot delete the twin.)
 (absent = 无行)。
 
 REDISTILL 熔断(#84):`attempts` 列记录该 key **连续** build 失败次数。每次写 status='error'
@@ -122,6 +124,8 @@ CREATE TABLE IF NOT EXISTS ks_ledger (
     doc_id            text NOT NULL,
     status            text NOT NULL,
     attempts          integer NOT NULL DEFAULT 0,
+    duplicate_of      text,
+    duplicate_content_hash text,
     last_processed_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (workspace, ingest_source, source_id)
 )
@@ -138,6 +142,8 @@ class LedgerRecord:
     doc_id: str
     status: str
     attempts: int = 0  # consecutive build-failure count (#84 circuit-breaker); 0 = clean
+    duplicate_of: Optional[str] = None
+    duplicate_content_hash: Optional[str] = None
 
 
 _pool: Optional[AsyncConnectionPool] = None
@@ -193,6 +199,8 @@ async def ensure_schema() -> None:
         await conn.execute(
             "ALTER TABLE ks_ledger ADD COLUMN IF NOT EXISTS attempts integer NOT NULL DEFAULT 0"
         )
+        await conn.execute("ALTER TABLE ks_ledger ADD COLUMN IF NOT EXISTS duplicate_of text")
+        await conn.execute("ALTER TABLE ks_ledger ADD COLUMN IF NOT EXISTS duplicate_content_hash text")
         # ★ condition the cold-migration steps (backfill UPDATE + SET NOT NULL) on a one-shot
         # introspect, mirroring the ④/⑤ guards below. The backfill UPDATE + `ALTER COLUMN
         # SET NOT NULL` were previously UNCONDITIONAL every startup: on an already-migrated
@@ -287,6 +295,8 @@ async def upsert(
     doc_id: str,
     status: str,
     fingerprint: Optional[str] = None,
+    duplicate_of: Optional[str] = None,
+    duplicate_content_hash: Optional[str] = None,
 ) -> None:
     if status not in VALID_STATUS:
         raise ValueError(f"invalid ledger status: {status!r} (allowed: {sorted(VALID_STATUS)})")
@@ -322,16 +332,20 @@ async def upsert(
         await conn.execute(
             """
             INSERT INTO ks_ledger
-                (workspace, ingest_source, source_id, fingerprint, doc_id, status, attempts, last_processed_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, now())
+                (workspace, ingest_source, source_id, fingerprint, doc_id, status, attempts,
+                 duplicate_of, duplicate_content_hash, last_processed_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT (workspace, ingest_source, source_id) DO UPDATE SET
                 fingerprint       = EXCLUDED.fingerprint,
                 doc_id            = EXCLUDED.doc_id,
                 status            = EXCLUDED.status,
                 attempts          = EXCLUDED.attempts,
+                duplicate_of      = EXCLUDED.duplicate_of,
+                duplicate_content_hash = EXCLUDED.duplicate_content_hash,
                 last_processed_at = now()
             """,
-            (ws, ingest_source, source_id, eff_fp, doc_id, eff_status, eff_attempts),
+            (ws, ingest_source, source_id, eff_fp, doc_id, eff_status, eff_attempts,
+             duplicate_of, duplicate_content_hash),
         )
         await conn.commit()
 
@@ -421,4 +435,6 @@ def _to_record(row: dict) -> LedgerRecord:
         doc_id=row["doc_id"],
         status=row["status"],
         attempts=int(row.get("attempts") or 0),
+        duplicate_of=row.get("duplicate_of"),
+        duplicate_content_hash=row.get("duplicate_content_hash"),
     )

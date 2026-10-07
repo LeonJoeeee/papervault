@@ -28,3 +28,11 @@ papervault stays current at the cost of one gated port per minor line. The fail-
 guards in `extraction_prompt.py` convert any missed touchpoint from silent degradation
 into a boot-time error. The 1.4.16-era behavior remains the recall reference until a
 new baseline supersedes it.
+
+## Amendment — breaker deferral adapter (#148, 2026-10-07)
+
+The maintainer-approved pause adapter binds to private document-pipeline hooks in 1.5.4.
+The package requirement now pins that exact patch, matching the lockfile and runtime version
+guard; clean installs must not resolve a newer patch that the adapter has not been ported to.
+A patch upgrade must update the adapter guard and pass its queue-deferral/recovery tests as
+well as the existing port gates. The bounded minor-line policy remains the upgrade direction.

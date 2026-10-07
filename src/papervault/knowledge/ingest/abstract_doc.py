@@ -2,9 +2,8 @@
 as ONE document built from its metadata and abstract, marked abstract-only everywhere.
 
 - Class: a paper in KS metadata state (no extract) whose library download_status is
-  `metadata_only` (no PDF could be found) and whose abstract is non-empty. A paper still on its
-  way to full text (PDF awaiting OCR, pending / failed download) stays META: its full text would
-  only delete the abstract doc again.
+  `metadata_only`, `extract_failed`, or `failed`, and whose abstract is non-empty. Pending
+  acquisition stays META; a failed acquisition can still supply its abstract.
 
 - Text: an explicit first line `ABSTRACT_HEADER`, then title / authors / year / venue / DOI /
   arXiv id / abstract, each capped so the whole doc stays one chunk (KS_CHUNK_TOKEN_SIZE 2400).
@@ -32,7 +31,7 @@ from papervault.knowledge.ingest.paper_library_client import PaperRecord
 ABSTRACT_HEADER = "[ABSTRACT ONLY — full text not available]"
 # paper-library's DOWNLOAD_STATUS_METADATA_ONLY (library/models.py), read through the on-disk
 # index contract like every other field (KS never imports the library plane).
-ELIGIBLE_DOWNLOAD_STATUS = "metadata_only"
+ELIGIBLE_DOWNLOAD_STATUSES = {"metadata_only", "extract_failed", "failed"}
 ABSTRACT_FP_PREFIX = "ABSTRACT:"
 DONE_ABSTRACT = "done_abstract"
 
@@ -71,8 +70,8 @@ def _cap(text: str, limit: int) -> str:
 
 def build_abstract_doc(rec: PaperRecord) -> Optional[str]:
     """The abstract-only doc text for `rec`, or None when `rec` is not in the class (not
-    download_status=metadata_only, or no usable abstract)."""
-    if rec.download_status != ELIGIBLE_DOWNLOAD_STATUS:
+    an eligible terminal download status, or no usable abstract)."""
+    if rec.download_status not in ELIGIBLE_DOWNLOAD_STATUSES:
         return None
     abstract = _clean(rec.abstract)
     if not abstract:

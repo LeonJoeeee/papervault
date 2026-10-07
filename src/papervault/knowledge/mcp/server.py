@@ -61,6 +61,7 @@ def _skip_embed_selfcheck() -> bool:
 # headroom for the load while still bounding a HANG so a wedged embed stack can never block
 # boot forever. Env-tunable.
 _EMBED_SELFCHECK_TIMEOUT_SEC = float(os.getenv("KS_EMBED_SELFCHECK_TIMEOUT_SEC", "60"))
+_embed_probe_task: Optional[asyncio.Task] = None
 
 
 async def _embedding_stack_ok() -> bool:
@@ -93,26 +94,32 @@ async def _embedding_stack_ok() -> bool:
         # A real embed returns a (1, dim) array → len == 1. A silent empty result is also a fault.
         return len(vec) if vec is not None else 0
 
+    global _embed_probe_task
     try:
-        # wait_for bounds a HANG. On timeout the coroutine is cancelled; if the encode is stuck
-        # in the offload worker thread that thread cannot be cancelled, but it is abandoned and
-        # boot proceeds WITHOUT the scheduler — the fail-safe outcome we want.
-        n = await asyncio.wait_for(_probe(), timeout=_EMBED_SELFCHECK_TIMEOUT_SEC)
+        # GPU to_thread work cannot be cancelled. Retain ONE probe across timeouts so
+        # retries neither release its GPU semaphore nor pile up executor/native threads.
+        if _embed_probe_task is None:
+            _embed_probe_task = asyncio.create_task(_probe(), name="ks-embedding-probe")
+        n = await asyncio.wait_for(asyncio.shield(_embed_probe_task),
+                                   timeout=_EMBED_SELFCHECK_TIMEOUT_SEC)
     except Exception as e:  # noqa: BLE001 — ANY failure (import/ABI/CUDA/timeout) must fail safe
         log.error(
             "KS embedding self-check FAILED — scheduler NOT started to avoid churning a broken "
             "build (re-distilling + failing every document, ~218 graph docs/round). Fix the "
-            "torch/embedding stack (e.g. torchvision ABI drift), then restart. Queries still "
+            "torch/embedding stack (e.g. torchvision ABI drift), automatic retry is scheduled. Queries still "
             "served (degraded). Bypass with KS_SKIP_EMBED_SELFCHECK=1 once known-good. "
             "Error: %s: %s",
             type(e).__name__, e, exc_info=True,
         )
         return False
+    finally:
+        if _embed_probe_task is not None and _embed_probe_task.done():
+            _embed_probe_task = None
     if n < 1:
         log.error(
             "KS embedding self-check FAILED — embedder returned an EMPTY result (len=%d); "
             "scheduler NOT started to avoid churning a broken build. Fix the embedding stack, "
-            "then restart. Bypass with KS_SKIP_EMBED_SELFCHECK=1 once known-good.",
+            "automatic retry is scheduled. Bypass with KS_SKIP_EMBED_SELFCHECK=1 once known-good.",
             n,
         )
         return False
@@ -132,42 +139,87 @@ async def _embedding_stack_ok() -> bool:
 # session exit.) SDD §6.6 single-loop still holds: the app lifespan AND the session lifespan both run
 # in uvicorn's loop — the same loop query() uses — so get_graph()'s singleton binds correctly.
 _bg_task: Optional[asyncio.Task] = None
+_startup_task: Optional[asyncio.Task] = None
+
+
+async def _wait_selfcheck_retry(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
+def _selfcheck_retry_delay() -> float:
+    """Fixed retry interval: never spin or postpone recovery indefinitely."""
+    try:
+        delay = float(os.getenv("KS_EMBED_SELFCHECK_RETRY_SEC", "60"))
+    except ValueError:
+        delay = 60.0
+    return min(300.0, max(1.0, delay))
+
+
+async def _start_once() -> bool:
+    if not await _embedding_stack_ok():
+        return False
+    from papervault.knowledge.scheduler.round import DEFAULT_ROUND_INTERVAL, main_loop
+    from papervault.knowledge.store.graph import get_graph
+
+    global _bg_task
+    interval = float(os.getenv("KS_AUTO_INGEST_INTERVAL_SEC", str(DEFAULT_ROUND_INTERVAL)))
+    rag = await get_graph()
+    _bg_task = asyncio.create_task(main_loop(rag, interval=interval), name="ks-auto-ingest")
+    log.info("S4 scheduler task started at server startup (interval=%ss)", interval)
+    return True
+
+
+async def _retry_start() -> None:
+    global _startup_task
+    try:
+        while _auto_ingest_enabled():
+            await _wait_selfcheck_retry(_selfcheck_retry_delay())
+            if await _start_once():
+                return
+    finally:
+        _startup_task = None
 
 
 async def start_background() -> None:
     """Start the S4 auto-ingest scheduler ONCE, in the server's event loop. Idempotent — safe to call
     from BOTH the server-startup app lifespan (boot, __main__) and the per-session FastMCP lifespan
     (no-op after boot). Default-OFF; opt in with KS_AUTO_INGEST_ENABLED=true."""
-    global _bg_task
-    if _bg_task is not None:
-        return  # already running (server-lifetime singleton)
+    global _startup_task
+    if _bg_task is not None or _startup_task is not None:
+        return
     if not _auto_ingest_enabled():
         log.info("auto-ingest DISABLED (set KS_AUTO_INGEST_ENABLED=true to opt in)")
         return
-
-    # issue #84 — boot-time embedding self-check BEFORE the scheduler. A broken embed stack
-    # (torch/torchvision ABI drift) must NOT let the destructive re-distill loop start and
-    # churn a broken build. Runs before get_graph() so a broken stack fails fast without even
-    # opening the graph/PG pools; queries still work (they open the graph lazily). FAIL SAFE:
-    # on failure we log LOUD and return without starting main_loop.
-    if not await _embedding_stack_ok():
-        return
-
-    from papervault.knowledge.scheduler.round import DEFAULT_ROUND_INTERVAL, main_loop
-    from papervault.knowledge.store.graph import get_graph
-
-    interval = float(os.getenv("KS_AUTO_INGEST_INTERVAL_SEC", str(DEFAULT_ROUND_INTERVAL)))
-    # get_graph() runs assert_safe_workspace(); refusing prod 'l0' (without KS_ALLOW_PROD_WORKSPACE=1)
-    # raises here = explicit failure, never a silent prod write. Binds the singleton to THIS loop.
-    rag = await get_graph()
-    _bg_task = asyncio.create_task(main_loop(rag, interval=interval), name="ks-auto-ingest")
-    log.info("S4 scheduler task started at server startup (interval=%ss)", interval)
+    # Publish before awaiting: concurrent session lifespans cannot start a second probe.
+    _startup_task = asyncio.create_task(_start_once(), name="ks-embedding-startup")
+    try:
+        ready = await _startup_task
+    except BaseException:
+        _startup_task = None
+        raise
+    _startup_task = None if ready else asyncio.create_task(
+        _retry_start(), name="ks-embedding-retry")
 
 
 async def stop_background() -> None:
     """Graceful SERVER-shutdown cleanup (called once from the app-lifespan shutdown, NOT per session):
     cancel the scheduler + close the graph/pool."""
-    global _bg_task
+    global _bg_task, _startup_task, _embed_probe_task
+    if _startup_task is not None:
+        startup = _startup_task
+        startup.cancel()
+        try:
+            await startup
+        except asyncio.CancelledError:
+            pass
+        _startup_task = None
+    if _embed_probe_task is not None:
+        _embed_probe_task.cancel()
+        try:
+            await _embed_probe_task
+        except (asyncio.CancelledError, Exception):
+            pass
+        _embed_probe_task = None
     if _bg_task is not None:
         _bg_task.cancel()
         try:

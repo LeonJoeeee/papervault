@@ -626,3 +626,21 @@ def test_strip_section_suffix():
     assert od.strip_section_suffix("notebook:idea-c12") == "notebook:idea-c12"
     # not a section suffix — a mid-string #s or a non-numeric tail is left intact.
     assert od.strip_section_suffix("textbook:X2020#section") == "textbook:X2020#section"
+
+
+def test_paused_operator_pipeline_does_not_record_a_failure(monkeypatch, tmp_path):
+    from papervault.knowledge.store.build_breaker import BuildPausedError
+    monkeypatch.setenv('PAPERVAULT_OPERATOR_SOURCES', '1')
+    writes = _patch_ledger(monkeypatch)
+    path = tmp_path / 'fixture.md'
+    path.write_text('# Fixture\nOperator content.')
+    rag = FakeRag()
+
+    async def paused():
+        raise BuildPausedError('fixture pause')
+
+    monkeypatch.setattr(rag, 'apipeline_process_enqueue_documents', paused)
+    with pytest.raises(BuildPausedError):
+        _run(od.ingest_document(rag, 'textbook', 'textbook:Fixture2020', path,
+                                tokenizer=FakeTok()))
+    assert all(w[3] == 'processing' for w in writes)

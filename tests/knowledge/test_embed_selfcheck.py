@@ -41,7 +41,15 @@ def _clean_env_and_task(monkeypatch):
     ):
         monkeypatch.delenv(var, raising=False)
     server._bg_task = None
+    server._startup_task = None
+    server._embed_probe_task = None
     yield
+    if server._embed_probe_task is not None:
+        server._embed_probe_task.cancel()
+        server._embed_probe_task = None
+    if server._startup_task is not None:
+        server._startup_task.cancel()
+        server._startup_task = None
     task = server._bg_task
     server._bg_task = None
     if task is not None:
@@ -203,3 +211,98 @@ async def test_selfcheck_not_run_when_auto_ingest_disabled(monkeypatch):
     assert embed["n"] == 0
     assert server._bg_task is None
     assert sched["main_loop"] == []
+
+
+async def test_timed_out_selfcheck_retries_without_client_and_is_bounded(monkeypatch):
+    monkeypatch.setenv('KS_AUTO_INGEST_ENABLED', 'true')
+    monkeypatch.setattr(server, '_EMBED_SELFCHECK_TIMEOUT_SEC', 0.01)
+    sched, _ = _patch_scheduler(monkeypatch)
+    calls = 0
+    retry_waits = []
+    release_retry = asyncio.Event()
+    release_probe = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def embed(_):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await release_probe.wait()
+        return np.zeros((1, 1024))
+
+    async def retry_sleep(delay):
+        retry_waits.append(delay)
+        await release_retry.wait()
+
+    _patch_embed(monkeypatch, embed)
+    monkeypatch.setattr(server, '_wait_selfcheck_retry', retry_sleep, raising=False)
+    await server.start_background()
+    await real_sleep(0)
+    assert calls == 1 and sched['get_graph'] == 0
+    assert retry_waits and 1 <= retry_waits[0] <= 300
+    await server.start_background()  # clients cannot bypass the retry delay or duplicate it
+    assert calls == 1
+    release_probe.set()
+    release_retry.set()
+    for _ in range(10):
+        await real_sleep(0)
+    assert calls == 1 and sched['get_graph'] == 1
+    assert len(sched['main_loop']) == 1
+
+
+async def test_repeated_failed_selfchecks_wait_each_time_and_stop(monkeypatch):
+    monkeypatch.setenv('KS_AUTO_INGEST_ENABLED', 'true')
+    monkeypatch.setenv('KS_EMBED_SELFCHECK_RETRY_SEC', '0')
+    sched, _ = _patch_scheduler(monkeypatch)
+    attempts = 0
+    waits = []
+    waiting = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def broken(_):
+        nonlocal attempts
+        attempts += 1
+        raise RuntimeError('broken fixture')
+
+    async def wait(delay):
+        waits.append(delay)
+        if len(waits) < 3:
+            await real_sleep(0)
+        else:
+            waiting.set()
+            await asyncio.Event().wait()
+
+    async def noop():
+        pass
+
+    from papervault.knowledge.store import graph
+    from papervault.knowledge.ledger import store
+    monkeypatch.setattr(graph, 'close_graph', noop)
+    monkeypatch.setattr(store, 'close_pool', noop)
+    monkeypatch.setattr(server, '_wait_selfcheck_retry', wait, raising=False)
+    _patch_embed(monkeypatch, broken)
+    await server.start_background()
+    await asyncio.wait_for(waiting.wait(), 1)
+    assert attempts == 3 and waits == [1, 1, 1]
+    assert sched['get_graph'] == 0 and server._bg_task is None
+    await server.stop_background()
+    assert server._startup_task is None
+
+
+async def test_repeated_timeouts_keep_one_uncancellable_probe(monkeypatch):
+    monkeypatch.setattr(server, '_EMBED_SELFCHECK_TIMEOUT_SEC', 0.01)
+    calls = 0
+    release = asyncio.Event()
+
+    async def embed(_):
+        nonlocal calls
+        calls += 1
+        await release.wait()
+        return np.zeros((1, 1024))
+
+    _patch_embed(monkeypatch, embed)
+    assert not await server._embedding_stack_ok()
+    assert not await server._embedding_stack_ok()
+    assert calls == 1
+    release.set()
+    assert await server._embedding_stack_ok()

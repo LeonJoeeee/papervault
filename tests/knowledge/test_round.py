@@ -28,7 +28,8 @@ class FakeLedger:
     def __init__(self, rows: dict[str, LedgerRecord] | None = None):
         self.rows: dict[str, LedgerRecord] = dict(rows or {})
 
-    async def upsert(self, ingest_source, source_id, *, doc_id, status, fingerprint=None):
+    async def upsert(self, ingest_source, source_id, *, doc_id, status, fingerprint=None,
+                     duplicate_of=None, duplicate_content_hash=None):
         prev = self.rows.get(source_id)
         prev_attempts = prev.attempts if prev else 0
         prev_fp = prev.fingerprint if prev else None
@@ -39,7 +40,8 @@ class FakeLedger:
         )
         fp = fingerprint if fingerprint is not None else prev_fp  # mirror COALESCE
         self.rows[source_id] = LedgerRecord(
-            "l0_probe", ingest_source, source_id, fp, doc_id, eff_status, eff_attempts
+            "l0_probe", ingest_source, source_id, fp, doc_id, eff_status, eff_attempts,
+            duplicate_of, duplicate_content_hash
         )
 
     async def delete(self, ingest_source, source_id):
@@ -75,6 +77,12 @@ class FakeDocStatusStore:
     def __init__(self, rag: "FakeRag"):
         self._rag = rag
 
+    async def get_by_ids(self, ids):
+        return [self._rag.rows.get(did) for did in ids]
+
+    async def get_by_id(self, did):
+        return self._rag.rows.get(did)
+
     async def get_doc_by_file_basename(self, basename):
         self._rag.calls.append(("get_doc_by_file_basename", basename))
         for did, row in self._rag.rows.items():
@@ -93,7 +101,7 @@ class FakeFullDocs:
         self._rag = rag
 
     async def get_by_id(self, did):
-        return {"content": "..."} if did in self._rag.full_docs_ids else None
+        return {"content": self._rag.contents.get(did, "...")} if did in self._rag.full_docs_ids else None
 
 
 class FakeRag:
@@ -107,6 +115,7 @@ class FakeRag:
 
     def __init__(self, *, doc_statuses=None, markers=None, full_docs_ids=None,
                  enqueue_raises=False, delete_results=None):
+        self.contents = {}
         self.calls: list[tuple] = []
         self.rows: dict[str, dict] = {}
         for did, st in (doc_statuses or {}).items():
@@ -130,7 +139,8 @@ class FakeRag:
         self.calls.append(("enqueue", list(ids)))
         if self.enqueue_raises:
             raise ValueError("simulated batch-level enqueue failure")
-        for did, fp in zip(ids, file_paths):
+        for did, fp, text in zip(ids, file_paths, input):
+            self.contents[did] = text
             base = _basename(fp)
             if did in self.rows or any(r["file_path"] == base for r in self.rows.values()):
                 marker = f"dup-{len(self.created_markers)}-{did}"
@@ -165,6 +175,8 @@ def fake_ledger(monkeypatch):
     fl = FakeLedger()
     monkeypatch.setattr(distill, "ledger", fl)
     monkeypatch.setattr(rnd, "ledger", fl)
+    from papervault.knowledge.scheduler import reconcile
+    monkeypatch.setattr(reconcile, "ledger", fl)
     return fl
 
 
@@ -607,3 +619,273 @@ async def test_distill_batch_never_purges_a_live_doc_on_the_same_file_path(fake_
     assert rag.created_markers == []
     assert fake_ledger.rows["A"].status == "error" and fake_ledger.rows["B"].status == "error"
     assert counters["blocked"] == 2
+
+
+async def test_reconcile_library_requeues_all_audited_classes(fake_ledger, monkeypatch, tmp_path):
+    from papervault.knowledge.ingest import fingerprint as fpmod
+    from papervault.knowledge.ingest.vault import read_extract_raw
+
+    # Only aggregate audit classes seed this fixture; all keys/content are invented here.
+    monkeypatch.setattr(fpmod, 'read_extract_raw', lambda rec: read_extract_raw(rec, tmp_path))
+    idx = {}
+    expected = {}
+    for status, download, count, extract in [
+        ('done', 'ok', 28, True), ('done_meta', 'ok', 11, True),
+        ('done_meta', 'metadata_only', 4, False),
+        ('done_meta', 'extract_failed', 92, False), ('done_meta', 'failed', 33, False),
+    ]:
+        for n in range(count):
+            key = f'{status}-{download}-{n}'
+            path = f'{key}.md' if extract else None
+            if path:
+                (tmp_path / path).write_text(f'Unique fixture content {key}.')
+            rec = PaperRecord(key=key, md_path=path, abstract=f'Fixture abstract {key}.',
+                              download_status=download)
+            idx[key] = rec
+            fake_ledger.rows[key] = LedgerRecord('l0_probe', 'paper', key,
+                                                fpmod.fingerprint(rec), f'paper:{key}', status)
+            expected[key] = 'done' if extract else 'done_abstract'
+    monkeypatch.setattr(distill, 'read_extract_raw', lambda rec: read_extract_raw(rec, tmp_path))
+    monkeypatch.setattr(rnd, 'load_clean_index', lambda: idx)
+    rag = FakeRag()
+    summary = await rnd.run_round(rag)
+    assert summary['library']['reopened'] == 168
+    assert summary['to_redistill'] == 0
+    assert len([r for r in rag.rows.values() if r['status'] == 'pending']) == 168
+    for did in list(rag.rows):
+        rag.set_status(did, 'processed')
+    await rnd.run_round(rag)
+    assert {k: r.status for k, r in fake_ledger.rows.items()} == expected
+
+
+async def test_reconcile_duplicate_names_twin_and_stops_missing_warnings(fake_ledger, monkeypatch, caplog):
+    from papervault.knowledge.scheduler.reconcile import reconcile_library
+
+    fake_ledger.rows = {
+        'A': LedgerRecord('l0_probe', 'paper', 'A', 'fp', 'paper:A', 'done'),
+        'B': LedgerRecord('l0_probe', 'paper', 'B', 'fp', 'paper:B', 'error_parked', 3),
+        'T#1': LedgerRecord('l0_probe', 'textbook', 'T#1', 'ft', 'textbook:T#1', 'done'),
+        'T#2': LedgerRecord('l0_probe', 'textbook', 'T#2', 'ft', 'textbook:T#2', 'error', 1),
+    }
+    rag = FakeRag(doc_statuses={'paper:A': 'processed', 'textbook:T#1': 'processed'},
+                  full_docs_ids={'paper:A', 'textbook:T#1'})
+    for key in ['B2', 'B3', 'B4', 'Bmeta']:
+        status = 'done_meta' if key == 'Bmeta' else 'error_parked'
+        fake_ledger.rows[key] = LedgerRecord('l0_probe', 'paper', key, 'fp', f'paper:{key}', status)
+    for key in ['T#3', 'T#4']:
+        fake_ledger.rows[key] = LedgerRecord('l0_probe', 'textbook', key, 'ft', f'textbook:{key}', 'error')
+    result = await reconcile_library(rag, {})
+    assert result['duplicates'] == 8
+    for key, twin in [('B', 'paper:A'), ('T#2', 'textbook:T#1')]:
+        row = fake_ledger.rows[key]
+        assert (row.status, row.doc_id, row.duplicate_of, row.attempts) == (
+            'done_meta', f'{row.ingest_source}:{key}', twin, 0)
+    await rnd.reconcile_healed(rag)
+    assert not any(kind == 'get_docs_by_ids' for kind, _ in rag.calls)
+    assert 'Document statuses not found' not in caplog.text
+    monkeypatch.setattr(rnd, 'load_clean_index', lambda: {'A': _rec('A'), 'B': _rec('B')})
+    monkeypatch.setattr(rnd, 'fingerprint', lambda _: 'fp')
+    summary = await rnd.run_round(rag)
+    assert summary['to_redistill'] == summary['to_distill'] == 0
+
+
+async def test_batch_duplicate_persists_same_twin_outcome(fake_ledger, monkeypatch):
+    monkeypatch.setattr(distill, 'read_extract_raw', lambda _: 'Same content.')
+    rag = FakeRag()
+    await distill.distill_batch(rag, [(_rec('A'), 'fp'), (_rec('B'), 'fp')])
+    row = fake_ledger.rows['B']
+    assert (row.status, row.doc_id, row.duplicate_of, row.fingerprint) == (
+        'done_meta', 'paper:B', 'paper:A', 'fp')
+
+
+async def test_reconcile_library_picks_up_gained_extract_without_deleting_twin(fake_ledger, monkeypatch, tmp_path):
+    from papervault.knowledge.ingest import fingerprint as fpmod
+    from papervault.knowledge.ingest.vault import read_extract_raw
+    from papervault.knowledge.scheduler import reconcile
+
+    rec = PaperRecord(key='B', download_status='metadata_only')
+    idx = {'B': rec}
+    fake_ledger.rows['B'] = LedgerRecord('l0_probe', 'paper', 'B', 'META', 'paper:B', 'done_meta')
+    monkeypatch.setattr(rnd, 'load_clean_index', lambda: idx)
+    monkeypatch.setattr(fpmod, 'read_extract_raw', lambda rec: read_extract_raw(rec, tmp_path))
+    monkeypatch.setattr(distill, 'read_extract_raw', lambda rec: read_extract_raw(rec, tmp_path))
+    rag = FakeRag()
+    await rnd.run_round(rag)
+    assert not rag.rows
+    rec.md_path = 'B.md'
+    (tmp_path / rec.md_path).write_text('Fixture gained full text.')
+    await rnd.run_round(rag)
+    assert rag.rows['paper:B']['status'] == 'pending'
+    assert not any(kind == 'delete' for kind, _ in rag.calls)
+    rag.set_status('paper:B', 'processed')
+    await rnd.run_round(rag)
+    assert fake_ledger.rows['B'].status == 'done'
+    # An alias whose twin disappears also reopens without deleting that twin.
+    fake_ledger.rows['B'].status = 'done_meta'
+    fake_ledger.rows['B'].duplicate_of = 'paper:gone-twin'
+    rag.rows.clear()
+    await reconcile.reconcile_library(rag, idx, only_keys={'unrelated'})
+    assert fake_ledger.rows['B'].duplicate_of == 'paper:gone-twin'
+    await rnd.run_round(rag)
+    assert fake_ledger.rows['B'].doc_id == 'paper:B'
+
+
+@pytest.mark.parametrize("kind", ["paper", "textbook"])
+async def test_lightrag_content_rejection_maps_to_twin(fake_ledger, kind):
+    from papervault.knowledge.scheduler.reconcile import reconcile_library
+
+    fake_ledger.rows['B'] = LedgerRecord('l0_probe', kind, 'B', 'different-raw-fp',
+                                        f'{kind}:B', 'processing')
+    marker = _marker('B' if kind == 'paper' else 'textbook:B', 'paper:A')
+    marker['metadata']['duplicate_kind'] = 'content_hash'
+    from lightrag.utils_pipeline import compute_text_content_hash
+    marker['content_hash'] = compute_text_content_hash('...')
+    rag = FakeRag(doc_statuses={'paper:A': 'processed'}, markers={'dup-B': marker},
+                  full_docs_ids={'paper:A'})
+    await reconcile_library(rag, {})
+    assert (fake_ledger.rows['B'].status, fake_ledger.rows['B'].doc_id,
+            fake_ledger.rows['B'].duplicate_of) == ('done_meta', f'{kind}:B', 'paper:A')
+
+
+async def test_paused_round_keeps_processing_rows_and_attempts(fake_ledger, monkeypatch):
+    from papervault.knowledge.store import build_breaker
+    from papervault.knowledge.store.build_breaker import BuildBreaker, BuildPausedError
+
+    breaker = BuildBreaker(threshold=1)
+    monkeypatch.setattr(build_breaker, '_BREAKER', breaker)
+    monkeypatch.setattr(rnd, 'load_clean_index', lambda: {'A': _rec('A')})
+    monkeypatch.setattr(rnd, 'fingerprint', lambda _: 'fp')
+    monkeypatch.setattr(distill, 'read_extract_raw', lambda _: 'Fixture content.')
+    rag = FakeRag()
+
+    async def pause():
+        breaker.record_failure()
+        raise BuildPausedError('fixture round pause')
+
+    monkeypatch.setattr(rag, 'apipeline_process_enqueue_documents', pause)
+    result = await rnd.run_round(rag)
+    assert result['paused']
+    for _ in range(5):
+        await rnd.run_round(rag)
+    assert (fake_ledger.rows['A'].status, fake_ledger.rows['A'].attempts) == ('processing', 0)
+    assert rag.rows['paper:A']['status'] == 'pending'
+    assert not any(kind == 'delete' for kind, _ in rag.calls)
+
+
+async def test_duplicate_reopens_when_twin_content_changes(fake_ledger, monkeypatch):
+    from papervault.knowledge.scheduler.reconcile import reconcile_library
+    monkeypatch.setattr(distill, 'read_extract_raw', lambda _: 'Original shared content.')
+    rag = FakeRag()
+    await distill.distill_batch(rag, [(_rec('A'), 'fp'), (_rec('B'), 'fp')])
+    rag.set_status('paper:A', 'processed')
+    rag.contents['paper:A'] = 'Changed twin content.'
+    monkeypatch.setattr(rnd, 'load_clean_index', lambda: {'A': _rec('A'), 'B': _rec('B')})
+    from papervault.knowledge.scheduler import reconcile
+    monkeypatch.setattr(reconcile, 'fingerprint', lambda _: 'fp')
+    result = await reconcile_library(rag, {'B': _rec('B')})
+    assert result['to_distill'] == [('B', 'fp')]
+
+
+async def test_duplicate_metadata_is_persisted_and_cleared_on_normal_upsert(monkeypatch):
+    from contextlib import asynccontextmanager
+    from papervault.knowledge.ledger import store
+
+    persisted = {}
+
+    class Cursor:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+        async def execute(self, *args):
+            pass
+
+        async def fetchone(self):
+            return persisted or None
+
+    class Connection:
+        def cursor(self, **kwargs):
+            return Cursor()
+
+        async def execute(self, sql, args):
+            # The storage boundary exposes its SQL column order and values to this fixture.
+            columns = sql.split('(', 1)[1].split(')', 1)[0].split(',')
+            persisted.update(zip([c.strip() for c in columns], args))
+
+        async def commit(self):
+            pass
+
+    @asynccontextmanager
+    async def conn():
+        yield Connection()
+
+    monkeypatch.setattr(store, '_workspace', lambda: 'fixture')
+    monkeypatch.setattr(store, '_conn', conn)
+    await store.upsert('paper', 'B', doc_id='paper:B', status='done_meta', fingerprint='own-fp',
+                       duplicate_of='paper:A', duplicate_content_hash='shared-content-hash')
+    row = store._to_record(persisted)
+    assert (row.doc_id, row.status, row.duplicate_of, row.duplicate_content_hash) == (
+        'paper:B', 'done_meta', 'paper:A', 'shared-content-hash')
+    await store.upsert('paper', 'B', doc_id='paper:B', status='processing', fingerprint='new-fp')
+    row = store._to_record(persisted)
+    assert row.duplicate_of is None and row.duplicate_content_hash is None
+
+
+async def test_postparse_duplicate_marker_cannot_block_rebuild_after_twin_changes(fake_ledger, monkeypatch):
+    from papervault.knowledge.scheduler import reconcile
+    fake_ledger.rows['B'] = LedgerRecord('l0_probe', 'paper', 'B', 'fp', 'paper:B', 'error')
+    marker = _marker('B', 'paper:A')
+    marker['metadata']['duplicate_kind'] = 'content_hash'
+    from lightrag.utils_pipeline import compute_text_content_hash
+    marker['content_hash'] = compute_text_content_hash('...')
+    rag = FakeRag(doc_statuses={'paper:A': 'processed'}, markers={'paper:B': marker},
+                  full_docs_ids={'paper:A'})
+    await reconcile.reconcile_library(rag, {})
+    assert fake_ledger.rows['B'].duplicate_of == 'paper:A'
+    rag.contents['paper:A'] = 'Rebuilt different content.'
+    monkeypatch.setattr(reconcile, 'fingerprint', lambda _: 'fp')
+    result = await reconcile.reconcile_library(rag, {'B': _rec('B')})
+    assert result['to_distill'] == [('B', 'fp')]
+    assert 'paper:B' not in rag.rows
+    assert rag.rows['paper:A']['status'] == 'processed'
+
+
+async def test_reconcile_does_not_adopt_a_changed_rejection_twin(fake_ledger):
+    from papervault.knowledge.scheduler.reconcile import reconcile_library
+    fake_ledger.rows['B'] = LedgerRecord('l0_probe', 'paper', 'B', 'old-fp', 'paper:B', 'error')
+    marker = _marker('B', 'paper:A')
+    marker['metadata']['duplicate_kind'] = 'content_hash'
+    marker['content_hash'] = 'rejected-old-content'
+    rag = FakeRag(doc_statuses={'paper:A': 'processed'}, markers={'paper:B': marker},
+                  full_docs_ids={'paper:A'})
+    result = await reconcile_library(rag, {})
+    assert result['duplicates'] == 0
+    assert fake_ledger.rows['B'].duplicate_of is None
+
+
+@pytest.mark.parametrize('source_matches', [False, True])
+async def test_hashless_enqueue_rejection_checks_current_library_content(fake_ledger, monkeypatch, source_matches):
+    from papervault.knowledge.scheduler import reconcile
+    fake_ledger.rows['B'] = LedgerRecord('l0_probe', 'paper', 'B', 'old-fp', 'paper:B', 'error')
+    marker = _marker('B', 'paper:A')
+    marker['metadata']['duplicate_kind'] = 'content_hash'
+    rag = FakeRag(doc_statuses={'paper:A': 'processed'}, markers={'dup-B': marker},
+                  full_docs_ids={'paper:A'})
+    monkeypatch.setattr(reconcile, 'read_extract_raw', lambda _: '...' if source_matches else 'Old shared body.')
+    result = await reconcile.reconcile_library(rag, {'B': _rec('B')})
+    assert result['duplicates'] == int(source_matches)
+    assert fake_ledger.rows['B'].duplicate_of == ('paper:A' if source_matches else None)
+
+
+async def test_hashless_operator_rejection_needs_current_content_evidence(fake_ledger):
+    from papervault.knowledge.scheduler.reconcile import reconcile_library
+    fake_ledger.rows['B'] = LedgerRecord('l0_probe', 'textbook', 'B', 'old-fp', 'textbook:B', 'error')
+    marker = _marker('textbook:B', 'paper:A')
+    marker['metadata']['duplicate_kind'] = 'content_hash'
+    rag = FakeRag(doc_statuses={'paper:A': 'processed'}, markers={'dup-B': marker},
+                  full_docs_ids={'paper:A'})
+    result = await reconcile_library(rag, {})
+    assert result['duplicates'] == 0
+    assert fake_ledger.rows['B'].duplicate_of is None

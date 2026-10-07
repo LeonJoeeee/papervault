@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "papervault"
-version = "0.5.1"
+version = "0.5.2"
 description = "Self-hosted literature + knowledge layer for coding agents — one MCP server: discover papers, read full text, query a graph-RAG knowledge base with cited answers."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -35,9 +35,10 @@ dependencies = [
     # Framework spine, ported to the 1.5.x line (2026-07-17 port map): ontology + exclusions
     # travel via addon_params['entity_types_guidance']; examples via PROMPTS (text mode);
     # one monkeypatch (kill the `Other` escape hatch) anchored on 1.5.x internals with a
-    # fail-loud guard; PARSING/ANALYZING doc phases handled in the scheduler. The ceiling is
-    # load-bearing: bump it only with a fresh port map + probe build + FAST recall gate.
-    "lightrag-hku>=1.5,<1.6",
+    # fail-loud guard; PARSING/ANALYZING doc phases handled in the scheduler. #148 pins the
+    # exact patch for its private pause adapter: upgrades require the adapter tests and the
+    # existing fresh port map + probe build + FAST recall gate (ADR-0005).
+    "lightrag-hku==1.5.4",
     "openai>=1.50",            # raw OpenAI-compatible SDK (knowledge LLM path)
     "asyncpg>=0.29",
     "psycopg[binary]>=3.2",

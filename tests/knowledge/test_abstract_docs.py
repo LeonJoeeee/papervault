@@ -81,6 +81,8 @@ def fake_ledger(monkeypatch):
     fl = FakeLedger()
     monkeypatch.setattr(distill, "ledger", fl)
     monkeypatch.setattr(rnd, "ledger", fl)
+    from papervault.knowledge.scheduler import reconcile
+    monkeypatch.setattr(reconcile, "ledger", fl)
     rnd._stuck.clear()
     return fl
 
@@ -154,11 +156,9 @@ def test_fingerprint_without_abstract_stays_meta():
     assert fingerprint(_meta_rec(abstract="")) == META
 
 
-@pytest.mark.parametrize("status", ["ok", "pending", "extract_failed", "failed", ""])
-def test_only_metadata_only_papers_get_an_abstract_doc(status):
-    # The class is the library's download_status=metadata_only (#144 Goal). A paper still on its way
-    # to full text (PDF awaiting OCR, a pending/failed download) keeps META — no abstract build that
-    # the full text would delete again days later.
+@pytest.mark.parametrize("status", ["ok", "pending", ""])
+def test_pending_or_successful_download_without_extract_stays_meta(status):
+    # Only terminal acquisition failures are eligible for the abstract-doc class.
     rec = _meta_rec(download_status=status)
     assert ad.build_abstract_doc(rec) is None
     assert fingerprint(rec) == META
@@ -231,7 +231,7 @@ async def test_rollout_redistills_existing_done_meta_rows(fake_ledger, monkeypat
 
     summary = await rnd.run_round(rag)
 
-    assert summary["to_redistill"] == 1
+    assert summary["library"]["reopened"] == 1
     assert ad.is_abstract_text(rag.contents["paper:" + rec.key])
     rag.set_status("paper:" + rec.key, DocStatus.PROCESSED)
     await rnd.run_round(rag)
@@ -484,3 +484,12 @@ def test_rollback_cli_apply_writes_when_the_service_is_stopped(monkeypatch):
     assert res.exit_code == 0, res.output
     assert fl.rows["A"].status == "done_meta" and fl.rows["B"].status == "done_meta"
     assert "KS_ABSTRACT_DOCS=0" in res.output
+
+
+@pytest.mark.parametrize("status", ["extract_failed", "failed"])
+def test_failed_acquisition_keeps_abstract_doc_class(status, monkeypatch):
+    rec = _meta_rec(download_status=status)
+    assert ad.build_abstract_doc(rec).startswith("[ABSTRACT ONLY — full text not available]")
+    assert fingerprint(rec).startswith("ABSTRACT:")
+    monkeypatch.setenv("KS_ABSTRACT_DOCS", "0")
+    assert fingerprint(rec) == "META"

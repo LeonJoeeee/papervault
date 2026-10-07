@@ -341,6 +341,8 @@ def fake_ledger(monkeypatch):
     fl = FakeLedger()
     monkeypatch.setattr(distill, "ledger", fl)
     monkeypatch.setattr(rnd, "ledger", fl)
+    from papervault.knowledge.scheduler import reconcile
+    monkeypatch.setattr(reconcile, "ledger", fl)
     return fl
 
 

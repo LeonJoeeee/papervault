@@ -63,6 +63,7 @@ from typing import Any, Callable, Optional
 
 from papervault.knowledge.ingest.chunking import chunking_by_sentence_boundary
 from papervault.knowledge.ledger import store as ledger
+from papervault.knowledge.store.build_breaker import BuildPausedError
 
 log = logging.getLogger("ks.ingest.operator_docs")
 
@@ -525,6 +526,9 @@ async def ingest_document(
         # the just-written `processing` rows would be orphaned. Rewrite them to `error` and
         # return — never punch a partial-write through to the caller.
         await enqueue_sections(rag, sections)
+    except BuildPausedError:
+        # The adapter leaves graph docs queued; preserve processing without a failed attempt.
+        raise
     except Exception as e:  # noqa: BLE001
         for s in sections:
             await ledger.upsert(

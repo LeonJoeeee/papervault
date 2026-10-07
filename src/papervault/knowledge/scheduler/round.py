@@ -4,26 +4,29 @@
 (ingest/distill.py: distill_batch / remove_one) into one incremental-sync round,
 preserving the §6.6 delete-then-insert mutex (先全删, 后全插).
 
-`reconcile_terminal()` is the ONLY way a ledger row leaves `processing`:
+`reconcile_terminal()` closes paper `processing` rows with their own document:
 apipeline_enqueue_documents only returns a track_id, never `done`. So each round
 first reads LightRAG doc_status terminal states for the still-`processing` rows and
 writes back `done` (PROCESSED) / `error` (FAILED). 中途态(PROCESSING/PENDING)留下轮;
 查不到 / 非预期态(PREPROCESSED, F10)计入 stuck_guard, 连续 N 轮不前进 → error
 (防 enqueue 早返 / 内容去重 F16 孤儿成为永久死状态).
 
-`reconcile_healed()` (#131) closes the other drift: LightRAG's own pipeline retries a
+`reconcile_library()` (#148) schedules terminal papers with available content and no graph doc,
+and records content duplicates as done_meta with an explicit surviving twin/content snapshot.
+
+`reconcile_healed()` (#131, #148) closes the other drift: LightRAG's own pipeline retries a
 FAILED-with-content doc until it is PROCESSED, but a ledger row that already reached
 `error` / `error_parked` was never revisited — the ledger kept reporting a failure (and an
 `error` row was re-distilled, deleting the good doc) while the graph held the paper. Any
 `error` / `error_parked` row whose doc is PROCESSED is written back `done`.
 
 Round shape (SDD §13):
-  reconcile_terminal → reconcile_healed → diff(含 status 维度) → REMOVE
+  reconcile_library → reconcile_terminal → reconcile_healed → diff(含 status 维度) → REMOVE
   → REDISTILL_DELETE(只回报删成功) → DISTILL_BATCH(只吃删成功的 redistill ∪ to_distill)
-  → 末尾无条件 process 一次(自愈孤儿).
+  → tail process for orphan recovery unless the build paused this round.
 
 Build-path breaker (#143): while the process-wide breaker (store/build_breaker.py) is OPEN — the
-upstream LLM path failed persistently — a round stops after the two reconcile steps (DB reads, no
+upstream LLM path failed persistently — a round stops after the reconcile steps (DB reads, no
 LLM): no diff-driven REMOVE / REDISTILL / DISTILL and no tail process, since each of them drives
 LLM calls. The main loop also defers the operator-doc pickup. After the cool-down the next round
 runs whole as the probe; the breaker logs its own transitions, a paused round logs only at DEBUG.
@@ -47,8 +50,8 @@ from papervault.knowledge.ingest.vault import load_clean_index
 from papervault.knowledge.ledger import store as ledger
 from papervault.knowledge.ledger.store import _max_attempts
 from papervault.knowledge.scheduler.opdoc_pickup import drain_pending
-from papervault.knowledge.scheduler.reconcile import Diff, diff
-from papervault.knowledge.store.build_breaker import get_breaker
+from papervault.knowledge.scheduler.reconcile import Diff, diff, reconcile_library
+from papervault.knowledge.store.build_breaker import BuildPausedError, get_breaker
 
 log = logging.getLogger("ks.scheduler.round")
 
@@ -108,6 +111,7 @@ async def reconcile_terminal(
             # LightRAG 1.5.x 新增的管线相位 — 不列入这里会落进 stuck_guard,3 轮后把
             # 慢文档误判成 error(1.5 移植面 #6)。
             counters["pending"] += 1
+            seen_terminal.add(rec.source_id)  # in-flight work is queued, not stuck
         else:
             # st is None(doc_status 无此行 — enqueue 早返/F16 内容去重孤儿)或非预期态(PREPROCESSED, F10)。
             # 记日志不静默跳过(§8 TOTAL);计 stuck_guard。
@@ -121,6 +125,8 @@ async def reconcile_terminal(
         if rec.source_id in seen_terminal:
             _stuck.pop(rec.source_id, None)
             continue
+        if not get_breaker().allows():
+            continue  # a paused round is not a failed attempt
         _stuck[rec.source_id] += 1
         if _stuck[rec.source_id] >= stuck_limit:
             await ledger.upsert(PAPER, rec.source_id, doc_id=rec.doc_id, status="error")
@@ -151,7 +157,8 @@ async def reconcile_healed(rag, *, only_keys: Optional[Iterable[str]] = None) ->
     Covers every ingest_source (operator-doc rows drift the same way). only_keys (subset entry,
     blocker ③): limit to those paper keys, like reconcile_terminal.
     """
-    rows = await ledger.load_by_status(_FAILED_LEDGER_STATUSES)
+    # Operator documents paused mid-ingest retain processing; finish those on a later round too.
+    rows = await ledger.load_by_status((*_FAILED_LEDGER_STATUSES, "processing"))
     if only_keys is not None:
         ks = set(only_keys)
         rows = [r for r in rows if r.ingest_source == PAPER and r.source_id in ks]
@@ -191,6 +198,9 @@ async def run_round(
     """
     only = set(only_keys) if only_keys is not None else None
 
+    idx = load_clean_index()
+    library = await reconcile_library(rag, idx, only_keys=only)
+
     # 阶段0(b):先收口上一轮/重启遗留的 processing(subset 时只扫 subset 行)。
     term = await reconcile_terminal(rag, stuck_limit=stuck_limit, only_keys=only)
     # #131:失败行(error/error_parked)的 doc 已被 LightRAG 自愈为 PROCESSED → done(先于 diff,
@@ -205,9 +215,11 @@ async def run_round(
         return summary
 
     # 阶段1:纯 KS diff(含 status 维度,error 行重投)。subset 时 idx+led 都先裁到 only。
-    idx = load_clean_index()
     led = await ledger.load(PAPER)
     d: Diff = diff(idx, led, fp_of=fingerprint, only_keys=only)
+    reopened = {k for k, _ in library["to_distill"]}
+    d.to_redistill = [(k, fp) for k, fp in d.to_redistill if k not in reopened]
+    d.to_distill.extend(library["to_distill"])
 
     # 阶段2:先全删(from idle,§6.6 删插互斥)。
     removed_count = 0
@@ -232,11 +244,17 @@ async def run_round(
 
     # 每轮末无条件再触发一次 process,让 LightRAG 自愈任意来源的 PROCESSING/FAILED 孤儿
     # (入口扫全 workspace 非终态 doc;无则廉价 return,lightrag.py:1769)。即使本轮 batch 空也调。
-    await rag.apipeline_process_enqueue_documents()
+    paused = bool(counters.get("deferred")) or not get_breaker().allows()
+    if not paused:
+        try:
+            await rag.apipeline_process_enqueue_documents()
+        except BuildPausedError:
+            paused = True
 
     summary = {
         "terminal": term,
         "healed": healed,
+        "library": {k: v for k, v in library.items() if k != "to_distill"},
         "to_distill": len(d.to_distill),
         "to_redistill": len(d.to_redistill),
         "redistill_removed": len(redistill_removed),
@@ -244,6 +262,8 @@ async def run_round(
         "removed": removed_count,
         "distill": counters,
     }
+    if paused:
+        summary["paused"] = True
     log.info("run_round: %s", summary)
 
     # OPTIONAL global gate (#84, nice-to-have): a round that ATTEMPTED builds (to_distill/to_redistill
@@ -275,6 +295,8 @@ async def main_loop(rag, *, interval: float = DEFAULT_ROUND_INTERVAL,
         while True:
             try:
                 await run_round(rag, stuck_limit=stuck_limit)
+            except BuildPausedError:
+                log.debug("run_round: deferred paused build")
             except Exception:  # noqa: BLE001 — 单轮异常不杀循环;下轮重试(distill 批级已自兜底,这里是兜底之兜底)
                 log.exception("run_round failed; retrying next interval")
             # #81 windowless operator-doc pickup: scan the pending dir and ingest dropped

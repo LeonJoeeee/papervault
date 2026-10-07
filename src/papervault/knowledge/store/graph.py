@@ -33,12 +33,12 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from lightrag import LightRAG
 from lightrag.utils import EmbeddingFunc
 
 from papervault.domain import get_domain
 from papervault.knowledge.config import CONFIG
 from papervault.knowledge.ingest.chunking import chunking_by_sentence_boundary
+from papervault.knowledge.store.build_pipeline import BuildAwareLightRAG as LightRAG
 from papervault.knowledge.store.build_breaker import get_breaker, is_upstream_failure
 from papervault.knowledge.store.extraction_prompt import apply_ks_extraction_prompt
 from papervault.knowledge.store.lightrag_init import _bge_embed, _bge_rerank

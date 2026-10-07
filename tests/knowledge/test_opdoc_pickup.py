@@ -774,3 +774,14 @@ def test_ocr_timeout_seconds_env(monkeypatch):
     assert op._ocr_timeout_seconds() == 0.0
     monkeypatch.setenv("KS_OPDOC_OCR_TIMEOUT_SEC", "not-a-number")
     assert op._ocr_timeout_seconds() == 30 * 60.0        # garbage → default (never crash)
+
+
+def test_build_pause_leaves_operator_input_pending(pending):
+    from papervault.knowledge.store.build_breaker import BuildPausedError
+    d, fake = pending
+    fake.raise_for['textbook:Fixture2020'] = BuildPausedError('fixture pause')
+    _drop(d, 'textbook-Fixture2020.md')
+    result = _run(drain_pending(rag=object()))
+    assert result['failed'] == 0
+    assert (d / 'textbook-Fixture2020.md').exists()
+    assert not (d / 'failed' / 'textbook-Fixture2020.md').exists()

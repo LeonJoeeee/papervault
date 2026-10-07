@@ -328,16 +328,7 @@ async def synth_answer(
     the out-feed must still return a well-formed {answer, cited_papers, kb_coverage}.
     """
     prompt = _build_prompt(data, intent)
-    # Model/thinking routing (issue #8): the research-plane synth call. Default routes to the
-    # SYNTH slot with no thinking param (today's behavior); an operator can pin the strong model
-    # + thinking ON via PAPERVAULT_LLM_SYNTH. Pass model only when non-empty (empty = ride the
-    # pool default, byte-identical to today) and enable_thinking only when the route pins it.
-    _model, _thinking = route("synth")
-    _route_kw: dict[str, Any] = {}
-    if _model:
-        _route_kw["model"] = _model
-    if _thinking is not None:
-        _route_kw["enable_thinking"] = _thinking
+    level = route("synth")
     # Bounded retry (issue #70): retry ONLY transient hiccups (see _is_transient_synth_error);
     # fail fast on deterministic ones; fall back to _SYNTH_FAILED_MSG once retries are exhausted.
     attempts = _SYNTH_MAX_RETRIES + 1
@@ -352,7 +343,7 @@ async def synth_answer(
                     system_prompt=_SYNTH_SYSTEM,
                     temperature=0.2,
                     max_tokens=_SYNTH_MAX_TOKENS,
-                    **_route_kw,
+                    model=level,
                 ),
                 timeout=timeout_s,
             )

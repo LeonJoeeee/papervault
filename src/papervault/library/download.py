@@ -121,10 +121,8 @@ def _llm_verify_identity(head: str, paper: Paper, *, llm=None,
         try:
             from .llm import get_llm
 
-            # verify role (issue #8): default = the current verify model
-            # (PAPER_PIPELINE_VERIFY_MODEL or openai/flash); operator-overridable
-            # via PAPERVAULT_LLM_VERIFY. Model only — the library plane sends no thinking param.
-            llm = get_llm(model=route("verify")[0])
+            # PDF metadata verification uses flash (PAPERVAULT_LLM_VERIFY overrides).
+            llm = get_llm(model=route("verify"))
         except Exception as exc:
             return True, f"verify_llm_unavailable: {repr(exc)[:60]}"
     msgs = [{"role": "system", "content": _VERIFY_PROMPT},

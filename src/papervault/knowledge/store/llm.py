@@ -55,6 +55,7 @@ from typing import Any
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from papervault import config
+from papervault.llm_routing import route
 from papervault.llm_usage import log_usage
 
 logger = logging.getLogger(__name__)
@@ -66,7 +67,7 @@ _KEYS_FILE = config.LLM_KEYS_FILE
 
 # A litellm-form model may carry a provider prefix ("openai/<model>"); the raw OpenAI SDK
 # (what the knowledge plane uses) wants the bare name, so we strip a leading provider prefix.
-_DEFAULT_MODEL = config.SYNTH_MODEL
+_DEFAULT_MODEL = route("synth")
 _DEFAULT_BASE = config.LLM_BASE_URL
 
 # Permanent (auto-disable) vs transient (just fail over) HTTP statuses.
@@ -180,8 +181,8 @@ def _endpoint_label(g: dict) -> str:
     return f"…{k[-4:]}@{host}"
 
 # OpenAI SDK ChatCompletions.create() accepted kwargs (whitelist).
-# LightRAG passes its own internal kwargs + MiMo-specific kwargs (e.g. enable_cot)
-# that openai SDK rejects. Whitelist is safer than blacklist.
+# LightRAG's internal kwargs are discarded. Provider extensions are not forwarded:
+# the endpoint owns model and effort for the requested level.
 _OPENAI_STANDARD_KWARGS = {
     "model",
     "messages",
@@ -204,16 +205,8 @@ _OPENAI_STANDARD_KWARGS = {
     "user",
     "extra_headers",
     "extra_query",
-    "extra_body",
     "timeout",
 }
-
-# MiMo-specific kwargs (LightRAG may pass these) — forward via extra_body.
-# "thinking" + "reasoning_effort" added 2026-07-16 (issue #3): litellm's xiaomi_mimo
-# transformation natively supports both (probed live per its own docstring), but this
-# whitelist silently dropped them one layer earlier — a dead-end for any graduated
-# reasoning-effort lever. Inert until a caller passes them.
-_MIMO_EXTRA_KWARGS = {"enable_cot", "enable_thinking", "thinking_mode", "thinking", "reasoning_effort"}
 
 
 def _env_fallback_groups() -> list[dict]:
@@ -271,11 +264,6 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
     stream that ends with no finish_reason, is normalised to ``StreamTruncated`` — except after
     the finish chunk, where the complete answer is kept and only the usage is lost."""
     kwargs = {k: v for k, v in openai_kwargs.items() if k not in _RESERVED_TRANSPORT_KEYS}
-    # The SDK merges extra_body OVER the request fields, so the reserved keys are stripped there
-    # too (from a copy — the caller's dict is not mutated) to keep the override unconditional.
-    if isinstance(kwargs.get("extra_body"), dict):
-        kwargs["extra_body"] = {k: v for k, v in kwargs["extra_body"].items()
-                                if k not in _RESERVED_TRANSPORT_KEYS}
     if not _STREAM:
         return await client.chat.completions.create(model=model, messages=messages, **kwargs)
     # One ABSOLUTE deadline for "the first chunk exists": it spans create() (the proxy sends the
@@ -506,23 +494,9 @@ class KeyPool:
             messages.extend(history_messages)
         messages.append({"role": "user", "content": prompt})
 
-        # Whitelist openai-standard kwargs; MiMo-specific kwargs route to extra_body;
-        # everything else (LightRAG internals like keyword_extraction, hashing_kv) drop.
-        openai_kwargs: dict[str, Any] = {}
-        extra_body: dict[str, Any] = {}
-        for k, v in kwargs.items():
-            if k in _OPENAI_STANDARD_KWARGS:
-                openai_kwargs[k] = v
-            elif k in _MIMO_EXTRA_KWARGS:
-                extra_body[k] = v
-            # else: drop silently (LightRAG internal kwarg)
-        if extra_body:
-            existing = openai_kwargs.get("extra_body", {})
-            if isinstance(existing, dict):
-                existing.update(extra_body)
-                openai_kwargs["extra_body"] = existing
-            else:
-                openai_kwargs["extra_body"] = extra_body
+        # Standard request parameters only: provider extensions could override
+        # the role's level or effort. Drop LightRAG's internal parameters too.
+        openai_kwargs = {k: v for k, v in kwargs.items() if k in _OPENAI_STANDARD_KWARGS}
         model_override = openai_kwargs.pop("model", None)
 
         last_error: Exception | None = None
@@ -585,8 +559,8 @@ class KeyPool:
         history_messages: list[dict] | None = None,
         **kwargs: Any,
     ) -> str:
-        """Thin path: build the SAME messages + apply the SAME kwarg whitelist / extra_body
-        routing / silent-drop as ``complete()``, then ``chat.completions.create`` against the
+        """Thin path: build the same messages and whitelist standard request parameters
+        as ``complete()``, then ``chat.completions.create`` against the
         proxy. The PROXY does key failover/cooldown, so there is NO shuffle and NO ``_MAX_ROUNDS``
         here; what KS adds (issue #102) is a bounded, wall-clock-budgeted retry of TRANSIENT
         failures — a stream cut before or while answering, 408/429, 5xx — because the proxy's
@@ -600,31 +574,9 @@ class KeyPool:
             messages.extend(history_messages)
         messages.append({"role": "user", "content": prompt})
 
-        # Whitelist openai-standard kwargs; MiMo-specific kwargs route to extra_body; everything
-        # else (LightRAG internals) drop — IDENTICAL to the direct path so the contract is one.
-        openai_kwargs: dict[str, Any] = {}
-        extra_body: dict[str, Any] = {}
-        for k, v in kwargs.items():
-            if k in _OPENAI_STANDARD_KWARGS:
-                openai_kwargs[k] = v
-            elif k in _MIMO_EXTRA_KWARGS:
-                extra_body[k] = v
-            # else: drop silently (LightRAG internal kwarg)
-        if extra_body:
-            existing = openai_kwargs.get("extra_body", {})
-            if isinstance(existing, dict):
-                existing.update(extra_body)
-                openai_kwargs["extra_body"] = existing
-            else:
-                openai_kwargs["extra_body"] = extra_body
-        # Gateway groups are capability tiers, selected by the deployment's two model slots:
-        # SYNTH_MODEL (e.g. "standard") by default; BUILD_MODEL (e.g. "flash") when a caller
-        # requests that slot or the "cheap" alias. The proxy owns key→deployment selection.
-        requested = openai_kwargs.pop("model", None)
-        # Strip any provider prefix (openai/<name>) before hitting the proxy: the gateway's
-        # model GROUP is the bare tier name, and PAPERVAULT_MODEL may legitimately carry a
-        # litellm-form prefix (the library plane builds one). Mirrors the direct path's _sdk_model.
-        model = _sdk_model(config.BUILD_MODEL if requested in (config.BUILD_MODEL, "cheap") else config.SYNTH_MODEL)
+        # Pass the requested level unchanged; the gateway resolves model and effort.
+        openai_kwargs = {k: v for k, v in kwargs.items() if k in _OPENAI_STANDARD_KWARGS}
+        model = _sdk_model(openai_kwargs.pop("model", None))
 
         # Gateway owns retry + timeout (config.yaml request_timeout/num_retries/retry_policy), so
         # send NO per-request retry/timeout to the proxy. synth.py / multiquery.py pass timeout=…

@@ -78,10 +78,7 @@ MCP_ALLOWED_HOSTS: list[str] = [
 # Single-endpoint fallback when no key-pool file is present:
 LLM_API_KEY = os.environ.get("PAPERVAULT_LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("PAPERVAULT_LLM_BASE_URL", "")
-# Two model slots. SYNTH = the strong model (answer synthesis, research plane);
-# BUILD = the cheaper model for graph extraction. Set them equal to use one model.
-SYNTH_MODEL = os.environ.get("PAPERVAULT_MODEL", "")
-BUILD_MODEL = os.environ.get("PAPERVAULT_BUILD_MODEL", "") or SYNTH_MODEL
+# Role levels and their operator overrides are resolved by llm_routing.route.
 
 # --- optional LiteLLM gateway (advanced: many keys behind a local proxy) ---
 USE_GATEWAY = os.environ.get("PAPERVAULT_LLM_GATEWAY", "0") == "1"

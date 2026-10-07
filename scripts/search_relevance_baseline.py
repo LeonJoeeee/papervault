@@ -33,8 +33,8 @@ from openai import AsyncOpenAI
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from papervault import config  # noqa: E402
+from papervault.llm_routing import route  # noqa: E402
 
-JUDGE_MODEL = "standard"
 RELEVANT_BAR = 0.7
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
 
@@ -64,7 +64,7 @@ async def _judge(client: AsyncOpenAI, intent: str, papers: list[dict]) -> list[f
     for attempt in (1, 2):
         try:
             resp = await client.chat.completions.create(
-                model=JUDGE_MODEL,
+                model=route("eval_judge"),
                 temperature=0.0,
                 messages=[
                     {"role": "system", "content": _JUDGE_SYSTEM},

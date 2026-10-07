@@ -398,8 +398,6 @@ def _gateway_mode(monkeypatch):
     monkeypatch.setattr(config, "USE_GATEWAY", True)
     monkeypatch.setattr(config, "GATEWAY_URL", "http://gw.example/v1")
     monkeypatch.setattr(config, "GATEWAY_KEY", "gw-key")
-    monkeypatch.setattr(config, "SYNTH_MODEL", "standard")
-    monkeypatch.setattr(config, "BUILD_MODEL", "flash")
 
 
 _HELLO_STREAM = [
@@ -544,16 +542,14 @@ async def test_stream_collects_only_choice_index_0_when_n_gt_1(tmp_path, monkeyp
     assert await pool.complete("ping", n=2) == "A1A2"
 
 
-async def test_reserved_stream_keys_inside_extra_body_are_stripped(tmp_path, monkeypatch):
-    """The SDK merges extra_body OVER the request fields, so a caller could re-enable the plain
-    call (or drop the usage chunk) through it. The override is unconditional: reserved keys are
-    removed from a COPY of extra_body; the caller's other keys and dict are untouched."""
+async def test_extra_body_cannot_override_transport_parameters(tmp_path, monkeypatch):
+    """Provider extensions are discarded, preserving streaming and the caller's input dict."""
     _gateway_mode(monkeypatch)
     created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
     pool = KeyPool(tmp_path / "unused.json")
     body = {"stream": False, "stream_options": {"include_usage": False}, "keep": 1}
     assert await pool.complete("ping", extra_body=body) == "Hello"
-    assert created[0]["extra_body"] == {"keep": 1}
+    assert "extra_body" not in created[0]
     assert created[0]["stream"] is True and created[0]["stream_options"] == {"include_usage": True}
     assert body == {"stream": False, "stream_options": {"include_usage": False}, "keep": 1}
 
@@ -771,10 +767,10 @@ async def test_mimo_complete_merge_stage_call_survives_one_cut(tmp_path, monkeyp
     created = _install_sequenced_stream_client(monkeypatch, [
         [_chunk(content="par"), httpx.RemoteProtocolError("peer closed")], list(_HELLO_STREAM)])
     out = await mimo_complete("Summarize entity `Energy`", system_prompt="merge", model="flash",
-                              enable_thinking=True, max_tokens=131072)
+                              max_tokens=131072)
     assert out == "Hello"
     assert len(created) == 2
-    assert created[1]["extra_body"] == {"enable_thinking": True} and created[1]["max_tokens"] == 131072
+    assert "extra_body" not in created[1] and created[1]["max_tokens"] == 131072
 
 
 # ---- #102 merge check 1, round 2: transport timeouts are transient; the unreachable loop needs room --
@@ -866,3 +862,20 @@ def test_default_max_tokens_is_131000_when_env_unset(tmp_path):
         cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
     )
     assert int(out.stdout.strip().splitlines()[-1]) == 131000
+
+
+@pytest.mark.parametrize("gateway", [False, True])
+@pytest.mark.parametrize("level", ["flash", "standard", "pro"])
+async def test_request_preserves_level_without_caller_effort(tmp_path, monkeypatch, gateway, level):
+    monkeypatch.setattr(config, "USE_GATEWAY", gateway)
+    monkeypatch.setattr(config, "GATEWAY_URL", "http://gw.example/v1")
+    monkeypatch.setattr(config, "GATEWAY_KEY", "test-key")
+    f = tmp_path / "keys.json"
+    _write(f, [_group("test-key", model="provider-model")])
+    created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    assert await KeyPool(f).complete(
+        "ping", model=level, reasoning_effort="max",
+        extra_body={"model": "provider-model", "thinking": True},
+    ) == "Hello"
+    assert created == [{"model": level, "max_tokens": llm_mod._DEFAULT_MAX_TOKENS,
+                        "stream": True, "stream_options": {"include_usage": True}}]

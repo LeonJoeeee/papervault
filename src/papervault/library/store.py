@@ -836,6 +836,13 @@ class Library:
     # ----- manifest log -----
 
     def log(self, event: dict) -> None:
+        """Append a manifest event as JSONL.
+
+        PDF tier outcomes carry ``key`` and ``source``: ``download_miss``
+        means attempted without a PDF; ``download_skip`` adds ``reason``
+        for an unmet prerequisite, without a network attempt. Reconcile
+        counts paper routes from status/disk facts, not these tier events.
+        """
         line = json.dumps(event, ensure_ascii=False)
         with self.manifest_path.open("a") as f:
             f.write(line + "\n")

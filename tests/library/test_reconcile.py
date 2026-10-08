@@ -8,6 +8,8 @@ download queue's pending-only recovery scan forgets.
 from __future__ import annotations
 
 import asyncio
+import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -48,6 +50,35 @@ def _mk(lib, key, status, *, pdf=False, md=False, md_source=None, attempts=0,
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def test_tier_skip_events_preserve_reconcile_counters(tmp_path, monkeypatch):
+    """Manifest tier skips must not change paper routing or count as downloads."""
+    lib = Library(tmp_path)
+    pending = _mk(lib, "Pending", "pending")
+    _mk(lib, "Terminal", "metadata_only")
+    monkeypatch.delenv("PAPER_PIPELINE_RESOLVE_STUB_DOIS", raising=False)
+    monkeypatch.delenv("PAPER_PIPELINE_JANITOR_PURGE", raising=False)
+    monkeypatch.setattr(reconcile, "_enrich_sweep", AsyncMock(return_value=0))
+    monkeypatch.setattr(reconcile, "_abstract_sweep", AsyncMock(return_value=0))
+    before = _run(reconcile_once(lib, _RecordingQueue(), _RecordingQueue()))
+    lib.log({"event": "download_skip", "key": pending.key,
+             "source": "wiley_tdm", "reason": "missing_credentials"})
+    lib.log({"event": "download_miss", "key": pending.key, "source": "arxiv"})
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+
+    after = _run(reconcile_once(lib, dq, eq))
+
+    assert after == before
+    assert after["scanned"] == 2
+    assert after["download"] == 1
+    assert after["terminal"] == 1
+    assert after["errors"] == 0
+    assert dq.added == [(pending.key, 5)]
+    assert eq.added == []
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    outcomes = [e for e in events if e.get("source") in {"wiley_tdm", "arxiv"}]
+    assert [e["event"] for e in outcomes] == ["download_skip", "download_miss"]
 
 
 def test_path_backfill_sets_md_path_when_on_disk_but_field_null(tmp_path):

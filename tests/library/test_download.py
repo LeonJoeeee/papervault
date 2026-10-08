@@ -210,21 +210,30 @@ def scidb_html():
 @pytest.fixture
 def scidb_browser(monkeypatch):
     """Only replace the external browser boundary; run the tier's real page_action."""
-    def install(rendered_html, *, challenge_timeout=False, status=200):
+    def install(rendered_html, *, detail_html=None, challenge_timeout=False, status=200):
+        if detail_html is None:
+            detail_html = (Path(__file__).parent / "fixtures" / "annas_detail_member.html").read_text()
+
         class Page:
             html = "<html><title>DDoS-Guard</title><body>Please wait</body></html>"
 
+            def __init__(self, url):
+                self.detail = "/md5/" in url
+
             def wait_for_selector(self, selector, *, state, timeout):
-                assert selector.startswith('a[href^="/md5/"], ')
-                assert 'title:has-text("Search - Anna")' in selector
+                if self.detail:
+                    assert 'h3:has-text("External downloads")' in selector
+                else:
+                    assert selector.startswith('a[href^="/md5/"], ')
+                    assert 'title:has-text("Search - Anna")' in selector
                 assert state == "attached"
                 assert 25000 < timeout <= 120000
                 if challenge_timeout:
                     raise TimeoutError("fixture challenge did not resolve")
-                if '/md5/' not in rendered_html and 'Search - Anna' not in rendered_html:
+                if not self.detail and '/md5/' not in rendered_html and 'Search - Anna' not in rendered_html:
                     if 'a[href*=".pdf" i]' not in selector:
                         raise TimeoutError("fixture PDF offered without an MD5 record link")
-                self.html = rendered_html
+                self.html = detail_html if self.detail else rendered_html
 
             def wait_for_load_state(self, state, *, timeout):
                 assert state == "domcontentloaded"
@@ -236,7 +245,8 @@ def scidb_browser(monkeypatch):
         class Fetcher:
             @staticmethod
             def fetch(url, **kwargs):
-                assert url == "https://annas-archive.gl/scidb/10.1/x"
+                assert url in {"https://annas-archive.gl/scidb/10.1/x",
+                               "https://annas-archive.gl/md5/0123456789abcdef0123456789abcdef"}
                 assert kwargs["headless"] is True
                 assert kwargs.get("wait", 0) == 0  # No fixed challenge sleep.
                 assert kwargs["timeout"] > 25000
@@ -244,7 +254,7 @@ def scidb_browser(monkeypatch):
                     "name": "aa_account_id2", "value": "fixture-token",
                     "url": "https://annas-archive.gl",
                 }]
-                page = Page()
+                page = Page(url)
                 try:
                     kwargs["page_action"](page)
                 except TimeoutError:
@@ -254,6 +264,12 @@ def scidb_browser(monkeypatch):
 
         monkeypatch.setitem(sys.modules, "scrapling.fetchers",
                             SimpleNamespace(StealthyFetcher=Fetcher))
+        def impersonated_get(url, **kwargs):
+            assert kwargs.pop("impersonate") == "chrome"
+            return requests.get(url, **kwargs)
+
+        monkeypatch.setitem(sys.modules, "curl_cffi", SimpleNamespace(
+            requests=SimpleNamespace(get=impersonated_get)))
         monkeypatch.setenv("ANNAS_ARCHIVE_API_KEY", "fixture-token")
         # A plain request must only see the bot wall. This is the old tier's failure.
         responses.get("https://annas-archive.gl/scidb/10.1/x", body="DDoS-Guard")
@@ -268,15 +284,16 @@ def scidb_browser(monkeypatch):
     ("Test%20paper%2Epdf", "Test%20paper.pdf"),
 ])
 @responses.activate
-def test_annas_scidb_offered_pdf_is_unlimited(
+def test_annas_detail_offered_pdf_is_unlimited(
     paper, scidb_html, scidb_browser, segment, filename, request_filename,
 ):
     """Follow the offered PDF anchor across CDN path changes, without using fast_download."""
-    scidb_browser(scidb_html.replace("/d4/", f"/{segment}/")
+    detail_html = (Path(__file__).parent / "fixtures" / "annas_detail_member.html").read_text()
+    scidb_browser(scidb_html, detail_html=detail_html.replace("/d4/", f"/{segment}/")
                   .replace("Test%20paper.pdf", filename))
     url = (f"https://partner-cdn.example:8443/{segment}/signed/"
            f"{request_filename}?token=fixture&expires=123")
-    responses.get(url, body=PDF_BYTES)
+    responses.get(url, body=PDF_BYTES, content_type="application/octet-stream")
 
     assert download._try_annas_archive_api(paper) == PDF_BYTES
     assert [call.request.url for call in responses.calls] == [url]
@@ -284,35 +301,35 @@ def test_annas_scidb_offered_pdf_is_unlimited(
 
 
 @responses.activate
-def test_annas_scidb_pdf_without_md5_record_is_unlimited(paper, scidb_html, scidb_browser):
-    scidb_html = scidb_html.replace('<a href="/md5/0123456789abcdef">Archive record</a>', '')
+def test_annas_record_pdf_without_md5_is_explained(paper, scidb_html, scidb_browser, caplog):
+    """A signed record link cannot bypass the md5 lookup required by #163."""
+    scidb_html = scidb_html.replace('<a href="/md5/0123456789abcdef0123456789abcdef">Archive record</a>', '')
     scidb_browser(scidb_html)
-    responses.get("https://partner-cdn.example:8443/d4/signed/Test%20paper.pdf", body=PDF_BYTES)
-    assert download._try_annas_archive_api(paper) == PDF_BYTES
-    assert len(responses.calls) == 1
-    assert "fast_download.json" not in responses.calls[0].request.url
+    assert download._try_annas_archive_api(paper) is None
+    assert "no md5" in caplog.text
+    assert not responses.calls
 
 
 @pytest.mark.parametrize("direct_body", [None, HTML_BYTES])
 @responses.activate
-def test_annas_scidb_miss_preserves_fast_download_fallback(
+def test_annas_detail_miss_preserves_fast_download_fallback(
     paper, scidb_html, scidb_browser, direct_body,
 ):
-    if direct_body is None:
-        scidb_html = '<html><a href="/md5/0123456789abcdef">Archive record</a></html>'
-    else:
+    detail_html = '<h3>External downloads</h3>'
+    if direct_body is not None:
+        detail_html = (Path(__file__).parent / "fixtures" / "annas_detail_member.html").read_text()
         responses.get(
             "https://Partner-CDN.example:8443/d4/signed/Test%20paper.pdf",
             body=direct_body,
         )
-    scidb_browser(scidb_html)
+    scidb_browser(scidb_html, detail_html=detail_html)
     responses.get("https://annas-archive.gl/dyn/api/fast_download.json",
                   json={"download_url": "https://partner.example/fallback.pdf"})
     responses.get("https://partner.example/fallback.pdf", body=PDF_BYTES)
 
     assert download._try_annas_archive_api(paper) == PDF_BYTES
     api_call = next(call for call in responses.calls if "fast_download.json" in call.request.url)
-    assert "md5=0123456789abcdef" in api_call.request.url
+    assert "md5=0123456789abcdef0123456789abcdef" in api_call.request.url
     assert "key=fixture-token" in api_call.request.url
     assert "Cookie" not in responses.calls[-1].request.headers
 

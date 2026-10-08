@@ -1,7 +1,8 @@
-"""Fetch PDFs into the library, trying arXiv → Unpaywall → OpenAlex →
-Inspire-HEP → NASA ADS → CrossRef-tm → citation_pdf_url (Highwire meta) →
-SSRN → EuropePMC → Zenodo → arxiv-by-title → ResearchGate → Sci-Hub in
-order.
+"""Fetch PDFs into the library through the ordered ``_STRATEGIES`` cascade.
+
+Operator overrides come first, followed by stored file URLs and arXiv.
+Publisher, aggregator, and last-resort tiers follow; every hit passes the
+same PDF identity verifier before saving.
 
 Sci-Hub is opt-in via PAPER_PIPELINE_USE_SCIHUB=1.
 NASA ADS requires ADS_API_TOKEN; silently skipped otherwise.
@@ -20,7 +21,7 @@ from html import unescape
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import unquote, urljoin, urlsplit
+from urllib.parse import parse_qs, unquote, urljoin, urlsplit
 
 import requests
 
@@ -295,6 +296,63 @@ def _try_url_overrides(paper: Paper) -> Optional[bytes]:
         if r.ok and _is_pdf_bytes(r.content):
             return r.content
     except Exception:
+        pass
+    return None
+
+
+def _known_file_url(paper: Paper) -> Optional[str]:
+    """Select a stored HTTP(S) file candidate, without resolving landing pages.
+
+    A PDF path or a recognized download endpoint is only eligibility, never
+    proof of availability or identity. Do not extract URLs embedded in prose
+    (notably Otsuka2020's meeting-program link).
+    """
+    url = paper.url or ""
+    # urlsplit removes some controls, and requests repairs malformed escapes.
+    # Reject those strings before either can turn them into a different URL.
+    if (not url or "\\" in url or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in url)
+            or re.search(r"%(?![0-9a-fA-F]{2})", url)):
+        return None
+    try:
+        parts = urlsplit(url)
+        if (parts.scheme not in {"http", "https"} or not parts.hostname
+                or parts.username is not None or parts.port == 0):
+            return None
+    except ValueError:
+        return None
+    path = unquote(parts.path)
+    if path.lower().endswith(".pdf"):
+        return url
+    query = parse_qs(parts.query)
+    # Digital Commons files need not have a PDF suffix (FIT / TRACE cohort).
+    if (path == "/cgi/viewcontent.cgi"
+            and len(query.get("article", [])) == 1
+            and re.fullmatch(r"[0-9]+", query["article"][0])
+            and len(query.get("context", [])) == 1
+            and re.fullmatch(r"[A-Za-z0-9_-]+", query["context"][0])):
+        return url
+    # CiteSeer's stored file links can carry a legacy Java session parameter.
+    if (parts.hostname == "citeseerx.ist.psu.edu"
+            and re.fullmatch(r"/viewdoc/download(?:;jsessionid=[A-Za-z0-9._-]+)?", path)
+            and len(query.get("doi", [])) == 1 and query["doi"][0]
+            and query.get("rep") == ["rep1"] and query.get("type") == ["pdf"]):
+        return url
+    return None
+
+
+def _try_known_file_url(paper: Paper) -> Optional[bytes]:
+    """Fetch a stored file candidate; the cascade still verifies its identity."""
+    url = _known_file_url(paper)
+    if not url:
+        return None
+    try:
+        r = requests.get(url, timeout=TIMEOUT,
+                         headers=BROWSER_HEADERS, allow_redirects=True)
+        # We asked for a whole file, so a partial response is not a download.
+        if (200 <= r.status_code < 300 and r.status_code != 206
+                and not r.headers.get("Content-Range") and _is_pdf_bytes(r.content)):
+            return r.content
+    except requests.RequestException:
         pass
     return None
 
@@ -2096,7 +2154,7 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
 
     Triggered only when:
       * a usable endpoint is configured (cloud key OR self-hosted URL)
-      * 18-tier PDF cascade has fully missed
+      * the PDF cascade has fully missed
       * No md extract already exists (don't overwrite higher-quality
         marker output). A firecrawl md, once it passes the completeness
         gate, is terminal: there is NO PDF-upgrade re-OCR even if a real
@@ -2273,7 +2331,7 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
     )
 
     # ---- Completeness gate (D5, SDD §6.3) — firecrawl text through the SAME
-    # whole-document gate as the OCR spine. The 18-tier cascade already missed,
+    # whole-document gate as the OCR spine. The PDF cascade already missed,
     # so this rendering is the last shot; if it's a paywall stub / truncated /
     # mid-sentence body it must NOT linger on disk as a serveable text_path
     # (serve-safety treats any md on disk as "real + complete"). FAIL → the
@@ -2552,6 +2610,7 @@ def _try_mdpi_scrapling(paper: Paper) -> Optional[bytes]:
 _STRATEGIES = [
     # === Free, fast, operator-controlled / preprint ===
     ("url_override", _try_url_overrides),         # 0% but free, operator escape hatch
+    ("known_file_url", _try_known_file_url),        # stored files, including identifierless papers
     ("arxiv", _try_arxiv),                          # 24/82 R1 (preprint primary)
 
     # === Publisher-direct (mihomo proxy makes these high-hit) ===
@@ -2592,6 +2651,11 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
     Keep these checks in sync with tier early returns; concurrent groups skip
     only when every member skips. Unknown tiers retain the miss behavior.
     """
+    if source == "known_file_url":
+        if not (paper.url or "").strip():
+            return "missing_file_url"
+        if not _known_file_url(paper):
+            return "not_file_url"
     credential = {
         "wiley_tdm": "WILEY_TDM_TOKEN",
         "elsevier_tdm": "ELSEVIER_TDM_API_KEY",
@@ -2693,7 +2757,7 @@ def download_paper(paper: Paper, library: Library) -> bool:
     # here (rule 3: ¬has_pdf ∧ firecrawl-md ∧ ¬exhausted → DOWNLOAD). The
     # design's mechanism to honor the §4.3 invariant "md on disk ⟺ gated" is
     # the firecrawl re-entry at the BOTTOM of this function — but that re-entry
-    # is only reached if all 18 tiers MISS. If a tier lands a real PDF first
+    # is only reached if all PDF tiers MISS. If a tier lands a real PDF first
     # (return True below), the re-gate is skipped: disk then has PDF + un-gated
     # md → classify rule 2 → TERMINAL → serve-safety hands out the never-gated
     # stub as full text PERMANENTLY (rule 2 / extract_md both refuse to re-OCR,

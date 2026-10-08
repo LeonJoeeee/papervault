@@ -140,7 +140,7 @@ def test_reconcile_skips_exhausted_firecrawl_md(tmp_path):
     paper whose real-PDF hunt is already exhausted
     (``firecrawl_pdf_hunt_exhausted`` stamped on a gate-PASS) must NOT be
     re-routed to DOWNLOAD on this or any later sweep — otherwise reconcile
-    re-runs the whole 18-tier download + LLM gate on it every 600s forever (the
+    re-runs the whole PDF download + LLM gate on it every 600s forever (the
     permanent hot-loop, and the repeated re-gating eventually deletes a good
     md). It RESTS in classify's rule-5 TERMINAL/skip while serve-safety keeps
     handing out its md. So neither queue is touched, and it counts as terminal."""

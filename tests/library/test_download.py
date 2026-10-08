@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import io
 import json
 import sys
 from pathlib import Path
@@ -35,6 +36,295 @@ def _logged_events(lib: Library) -> list[dict]:
     if not lib.manifest_path.exists():
         return []
     return [json.loads(line) for line in lib.manifest_path.read_text().splitlines() if line]
+
+
+def _text_pdf(text: str) -> bytes:
+    """A readable PDF so cascade tests exercise the real identity gate."""
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=612, height=792)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)}),
+    })
+    stream = DecodedStreamObject()
+    escaped = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    stream.set_data(f"BT /F1 12 Tf 72 720 Td ({escaped}) Tj ET".encode("ascii"))
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+@pytest.fixture
+def file_url_identity(monkeypatch, paper):
+    """Replace only the external LLM; parse and verify PDF text normally."""
+    prompts = []
+
+    def judge(messages):
+        prompts.append(messages[1]["content"])
+        program = "Meeting program and poster listing" in messages[1]["content"]
+        return json.dumps({"match": not program,
+                           "reason": "meeting program" if program else "same work"})
+
+    monkeypatch.setattr("papervault.library.llm.get_llm",
+                        lambda **_: SimpleNamespace(call=judge))
+    data = _text_pdf(f"{paper.title}. A. Abstract. We study cosmic ray transport in space.")
+    return data, prompts
+
+
+@pytest.mark.parametrize("url", [
+    "https://eprints.lancs.ac.uk/6681/1/art_834.pdf",
+    "https://wrap.warwick.ac.uk/56873/7/WRAP_THESIS_Parmar_2012.pdf",
+    "https://core.ac.uk/download/475653135.pdf",
+    "https://core.ac.uk/download/pdf/357359140.pdf",
+    "http://repository.example/Characteristic%20of%20electrical%20signal.pdf",
+    "https://repository.example/paper.PDF?download=1#page=2",
+    "https://repository.example/paper.%70df",
+    "https://repository.fit.edu/cgi/viewcontent.cgi?article=1470&context=etd",
+    "https://trace.tennessee.edu/cgi/viewcontent.cgi?article=9817&context=utk_graddiss",
+    "https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.1051.1229&rep=rep1&type=pdf",
+    "http://citeseerx.ist.psu.edu/viewdoc/download;jsessionid=ABC123"
+    "?doi=10.1.1.1051.1229&rep=rep1&type=pdf",
+])
+@responses.activate
+def test_known_file_url_identifierless_download_verifies_identity(
+        lib, paper, monkeypatch, file_url_identity, url):
+    """A stored file must reach the early cascade without an override or identifier."""
+    paper.doi = paper.arxiv_id = ""
+    paper.url = url
+    data, prompts = file_url_identity
+    monkeypatch.setenv("PAPERVAULT_VAULT", str(lib.root))
+    monkeypatch.setattr(download, "_try_firecrawl_text_fallback", lambda *_: False)
+    # requests decodes unreserved escapes before sending the HTTP request.
+    request_url = url.replace(".%70df", ".pdf").split("#", 1)[0]
+    responses.get(request_url, body=data, content_type="application/octet-stream")
+
+    assert download.download_paper(paper, lib) is True
+    assert lib.pdf_path(paper.key).read_bytes() == data
+    assert paper.pdf_path == f"pdfs/{paper.key}.pdf"
+    assert paper.download_status == "ok"
+    assert paper.download_source == "known_file_url"
+    assert paper.doi == paper.arxiv_id == ""
+    assert len(prompts) == 1
+    assert f"Requested title: {paper.title}" in prompts[0]
+    assert "Abstract. We study cosmic ray transport in space." in prompts[0]
+    outcomes = [e for e in _logged_events(lib) if e.get("source")]
+    assert [(e["event"], e["source"]) for e in outcomes] == [
+        ("download_skip", "url_override"), ("downloaded", "known_file_url"),
+    ]
+    assert outcomes[-1]["verify"] == "llm_match: same work"
+    assert [c.request.url.split("#", 1)[0] for c in responses.calls] == [request_url]
+    assert not (lib.root / "url_overrides.json").exists()
+    lib.save()
+    saved = Library(lib.root).get(paper.key)
+    assert saved.download_source == "known_file_url"
+    assert saved.pdf_path == paper.pdf_path
+
+
+@pytest.mark.parametrize("url, reason", [
+    ("", "missing_file_url"),
+    ("   ", "missing_file_url"),
+    ("file:///tmp/paper.pdf", "not_file_url"),
+    ("ftp://repository.example/paper.pdf", "not_file_url"),
+    ("//repository.example/paper.pdf", "not_file_url"),
+    ("https:///paper.pdf", "not_file_url"),
+    ("https://[broken/paper.pdf", "not_file_url"),
+    ("https://repository.example:invalid/paper.pdf", "not_file_url"),
+    ("https://repository.example:99999/paper.pdf", "not_file_url"),
+    ("https://user:password@repository.example/paper.pdf", "not_file_url"),
+    ("https://repository.example/pap\ner.pdf", "not_file_url"),
+    ("https://repository.example/paper.pdf\x00", "not_file_url"),
+    ("https://repository.example/paper%GG.pdf", "not_file_url"),
+    ("https://repository.example\\other.example/paper.pdf", "not_file_url"),
+    ("全文連結http://pcwave.rish.kyoto-u.ac.jp/versim/data/VERSIM_Program_poster.pdf", "not_file_url"),
+    ("https://hdl.handle.net/2060/19850026519", "not_file_url"),
+    ("https://openalex.org/W3103168219", "not_file_url"),
+    ("https://ui.adsabs.harvard.edu/abs/2020AGUFM/abstract", "not_file_url"),
+    ("https://arxiv.org/abs/2401.0001", "not_file_url"),
+    ("https://repository.example/landing?file=paper.pdf", "not_file_url"),
+    ("https://repository.fit.edu/cgi/viewcontent.cgi?article=1470", "not_file_url"),
+    ("https://repository.fit.edu/cgi/viewcontent.cgi?article=bad&context=etd", "not_file_url"),
+    ("https://repository.example/cgi/other.cgi?article=1470&context=etd", "not_file_url"),
+    ("https://citeseerx.ist.psu.edu/viewdoc/download?doi=10.1.1.1051.1229&rep=rep1&type=html", "not_file_url"),
+])
+@responses.activate
+def test_known_file_url_ineligible_url_is_a_skip(lib, paper, monkeypatch, url, reason):
+    """Malformed strings and record pages must not be counted as file requests."""
+    _isolate_tier(monkeypatch, "known_file_url")
+    paper.doi = paper.arxiv_id = ""
+    paper.url = url
+
+    assert download.download_paper(paper, lib) is False
+    outcomes = [e for e in _logged_events(lib) if e.get("source") == "known_file_url"]
+    assert [(e["event"], e.get("reason")) for e in outcomes] == [("download_skip", reason)]
+    assert not responses.calls
+    assert not lib.has_pdf(paper.key)
+    assert paper.url == url
+
+
+@pytest.mark.parametrize("status, body, headers", [
+    (200, HTML_BYTES, {"Content-Type": "application/pdf"}),
+    (200, b'<meta name="citation_pdf_url" content="/real.pdf">', {}),
+    (403, HTML_BYTES, {}),
+    (404, PDF_BYTES, {}),
+    (429, HTML_BYTES, {}),
+    (500, PDF_BYTES, {}),
+    (302, PDF_BYTES, {}),
+    (206, PDF_BYTES, {"Content-Range": "bytes 0-19/500"}),
+    (200, PDF_BYTES, {"Content-Range": "bytes 0-19/500"}),
+])
+@pytest.mark.parametrize("abstract, terminal", [("", "failed"), ("Known abstract.", "metadata_only")])
+@responses.activate
+def test_known_file_url_bad_response_is_a_miss(
+        lib, paper, monkeypatch, file_url_identity, status, body, headers, abstract, terminal):
+    """Suffixes, MIME, partial content, and error bodies cannot prove a download."""
+    _isolate_tier(monkeypatch, "known_file_url")
+    paper.doi = paper.arxiv_id = ""
+    paper.url = "https://core.ac.uk/download/475653135.pdf"
+    paper.abstract = abstract
+    _, prompts = file_url_identity
+    responses.get(paper.url, status=status, body=body, headers=headers)
+
+    assert download.download_paper(paper, lib) is False
+    outcomes = [e for e in _logged_events(lib) if e.get("source") == "known_file_url"]
+    assert [e["event"] for e in outcomes] == ["download_miss"]
+    assert len(responses.calls) == 1
+    assert not prompts
+    assert not lib.has_pdf(paper.key)
+    assert paper.download_status == terminal
+    assert paper.download_source == ""
+    assert paper.url == "https://core.ac.uk/download/475653135.pdf"
+
+
+@pytest.mark.parametrize("error", [
+    requests.Timeout("fixture timeout"),
+    requests.ConnectionError("fixture dead host"),
+    requests.exceptions.ChunkedEncodingError("fixture truncated body"),
+])
+@responses.activate
+def test_known_file_url_request_failure_is_a_miss(lib, paper, monkeypatch, error):
+    _isolate_tier(monkeypatch, "known_file_url")
+    paper.url = "https://repository.example/paper.pdf"
+    responses.get(paper.url, body=error)
+
+    assert download.download_paper(paper, lib) is False
+    outcomes = [e for e in _logged_events(lib) if e.get("source") == "known_file_url"]
+    assert [e["event"] for e in outcomes] == ["download_miss"]
+    assert len(responses.calls) == 1
+    assert paper.doi == "10.1/x" and paper.arxiv_id == "2401.0001"
+    assert not lib.has_pdf(paper.key)
+
+
+@pytest.mark.parametrize("is_pdf", [True, False])
+@responses.activate
+def test_known_file_url_redirect_checks_final_body(lib, paper, monkeypatch, file_url_identity, is_pdf):
+    _isolate_tier(monkeypatch, "known_file_url")
+    paper.doi = paper.arxiv_id = ""
+    paper.url = "http://authors.library.caltech.edu/46479/1/1995-43.pdf"
+    target = "https://repository.example/content/object"
+    data, prompts = file_url_identity
+    responses.get(paper.url, status=302, headers={"Location": target})
+    responses.get(target, body=data if is_pdf else HTML_BYTES)
+
+    assert download.download_paper(paper, lib) is is_pdf
+    assert [c.request.url for c in responses.calls] == [paper.url, target]
+    assert lib.has_pdf(paper.key) is is_pdf
+    outcomes = [e for e in _logged_events(lib) if e.get("source") == "known_file_url"]
+    assert [e["event"] for e in outcomes] == ["downloaded" if is_pdf else "download_miss"]
+    assert len(prompts) == int(is_pdf)
+    if is_pdf:
+        assert paper.download_source == "known_file_url"
+
+
+@responses.activate
+def test_known_file_url_unsupported_redirect_is_a_miss(lib, paper, monkeypatch):
+    _isolate_tier(monkeypatch, "known_file_url")
+    paper.url = "https://repository.example/paper.pdf"
+    responses.get(paper.url, status=302, headers={"Location": "file:///tmp/paper.pdf"})
+
+    assert download.download_paper(paper, lib) is False
+    outcomes = [e for e in _logged_events(lib) if e.get("source") == "known_file_url"]
+    assert [e["event"] for e in outcomes] == ["download_miss"]
+    assert len(responses.calls) == 1
+    assert not lib.has_pdf(paper.key)
+
+
+@responses.activate
+def test_known_file_url_redirect_loop_is_a_miss(lib, paper, monkeypatch):
+    _isolate_tier(monkeypatch, "known_file_url")
+    paper.url = "https://repository.example/paper.pdf"
+    responses.get(paper.url, status=302, headers={"Location": paper.url})
+
+    assert download.download_paper(paper, lib) is False
+    outcomes = [e for e in _logged_events(lib) if e.get("source") == "known_file_url"]
+    assert [e["event"] for e in outcomes] == ["download_miss"]
+    assert responses.calls
+    assert not lib.has_pdf(paper.key)
+
+
+@responses.activate
+def test_known_file_url_program_rejection_continues_cascade(lib, paper, monkeypatch, file_url_identity):
+    """A parseable program PDF is not saved when the normal identity gate rejects it."""
+    strategies = dict(download._STRATEGIES)
+    monkeypatch.setattr(download, "_STRATEGIES", [
+        ("known_file_url", strategies["known_file_url"]), ("arxiv", strategies["arxiv"]),
+    ])
+    paper.url = "http://pcwave.rish.kyoto-u.ac.jp/versim/data/VERSIM_Program_poster.pdf"
+    program = _text_pdf("Meeting program and poster listing. Speakers, sessions, and poster titles.")
+    data, prompts = file_url_identity
+    responses.get(paper.url, body=program)
+    responses.get("https://arxiv.org/pdf/2401.0001", body=data)
+
+    assert download.download_paper(paper, lib) is True
+    assert paper.download_source == "arxiv"
+    assert lib.pdf_path(paper.key).read_bytes() == data
+    outcomes = [e for e in _logged_events(lib) if e.get("source")]
+    assert [(e["event"], e["source"]) for e in outcomes] == [
+        ("download_pdf_mismatch", "known_file_url"), ("downloaded", "arxiv"),
+    ]
+    assert outcomes[0]["reason"] == "llm_mismatch: meeting program"
+    assert len(prompts) == 2
+
+
+@responses.activate
+def test_known_file_url_keeps_operator_override_priority(lib, paper, monkeypatch, file_url_identity):
+    monkeypatch.setenv("PAPERVAULT_VAULT", str(lib.root))
+    overrides_path = lib.root / "url_overrides.json"
+    overrides = json.dumps({paper.doi: "https://operator.example/chosen.pdf"})
+    overrides_path.write_text(overrides)
+    paper.url = "https://repository.example/paper.pdf"
+    data, _ = file_url_identity
+    responses.get("https://operator.example/chosen.pdf", body=data)
+
+    assert download.download_paper(paper, lib) is True
+    assert paper.download_source == "url_override"
+    assert [c.request.url for c in responses.calls] == ["https://operator.example/chosen.pdf"]
+    assert overrides_path.read_text() == overrides
+
+
+@responses.activate
+def test_known_file_url_existing_pdf_is_not_refetched(lib, paper, file_url_identity):
+    paper.url = "https://repository.example/paper.pdf"
+    data, prompts = file_url_identity
+    dest = lib.pdf_path(paper.key)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(data)
+    paper.download_status = "ok"
+    paper.download_source = "arxiv"
+    before = _logged_events(lib)
+
+    assert download.download_paper(paper, lib) is True
+    assert dest.read_bytes() == data
+    assert paper.download_source == "arxiv"
+    assert not responses.calls and not prompts
+    assert _logged_events(lib) == before
 
 
 @pytest.mark.parametrize("padding", [0, 8400])

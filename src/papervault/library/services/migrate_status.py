@@ -42,7 +42,7 @@ completeness_gate now runs at WRITE time on freshly-scraped firecrawl text
 (download._try_firecrawl_text_fallback): a stub/truncation is deleted +
 demoted before it ever reaches disk. This migration only touches HISTORICAL
 md that predate the gate, so it does NOT re-gate them inline — they migrate to
-``ok`` and the FIRST reconcile sweep routes them DOWNLOAD → 18 tiers miss →
+``ok`` and the FIRST reconcile sweep routes them DOWNLOAD → PDF tiers miss →
 ``_try_firecrawl_text_fallback`` idempotent re-entry → ``_gate_firecrawl_md``
 re-gates the on-disk body exactly once (PASS → ok + stamp exhausted; FAIL →
 deleted + terminal). No audit / re-scrape command is involved.

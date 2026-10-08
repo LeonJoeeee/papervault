@@ -358,7 +358,7 @@ class Paper(BaseModel):
     extract_deferred_epoch: int = 0
 
     # S3 (firecrawl terminal): one-shot resting marker for a firecrawl-md paper.
-    # A firecrawl md only exists AFTER the full 18-tier PDF cascade missed, so
+    # A firecrawl md only exists AFTER the full PDF cascade missed, so
     # when ``_gate_firecrawl_md`` PASSes (the md is real full text) the real-PDF
     # hunt is, by construction, EXHAUSTED for this paper. We stamp this True at
     # that moment so ``classify`` stops re-routing it to DOWNLOAD on every

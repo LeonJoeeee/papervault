@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import builtins
 import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import requests
@@ -155,6 +158,7 @@ def test_unattempted_tier_logs_skip_not_miss(lib, paper, monkeypatch, source, fi
 @pytest.mark.parametrize("source, module", [
     ("curl_impersonate", "curl_cffi"),
     ("cloudscraper", "cloudscraper"),
+    ("annas_archive", "scrapling.fetchers"),
     ("mdpi_scrapling", "scrapling.fetchers"),
     ("researchgate", "scrapling.fetchers"),
 ])
@@ -162,6 +166,7 @@ def test_unattempted_tier_logs_skip_not_miss(lib, paper, monkeypatch, source, fi
 def test_missing_optional_dependency_logs_skip(lib, paper, monkeypatch, source, module):
     _isolate_tier(monkeypatch, source)
     paper.doi = "10.3390/x"
+    monkeypatch.setenv("ANNAS_ARCHIVE_API_KEY", "fixture-token")
     original_import = builtins.__import__
 
     def absent_import(name, *args, **kwargs):
@@ -173,7 +178,177 @@ def test_missing_optional_dependency_logs_skip(lib, paper, monkeypatch, source, 
     assert download.download_paper(paper, lib) is False
     events = [e for e in _logged_events(lib) if e.get("source") == source]
     assert [e["event"] for e in events] == ["download_skip"]
+    assert events[0]["reason"] == "missing_dependency"
     assert len(responses.calls) == 0
+
+
+@pytest.mark.parametrize("source", ["annas_archive", "mdpi_scrapling", "researchgate"])
+@responses.activate
+def test_browser_tier_import_failure_warns(paper, monkeypatch, caplog, source):
+    """Direct tier callers must also hear about a missing transitive Playwright import."""
+    paper.doi = "10.3390/x"
+    monkeypatch.setenv("ANNAS_ARCHIVE_API_KEY", "fixture-token")
+    original_import = builtins.__import__
+
+    def absent_browser(name, *args, **kwargs):
+        if name == "scrapling.fetchers":
+            raise ModuleNotFoundError("No module named 'playwright'")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", absent_browser)
+    assert dict(download._STRATEGIES)[source](paper) is None
+    assert source in caplog.text
+    assert "scrapling[fetchers]" in caplog.text
+    assert not responses.calls
+
+
+@pytest.fixture
+def scidb_html():
+    return (Path(__file__).parent / "fixtures" / "annas_scidb_member.html").read_text()
+
+
+@pytest.fixture
+def scidb_browser(monkeypatch):
+    """Only replace the external browser boundary; run the tier's real page_action."""
+    def install(rendered_html, *, challenge_timeout=False, status=200):
+        class Page:
+            html = "<html><title>DDoS-Guard</title><body>Please wait</body></html>"
+
+            def wait_for_selector(self, selector, *, state, timeout):
+                assert selector.startswith('a[href^="/md5/"], ')
+                assert 'title:has-text("Search - Anna")' in selector
+                assert state == "attached"
+                assert 25000 < timeout <= 120000
+                if challenge_timeout:
+                    raise TimeoutError("fixture challenge did not resolve")
+                if '/md5/' not in rendered_html and 'Search - Anna' not in rendered_html:
+                    if 'a[href*=".pdf" i]' not in selector:
+                        raise TimeoutError("fixture PDF offered without an MD5 record link")
+                self.html = rendered_html
+
+            def wait_for_load_state(self, state, *, timeout):
+                assert state == "domcontentloaded"
+                assert timeout > 25000
+
+            def content(self):
+                return self.html
+
+        class Fetcher:
+            @staticmethod
+            def fetch(url, **kwargs):
+                assert url == "https://annas-archive.gl/scidb/10.1/x"
+                assert kwargs["headless"] is True
+                assert kwargs.get("wait", 0) == 0  # No fixed challenge sleep.
+                assert kwargs["timeout"] > 25000
+                assert kwargs["cookies"] == [{
+                    "name": "aa_account_id2", "value": "fixture-token",
+                    "url": "https://annas-archive.gl",
+                }]
+                page = Page()
+                try:
+                    kwargs["page_action"](page)
+                except TimeoutError:
+                    # Scrapling logs and swallows page_action errors, then returns a response.
+                    pass
+                return SimpleNamespace(status=status, html_content=page.content())
+
+        monkeypatch.setitem(sys.modules, "scrapling.fetchers",
+                            SimpleNamespace(StealthyFetcher=Fetcher))
+        monkeypatch.setenv("ANNAS_ARCHIVE_API_KEY", "fixture-token")
+        # A plain request must only see the bot wall. This is the old tier's failure.
+        responses.get("https://annas-archive.gl/scidb/10.1/x", body="DDoS-Guard")
+
+    return install
+
+
+@pytest.mark.parametrize("segment", ["d4", "d3", "unlimited/next-generation"])
+@pytest.mark.parametrize("filename, request_filename", [
+    ("Test%20paper.pdf", "Test%20paper.pdf"),
+    ("Test%20paper.PDF", "Test%20paper.PDF"),
+    ("Test%20paper%2Epdf", "Test%20paper.pdf"),
+])
+@responses.activate
+def test_annas_scidb_offered_pdf_is_unlimited(
+    paper, scidb_html, scidb_browser, segment, filename, request_filename,
+):
+    """Follow the offered PDF anchor across CDN path changes, without using fast_download."""
+    scidb_browser(scidb_html.replace("/d4/", f"/{segment}/")
+                  .replace("Test%20paper.pdf", filename))
+    url = (f"https://partner-cdn.example:8443/{segment}/signed/"
+           f"{request_filename}?token=fixture&expires=123")
+    responses.get(url, body=PDF_BYTES)
+
+    assert download._try_annas_archive_api(paper) == PDF_BYTES
+    assert [call.request.url for call in responses.calls] == [url]
+    assert "Cookie" not in responses.calls[0].request.headers
+
+
+@responses.activate
+def test_annas_scidb_pdf_without_md5_record_is_unlimited(paper, scidb_html, scidb_browser):
+    scidb_html = scidb_html.replace('<a href="/md5/0123456789abcdef">Archive record</a>', '')
+    scidb_browser(scidb_html)
+    responses.get("https://partner-cdn.example:8443/d4/signed/Test%20paper.pdf", body=PDF_BYTES)
+    assert download._try_annas_archive_api(paper) == PDF_BYTES
+    assert len(responses.calls) == 1
+    assert "fast_download.json" not in responses.calls[0].request.url
+
+
+@pytest.mark.parametrize("direct_body", [None, HTML_BYTES])
+@responses.activate
+def test_annas_scidb_miss_preserves_fast_download_fallback(
+    paper, scidb_html, scidb_browser, direct_body,
+):
+    if direct_body is None:
+        scidb_html = '<html><a href="/md5/0123456789abcdef">Archive record</a></html>'
+    else:
+        responses.get(
+            "https://Partner-CDN.example:8443/d4/signed/Test%20paper.pdf",
+            body=direct_body,
+        )
+    scidb_browser(scidb_html)
+    responses.get("https://annas-archive.gl/dyn/api/fast_download.json",
+                  json={"download_url": "https://partner.example/fallback.pdf"})
+    responses.get("https://partner.example/fallback.pdf", body=PDF_BYTES)
+
+    assert download._try_annas_archive_api(paper) == PDF_BYTES
+    api_call = next(call for call in responses.calls if "fast_download.json" in call.request.url)
+    assert "md5=0123456789abcdef" in api_call.request.url
+    assert "key=fixture-token" in api_call.request.url
+    assert "Cookie" not in responses.calls[-1].request.headers
+
+
+@responses.activate
+def test_annas_unresolved_challenge_does_not_consume_quota(paper, scidb_html, scidb_browser):
+    scidb_browser(scidb_html, challenge_timeout=True)
+    assert download._try_annas_archive_api(paper) is None
+    assert not responses.calls
+
+
+@responses.activate
+def test_annas_browser_error_page_does_not_consume_quota(paper, scidb_html, scidb_browser):
+    scidb_browser(scidb_html, status=403)
+    assert download._try_annas_archive_api(paper) is None
+    assert not responses.calls
+
+
+@responses.activate
+def test_annas_search_page_returns_none(paper, scidb_browser):
+    scidb_browser('<html><title>Search - Anna\'s Archive</title></html>')
+    assert download._try_annas_archive_api(paper) is None
+    assert not responses.calls
+
+
+@responses.activate
+def test_annas_browser_failure_returns_none(paper, scidb_html, scidb_browser, monkeypatch):
+    scidb_browser(scidb_html)
+
+    def unavailable_browser(*args, **kwargs):
+        raise RuntimeError("fixture browser executable unavailable")
+
+    monkeypatch.setattr(sys.modules["scrapling.fetchers"].StealthyFetcher,
+                        "fetch", unavailable_browser)
+    assert download._try_annas_archive_api(paper) is None
+    assert not responses.calls
 
 
 @pytest.mark.parametrize("response", [403, 404, requests.ConnectionError("fixture outage")])
@@ -1281,8 +1456,7 @@ def test_researchgate_bails_on_short_title_no_doi(lib):
 
 def test_researchgate_bails_when_scrapling_unavailable(lib, monkeypatch):
     """If Scrapling isn't installed, the import inside the tier raises
-    ImportError; the tier should swallow it and return None rather than
-    propagate."""
+    ImportError; the tier reports the missing dependency and returns None."""
     from papervault.library.models import Paper
     import sys
     monkeypatch.setitem(sys.modules, "scrapling.fetchers", None)

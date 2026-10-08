@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "papervault"
-version = "0.6.1"
+version = "0.6.2"
 description = "Self-hosted literature + knowledge layer for coding agents — one MCP server: discover papers, read full text, query a graph-RAG knowledge base with cited answers."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -63,7 +63,7 @@ dependencies = [
 grey = [
     "cloudscraper>=1.2",
     "curl-cffi>=0.7",
-    "scrapling>=0.2",
+    "scrapling[fetchers]>=0.2",
     "firecrawl-py>=1.0",
 ]
 # PDF -> markdown OCR. The papervault service is an http-CLIENT of a MinerU vLLM server that

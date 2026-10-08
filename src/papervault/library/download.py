@@ -318,7 +318,10 @@ def _known_file_url(paper: Paper) -> Optional[str]:
         if (parts.scheme not in {"http", "https"} or not parts.hostname
                 or parts.username is not None or parts.port == 0):
             return None
-    except ValueError:
+        # Apply the HTTP client's host/IDNA validation without any transport.
+        # Preparation failures are prerequisites, not attempted downloads.
+        requests.PreparedRequest().prepare_url(url, None)
+    except (ValueError, requests.RequestException):
         return None
     path = unquote(parts.path)
     if path.lower().endswith(".pdf"):

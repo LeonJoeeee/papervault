@@ -136,6 +136,8 @@ def test_known_file_url_identifierless_download_verifies_identity(
     ("//repository.example/paper.pdf", "not_file_url"),
     ("https:///paper.pdf", "not_file_url"),
     ("https://[broken/paper.pdf", "not_file_url"),
+    ("https://.example/paper.pdf", "not_file_url"),
+    ("https://*/paper.pdf", "not_file_url"),
     ("https://repository.example:invalid/paper.pdf", "not_file_url"),
     ("https://repository.example:99999/paper.pdf", "not_file_url"),
     ("https://user:password@repository.example/paper.pdf", "not_file_url"),

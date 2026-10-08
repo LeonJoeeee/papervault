@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import builtins
 import json
 
 import pytest
@@ -31,6 +32,232 @@ def _logged_events(lib: Library) -> list[dict]:
     if not lib.manifest_path.exists():
         return []
     return [json.loads(line) for line in lib.manifest_path.read_text().splitlines() if line]
+
+
+@pytest.mark.parametrize("padding", [0, 8400])
+@pytest.mark.parametrize("page, pdf_url", [
+    ('<meta name="citation_pdf_url" content="//pdf.example/paper.pdf#view">',
+     "https://pdf.example/paper.pdf"),
+    ('<object type="application/pdf" data="/paper.pdf"></object>',
+     "https://mirror.example/paper.pdf"),
+    ('<iframe src="https://pdf.example/paper.pdf"></iframe>',
+     "https://pdf.example/paper.pdf"),
+    ('<script>location.href = "https://pdf.example/paper.pdf";</script>',
+     "https://pdf.example/paper.pdf"),
+])
+@responses.activate
+def test_scihub_short_page_with_link_downloads_pdf(page, pdf_url, padding, monkeypatch):
+    """A layout shrink must not discard a page containing a matching link."""
+    page += " " * padding
+    assert len(page) < 12000
+    monkeypatch.setattr(download.time, "sleep", lambda _: None)
+    responses.get("https://mirror.example/10.1/x", body=page)
+    responses.get(pdf_url, body=PDF_BYTES)
+
+    assert download._scihub_one_mirror("https://mirror.example", "10.1/x") == PDF_BYTES
+    assert [c.request.url for c in responses.calls] == [
+        "https://mirror.example/10.1/x", pdf_url,
+    ]
+
+
+@pytest.mark.parametrize("padding", [0, 8400, 15000])
+@responses.activate
+def test_scihub_linkless_page_retries_then_fails(padding, monkeypatch):
+    """Captcha/linkless pages still get three fresh requests, regardless of size."""
+    sleeps = []
+    monkeypatch.setattr(download.time, "sleep", sleeps.append)
+    responses.get("https://mirror.example/10.1/x",
+                  body="<html>Captcha: verify you are human</html>" + " " * padding)
+
+    assert download._scihub_one_mirror("https://mirror.example", "10.1/x") is None
+    assert [c.request.url for c in responses.calls] == ["https://mirror.example/10.1/x"] * 3
+    assert sleeps == [1, 2]
+
+
+@responses.activate
+def test_scihub_linkless_retry_can_recover(monkeypatch):
+    monkeypatch.setattr(download.time, "sleep", lambda _: None)
+    responses.get("https://mirror.example/10.1/x", body="<html>Captcha</html>")
+    responses.get("https://mirror.example/10.1/x",
+                  body='<meta name="citation_pdf_url" content="/paper.pdf">')
+    responses.get("https://mirror.example/paper.pdf", body=PDF_BYTES)
+
+    assert download._scihub_one_mirror("https://mirror.example", "10.1/x") == PDF_BYTES
+    assert len(responses.calls) == 3
+
+
+@responses.activate
+def test_scihub_matching_link_still_requires_pdf_bytes(monkeypatch):
+    monkeypatch.setattr(download.time, "sleep", lambda _: None)
+    responses.get("https://mirror.example/10.1/x",
+                  body='<meta name="citation_pdf_url" content="/paper.pdf">')
+    responses.get("https://mirror.example/paper.pdf", body=HTML_BYTES)
+
+    assert download._scihub_one_mirror("https://mirror.example", "10.1/x") is None
+    assert len(responses.calls) == 6
+
+
+def _isolate_tier(monkeypatch, source):
+    strategy = dict(download._STRATEGIES)[source]
+    monkeypatch.setattr(download, "_STRATEGIES", [(source, strategy)])
+    monkeypatch.setattr(download, "_try_firecrawl_text_fallback", lambda *_: False)
+
+
+@pytest.mark.parametrize("source, fields, env", [
+    ("url_override", {}, {}),
+    ("arxiv", {"arxiv_id": ""}, {}),
+    ("iopscience_direct", {}, {}),
+    ("crossref_tm", {"doi": ""}, {}),
+    ("citation_pdf_url", {"doi": ""}, {}),
+    ("wiley_tdm", {"doi": "10.1029/x"}, {}),
+    ("wiley_tdm", {}, {"WILEY_TDM_TOKEN": "fixture-token"}),
+    ("elsevier_tdm", {"doi": "10.1016/x"}, {}),
+    ("elsevier_tdm", {}, {"ELSEVIER_TDM_API_KEY": "fixture-token"}),
+    ("oa_aggregators", {"doi": ""}, {}),
+    ("oa_aggregators", {"doi": "", "title": "Short"}, {"CORE_API_KEY": "fixture-token"}),
+    ("scihub", {}, {}),
+    ("scihub", {"doi": "", "arxiv_id": "", "url": ""}, {"PAPER_PIPELINE_USE_SCIHUB": "1"}),
+    ("annas_archive", {}, {}),
+    ("annas_archive", {"doi": ""}, {"ANNAS_ARCHIVE_API_KEY": "fixture-token"}),
+    ("domain_aggregators", {"doi": "", "arxiv_id": ""}, {}),
+    ("curl_impersonate", {"doi": ""}, {}),
+    ("ssrn", {}, {}),
+    ("ssrn", {"doi": "10.2139/ssrn."}, {}),
+    ("arxiv_by_title", {}, {}),
+    ("arxiv_by_title", {"arxiv_id": "", "title": "Short"}, {}),
+    ("arxiv_by_title", {"arxiv_id": "", "title": "?" * 25}, {}),
+    ("cloudscraper", {"doi": ""}, {}),
+    ("mdpi_scrapling", {}, {}),
+    ("researchgate", {"doi": "", "title": "Short"}, {}),
+    ("web_search", {"title": "Short"}, {}),
+])
+@responses.activate
+def test_unattempted_tier_logs_skip_not_miss(lib, paper, monkeypatch, source, fields, env):
+    """Missing credentials/identifiers or applicability must not inflate misses."""
+    _isolate_tier(monkeypatch, source)
+    monkeypatch.setenv("PAPERVAULT_VAULT", str(lib.root))
+    for name in ("WILEY_TDM_TOKEN", "ELSEVIER_TDM_API_KEY", "ANNAS_ARCHIVE_API_KEY",
+                 "CORE_API_KEY", "PAPER_PIPELINE_USE_SCIHUB"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    for name, value in fields.items():
+        setattr(paper, name, value)
+
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == source]
+    assert len(events) == 1
+    assert events[0]["event"] == "download_skip"
+    assert events[0]["reason"]
+    assert len(responses.calls) == 0
+
+
+@pytest.mark.parametrize("source, module", [
+    ("curl_impersonate", "curl_cffi"),
+    ("cloudscraper", "cloudscraper"),
+    ("mdpi_scrapling", "scrapling.fetchers"),
+    ("researchgate", "scrapling.fetchers"),
+])
+@responses.activate
+def test_missing_optional_dependency_logs_skip(lib, paper, monkeypatch, source, module):
+    _isolate_tier(monkeypatch, source)
+    paper.doi = "10.3390/x"
+    original_import = builtins.__import__
+
+    def absent_import(name, *args, **kwargs):
+        if name == module:
+            raise ImportError("fixture dependency absent")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", absent_import)
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == source]
+    assert [e["event"] for e in events] == ["download_skip"]
+    assert len(responses.calls) == 0
+
+
+@pytest.mark.parametrize("response", [403, 404, requests.ConnectionError("fixture outage")])
+@responses.activate
+def test_attempted_tier_keeps_download_miss(lib, paper, monkeypatch, response):
+    """A 404 can clear the ID, but that network attempt must remain a miss."""
+    _isolate_tier(monkeypatch, "arxiv")
+    kwargs = {"status": response} if isinstance(response, int) else {"body": response}
+    responses.get("https://arxiv.org/pdf/2401.0001", **kwargs)
+
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == "arxiv"]
+    assert [e["event"] for e in events] == ["download_miss"]
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_oa_group_with_title_and_core_key_is_attempted(lib, paper, monkeypatch):
+    """DOI-only members skip, while CORE's title search still makes the group run."""
+    _isolate_tier(monkeypatch, "oa_aggregators")
+    paper.doi = ""
+    monkeypatch.setenv("CORE_API_KEY", "fixture-token")
+    responses.get("https://api.core.ac.uk/v3/search/works/", json={"results": []})
+
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == "oa_aggregators"]
+    assert [e["event"] for e in events] == ["download_miss"]
+    assert len(responses.calls) == 1
+
+
+@pytest.mark.parametrize("source, doi, credential, url", [
+    ("wiley_tdm", "10.1029/x", "WILEY_TDM_TOKEN",
+     "https://api.wiley.com/onlinelibrary/tdm/v1/articles/10.1029%2Fx"),
+    ("wiley_tdm", "10.1029", "WILEY_TDM_TOKEN",
+     "https://api.wiley.com/onlinelibrary/tdm/v1/articles/10.1029"),
+    ("elsevier_tdm", "10.1016/x", "ELSEVIER_TDM_API_KEY",
+     "https://api.elsevier.com/content/article/doi/10.1016/x?apiKey=fixture-token"),
+    ("elsevier_tdm", "10.1016", "ELSEVIER_TDM_API_KEY",
+     "https://api.elsevier.com/content/article/doi/10.1016?apiKey=fixture-token"),
+])
+@responses.activate
+def test_credentialed_tdm_refusal_is_a_miss(lib, paper, monkeypatch, source, doi, credential, url):
+    """Use each TDM tier's exact DOI gate, even for malformed bare prefixes."""
+    _isolate_tier(monkeypatch, source)
+    paper.doi = doi
+    monkeypatch.setenv(credential, "fixture-token")
+    responses.get(url, status=403)
+
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == source]
+    assert [e["event"] for e in events] == ["download_miss"]
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_configured_url_override_uses_canonical_vault_path(lib, paper, tmp_path, monkeypatch):
+    _isolate_tier(monkeypatch, "url_override")
+    configured_vault = tmp_path / "configured-vault"
+    configured_vault.mkdir()
+    (configured_vault / "url_overrides.json").write_text(
+        json.dumps({"10.1/x": "https://override.example/paper.pdf"}))
+    monkeypatch.setenv("PAPERVAULT_VAULT", str(configured_vault))
+    responses.get("https://override.example/paper.pdf", body=HTML_BYTES)
+
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == "url_override"]
+    assert [e["event"] for e in events] == ["download_miss"]
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_domain_group_with_arxiv_only_is_attempted(lib, paper, monkeypatch):
+    _isolate_tier(monkeypatch, "domain_aggregators")
+    paper.doi = ""
+    monkeypatch.delenv("ADS_API_TOKEN", raising=False)
+    responses.get("https://inspirehep.net/api/literature", json={"hits": {"hits": []}})
+    responses.get("https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                  json={"resultList": {"result": []}})
+    responses.get("https://zenodo.org/api/records", json={"hits": {"hits": []}})
+
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == "domain_aggregators"]
+    assert [e["event"] for e in events] == ["download_miss"]
+    assert len(responses.calls) == 3
 
 
 @responses.activate

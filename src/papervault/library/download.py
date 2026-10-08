@@ -486,11 +486,11 @@ def _scihub_one_mirror(mirror: str, target: str, max_attempts: int = 3) -> Optio
     iterate serially (40+s under racing-cascade concurrency, well past
     the per-paper deadline).
 
-    Some mihomo exit IPs get a STRIPPED 7KB landing page from scihub.ru
-    with no citation_pdf_url meta, others get the full 26KB page with
-    the PDF link. Retry up to ``max_attempts`` with fresh connections
+    Some mihomo exit IPs get stripped/captcha landing pages with no PDF
+    link. Page size varies across healthy layouts, so inspect every OK
+    response for a link. Retry up to ``max_attempts`` with fresh connections
     (each requests.get opens a new TCP socket → new mihomo round-robin
-    exit) when the response is suspiciously short or lacks the PDF link.
+    exit) when the response fails or lacks the PDF link.
     """
     landing_url = f"{mirror}/{target}"
     for attempt in range(max_attempts):
@@ -501,9 +501,7 @@ def _scihub_one_mirror(mirror: str, target: str, max_attempts: int = 3) -> Optio
             if attempt < max_attempts - 1:
                 time.sleep(2 ** attempt)
             continue
-        # Stripped/throttled response: too short to contain a PDF link.
-        # Retry with a fresh connection (different mihomo exit IP).
-        if not r.ok or len(r.text) < 12000:
+        if not r.ok:
             if attempt < max_attempts - 1:
                 time.sleep(2 ** attempt)
             continue
@@ -2293,6 +2291,89 @@ _STRATEGIES = [
 ]
 
 
+def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
+    """Mirror the tiers' no-network prerequisites for manifest bookkeeping.
+
+    Check immediately before each call: tiers can mutate identifiers (arXiv
+    clears its ID on a 404), so checking afterwards can mislabel a real miss.
+    Keep these checks in sync with tier early returns; concurrent groups skip
+    only when every member skips. Unknown tiers retain the miss behavior.
+    """
+    credential = {
+        "wiley_tdm": "WILEY_TDM_TOKEN",
+        "elsevier_tdm": "ELSEVIER_TDM_API_KEY",
+        "annas_archive": "ANNAS_ARCHIVE_API_KEY",
+    }.get(source)
+    if credential and not os.environ.get(credential, "").strip():
+        return "missing_credentials"
+    if source == "scihub":
+        if os.environ.get("PAPER_PIPELINE_USE_SCIHUB", "").strip() not in {"1", "true", "yes"}:
+            return "disabled"
+        if not (paper.doi or paper.arxiv_id or paper.url):
+            return "missing_identifier"
+    if source == "arxiv" and not paper.arxiv_id:
+        return "missing_arxiv_id"
+    if source in {"crossref_tm", "citation_pdf_url", "wiley_tdm", "elsevier_tdm",
+                  "annas_archive", "curl_impersonate", "cloudscraper"} and not paper.doi:
+        return "missing_doi"
+    prefixes = {
+        "iopscience_direct": ("10.3847/", "10.1088/"),
+        "mdpi_scrapling": ("10.3390/",),
+        "ssrn": ("10.2139/ssrn.",),
+    }.get(source)
+    if prefixes and not (paper.doi or "").startswith(prefixes):
+        return "not_applicable"
+    tdm_prefixes = {
+        "wiley_tdm": ("10.1002", "10.1029", "10.1111", "10.1046"),
+        "elsevier_tdm": ("10.1016",),
+    }.get(source)
+    if tdm_prefixes and paper.doi.split("/", 1)[0] not in tdm_prefixes:
+        return "not_applicable"
+    if source == "ssrn" and not paper.doi.split("ssrn.")[-1].strip():
+        return "missing_identifier"
+    if source == "domain_aggregators" and not (paper.doi or paper.arxiv_id):
+        return "missing_identifier"
+    if source == "oa_aggregators" and not paper.doi:
+        if not (os.environ.get("CORE_API_KEY", "").strip()
+                and paper.title and len(paper.title) >= 20):
+            return "no_applicable_member"
+    if source == "arxiv_by_title":
+        if paper.arxiv_id:
+            return "already_has_arxiv_id"
+        title = (paper.title or "").strip()
+        if len(title) < 20 or not re.sub(r'["\\?<>]', '', title)[:100]:
+            return "insufficient_title"
+    if source == "web_search" and (not paper.title or len(paper.title) < 20):
+        return "insufficient_title"
+    if source == "researchgate" and len((paper.title or "").strip()) < 20 and not (paper.doi or "").strip():
+        return "missing_identifier"
+    if source == "url_override":
+        if not (paper.doi or paper.arxiv_id):
+            return "missing_identifier"
+        from .services.concurrency import _vault_path
+        try:
+            overrides = json.loads((Path(_vault_path()) / "url_overrides.json").read_text())
+        except (FileNotFoundError, ValueError):
+            return "missing_url_override"
+        if not (overrides.get(paper.doi or "") or overrides.get(paper.arxiv_id or "")):
+            return "missing_url_override"
+    dependency = {
+        "curl_impersonate": ("curl_cffi", "requests"),
+        "cloudscraper": ("cloudscraper", None),
+        "mdpi_scrapling": ("scrapling.fetchers", "StealthyFetcher"),
+        "researchgate": ("scrapling.fetchers", "StealthyFetcher"),
+    }.get(source)
+    if dependency:
+        module, attribute = dependency
+        try:
+            imported = __import__(module, fromlist=[attribute] if attribute else [])
+            if attribute:
+                getattr(imported, attribute)
+        except (ImportError, AttributeError):
+            return "missing_dependency"
+    return None
+
+
 def download_paper(paper: Paper, library: Library) -> bool:
     """Download a single paper's PDF if missing.
 
@@ -2352,6 +2433,7 @@ def download_paper(paper: Paper, library: Library) -> bool:
 
     for source, strategy in _STRATEGIES:
         try:
+            skip_reason = _download_skip_reason(source, paper)
             data = strategy(paper)
         except Exception as exc:
             library.log({"event": "download_error", "key": paper.key,
@@ -2372,7 +2454,11 @@ def download_paper(paper: Paper, library: Library) -> bool:
             library.log({"event": "downloaded", "key": paper.key, "source": source,
                          "size": len(data), "verify": verify_reason})
             return True
-        library.log({"event": "download_miss", "key": paper.key, "source": source})
+        if skip_reason:
+            library.log({"event": "download_skip", "key": paper.key,
+                         "source": source, "reason": skip_reason})
+        else:
+            library.log({"event": "download_miss", "key": paper.key, "source": source})
 
     # All PDF tiers missed. Try the firecrawl text-only fallback as
     # last resort. On success it writes extracts/md/{key}.md directly and

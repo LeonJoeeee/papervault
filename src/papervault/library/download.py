@@ -859,6 +859,10 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
                     'title:has-text("Search - Anna")')
     if record is None:
         return None
+    if re.search(r"<title[^>]*>[^<]*Search - Anna", record, re.I):
+        log.warning("annas_archive[%s]: not in Anna's index: DOI lookup returned search results",
+                    paper.key)
+        return None
     lookup = _AnnasLinks()
     lookup.feed(record)
     md5 = None
@@ -868,10 +872,7 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
             md5 = match.group(1).lower()
             break
     if not md5:
-        if re.search(r"<title[^>]*>[^<]*Search - Anna", record, re.I):
-            log.warning("annas_archive[%s]: not in Anna's index: DOI lookup has no md5", paper.key)
-        else:
-            log.warning("annas_archive[%s]: download refused: DOI record has no md5", paper.key)
+        log.warning("annas_archive[%s]: download refused: DOI record has no md5", paper.key)
         return None
 
     detail_url = f"{base}/md5/{md5}"

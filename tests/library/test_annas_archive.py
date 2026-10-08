@@ -207,6 +207,22 @@ def test_lookup_miss_is_explained_without_spending_quota(paper, browser, caplog)
 
 
 @responses.activate
+def test_search_page_with_unrelated_md5_is_an_index_miss(paper, browser, caplog):
+    """A search result's available PDF must never stand in for the requested DOI."""
+    record = (FIXTURES / "annas_search_unrelated_md5.html").read_text()
+    visited = browser(detail_option(LIVE), record=record)
+    responses.get(LIVE, body=b"%PDF-1.4\nunrelated search result", content_type="application/pdf")
+    caplog.set_level("INFO", logger=download.log.name)
+
+    assert download._try_annas_archive_api(paper) is None
+    assert "not in Anna's index" in caplog.text
+    assert "download refused" not in caplog.text
+    assert "retrieved" not in caplog.text
+    assert visited == [f"{BASE}/scidb/10.1/x"]
+    assert not responses.calls
+
+
+@responses.activate
 def test_detail_challenge_is_not_reported_as_index_miss(paper, browser, caplog):
     browser(detail_option(LIVE), detail_timeout=True)
     responses.get(f"{BASE}/dyn/api/fast_download.json", json={"error": "unavailable"})

@@ -18,7 +18,7 @@ was false for exactly the population reconcile exists to rescue):
     final guard — a re-add of a paper already moving through is a no-op.
   * **firecrawl-md papers** (``has_md`` ∧ ``¬has_pdf``, classify rule 3): these
     NEVER hit the download worker's ``has_pdf`` short-circuit (it only fires
-    when has_pdf is True). A re-enqueue actually re-runs the full 18-tier
+    when has_pdf is True). A re-enqueue actually re-runs the full PDF
     ``download_paper`` + the firecrawl re-gate (an LLM call). Convergence to
     "PDF hunt + re-gate at most once per paper" rests on the persistent
     ``firecrawl_pdf_hunt_exhausted`` stamp (set on the gate PASS in

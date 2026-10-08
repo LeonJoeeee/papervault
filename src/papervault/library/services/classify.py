@@ -26,7 +26,7 @@ hit, so each paper lands in exactly one Action (SDD §5 ``post``):
   3. ¬has_pdf → decide download vs rest:
        • ¬has_md                                     → DOWNLOAD (hunt the PDF)
        • has_md ∧ md_source=firecrawl ∧ ¬hunt_exhausted
-                                                     → DOWNLOAD (re-run the 18
+                                                     → DOWNLOAD (re-run the
                  strategies once to hunt a real PDF — rescues the ~48 firecrawl
                  papers both queues used to forget, D8; ONLY while the hunt is
                  not yet exhausted, else it would re-download + re-gate forever.

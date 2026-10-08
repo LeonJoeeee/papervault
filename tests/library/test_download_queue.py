@@ -325,11 +325,11 @@ def test_stale_lower_prio_tuple_of_firecrawl_md_is_dropped_not_rehunted(
     the F7-protected population) re-added at URGENT while already queued at
     NORMAL leaves a STALE NORMAL tuple behind. When a worker later pops that
     stale tuple it must be DROPPED — NOT re-run through ``download_paper`` /
-    the 18-tier PDF hunt a second time.
+    the PDF hunt a second time.
 
     Pre-fix this was false for ¬has_pdf keys: the worker's ``has_pdf``
     short-circuit never fires for a firecrawl-md key, so the stale tuple
-    re-entered ``download_paper`` and re-ran all 18 tiers. The pop-time dedup
+    re-entered ``download_paper`` and re-ran all PDF tiers. The pop-time dedup
     makes the "no-op" claim true by construction: the first tuple to surface
     claims the ``_pending`` mark; the stale duplicate finds it gone and is
     discarded without calling ``download_paper``.
@@ -380,7 +380,7 @@ def test_stale_lower_prio_tuple_of_firecrawl_md_is_dropped_not_rehunted(
 
     assert download_calls == [key_a], (
         "the stale lower-prio firecrawl-md tuple re-ran download_paper / the "
-        f"18-tier hunt a second time (calls={download_calls!r}); the pop-time "
+        f"PDF hunt a second time (calls={download_calls!r}); the pop-time "
         "dedup must drop it as a true no-op"
     )
 

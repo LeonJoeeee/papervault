@@ -145,7 +145,7 @@ def test_firecrawl_paywall_stub_rejected_by_gate(
 ):
     """D5: a paywall stub fails the completeness_gate → the md is DELETED (not
     left on disk as a serveable text_path) and the paper is demoted to a
-    terminal status. The 18-tier cascade already missed; firecrawl is the final
+    terminal status. The PDF cascade already missed; firecrawl is the final
     answer, so "fail the gate → no full text at all, leave nothing on disk to
     retry". Has abstract → metadata_only."""
     responses.add(
@@ -480,7 +480,7 @@ def test_firecrawl_fresh_pass_stamps_pdf_hunt_exhausted(
     lib, paper, firecrawl_env, monkeypatch
 ):
     """A freshly-scraped firecrawl md that PASSes the gate is ALSO stamped — the
-    18-tier cascade just missed, so re-hunting it every 600s is the same hot-loop
+    PDF cascade just missed, so re-hunting it every 600s is the same hot-loop
     we kill for the historical papers."""
     responses.add(
         responses.POST, "https://api.firecrawl.dev/v1/scrape",
@@ -538,7 +538,7 @@ def test_download_paper_nonfirecrawl_md_reentry_keeps_status_ok(
     lib, paper, firecrawl_env, monkeypatch
 ):
     """A status=ok paper with a valid marker/dots md but no PDF, fed directly into
-    download_paper and missing all 18 tiers, must come out STILL ``ok`` — not
+    download_paper and missing all PDF tiers, must come out STILL ``ok`` — not
     clobbered to metadata_only/failed. (issue #3 / §4.3: status must match the
     served md. Post-G2, classify rests this paper at TERMINAL rather than routing
     it to DOWNLOAD, so the re-assert is a defensive no-clobber guard, not a step
@@ -565,7 +565,7 @@ def test_download_paper_nonfirecrawl_md_reentry_keeps_status_ok(
 # issue #1 (med) — the §4.3 "md on disk ⟺ gated" invariant for HISTORICAL
 # un-gated firecrawl md. The 48 migrated firecrawl md predate the gate; the
 # design re-gates them via the firecrawl re-entry, but that re-entry is only
-# reached when all 18 tiers MISS. If a tier lands a real PDF FIRST, the re-gate
+# reached when all PDF tiers MISS. If a tier lands a real PDF FIRST, the re-gate
 # is skipped → disk has PDF + un-gated md → classify rule 2 TERMINAL → serve
 # hands out a never-gated stub as full text forever. Fix (Option A): re-gate the
 # historical md BEFORE the tier loop, so a later tier-hit only ever co-exists

@@ -567,27 +567,34 @@ def _try_scihub(paper: Paper) -> Optional[bytes]:
     return None
 
 
-def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
-    """Anna's Archive — fetch PDF via the documented members-only JSON API.
+def _load_stealthy_fetcher(source: str) -> Optional[type]:
+    """Lazy browser import, with a diagnostic for direct tier callers too."""
+    try:
+        from scrapling.fetchers import StealthyFetcher
+    except ImportError:
+        log.warning("%s: browser dependency unavailable; install the grey extra "
+                    "(scrapling[fetchers])", source)
+        return None
+    return StealthyFetcher
 
-    Anna's puts CAPTCHAs on browser download paths but offers a stable
-    JSON API for members. The cheapest "Brilliant Bookworm" tier
-    ($2-7/month) includes "🧬 SciDB papers unlimited without verification"
-    plus JSON API access — perfect for academic paper cascades.
+
+def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
+    """Anna's Archive — unlimited DOI-keyed SciDB, then the members' JSON API.
 
     Set ``ANNAS_ARCHIVE_API_KEY`` to your member secret key
     (https://annas-archive.gl/account → "Secret key").
 
     Two download paths, PRIMARY first:
       1. ``GET /scidb/<DOI>`` with the member secret as cookie
-         ``aa_account_id2=<KEY>``. For a member this page embeds a direct
-         ``https://<partner>/d3/...`` download URL. Fetching it (same cookie)
-         returns the PDF. This is the **SciDB path — UNLIMITED** (does NOT
+         ``aa_account_id2=<KEY>``. A browser waits for a record/PDF link or
+         final search page, then reads the offered PDF anchor, regardless
+         of the partner's path segment. The signed URL needs no cookie.
+         This is the **SciDB path — UNLIMITED** (does NOT
          consume the 25/day fast-download quota; verified 2026-07-20). Since
          every ingest target is a scientific paper, this is the right path.
       2. FALLBACK ``GET /dyn/api/fast_download.json?md5=<HASH>&key=<KEY>`` →
          ``{download_url: "..."}``. Capped at 25/day (``downloads_per_day``);
-         used only if the scidb page yields no d3 link.
+         used only if the SciDB page yields no usable PDF.
 
     Anna's coverage is roughly sci-hub union LibGen plus their own
     scrapes. For modern paywalled papers that escape both, Anna's is the
@@ -598,42 +605,85 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
         return None
     if not paper.doi:
         return None
+    StealthyFetcher = _load_stealthy_fetcher("annas_archive")
+    if StealthyFetcher is None:
+        return None
+    from html.parser import HTMLParser
+    from urllib.parse import unquote, urlsplit
+
     base = "https://annas-archive.gl"
-    # The member secret rides as a cookie so the scidb page renders the
-    # unlimited direct-download (d3) link rather than a captcha/upsell page.
-    cookies = {"aa_account_id2": api_key}
-    # 1. /scidb/<DOI> → member page (with d3 link) + md5 for the fallback.
+    rendered_html = None
+
+    def wait_for_scidb(page):
+        nonlocal rendered_html
+        # DDoS-Guard has no SciDB record/PDF link or Anna's final search
+        # title. Wait across the challenge's JS navigation, with a cap, rather
+        # than sleeping for the 25 seconds that happened to work once.
+        page.wait_for_selector(
+            'a[href^="/md5/"], a[href*=".pdf" i], a[href*="%2epdf" i], '
+            'title:has-text("Search - Anna")',
+            state="attached", timeout=60000,
+        )
+        page.wait_for_load_state("domcontentloaded", timeout=60000)
+        rendered_html = page.content()
+
+    # 1. /scidb/<DOI> → rendered member page + md5 for the fallback.
     try:
-        r = requests.get(f"{base}/scidb/{paper.doi}", timeout=TIMEOUT,
-                         headers={"User-Agent": USER_AGENT}, cookies=cookies)
+        r = StealthyFetcher.fetch(
+            f"{base}/scidb/{paper.doi}", headless=True, timeout=60000,
+            cookies=[{"name": "aa_account_id2", "value": api_key, "url": base}],
+            page_action=wait_for_scidb,
+        )
     except Exception as exc:
-        log.warning("annas_archive[%s]: scidb request failed %r", paper.key, exc)
+        log.warning("annas_archive[%s]: scidb browser failed %s",
+                    paper.key, type(exc).__name__)
         return None
-    if not r.ok:
+    # Scrapling swallows page_action exceptions. A returned response alone
+    # therefore does not prove the challenge resolved.
+    if not rendered_html or r.status != 200:
+        log.warning("annas_archive[%s]: scidb page did not finish rendering", paper.key)
         return None
-    title_m = re.search(r"<title[^>]*>([^<]+)</title>", r.text)
+    title_m = re.search(r"<title[^>]*>([^<]+)</title>", rendered_html)
     if title_m and "Search - Anna" in title_m.group(1):
         return None  # Paper not in Anna's index
 
-    # PRIMARY (unlimited SciDB): the member page embeds a direct d3 URL.
-    # Host class allows hyphen/uppercase/port — partner CDN hosts often carry
-    # them, and a too-narrow class would silently miss the unlimited path.
-    d3_m = re.search(r'https?://[A-Za-z0-9.:\-]+/d3/[^"\s\\]+', r.text)
-    if d3_m:
+    class PDFLinks(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.urls = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag != "a":
+                return
+            href = dict(attrs).get("href") or ""
+            try:
+                url = urlsplit(href)
+            except ValueError:
+                return
+            # The page offers a PDF filename, not a permanent CDN directory.
+            # HTMLParser decodes query entities; unquote handles encoded suffixes.
+            if (url.scheme in {"http", "https"} and url.netloc
+                    and unquote(url.path).lower().endswith(".pdf")):
+                self.urls.append(href)
+
+    links = PDFLinks()
+    links.feed(rendered_html)
+    # PRIMARY (unlimited SciDB): try the PDF anchors actually offered.
+    for pdf_url in links.urls:
         try:
-            # No cookie on the d3 GET: the partner URL is self-signed and
+            # No cookie on the partner GET: the URL is self-signed and
             # downloads without the member secret (verified) — don't transmit
             # the credential to a third-party host.
-            pdf = requests.get(d3_m.group(0), timeout=60, allow_redirects=True,
+            pdf = requests.get(pdf_url, timeout=60, allow_redirects=True,
                                headers={"User-Agent": USER_AGENT})
             if pdf.ok and _is_pdf_bytes(pdf.content):
                 return pdf.content
         except Exception as exc:
-            log.warning("annas_archive[%s]: scidb d3 fetch failed %r",
+            log.warning("annas_archive[%s]: scidb PDF fetch failed %r",
                         paper.key, exc)
-        # fall through to the fast-download API on any d3 miss
+        # Try other offered anchors before using the quota-limited fallback.
 
-    md5_m = re.search(r'href="/md5/([a-f0-9]+)"', r.text)
+    md5_m = re.search(r'href="/md5/([a-f0-9]+)"', rendered_html)
     if not md5_m:
         return None
     md5 = md5_m.group(1)
@@ -1529,9 +1579,8 @@ def _try_researchgate(paper: Paper) -> Optional[bytes]:
     if len(title) < 20 and not doi:
         return None
 
-    try:
-        from scrapling.fetchers import StealthyFetcher
-    except ImportError:
+    StealthyFetcher = _load_stealthy_fetcher("researchgate")
+    if StealthyFetcher is None:
         return None
 
     # Stage 1: find an RG publication URL via Google Scholar.
@@ -2207,9 +2256,8 @@ def _try_mdpi_scrapling(paper: Paper) -> Optional[bytes]:
     doi = paper.doi or ""
     if not doi.startswith("10.3390/"):
         return None
-    try:
-        from scrapling.fetchers import StealthyFetcher  # type: ignore
-    except ImportError:
+    StealthyFetcher = _load_stealthy_fetcher("mdpi_scrapling")
+    if StealthyFetcher is None:
         return None
     import tempfile, os as _os, os.path as _osp
     save_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
@@ -2360,6 +2408,7 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
     dependency = {
         "curl_impersonate": ("curl_cffi", "requests"),
         "cloudscraper": ("cloudscraper", None),
+        "annas_archive": ("scrapling.fetchers", "StealthyFetcher"),
         "mdpi_scrapling": ("scrapling.fetchers", "StealthyFetcher"),
         "researchgate": ("scrapling.fetchers", "StealthyFetcher"),
     }.get(source)

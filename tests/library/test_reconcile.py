@@ -52,6 +52,16 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture
+def metadata_sweeps(monkeypatch):
+    """Keep routing fixtures with synthetic DOIs off live metadata APIs."""
+    enrich = AsyncMock(return_value=0)
+    abstract = AsyncMock(return_value=0)
+    monkeypatch.setattr(reconcile, "_enrich_sweep", enrich)
+    monkeypatch.setattr(reconcile, "_abstract_sweep", abstract)
+    return enrich, abstract
+
+
 def test_tier_skip_events_preserve_reconcile_counters(tmp_path, monkeypatch):
     """Manifest tier skips must not change paper routing or count as downloads."""
     lib = Library(tmp_path)
@@ -107,7 +117,7 @@ def test_path_backfill_noop_when_no_extract_on_disk(tmp_path):
     assert _run(reconcile._path_backfill_sweep(lib)) == 0
 
 
-def test_reconcile_routes_pending_no_pdf_to_download(tmp_path):
+def test_reconcile_routes_pending_no_pdf_to_download(tmp_path, metadata_sweeps):
     lib = Library(tmp_path)
     p = _mk(lib, "Pendingnopdf2024", "pending", pdf=False)
     dq, eq = _RecordingQueue(), _RecordingQueue()
@@ -119,7 +129,7 @@ def test_reconcile_routes_pending_no_pdf_to_download(tmp_path):
     assert counts["download"] == 1
 
 
-def test_reconcile_rescues_firecrawl_md_to_download(tmp_path):
+def test_reconcile_rescues_firecrawl_md_to_download(tmp_path, metadata_sweeps):
     """The D8 headline case: md on disk (firecrawl) but no PDF + status ok →
     classify routes DOWNLOAD to hunt the real PDF. The download queue's own
     recovery scan only re-enqueues ``pending``, so reconcile is what catches
@@ -135,7 +145,7 @@ def test_reconcile_rescues_firecrawl_md_to_download(tmp_path):
     assert eq.added == []
 
 
-def test_reconcile_skips_exhausted_firecrawl_md(tmp_path):
+def test_reconcile_skips_exhausted_firecrawl_md(tmp_path, metadata_sweeps):
     """The other half of the firecrawl story (S3 issue #1/#2): a firecrawl-md
     paper whose real-PDF hunt is already exhausted
     (``firecrawl_pdf_hunt_exhausted`` stamped on a gate-PASS) must NOT be
@@ -157,7 +167,7 @@ def test_reconcile_skips_exhausted_firecrawl_md(tmp_path):
     assert counts["download"] == 0
 
 
-def test_reconcile_routes_ok_pdf_no_md_to_extract(tmp_path, monkeypatch):
+def test_reconcile_routes_ok_pdf_no_md_to_extract(tmp_path, monkeypatch, metadata_sweeps):
     """PDF on disk, no md, status ok, attempts under ceiling → EXTRACT."""
     lib = Library(tmp_path)
     p = _mk(lib, "Pdfnoextract2024", "ok", pdf=True, md=False)
@@ -174,7 +184,7 @@ def test_reconcile_routes_ok_pdf_no_md_to_extract(tmp_path, monkeypatch):
     assert dq.added == []
 
 
-def test_reconcile_long_paper_goes_low_priority(tmp_path, monkeypatch):
+def test_reconcile_long_paper_goes_low_priority(tmp_path, monkeypatch, metadata_sweeps):
     """>90-page paper routed to EXTRACT lands in the PRIORITY_LOW slow lane."""
     lib = Library(tmp_path)
     p = _mk(lib, "Longreview2024", "ok", pdf=True, md=False)
@@ -190,7 +200,7 @@ def test_reconcile_long_paper_goes_low_priority(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("status", ["extract_failed", "failed", "metadata_only"])
-def test_reconcile_skips_terminal(tmp_path, status):
+def test_reconcile_skips_terminal(tmp_path, status, metadata_sweeps):
     """Terminal papers are never auto-revived — neither queue is touched."""
     lib = Library(tmp_path)
     _mk(lib, f"Terminal{status}2024", status, pdf=True, md=False)
@@ -203,7 +213,7 @@ def test_reconcile_skips_terminal(tmp_path, status):
     assert counts["terminal"] == 1
 
 
-def test_reconcile_real_pdf_already_extracted_is_terminal(tmp_path):
+def test_reconcile_real_pdf_already_extracted_is_terminal(tmp_path, metadata_sweeps):
     """has_pdf ∧ has_md (a real PDF already extracted) = done → skipped."""
     lib = Library(tmp_path)
     _mk(lib, "Donealready2024", "ok", pdf=True, md=True)  # md, no firecrawl src
@@ -216,7 +226,7 @@ def test_reconcile_real_pdf_already_extracted_is_terminal(tmp_path):
     assert counts["terminal"] == 1
 
 
-def test_reconcile_is_idempotent(tmp_path):
+def test_reconcile_is_idempotent(tmp_path, metadata_sweeps):
     """Running twice is safe and produces the same routing (queue add() is
     itself idempotent at the worker, so re-adds are harmless)."""
     lib = Library(tmp_path)
@@ -230,7 +240,7 @@ def test_reconcile_is_idempotent(tmp_path):
     assert len(dq.added) == 2               # added each sweep, by design
 
 
-def test_reconcile_bad_record_does_not_abort_sweep(tmp_path, monkeypatch):
+def test_reconcile_bad_record_does_not_abort_sweep(tmp_path, monkeypatch, metadata_sweeps):
     """A classify() blowup on ONE paper is logged + skipped; the rest of the
     sweep still routes (SDD §6.4 — one bad record never blocks the rest)."""
     lib = Library(tmp_path)
@@ -365,7 +375,7 @@ def _mk_deferred_extract(lib, key):
     return p
 
 
-def test_reconcile_skips_transport_deferred_extract(tmp_path, monkeypatch):
+def test_reconcile_skips_transport_deferred_extract(tmp_path, monkeypatch, metadata_sweeps):
     """Terminal-state skip: a deferred EXTRACT paper is NOT re-enqueued. (Canary
     disabled here to isolate the skip; the canary bound is its own test below.)"""
     from papervault.library.services import extract_defer
@@ -377,12 +387,15 @@ def test_reconcile_skips_transport_deferred_extract(tmp_path, monkeypatch):
 
     counts = _run(reconcile_once(lib, dq, eq))
 
+    enrich, abstract = metadata_sweeps
+    enrich.assert_awaited_once_with(lib, cap=reconcile._ENRICH_CAP)
+    abstract.assert_awaited_once_with(lib, cap=reconcile._ABSTRACT_CAP)
     assert eq.added == []                       # skipped, not re-enqueued
     assert counts["extract"] == 0
     assert counts["extract_deferred"] == 1
 
 
-def test_reconcile_reenqueues_when_pdf_artifact_changes(tmp_path):
+def test_reconcile_reenqueues_when_pdf_artifact_changes(tmp_path, metadata_sweeps):
     """Artifact-appearance retry: if the PDF changes (re-download lands new
     bytes → new signature), the deferral no longer matches and the paper
     re-enters extraction."""
@@ -401,7 +414,7 @@ def test_reconcile_reenqueues_when_pdf_artifact_changes(tmp_path):
     assert counts["extract_deferred"] == 0
 
 
-def test_reconcile_reenqueues_deferred_after_backend_recovery(tmp_path):
+def test_reconcile_reenqueues_deferred_after_backend_recovery(tmp_path, metadata_sweeps):
     """Backend recovery: once ANY extraction succeeds (success epoch advances),
     a deferred paper goes stale and is re-enqueued (no data loss)."""
     from papervault.library.services import extract_defer
@@ -419,7 +432,7 @@ def test_reconcile_reenqueues_deferred_after_backend_recovery(tmp_path):
     assert counts["extract_deferred"] == 0
 
 
-def test_reconcile_deferred_canary_is_bounded(tmp_path):
+def test_reconcile_deferred_canary_is_bounded(tmp_path, metadata_sweeps):
     """During a stable outage reconcile still promotes a bounded canary slice
     (DEFER_CANARY) to detect recovery — not the whole pending-extract set."""
     from papervault.library.services import extract_defer
@@ -432,13 +445,16 @@ def test_reconcile_deferred_canary_is_bounded(tmp_path):
 
     counts = _run(reconcile_once(lib, dq, eq))
 
+    enrich, abstract = metadata_sweeps
+    enrich.assert_awaited_once_with(lib, cap=reconcile._ENRICH_CAP)
+    abstract.assert_awaited_once_with(lib, cap=reconcile._ABSTRACT_CAP)
     # Only DEFER_CANARY promoted; the rest stay deferred (skipped).
     assert counts["extract_canary"] == extract_defer.DEFER_CANARY
     assert len(eq.added) == extract_defer.DEFER_CANARY
     assert counts["extract_deferred"] == n - extract_defer.DEFER_CANARY
 
 
-def test_reconcile_extract_not_deferred_is_enqueued_normally(tmp_path):
+def test_reconcile_extract_not_deferred_is_enqueued_normally(tmp_path, metadata_sweeps):
     """Control: an EXTRACT paper with NO deferral marker is enqueued as before."""
     from papervault.library.services import extract_defer
     extract_defer.reset_for_test()
@@ -452,7 +468,7 @@ def test_reconcile_extract_not_deferred_is_enqueued_normally(tmp_path):
     assert counts["extract_deferred"] == 0
 
 
-def test_reconcile_reprobes_persisted_epoch0_stamp_on_fresh_process(tmp_path):
+def test_reconcile_reprobes_persisted_epoch0_stamp_on_fresh_process(tmp_path, metadata_sweeps):
     """Restart-semantics (issue #43 corrected mechanism, PI decision).
 
     A row PERSISTED transport-deferred at epoch 0 — the field default, i.e. the

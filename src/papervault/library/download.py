@@ -1,5 +1,6 @@
 """Fetch PDFs into the library through the ordered ``_STRATEGIES`` cascade.
 
+Known arXiv records are checked for current-version withdrawal before fetching.
 Operator overrides come first, followed by stored file URLs and arXiv.
 Publisher, aggregator, and last-resort tiers follow; every hit passes the
 same PDF identity verifier before saving.
@@ -74,8 +75,15 @@ from .download_sources.annas_archive import (
     _try_annas_archive_api as _try_annas_archive_api,
 )
 from .download_sources.arxiv import (
+    _ArxivRecord,
+    _arxiv_input,
+    _arxiv_title_has_identity,
+    _canonical_arxiv_url_id,
+    _confirmed_arxiv_withdrawal,
+    _prepare_arxiv,
     _try_arxiv as _try_arxiv,
     _try_arxiv_by_title as _try_arxiv_by_title,
+    _try_arxiv_with_record,
 )
 from .download_sources.core import (
     _commit_core_identifiers,
@@ -375,11 +383,13 @@ _STRATEGIES = [
 ]
 
 
-def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
+def _download_skip_reason(source: str, paper: Paper, *,
+                          arxiv_record: Optional[_ArxivRecord] = None) -> Optional[str]:
     """Mirror the tiers' no-network prerequisites for manifest bookkeeping.
 
     Check immediately before each call: tiers can mutate identifiers (arXiv
-    clears its ID on a 404), so checking afterwards can mislabel a real miss.
+    clears its ID only on confirmed base absence), so checking afterwards can
+    mislabel a real miss.
     Keep these checks in sync with tier early returns; concurrent groups skip
     only when every member skips. Unknown tiers retain the miss behavior.
     """
@@ -388,6 +398,8 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
             return "missing_file_url"
         if not _known_file_url(paper):
             return "not_file_url"
+        if _canonical_arxiv_url_id(paper.url, allow_pdf=True):
+            return "current_arxiv_version_required"
     credential = {
         "wiley_tdm": "WILEY_TDM_TOKEN",
         "elsevier_tdm": "ELSEVIER_TDM_API_KEY",
@@ -400,7 +412,7 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
             return "disabled"
         if not (paper.doi or paper.arxiv_id or paper.url):
             return "missing_identifier"
-    if source == "arxiv" and not paper.arxiv_id:
+    if source == "arxiv" and not _arxiv_input(paper):
         return "missing_arxiv_id"
     if source == "hal_repository" and not (paper.doi or "").strip():
         return "missing_doi"
@@ -428,7 +440,7 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
         if _core_skip_reason(paper):
             return "no_applicable_member"
     if source == "arxiv_by_title":
-        if paper.arxiv_id:
+        if _arxiv_title_has_identity(paper, arxiv_record):
             return "already_has_arxiv_id"
         title = (paper.title or "").strip()
         if len(title) < 20 or not re.sub(r'["\\?<>]', '', title)[:100]:
@@ -445,8 +457,11 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
             overrides = json.loads((Path(_vault_path()) / "url_overrides.json").read_text())
         except (FileNotFoundError, ValueError):
             return "missing_url_override"
-        if not (overrides.get(paper.doi or "") or overrides.get(paper.arxiv_id or "")):
+        override = overrides.get(paper.doi or "") or overrides.get(paper.arxiv_id or "")
+        if not override:
             return "missing_url_override"
+        if isinstance(override, str) and _canonical_arxiv_url_id(override, allow_pdf=True):
+            return "current_arxiv_version_required"
     dependency = {
         "curl_impersonate": ("curl_cffi", "requests"),
         "annas_archive": ("scrapling.fetchers", "StealthyFetcher"),
@@ -462,6 +477,51 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
         except (ImportError, AttributeError):
             return "missing_dependency"
     return None
+
+
+def _settle_arxiv_withdrawal(paper: Paper, library: Library, *,
+                             source: str = "arxiv", attempted: bool = False) -> bool:
+    evidence = _confirmed_arxiv_withdrawal(paper)
+    if evidence is None:
+        return False
+    # Acquisition stops without deleting, replacing, or relabeling any asset.
+    # download_source continues to describe a past successful acquisition only.
+    paper.download_status = (DOWNLOAD_STATUS_METADATA_ONLY if (paper.abstract or "").strip()
+                             else DOWNLOAD_STATUS_FAILED)
+    library.log({"event": "download_miss" if attempted else "download_skip",
+                 "key": paper.key, "source": source, "reason": "current_version_withdrawn",
+                 "withdrawal": evidence.model_dump()})
+    library.log({"event": "download_metadata_only" if paper.download_status == DOWNLOAD_STATUS_METADATA_ONLY
+                 else "download_failed", "key": paper.key,
+                 "doi": paper.doi, "arxiv_id": paper.arxiv_id,
+                 "reason": "current_version_withdrawn", "withdrawal": evidence.model_dump()})
+    return True
+
+
+def _prepare_cascade_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
+    record = _prepare_arxiv(paper)
+    if record is not None or paper.arxiv_id:
+        return record
+    # An operator can supply an arXiv file URL for a DOI-only record. Route it
+    # through current-version resolution as well, rather than disabling that
+    # approved source route or fetching its historical URL directly.
+    from .services.concurrency import _vault_path
+    try:
+        overrides = json.loads((Path(_vault_path()) / "url_overrides.json").read_text())
+        override = overrides.get(paper.doi or "")
+    except (OSError, ValueError, AttributeError):
+        return None
+    identifier = (_canonical_arxiv_url_id(override, allow_pdf=True)
+                  if isinstance(override, str) else "")
+    if not identifier:
+        return None
+    candidate = paper.model_copy(deep=True)
+    candidate.arxiv_id = identifier
+    record = _prepare_arxiv(candidate)
+    if record is not None and record.status == "found":
+        paper.arxiv_id = candidate.arxiv_id
+        paper.arxiv_withdrawal = candidate.arxiv_withdrawal
+    return record
 
 
 def download_paper(paper: Paper, library: Library) -> bool:
@@ -481,8 +541,17 @@ def download_paper(paper: Paper, library: Library) -> bool:
     Idempotent: if the file exists, returns True without re-fetching.
     """
     dest = library.pdf_path(paper.key)
+    if _settle_arxiv_withdrawal(paper, library):
+        return False
     if library.has_pdf(paper.key):
         return True
+    # Only the enabled arXiv tier owns this observation. Reuse it at its normal
+    # position, but confirm withdrawal before an earlier tier or text re-gate
+    # can supply/remove an older copy. This is per-call state, not a global cache.
+    arxiv_record = (_prepare_cascade_arxiv(paper) if any(strategy is _try_arxiv for _, strategy in _STRATEGIES)
+                    else None)
+    if _settle_arxiv_withdrawal(paper, library, attempted=arxiv_record is not None):
+        return False
     if _settle_ads_abstract(paper, library):
         return False
     ads_member = None
@@ -542,8 +611,18 @@ def download_paper(paper: Paper, library: Library) -> bool:
 
     for source, strategy in _STRATEGIES:
         try:
-            skip_reason = _download_skip_reason(source, paper)
-            if ads_member is not None and strategy is _try_domain_aggregators:
+            skip_reason = _download_skip_reason(source, paper, arxiv_record=arxiv_record)
+            if skip_reason == "current_arxiv_version_required":
+                data = None
+            elif strategy is _try_arxiv:
+                # The preflight can clear a nonexistent ID, but its attempted
+                # metadata lookup still counts as an arXiv miss, not a skip.
+                if arxiv_record is not None:
+                    skip_reason = None
+                data = _try_arxiv_with_record(paper, arxiv_record)
+            elif strategy is _try_arxiv_by_title:
+                data = _try_arxiv_by_title(paper, record=arxiv_record)
+            elif ads_member is not None and strategy is _try_domain_aggregators:
                 data = _try_domain_aggregators(paper, ads_member=ads_member)
             else:
                 data = strategy(paper)
@@ -551,6 +630,8 @@ def download_paper(paper: Paper, library: Library) -> bool:
             library.log({"event": "download_error", "key": paper.key,
                          "source": source, "error": repr(exc)[:200]})
             continue
+        if _settle_arxiv_withdrawal(paper, library, source=source, attempted=not skip_reason):
+            return False
         if data:
             ok, verify_reason = _verify_pdf_matches_metadata(data, paper)
             if source == "domain_aggregators":

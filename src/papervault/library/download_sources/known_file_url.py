@@ -61,14 +61,16 @@ def _try_known_file_url(paper: Paper) -> Optional[bytes]:
     return _fetch_pdf_url(url)
 
 
-def _fetch_pdf_url(url: str, *, get: Optional[Callable[..., requests.Response]] = None) -> Optional[bytes]:
+def _fetch_pdf_url(url: str, *, get: Optional[Callable[..., requests.Response]] = None,
+                   headers: Optional[dict[str, str]] = None) -> Optional[bytes]:
     """Fetch a whole PDF candidate; identity remains the cascade's responsibility.
 
-    Repository tiers can supply a transport to enforce their request limits.
+    Repository tiers can supply their request limits and API-friendly headers.
     """
     try:
         r = (get or requests.get)(url, timeout=TIMEOUT,
-                                  headers=BROWSER_HEADERS, allow_redirects=True)
+                                  headers=BROWSER_HEADERS if headers is None else headers,
+                                  allow_redirects=True)
         # We asked for a whole file, so a partial response is not a download.
         if (200 <= r.status_code < 300 and r.status_code != 206
                 and not r.headers.get("Content-Range") and _is_pdf_bytes(r.content)):

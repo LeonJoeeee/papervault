@@ -106,7 +106,9 @@ def _try_hal_repository(paper: Paper) -> Optional[bytes]:
         if parts.scheme not in {"http", "https"} or not parts.hostname:
             continue
         seen.add(url)
-        data = _fetch_pdf_url(url, get=_hal_get)
+        # HAL serves bot-check HTML to the browser header profile; use the
+        # library agent for API and document requests alike.
+        data = _fetch_pdf_url(url, get=_hal_get, headers={"User-Agent": USER_AGENT})
         if data:
             return data
     return None

@@ -94,6 +94,21 @@ def test_hal_escapes_query_quotes_and_backslashes(paper):
     assert params["q"] == ['doiId_s:("10.1/a\\\\b\\" OR *:*")']
 
 
+@responses.activate
+def test_hal_document_uses_library_headers_to_avoid_browser_challenge(paper):
+    """Live HAL serves challenge HTML to the shared browser header profile."""
+    _docs(_record())
+
+    def document(request):
+        is_library = request.headers.get("User-Agent", "").startswith("paper-pipeline/")
+        if is_library and "Sec-Fetch-Mode" not in request.headers:
+            return 200, {"Content-Type": "application/pdf"}, PDF
+        return 200, {"Content-Type": "text/html"}, b"<html>Making sure you're not a bot!</html>"
+
+    responses.add_callback(responses.GET, DOCUMENT, callback=document)
+    assert _try(paper) == PDF
+
+
 @pytest.mark.parametrize("updates", [
     {"doiId_s": "10.1002/2015JA021419.extra"},
     {"doiId_s": "10.1002/2015JA02141"},

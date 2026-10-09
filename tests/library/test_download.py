@@ -1056,14 +1056,14 @@ def test_ads_happy_path(lib, paper, monkeypatch):
     responses.add(
         responses.GET, "https://api.adsabs.harvard.edu/v1/search/query",
         json={"response": {"docs": [
-            {"bibcode": "2020ApJ...1B", "esources": ["EPRINT_HTML", "PUB_PDF"]},
+            {"bibcode": "2020ApJ...900....1B", "doi": ["10.1/x"], "identifier": ["arXiv:2401.0001"], "esources": ["EPRINT_HTML", "PUB_PDF"]},
         ]}},
         status=200,
     )
     # First esource isn't a PDF type, second is — link_gateway returns the body.
     responses.add(
         responses.GET,
-        "https://ui.adsabs.harvard.edu/link_gateway/2020ApJ...1B/PUB_PDF",
+        "https://ui.adsabs.harvard.edu/link_gateway/2020ApJ...900....1B/PUB_PDF",
         body=PDF_BYTES, status=200,
     )
     assert download.download_paper(paper, lib) is True
@@ -1095,7 +1095,7 @@ def test_ads_returns_none_on_no_pdf_esources(lib, paper, monkeypatch):
     responses.add(
         responses.GET, "https://api.adsabs.harvard.edu/v1/search/query",
         json={"response": {"docs": [
-            {"bibcode": "2020ApJ...1B", "esources": ["EPRINT_HTML", "AUTHOR_HTML"]},
+            {"bibcode": "2020ApJ...900....1B", "doi": ["10.1/x"], "identifier": ["arXiv:2401.0001"], "esources": ["EPRINT_HTML", "AUTHOR_HTML"]},
         ]}},
         status=200,
     )
@@ -1122,13 +1122,13 @@ def test_full_cascade_arxiv_to_ads(lib, paper, monkeypatch):
     responses.add(
         responses.GET, "https://api.adsabs.harvard.edu/v1/search/query",
         json={"response": {"docs": [
-            {"bibcode": "2020Bib", "esources": ["ADS_PDF"]},
+            {"bibcode": "2020ApJ...900....2B", "doi": ["10.1/x"], "identifier": ["arXiv:2401.0001"], "esources": ["ADS_PDF"]},
         ]}},
         status=200,
     )
     responses.add(
         responses.GET,
-        "https://ui.adsabs.harvard.edu/link_gateway/2020Bib/ADS_PDF",
+        "https://ui.adsabs.harvard.edu/link_gateway/2020ApJ...900....2B/ADS_PDF",
         body=PDF_BYTES, status=200,
     )
     assert download.download_paper(paper, lib) is True

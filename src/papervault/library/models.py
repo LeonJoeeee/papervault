@@ -36,7 +36,8 @@ from .insight.schema import Insight  # noqa: E402  (intentional pre-class import
 #                     reset (D9).
 #   failed          — TERMINAL. Every download tier missed AND there is no
 #                     abstract to cite from (a "true zero").
-#   metadata_only   — TERMINAL. Download missed but rich metadata
+#   metadata_only   — TERMINAL. Download missed or the indexed item was
+#                     confirmed to be a published abstract; rich metadata
 #                     (DOI/title/authors/year/abstract) is in hand; the
 #                     paper is citable even without full text.
 #
@@ -84,6 +85,43 @@ MAX_EXTRACT_ATTEMPTS = 3
 MIN_TXT_SERVE_BYTES = 500
 
 ExtractStatus = Literal["none", "txt", "md", "both"]
+
+
+class ADSDocumentEvidence(BaseModel):
+    """One bounded source observation; failures never establish absence."""
+
+    url: str = ""  # stable ADS request URL, never a signed redirect URL
+    status_code: Optional[int] = None
+    outcome: Literal[
+        "pdf", "blocked", "stale", "html", "http_error", "transport_error",
+        "incomplete", "invalid_pdf",
+    ] = "invalid_pdf"
+    document_kind: Literal["unknown", "full_text", "meeting_abstract", "abstract_anthology"] = "unknown"
+    identity_match: bool = False
+    identity_rejected: bool = False
+    pages: Optional[int] = None
+    target_page: Optional[int] = None
+    size_bytes: int = 0
+    sha256: str = ""
+    reason: str = ""
+
+
+class ADSAvailability(BaseModel):
+    """Availability of this indexed ADS item, not a global absence claim.
+
+    Publication kind retains ADS's doctype, independently of document evidence
+    (an inproceedings link can be an abstract book). Existing records are unknown.
+    """
+
+    availability: Literal["confirmed_abstract_only", "retrievable", "blocked", "unknown"] = "unknown"
+    publication_kind: str = "unknown"
+    bibcode: str = ""
+    reason: str = "not_checked"
+    checked_at: Optional[str] = None
+    esources: list[str] = Field(default_factory=list)
+    identifiers: list[str] = Field(default_factory=list)
+    documents: list[ADSDocumentEvidence] = Field(default_factory=list)
+    existing_assets: list[str] = Field(default_factory=list)
 
 
 def slugify_lastname(name: str) -> str:
@@ -227,12 +265,14 @@ class Paper(BaseModel):
 
     doi: str = ""
     arxiv_id: str = ""
-    paper_id: str = ""  # Semantic Scholar paperId
+    paper_id: str = ""  # source-qualified ID: Semantic Scholar paperId or ADS bibcode
     url: str = ""
 
     citation_count: int = 0
     is_review: bool = False
     publication_types: list[str] = Field(default_factory=list)
+
+    ads_availability: ADSAvailability = Field(default_factory=ADSAvailability)
 
     pdf_path: Optional[str] = None
     txt_path: Optional[str] = None

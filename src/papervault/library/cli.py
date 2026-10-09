@@ -499,7 +499,9 @@ def _print_retry_extract_keys(result: dict) -> None:
 def cmd_audit(args) -> int:
     """`python -m papervault.library.cli audit [--fix] [--queue] [--retry-failed] [--retry-low-quality] [--retry-metadata-only]` — index/disk + BG queue.
 
-    Default (no action flag) runs the drift/dangling/orphan scan. Each of the
+    Default (no action flag) runs the drift/dangling/orphan scan. The read-only
+    ``--ads-availability`` report lists stored ADS evidence without fetching or
+    resetting records. Each of the
     action flags (``--fix``, ``--queue``, ``--retry-failed``,
     ``--retry-low-quality``, ``--retry-metadata-only``,
     ``--retry-extract-keys FILE``) can be combined.
@@ -539,7 +541,18 @@ def cmd_audit(args) -> int:
     do_drift_scan = args.fix or not (
         args.queue or args.retry_failed or args.retry_low_quality
         or args.retry_metadata_only or args.resolve_stub_dois
-        or args.retry_extract_keys)
+        or args.retry_extract_keys or args.ads_availability)
+
+    if args.ads_availability:
+        from .download_sources.ads import _ads_availability_report
+        report = _ads_availability_report(lib)
+        payload["ads_availability"] = report
+        if not args.json:
+            for state, count in report["counts"].items():
+                print(f"ADS {state}: {count}")
+            for row in report["records"]:
+                print(f"  {row['key']}: {row['publication_kind']} / "
+                      f"{row['availability']} — {row['reason']}")
 
     if retry_keys is not None:
         result = _retry_extract_keys(lib, retry_keys, dry_run=args.dry_run)
@@ -1024,6 +1037,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="backfill index fields when files exist but the index is missing them")
     pau.add_argument("--queue", action="store_true",
                      help="show background ingest queue status (download_status breakdown)")
+    pau.add_argument("--ads-availability", action="store_true",
+                     help="report stored ADS publication/document evidence; no fetches or resets")
     pau.add_argument("--retry-failed", action="store_true",
                      help="reset all 'failed' papers to 'pending' so they get retried")
     pau.add_argument("--retry-low-quality", action="store_true",

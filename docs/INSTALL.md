@@ -330,6 +330,29 @@ Before the repo flips public, this shipped default reverts to OFF — see
 [ADR-0004](adr/0004-grey-download-tiers-flag-gated.md) and its amendment.
 
 
+## ADS availability evidence
+
+The existing ADS member of `domain_aggregators` accepts DOI/arXiv identifiers and
+validated stored ADS record URLs or ADS-qualified bibcodes. It requires
+`ADS_API_TOKEN`. Every returned PDF still passes the cascade's identity check.
+
+ADS attempts record `Paper.ads_availability`: publication kind, availability,
+checked time, stable request URLs and document evidence. Inspect stored outcomes
+with `python -m papervault.library.cli audit --ads-availability --json`. This report
+makes no source requests and does not reset terminal records; older, unaudited
+records remain `unknown`.
+
+Availability separates `retrievable`, `blocked`, `unknown`, and
+`confirmed_abstract_only`. Confirmation requires matching document evidence for
+a published meeting abstract or an abstract-book contribution, including entries
+beyond the book's first pages. It settles the indexed item's full-paper hunt with
+a durable reason and preserves existing PDFs/extracts. The conclusion applies
+to that publication, not to whether a related full paper exists elsewhere.
+Missing ADS links, HTML-only metadata, access blocks, API errors and incomplete
+documents do not establish full-text absence. Ambiguous forms remain unknown.
+The document rules recognize conservative English publication forms; very short
+entries and unfamiliar languages or layouts remain unknown.
+
 ## Run papervault as a service (optional)
 
 `deploy/papervault.service` is a user-level systemd unit for the server. Its

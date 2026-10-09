@@ -57,7 +57,13 @@ from .download_sources._shared import (
     _load_stealthy_fetcher as _load_stealthy_fetcher,
     _strip_frontmatter as _strip_frontmatter,
 )
-from .download_sources.ads import _try_ads as _try_ads
+from .download_sources.ads import (
+    _ads_bibcode,
+    _log_ads_availability,
+    _record_ads_verification,
+    _settle_ads_abstract,
+    _try_ads as _try_ads,
+)
 from .download_sources.annas_archive import (
     _AnnasLink as _AnnasLink,
     _AnnasLinks as _AnnasLinks,
@@ -311,7 +317,9 @@ def _try_oa_aggregators(paper: Paper) -> Optional[bytes]:
     ])
 
 
-def _try_domain_aggregators(paper: Paper) -> Optional[bytes]:
+def _try_domain_aggregators(
+    paper: Paper, *, ads_member: Optional[Callable[[Paper], Optional[bytes]]] = None,
+) -> Optional[bytes]:
     """Concurrent first-hit over four domain-specific paper indexes.
 
     inspire (HEP), ads (astrophysics), europepmc (biomed), zenodo (data
@@ -320,7 +328,7 @@ def _try_domain_aggregators(paper: Paper) -> Optional[bytes]:
     ~6-8s on the misses."""
     return _try_concurrent_first_hit(paper, [
         ("inspire", _try_inspire),
-        ("ads", _try_ads),
+        ("ads", _try_ads if ads_member is None else ads_member),
         ("europepmc", _try_europepmc),
         ("zenodo", _try_zenodo),
     ])
@@ -412,7 +420,10 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
     if tdm_prefixes and paper.doi.split("/", 1)[0] not in tdm_prefixes:
         return "not_applicable"
     if source == "domain_aggregators" and not (paper.doi or paper.arxiv_id):
-        return "missing_identifier"
+        if not _ads_bibcode(paper):
+            return "missing_identifier"
+        if not os.environ.get("ADS_API_TOKEN", "").strip():
+            return "missing_credentials"
     if source == "oa_aggregators" and not (paper.doi or _openalex_work_id(paper)):
         if _core_skip_reason(paper):
             return "no_applicable_member"
@@ -457,7 +468,8 @@ def download_paper(paper: Paper, library: Library) -> bool:
     """Download a single paper's PDF if missing.
 
     Returns True iff a PDF binary was successfully obtained and written to
-    disk. False can mean either total failure OR a successful firecrawl
+    disk. False can also mean a confirmed published ADS abstract, total failure,
+    or a successful firecrawl
     text-only fallback — callers must inspect ``paper.download_status`` +
     disk facts (or just call ``services.classify.classify``). A firecrawl
     fallback win leaves ``download_status="ok"`` +
@@ -471,6 +483,9 @@ def download_paper(paper: Paper, library: Library) -> bool:
     dest = library.pdf_path(paper.key)
     if library.has_pdf(paper.key):
         return True
+    if _settle_ads_abstract(paper, library):
+        return False
+    ads_member = None
 
     # ── Re-gate an un-gated HISTORICAL firecrawl md BEFORE hunting a PDF ──
     # (issue #1, manifestation 1). The ~48 migrated firecrawl md predate the
@@ -490,6 +505,21 @@ def download_paper(paper: Paper, library: Library) -> bool:
         and library.md_source(paper.key) == "firecrawl"
         and not paper.firecrawl_pdf_hunt_exhausted
     ):
+        # A source-confirmed abstract must preserve this existing asset before
+        # the historical firecrawl gate can delete it. Reuse this one ADS
+        # observation inside the normal group; no shared/global cache or retry.
+        if _ads_bibcode(paper) and os.environ.get("ADS_API_TOKEN", "").strip():
+            ads_identity = (paper.doi, paper.arxiv_id, _ads_bibcode(paper))
+            ads_data = _safe_call(_try_ads, paper)
+            _log_ads_availability(paper, library)
+            if _settle_ads_abstract(paper, library):
+                return False
+
+            def ads_member(current):
+                if (current.doi, current.arxiv_id, _ads_bibcode(current)) != ads_identity:
+                    return _try_ads(current)
+                return ads_data
+
         try:
             on_disk = library.md_path(paper.key).read_text(
                 encoding="utf-8", errors="replace")
@@ -513,17 +543,25 @@ def download_paper(paper: Paper, library: Library) -> bool:
     for source, strategy in _STRATEGIES:
         try:
             skip_reason = _download_skip_reason(source, paper)
-            data = strategy(paper)
+            if ads_member is not None and strategy is _try_domain_aggregators:
+                data = _try_domain_aggregators(paper, ads_member=ads_member)
+            else:
+                data = strategy(paper)
         except Exception as exc:
             library.log({"event": "download_error", "key": paper.key,
                          "source": source, "error": repr(exc)[:200]})
             continue
         if data:
             ok, verify_reason = _verify_pdf_matches_metadata(data, paper)
+            if source == "domain_aggregators":
+                _record_ads_verification(paper, data, ok)
+                _log_ads_availability(paper, library)
             if not ok:
                 library.log({"event": "download_pdf_mismatch", "key": paper.key,
                              "source": source, "size": len(data),
                              "reason": verify_reason})
+                if source == "domain_aggregators" and _settle_ads_abstract(paper, library):
+                    return False
                 continue
             _atomic_save(dest, data)
             _apply_openalex_identifiers(data, paper, library, verify_reason)
@@ -535,6 +573,10 @@ def download_paper(paper: Paper, library: Library) -> bool:
             library.log({"event": "downloaded", "key": paper.key, "source": source,
                          "size": len(data), "verify": verify_reason})
             return True
+        if source == "domain_aggregators":
+            _log_ads_availability(paper, library)
+            if _settle_ads_abstract(paper, library):
+                return False
         if skip_reason:
             library.log({"event": "download_skip", "key": paper.key,
                          "source": source, "reason": skip_reason})

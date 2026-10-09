@@ -36,6 +36,30 @@ def _json(obj) -> None:
 # ------------------------------- handlers ----------------------------------
 
 
+def cmd_identity_backfill(args) -> int:
+    """Inspect without filesystem writes; apply through the normal library store."""
+    from papervault import config
+    from .services.identity_backfill import backfill_identities, inspect_identities, read_identity_records
+
+    try:
+        keys = _read_key_file(args.keys) if args.keys else None
+        if args.apply:
+            from papervault.ops_guards import active_service_units
+            if active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES):
+                _err("papervault.service is running and would overwrite this maintenance pass")
+                return 2
+            result = backfill_identities(Library(), cap=args.cap, keys=keys, acquire=args.acquire)
+        else:
+            root = Path(os.path.expanduser(os.environ.get("PAPERVAULT_VAULT")
+                        or os.environ.get("PAPER_LIBRARY_PATH") or str(config.VAULT_PATH)))
+            result = inspect_identities(read_identity_records(root), cap=args.cap, keys=keys)
+    except (OSError, ValueError, KeyError) as exc:
+        _err(str(exc))
+        return 2
+    _json(result)
+    return 0
+
+
 def cmd_add(args) -> int:
     """`python -m papervault.library.cli add <ident>` — enqueue one paper for background ingest.
 
@@ -1031,6 +1055,22 @@ def build_parser() -> argparse.ArgumentParser:
     pc.add_argument("--json", action="store_true")
     pc.set_defaults(func=cmd_cite_check)
 
+    # identity-backfill: explicit record cap for both recovery and acquisition.
+    from .services.identity_backfill import MAX_CAP
+    def identity_cap(raw):
+        value = int(raw)
+        if not 1 <= value <= MAX_CAP:
+            raise argparse.ArgumentTypeError(f"cap must be between 1 and {MAX_CAP}")
+        return value
+    pib = sp.add_parser("identity-backfill", help="recover verified identifiers from stored URLs")
+    pib.add_argument("--cap", type=identity_cap, required=True,
+                     help=f"maximum records inspected/acquired in this pass (1..{MAX_CAP})")
+    pib.add_argument("--keys", metavar="FILE", help="restrict to listed citation keys, in file order")
+    pib.add_argument("--apply", action="store_true", help="persist verified identities (default: read-only)")
+    pib.add_argument("--acquire", action="store_true", help="run the cascade only on newly recovered rows; requires --apply")
+    pib.add_argument("--json", action="store_true", help="emit the recorded JSON accounting")
+    pib.set_defaults(func=cmd_identity_backfill)
+
     # audit
     pau = sp.add_parser("audit", help="check / fix index ↔ disk consistency")
     pau.add_argument("--fix", action="store_true",
@@ -1110,6 +1150,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     os.environ["PAPERVAULT_BIB_MIN_INTERVAL_S"] = "0"
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "identity-backfill" and args.acquire and not args.apply:
+        parser.error("--acquire requires --apply")
     if args.library_path:
         os.environ["PAPER_LIBRARY_PATH"] = args.library_path
     try:

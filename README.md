@@ -54,6 +54,33 @@ instruction text — lives in editable config files (`src/papervault/domain/`). 
 another field means editing those files; quality outside the shipped domain is the adapting
 operator's responsibility.
 
+## URL identity backfill
+
+For records with a URL but no DOI or arXiv ID, inspect a bounded sample without
+writing to the vault:
+
+```bash
+python -m papervault.library.cli identity-backfill --cap 20 --json
+```
+
+Recovery checks DOI/publisher and arXiv URL patterns, then one citation-metadata
+landing fetch (including its redirect target), then exact ADS, CORE, OpenAlex or
+INSPIRE metadata. DOI registry metadata or the current arXiv page must pass the
+existing title/author consistency screen before an identifier is filled. Missing,
+blocked, ambiguous or conflicting evidence causes abstention. Existing identifiers
+and collisions are left intact; successful fills retain route, URL, verified title
+and UTC observation time in `identity_recovery`.
+
+In an authorized maintenance window after deployment, add `--apply --acquire` to
+persist identities and immediately run the ordinary current-only cascade on only
+the newly recovered rows without existing assets. `--keys FILE` restricts selection
+to listed citation keys (one per line). `--cap` is required, accepts 1–50, and bounds
+both inspected and acquired records; unrelated terminal sets are never reset.
+Writes refuse while `papervault.service` is running. The JSON result and library
+manifest record recovery counts by route, acquisition outcomes, and successful
+sources (including the winning member of aggregator groups). Report that post-deploy
+pass's numbers on [issue #197](https://github.com/LeonJoeeee/papervault/issues/197).
+
 ## Releases
 
 papervault is consumed **by pin** (ADR-0001): deployments track an annotated git tag

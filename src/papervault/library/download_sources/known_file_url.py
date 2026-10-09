@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Callable, Optional
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import requests
@@ -58,9 +58,17 @@ def _try_known_file_url(paper: Paper) -> Optional[bytes]:
     url = _known_file_url(paper)
     if not url:
         return None
+    return _fetch_pdf_url(url)
+
+
+def _fetch_pdf_url(url: str, *, get: Optional[Callable[..., requests.Response]] = None) -> Optional[bytes]:
+    """Fetch a whole PDF candidate; identity remains the cascade's responsibility.
+
+    Repository tiers can supply a transport to enforce their request limits.
+    """
     try:
-        r = requests.get(url, timeout=TIMEOUT,
-                         headers=BROWSER_HEADERS, allow_redirects=True)
+        r = (get or requests.get)(url, timeout=TIMEOUT,
+                                  headers=BROWSER_HEADERS, allow_redirects=True)
         # We asked for a whole file, so a partial response is not a download.
         if (200 <= r.status_code < 300 and r.status_code != 206
                 and not r.headers.get("Content-Range") and _is_pdf_bytes(r.content)):

@@ -76,6 +76,7 @@ from .download_sources.crossref import _try_crossref_link as _try_crossref_link
 from .download_sources.elsevier import _try_elsevier_tdm as _try_elsevier_tdm
 from .download_sources.europepmc import _try_europepmc as _try_europepmc
 from .download_sources.firecrawl import _try_firecrawl_text_fallback as _try_firecrawl_text_fallback
+from .download_sources.hal_repository import _try_hal_repository as _try_hal_repository
 from .download_sources.inspire import _try_inspire as _try_inspire
 from .download_sources.iopscience import _try_iopscience_direct as _try_iopscience_direct
 from .download_sources.known_file_url import (
@@ -348,6 +349,9 @@ _STRATEGIES = [
     # === Concurrent domain-specific indexes ===
     ("domain_aggregators", _try_domain_aggregators),  # inspire/ads/europepmc/zenodo
 
+    # === Free DOI-indexed repository, before last-resort scrapers ===
+    ("hal_repository", _try_hal_repository),        # HAL, including HAL-INSU deposits
+
     # === Heuristics / fragile last-resort scrapers ===
     ("curl_impersonate", _try_curl_impersonate),    # Akamai TLS fingerprint
     ("ssrn", _try_ssrn),
@@ -386,6 +390,8 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
             return "missing_identifier"
     if source == "arxiv" and not paper.arxiv_id:
         return "missing_arxiv_id"
+    if source == "hal_repository" and not (paper.doi or "").strip():
+        return "missing_doi"
     if source in {"crossref_tm", "citation_pdf_url", "wiley_tdm", "elsevier_tdm",
                   "annas_archive", "curl_impersonate", "cloudscraper"} and not paper.doi:
         return "missing_doi"

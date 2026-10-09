@@ -418,12 +418,9 @@ def _isolate_tier(monkeypatch, source):
     ("annas_archive", {"doi": ""}, {"ANNAS_ARCHIVE_API_KEY": "fixture-token"}),
     ("domain_aggregators", {"doi": "", "arxiv_id": ""}, {}),
     ("curl_impersonate", {"doi": ""}, {}),
-    ("ssrn", {}, {}),
-    ("ssrn", {"doi": "10.2139/ssrn."}, {}),
     ("arxiv_by_title", {}, {}),
     ("arxiv_by_title", {"arxiv_id": "", "title": "Short"}, {}),
     ("arxiv_by_title", {"arxiv_id": "", "title": "?" * 25}, {}),
-    ("cloudscraper", {"doi": ""}, {}),
     ("mdpi_scrapling", {}, {}),
     ("researchgate", {"doi": "", "title": "Short"}, {}),
     ("web_search", {"title": "Short"}, {}),
@@ -451,7 +448,6 @@ def test_unattempted_tier_logs_skip_not_miss(lib, paper, monkeypatch, source, fi
 
 @pytest.mark.parametrize("source, module", [
     ("curl_impersonate", "curl_cffi"),
-    ("cloudscraper", "cloudscraper"),
     ("annas_archive", "scrapling.fetchers"),
     ("mdpi_scrapling", "scrapling.fetchers"),
     ("researchgate", "scrapling.fetchers"),
@@ -1748,61 +1744,6 @@ def test_citation_pdf_url_skipped_without_doi(lib):
     with responses.RequestsMock() as rmocks:
         assert download._try_citation_pdf_url(p) is None
         assert len(rmocks.calls) == 0
-
-
-# ---------------------------------------------------------------------------
-# SSRN strategy
-# ---------------------------------------------------------------------------
-
-@responses.activate
-def test_ssrn_happy_path(lib):
-    """Paper with SSRN DOI → fetch landing page, follow Delivery.cfm link."""
-    p, _ = lib.upsert({"title": "An SSRN paper title that is long enough",
-                       "authors": ["A"], "year": 2022,
-                       "doi": "10.2139/ssrn.4000235"})
-    landing_html = (
-        b'<html><body>'
-        b'<a class="download" href="/sol3/Delivery.cfm/'
-        b'SSRN_ID4000235_code1234.pdf?abstractid=4000235">Download</a>'
-        b'</body></html>'
-    )
-    responses.add(
-        responses.GET,
-        "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4000235",
-        body=landing_html, status=200,
-    )
-    responses.add(
-        responses.GET,
-        "https://papers.ssrn.com/sol3/Delivery.cfm/"
-        "SSRN_ID4000235_code1234.pdf",
-        body=PDF_BYTES, status=200,
-    )
-    assert download._try_ssrn(p) == PDF_BYTES
-
-
-@responses.activate
-def test_ssrn_skipped_for_non_ssrn_doi(lib, paper):
-    """Paper with non-SSRN DOI → no HTTP, return None."""
-    # The fixture `paper` has doi 10.1/x — not SSRN.
-    with responses.RequestsMock() as rmocks:
-        assert download._try_ssrn(paper) is None
-        assert len(rmocks.calls) == 0
-
-
-@responses.activate
-def test_ssrn_landing_without_delivery_link_returns_none(lib):
-    """SSRN landing page renders but has no Delivery.cfm link (paywalled or
-    the layout has changed) → strategy returns None gracefully."""
-    p, _ = lib.upsert({"title": "Another SSRN paper without a delivery link",
-                       "authors": ["A"], "year": 2022,
-                       "doi": "10.2139/ssrn.5000999"})
-    responses.add(
-        responses.GET,
-        "https://papers.ssrn.com/sol3/papers.cfm?abstract_id=5000999",
-        body=b"<html><body>Subscription required</body></html>",
-        status=200,
-    )
-    assert download._try_ssrn(p) is None
 
 
 # ---------------------------------------------------------------------------

@@ -93,7 +93,6 @@ from .download_sources.publisher import (
     _CITATION_PDF_URL_RE as _CITATION_PDF_URL_RE,
     _CITATION_PDF_URL_RE_REV as _CITATION_PDF_URL_RE_REV,
     _try_citation_pdf_url as _try_citation_pdf_url,
-    _try_cloudscraper_publisher as _try_cloudscraper_publisher,
     _try_curl_impersonate as _try_curl_impersonate,
 )
 from .download_sources.researchgate import (
@@ -112,7 +111,6 @@ from .download_sources.scihub import (
     _try_scihub as _try_scihub,
 )
 from .download_sources.semantic_scholar import _try_semantic_scholar_oa as _try_semantic_scholar_oa
-from .download_sources.ssrn import _SSRN_DELIVERY_RE as _SSRN_DELIVERY_RE, _try_ssrn as _try_ssrn
 from .download_sources.unpaywall import _try_unpaywall as _try_unpaywall
 from .download_sources.url_overrides import _try_url_overrides as _try_url_overrides
 from .download_sources.web_search import _try_web_search as _try_web_search
@@ -358,9 +356,7 @@ _STRATEGIES = [
 
     # === Heuristics / fragile last-resort scrapers ===
     ("curl_impersonate", _try_curl_impersonate),    # Akamai TLS fingerprint
-    ("ssrn", _try_ssrn),
     ("arxiv_by_title", _try_arxiv_by_title),
-    ("cloudscraper", _try_cloudscraper_publisher),  # Cloudflare interstitial
     ("mdpi_scrapling", _try_mdpi_scrapling),        # 3/3 MDPI hits via Akamai bm-verify trick (R11)
     ("researchgate", _try_researchgate),
     ("web_search", _try_web_search),                # DDG title+filetype:pdf, last-ditch
@@ -397,12 +393,11 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
     if source == "hal_repository" and not (paper.doi or "").strip():
         return "missing_doi"
     if source in {"crossref_tm", "citation_pdf_url", "wiley_tdm", "elsevier_tdm",
-                  "annas_archive", "curl_impersonate", "cloudscraper"} and not paper.doi:
+                  "annas_archive", "curl_impersonate"} and not paper.doi:
         return "missing_doi"
     prefixes = {
         "iopscience_direct": ("10.3847/", "10.1088/"),
         "mdpi_scrapling": ("10.3390/",),
-        "ssrn": ("10.2139/ssrn.",),
     }.get(source)
     if prefixes and not (paper.doi or "").startswith(prefixes):
         return "not_applicable"
@@ -412,8 +407,6 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
     }.get(source)
     if tdm_prefixes and paper.doi.split("/", 1)[0] not in tdm_prefixes:
         return "not_applicable"
-    if source == "ssrn" and not paper.doi.split("ssrn.")[-1].strip():
-        return "missing_identifier"
     if source == "domain_aggregators" and not (paper.doi or paper.arxiv_id):
         return "missing_identifier"
     if source == "oa_aggregators" and not (paper.doi or _openalex_work_id(paper)):
@@ -442,7 +435,6 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
             return "missing_url_override"
     dependency = {
         "curl_impersonate": ("curl_cffi", "requests"),
-        "cloudscraper": ("cloudscraper", None),
         "annas_archive": ("scrapling.fetchers", "StealthyFetcher"),
         "mdpi_scrapling": ("scrapling.fetchers", "StealthyFetcher"),
         "researchgate": ("scrapling.fetchers", "StealthyFetcher"),

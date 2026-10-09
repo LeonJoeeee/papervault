@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "papervault"
-version = "0.7.6"
+version = "0.7.7"
 description = "Self-hosted literature + knowledge layer for coding agents — one MCP server: discover papers, read full text, query a graph-RAG knowledge base with cited answers."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -62,7 +62,6 @@ dependencies = [
 # the imports are absent (the cascade records a download_skip). Enabling
 # them (install + the tier env flags) is the operator's own legal decision.
 grey = [
-    "cloudscraper>=1.2",
     "curl-cffi>=0.7",
     "scrapling[fetchers]>=0.2",
     "firecrawl-py>=1.0",

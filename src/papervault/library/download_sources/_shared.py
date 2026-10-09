@@ -23,7 +23,7 @@ BROWSER_USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
-# Full browser-style headers: many publisher CDNs (MDPI, SSRN, Springer)
+# Full browser-style headers: many publisher CDNs (MDPI, Springer)
 # return 403 to bare User-Agent strings without Accept / Accept-Language /
 # Sec-Fetch-* hints. Empirically MDPI 403s on UA-only Chrome request but
 # 200s with the full set.
@@ -58,18 +58,6 @@ def _load_stealthy_fetcher(source: str) -> Optional[type]:
     return StealthyFetcher
 
 
-# Order rationale:
-#   1-2: official free sources (arxiv preprint, unpaywall OA copy) — cheapest
-#        and most legitimate.
-#   3:   sci-hub — high hit rate across paywalled publishers (Elsevier / MDPI /
-#        Wiley / Springer). Promoted from last-position in 2026-05 after fixing
-#        the regex; running it early avoids ~5 min of timeouts on tiers 4-13
-#        for the typical paywalled paper.
-#   4-10: OA aggregators (openalex/inspire/ads/europepmc/zenodo) and link
-#         heuristics (crossref_tm, citation_pdf_url, ssrn). Cover papers
-#         sci-hub doesn't have.
-#   11-14: heuristics + scrapers (arxiv_by_title, cloudscraper, researchgate)
-#          — last-resort, fragile.
 def _strip_frontmatter(text: str) -> str:
     """Drop a leading ``---\\n … \\n---\\n`` YAML frontmatter block, if present.
 

@@ -716,6 +716,41 @@ class Library:
                   "source": p.source})
         return ("set", doi)
 
+    def fill_verified_identifiers(self, key: str, *, doi: str = "",
+                                  arxiv_id: str = "") -> dict[str, str]:
+        """Fill verified blanks on this row; never redirect a merge to a twin.
+
+        Atomic dictionary claims arbitrate concurrent download workers before
+        the existing in-place merge. Unlike upsert/set_resolved_doi this never
+        selects or purges another row. The normal caller still batches save().
+        """
+        paper = self.get(key)
+        if paper is None:
+            return {}
+        incoming = {}
+        for name, value, index, normalized in (
+            ("doi", doi, self._by_doi, doi.lower()),
+            ("arxiv_id", arxiv_id, self._by_arxiv, _normalize_arxiv(arxiv_id)),
+        ):
+            if value and not getattr(paper, name):
+                if index.setdefault(normalized, key) == key:
+                    incoming[name] = value
+        self._merge(paper, incoming)
+        applied = {}
+        for name, value in incoming.items():
+            current = getattr(paper, name)
+            if current == value:
+                applied[name] = value
+                continue
+            # Another writer filled this blank first. Remove our unused claim,
+            # retaining the index when only the arXiv version/case differs.
+            index = self._by_doi if name == "doi" else self._by_arxiv
+            normalize = str.lower if name == "doi" else _normalize_arxiv
+            normalized = normalize(value)
+            if normalize(current) != normalized and index.get(normalized) == key:
+                index.pop(normalized, None)
+        return applied
+
     def export_bibtex(self, keys: Optional[list[str]] = None) -> tuple[str, list[str]]:
         """Render BibTeX for a subset (or the whole library if keys is None).
 

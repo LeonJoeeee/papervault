@@ -14,6 +14,7 @@ import requests
 import responses
 
 from papervault.library import Library, download
+from papervault.library.models import Paper
 
 
 PDF_BYTES = b"%PDF-1.4\n%fake-pdf"
@@ -1346,6 +1347,63 @@ def test_europepmc_no_results_returns_none(lib, paper, monkeypatch):
 # ---------------------------------------------------------------------------
 # Zenodo strategy
 # ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "file_metadata, attempted",
+    [
+        pytest.param({"key": "poster.pdf"}, True, id="untyped-pdf"),
+        pytest.param({"key": "poster.PDF"}, True, id="untyped-uppercase-pdf"),
+        pytest.param({"key": "poster.pdf", "type": None}, True, id="null-type-pdf"),
+        pytest.param({"key": "poster.pdf", "type": ""}, True, id="empty-type-pdf"),
+        pytest.param({"type": "pdf"}, True, id="legacy-pdf-without-key"),
+        pytest.param({"key": "download", "type": "PDF"}, True, id="legacy-uppercase-type"),
+        pytest.param({"key": "data.csv"}, False, id="untyped-csv"),
+        pytest.param({"key": "poster.pdf.csv"}, False, id="pdf-in-non-pdf-name"),
+        pytest.param({"key": "pdf"}, False, id="no-pdf-extension"),
+        pytest.param({}, False, id="no-type-or-key"),
+        pytest.param({"key": "data.csv", "type": "csv"}, False, id="legacy-csv"),
+        pytest.param({"key": "poster.pdf", "type": "csv"}, False,
+                     id="explicit-non-pdf-type"),
+    ],
+)
+@responses.activate
+def test_zenodo_file_selection(file_metadata, attempted):
+    """Missing types use the advertised filename; explicit types retain their behavior."""
+    file_url = "https://zenodo.org/api/records/12345/files/attachment/content"
+    responses.get(
+        "https://zenodo.org/api/records",
+        json={"hits": {"hits": [{"files": [
+            {**file_metadata, "links": {"self": file_url}},
+        ]}]}},
+    )
+    responses.get(file_url, body=PDF_BYTES, content_type="application/octet-stream")
+
+    result = download._try_zenodo(Paper(key="Zenodo2023", doi="10.5281/zenodo.12345"))
+
+    assert result == (PDF_BYTES if attempted else None)
+    assert len(responses.calls) == (2 if attempted else 1)
+    if attempted:
+        assert responses.calls[1].request.url == file_url
+
+
+@pytest.mark.parametrize("file_metadata", [{"key": "poster.pdf"}, {"type": "pdf"}],
+                         ids=["untyped-pdf", "legacy-typed-pdf"])
+@responses.activate
+def test_zenodo_advertised_pdf_rejects_non_pdf_bytes(file_metadata):
+    """A PDF advertisement must not bypass the existing fetched-byte check."""
+    file_url = "https://zenodo.org/api/records/12345/files/poster.pdf/content"
+    responses.get(
+        "https://zenodo.org/api/records",
+        json={"hits": {"hits": [{"files": [
+            {**file_metadata, "links": {"self": file_url}},
+        ]}]}},
+    )
+    responses.get(file_url, body=b"\x00not a PDF", content_type="application/octet-stream")
+
+    assert download._try_zenodo(Paper(key="Zenodo2023", doi="10.5281/zenodo.12345")) is None
+    assert len(responses.calls) == 2
+    assert responses.calls[1].request.url == file_url
+
 
 @responses.activate
 def test_zenodo_happy_path(lib, paper, monkeypatch):

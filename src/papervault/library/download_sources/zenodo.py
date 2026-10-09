@@ -13,8 +13,8 @@ def _try_zenodo(paper: Paper) -> Optional[bytes]:
     """Try Zenodo (CERN-hosted records API).
 
     Strong for CS / physics preprints, datasets, and conference papers.
-    Pulls `hits.hits[0].files[]` and downloads each file with
-    `type == "pdf"` via its `links.self` URL.
+    Pulls `hits.hits[0].files[]` and downloads PDF files via `links.self`.
+    Uses `type == "pdf"`, or a `.pdf` key when the type is missing or empty.
     """
     if not paper.doi and not paper.arxiv_id:
         return None
@@ -39,7 +39,8 @@ def _try_zenodo(paper: Paper) -> Optional[bytes]:
     files = hits[0].get("files") or []
     for f in files:
         ftype = (f.get("type") or "").lower()
-        if ftype != "pdf":
+        untyped_pdf = not ftype and (f.get("key") or "").lower().endswith(".pdf")
+        if ftype != "pdf" and not untyped_pdf:
             continue
         url = ((f.get("links") or {}).get("self"))
         if not url:

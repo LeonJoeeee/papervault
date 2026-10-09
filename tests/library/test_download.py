@@ -2497,3 +2497,71 @@ def test_openalex_connect_attempts_share_absolute_deadline(monkeypatch):
         openalex._connect_socket(connection, deadline=0.03)
     assert now[0] <= 0.03
     assert len(attempts) == 1
+
+
+def test_openalex_connect_falls_back_from_unsupported_address_family(monkeypatch):
+    import errno
+    import socket
+    from types import SimpleNamespace
+
+    attempts = []
+    addresses = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", 80)),
+                 (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+
+    class Socket:
+        def settimeout(self, timeout):
+            pass
+
+        def connect(self, address):
+            attempts.append(address)
+
+    connected = Socket()
+
+    def create(family, *args):
+        if family == socket.AF_INET6:
+            raise OSError(errno.EAFNOSUPPORT, "IPv6 unavailable")
+        return connected
+
+    monkeypatch.setattr(openalex.time, "monotonic", lambda: 0)
+    monkeypatch.setattr(openalex, "_resolve_addresses", lambda *args: addresses)
+    monkeypatch.setattr(socket, "socket", create)
+    connection = SimpleNamespace(_dns_host="repo.example", port=80, timeout=10,
+                                 source_address=None, socket_options=[])
+    assert openalex._connect_socket(connection, deadline=0.03) is connected
+    assert attempts == [("127.0.0.1", 80)]
+
+
+@pytest.mark.parametrize("elapsed", [0.03, 0.04])
+def test_openalex_connect_deducts_tcp_time_before_tls(monkeypatch, elapsed):
+    import socket
+    from types import SimpleNamespace
+
+    now = [0.0]
+    timeouts = []
+    closed = []
+
+    class Socket:
+        def settimeout(self, timeout):
+            timeouts.append(timeout)
+
+        def connect(self, address):
+            now[0] = elapsed
+
+        def close(self):
+            closed.append(True)
+
+    connected = Socket()
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
+    monkeypatch.setattr(openalex.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(openalex, "_resolve_addresses", lambda *args: addresses)
+    monkeypatch.setattr(socket, "socket", lambda *args: connected)
+    connection = SimpleNamespace(_dns_host="repo.example", port=443, timeout=10,
+                                 source_address=None, socket_options=[])
+    if elapsed < 0.04:
+        assert openalex._connect_socket(connection, deadline=0.04) is connected
+        assert timeouts == pytest.approx([0.04, 0.01])
+        assert not closed
+    else:
+        with pytest.raises(requests.Timeout):
+            openalex._connect_socket(connection, deadline=0.04)
+        assert closed == [True]

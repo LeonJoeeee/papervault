@@ -69,18 +69,28 @@ def _connect_socket(connection, *, deadline: float):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise requests.Timeout("OpenAlex connect deadline exhausted")
-        sock = socket.socket(family, kind, protocol)
+        sock = None
         try:
+            sock = socket.socket(family, kind, protocol)
             sock.settimeout(min(connection.timeout, remaining))
             for option in connection.socket_options or []:
                 sock.setsockopt(*option)
             if connection.source_address:
                 sock.bind(connection.source_address)
             sock.connect(address)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise requests.Timeout("OpenAlex connect deadline exhausted")
+            sock.settimeout(min(connection.timeout, remaining))
             return sock
+        except requests.Timeout:
+            if sock is not None:
+                sock.close()
+            raise
         except OSError as exc:
             error = exc
-            sock.close()
+            if sock is not None:
+                sock.close()
     raise requests.ConnectionError(str(error or "no resolved addresses"))
 
 

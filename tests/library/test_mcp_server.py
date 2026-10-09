@@ -731,7 +731,8 @@ def _fake_plan(**over):
 
 # The internal pipeline tags that must NEVER leak into an output record.
 _INTERNAL_TAGS = {"_source_origin", "term_idx", "rank", "term_ranks", "_rrf",
-                  "paper_id", "url", "source", "_bm25_score", "publication_types"}
+                  "paper_id", "url", "source", "_bm25_score", "publication_types",
+                  "inspire_record_id", "inspire_document_urls", "_inspire_metadata"}
 
 # Term-0 candidates: an in-domain real paper (rank 0), an in-domain DATASET
 # (metadata says non-paper, rank 1), an off-domain medical paper (rank 2), plus
@@ -1805,3 +1806,127 @@ def test_derive_source_health_no_terms_no_degrade():
     from papervault.library.mcp import server as srv
     unconfigured, degraded_list = srv._derive_source_health({"arxiv": 0}, 0)
     assert degraded_list == []
+
+
+@pytest.mark.parametrize("origin", ["external", "library"])
+@pytest.mark.parametrize("conflict", [None, "authors", "year", "title", "recid"])
+async def test_search_fold_retains_only_verified_inspire_pairs(
+        server, populated_lib, monkeypatch, origin, conflict):
+    """The discarded INSPIRE twin may fill source metadata, never a title collision."""
+    from types import SimpleNamespace
+
+    target = {"title": "Silicon tracker alignment in cosmic ray physics",
+              "authors": ["Ambrosi, G."], "year": 2013,
+              "doi": "", "arxiv_id": "", "abstract": "", "source": "semantic_scholar",
+              "publication_types": ["JournalArticle"]}
+    if conflict == "recid":
+        target["inspire_record_id"] = "99"
+    twin = dict(target, source="inspire", inspire_record_id="1412451",
+                inspire_document_urls=["https://inspirehep.net/files/alignment"])
+    if conflict == "authors":
+        twin["authors"] = ["Someone, Else"]
+    elif conflict == "year":
+        twin["year"] = 2014
+    elif conflict == "title":
+        # Same loose fold key, different exact bibliographic title.
+        twin["title"] += "!"
+    existing = None
+    if origin == "library":
+        existing, _ = populated_lib.upsert(dict(target))
+        existing.download_status = "metadata_only"
+        populated_lib.save(force=True)
+    queued = []
+    server._paper_download_queue.add = lambda key, **_: queued.append(key)
+    monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda **_: SimpleNamespace())
+    monkeypatch.setattr("papervault.library.mcp.server.parse_intent",
+                        lambda *_, **__: _fake_plan(search_terms=["silicon tracker alignment"]))
+
+    async def external(*_, **__):
+        nodes = [_tag(twin, 0, 1)]
+        if origin == "external":
+            nodes.insert(0, _tag(target, 0, 0))
+        return nodes, {}
+
+    async def ingest(cands, **_):
+        return {i: {"ingest_ok": True, "llm_is_paper": True, "tier": "1A"}
+                for i in range(len(cands))}, 0
+
+    async def ret(cands, *_, **__):
+        return {i: {"score": 0.9, "reason": "same topic"} for i in range(len(cands))}, 0
+
+    monkeypatch.setattr("papervault.library.mcp.server.search_external_async", external)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", ingest)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
+    result = await _call(server, "search_papers", {"query": "silicon tracker alignment"})
+    assert result["status"] == "ok"
+    paper = populated_lib.find(title=target["title"])
+    if origin == "external" and conflict not in {None, "recid"}:
+        assert paper is None  # contentless collision still fails the existing ingest floor
+        return
+    assert paper is not None
+    expected_id = "99" if conflict == "recid" else ("1412451" if conflict is None else "")
+    assert paper.inspire_record_id == expected_id
+    assert paper.inspire_document_urls == (twin["inspire_document_urls"] if conflict is None else [])
+    reloaded = Library(populated_lib.root).get(paper.key)
+    assert reloaded.inspire_record_id == expected_id
+    assert reloaded.inspire_document_urls == paper.inspire_document_urls
+    if existing:
+        assert paper is existing
+        assert paper.download_status == "metadata_only"
+        assert queued == []
+    else:
+        assert queued == [paper.key]
+    for item in result["results"]:
+        assert "inspire_record_id" not in item and "inspire_document_urls" not in item
+
+
+@pytest.mark.parametrize("mode", ["library_await", "external_upsert", "library_repeated",
+                                  "external_repeated", "external_same_url"])
+async def test_inspire_fold_rechecks_original_source_evidence(
+        server, populated_lib, monkeypatch, mode):
+    """Discarded donor evidence must survive both the await and final title-based upsert."""
+    from types import SimpleNamespace
+
+    title = "Silicon tracker alignment in cosmic ray physics"
+    existing = {"title": title, "authors": ["Ambrosi, G."], "year": None}
+    if mode.startswith("external"):
+        existing.update(year=2014, doi="10.1/existing")
+    paper, _ = populated_lib.upsert(existing)
+    twin = {"title": title, "authors": ["Ambrosi, G."], "year": 2013, "source": "inspire",
+            "inspire_record_id": "1412451", "inspire_document_urls": ["https://inspirehep.net/files/alignment"]}
+    monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda **_: SimpleNamespace())
+    monkeypatch.setattr("papervault.library.mcp.server.parse_intent",
+                        lambda *_, **__: _fake_plan(search_terms=["silicon tracker alignment"]))
+
+    async def external(*_, **__):
+        nodes = [twin]
+        if mode in {"library_repeated", "external_repeated", "external_same_url"}:
+            first = dict(twin, year=None)
+            if mode != "external_same_url":
+                first["inspire_document_urls"] = ["https://inspirehep.net/files/first"]
+            nodes.insert(0, first)
+        if mode.startswith("external"):
+            # The library's DOI key differs from both external title keys.
+            representative = {"title": title, "authors": ["Ambrosi, G."],
+                              "year": None, "source": "semantic_scholar"}
+            nodes.insert(0, representative)
+        return [_tag(node, 0, rank) for rank, node in enumerate(nodes)], {}
+
+    async def ingest(cands, **__):
+        if mode.startswith("library"):
+            paper.year = 2014  # another actor filled the unknown year during the await
+        return {i: {"ingest_ok": True, "llm_is_paper": True, "tier": "1A"}
+                for i in range(len(cands))}, 0
+
+    async def ret(cands, *_, **__):
+        return {i: {"score": 0.9, "reason": "same topic"} for i in range(len(cands))}, 0
+
+    monkeypatch.setattr("papervault.library.mcp.server.search_external_async", external)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", ingest)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
+    result = await _call(server, "search_papers", {"query": "silicon tracker alignment"})
+    assert result["status"] == "ok"
+    assert paper.year == 2014
+    assert paper.inspire_record_id == ""
+    assert paper.inspire_document_urls == []
+    assert Library(populated_lib.root).get(paper.key).inspire_record_id == ""

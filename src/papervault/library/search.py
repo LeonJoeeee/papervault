@@ -30,6 +30,7 @@ import requests
 from .sources.arxiv import search_arxiv  # noqa: F401
 from .sources.semantic_scholar import search_semantic_scholar  # noqa: F401
 from .sources.inspire import search_inspire  # noqa: F401
+from .sources.inspire import retained_inspire_fields
 from .sources.ads import search_ads  # noqa: F401
 from .sources.core import search_core  # noqa: F401
 from .sources.exceptions import BackendDegraded
@@ -221,6 +222,7 @@ def _normalize_paper(p: dict, source: str) -> dict:
         "doi": (p.get("doi") or "").strip(),
         "arxiv_id": (p.get("arxiv_id") or "").strip(),
         "paper_id": (p.get("paper_id") or "").strip(),
+        **retained_inspire_fields(p),
         "url": (p.get("url") or "").strip(),
         "citation_count": int(p.get("citation_count") or 0),
         "publication_types": p.get("publication_types") or [],

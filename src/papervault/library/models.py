@@ -266,6 +266,8 @@ class Paper(BaseModel):
     doi: str = ""
     arxiv_id: str = ""
     paper_id: str = ""  # source-qualified ID: Semantic Scholar paperId or ADS bibcode
+    inspire_record_id: str = ""  # INSPIRE literature recid (separate namespace)
+    inspire_document_urls: list[str] = Field(default_factory=list)
     url: str = ""
 
     citation_count: int = 0

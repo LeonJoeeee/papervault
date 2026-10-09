@@ -4,6 +4,9 @@ import json
 import io
 import os
 import re
+import queue
+import socket
+import threading
 import time
 from dataclasses import dataclass, field
 from contextlib import contextmanager
@@ -31,6 +34,54 @@ _MAX_HTML_BYTES = 128 * 1024
 _MAX_PDF_BYTES = 32 * 1024 * 1024
 _TIME_BUDGET = 60
 _SOCKET_TIMEOUT = 10
+_DNS_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _resolve_addresses(host: str, port: int, deadline: float) -> list:
+    """Wait only within the budget; at most four system resolvers can linger."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or not _DNS_SLOTS.acquire(blocking=False):
+        raise requests.Timeout("OpenAlex DNS budget exhausted")
+    result = queue.Queue(maxsize=1)
+
+    def resolve():
+        try:
+            result.put((True, socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)))
+        except OSError as exc:
+            result.put((False, exc))
+        finally:
+            _DNS_SLOTS.release()
+
+    threading.Thread(target=resolve, daemon=True, name="openalex-dns").start()
+    try:
+        ok, value = result.get(timeout=remaining)
+    except queue.Empty as exc:
+        raise requests.Timeout("OpenAlex DNS deadline exhausted") from exc
+    if not ok:
+        raise requests.ConnectionError(str(value))
+    return value
+
+
+def _connect_socket(connection, *, deadline: float):
+    addresses = _resolve_addresses(connection._dns_host, connection.port, deadline)
+    error = None
+    for family, kind, protocol, _, address in addresses:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise requests.Timeout("OpenAlex connect deadline exhausted")
+        sock = socket.socket(family, kind, protocol)
+        try:
+            sock.settimeout(min(connection.timeout, remaining))
+            for option in connection.socket_options or []:
+                sock.setsockopt(*option)
+            if connection.source_address:
+                sock.bind(connection.source_address)
+            sock.connect(address)
+            return sock
+        except OSError as exc:
+            error = exc
+            sock.close()
+    raise requests.ConnectionError(str(error or "no resolved addresses"))
 
 
 class _DeadlineReader(io.RawIOBase):
@@ -67,13 +118,20 @@ class _DeadlineAdapter(requests.adapters.HTTPAdapter):
         super().__init__(max_retries=0)
 
     def _bind_deadline(self, manager):
-        factory = staticmethod(partial(_deadline_response, deadline=self.deadline))
+        deadline = self.deadline
+        factory = staticmethod(partial(_deadline_response, deadline=deadline))
 
         class HTTP(HTTPConnection):
             response_class = factory
 
+            def _new_conn(self):
+                return _connect_socket(self, deadline=deadline)
+
         class HTTPS(HTTPSConnection):
             response_class = factory
+
+            def _new_conn(self):
+                return _connect_socket(self, deadline=deadline)
 
         class HTTPPool(HTTPConnectionPool):
             ConnectionCls = HTTP

@@ -2410,3 +2410,90 @@ def test_openalex_writeback_cannot_redirect_to_racing_identifier_owner(lib, open
     assert holder.arxiv_id == ""
     assert p.doi == ""
     assert lib.find(doi=doi) is holder
+
+
+def test_openalex_recovery_removes_unused_claims_on_same_row_update(
+        lib, openalex_paper, monkeypatch):
+    p = openalex_paper
+    merge = lib._merge
+
+    def intervening_update(paper, incoming):
+        lib.set_resolved_doi(p.key, "10.1088/other")
+        return merge(paper, incoming)
+
+    monkeypatch.setattr(lib, "_merge", intervening_update)
+    changed = lib.fill_verified_identifiers(p.key, doi="10.1088/recovered")
+    assert changed == {}
+    assert p.doi == "10.1088/other"
+    assert lib.find(doi="10.1088/recovered") is None
+    assert lib.find(doi=p.doi) is p
+
+
+def test_openalex_recovery_preserves_intervening_arxiv_version_index(
+        lib, openalex_paper, monkeypatch):
+    p = openalex_paper
+    merge = lib._merge
+
+    def intervening_update(paper, incoming):
+        merge(paper, {"arxiv_id": "2102.11582v1"})
+        lib._reindex(paper)
+        return merge(paper, incoming)
+
+    monkeypatch.setattr(lib, "_merge", intervening_update)
+    assert lib.fill_verified_identifiers(p.key, arxiv_id="2102.11582v3") == {}
+    assert p.arxiv_id == "2102.11582v1"
+    assert lib.find(arxiv_id="2102.11582") is p
+
+
+def test_openalex_dns_wait_is_bounded(monkeypatch):
+    import socket
+    import threading
+    import time
+
+    release = threading.Event()
+
+    def resolver(*args, **kwargs):
+        release.wait(2)
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 80))]
+
+    monkeypatch.setattr(socket, "getaddrinfo", resolver)
+    try:
+        with pytest.raises(requests.Timeout):
+            openalex._resolve_addresses("repo.example", 80, time.monotonic() + 0.02)
+    finally:
+        release.set()
+
+
+def test_openalex_connect_attempts_share_absolute_deadline(monkeypatch):
+    import socket
+    from types import SimpleNamespace
+
+    now = [0.0]
+    attempts = []
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (f"127.0.0.{i}", 80))
+                 for i in range(1, 4)]
+
+    class Socket:
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def setsockopt(self, *args):
+            pass
+
+        def connect(self, address):
+            attempts.append(address)
+            now[0] += self.timeout
+            raise OSError("connection refused")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(openalex.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(openalex, "_resolve_addresses", lambda *args: addresses)
+    monkeypatch.setattr(socket, "socket", lambda *args: Socket())
+    connection = SimpleNamespace(_dns_host="repo.example", port=80, timeout=10,
+                                 source_address=None, socket_options=[])
+    with pytest.raises(requests.Timeout):
+        openalex._connect_socket(connection, deadline=0.03)
+    assert now[0] <= 0.03
+    assert len(attempts) == 1

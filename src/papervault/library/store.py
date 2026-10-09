@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .models import DOWNLOAD_STATUS_PENDING, Paper, base_key, normalize_title
+from .models import DOWNLOAD_STATUS_PENDING, IdentityRecovery, Paper, base_key, normalize_title
 from .sources.inspire import merge_inspire_fields, retained_inspire_fields
 
 
@@ -717,6 +717,32 @@ class Library:
         self.log({"event": "doi_resolved", "key": key, "doi": doi,
                   "source": p.source})
         return ("set", doi)
+
+    def set_recovered_identity(self, key: str, recovery: IdentityRecovery) -> str:
+        """Claim a verified identity on an identifierless row, without merging twins.
+
+        The backfill caller owns verification and the normal save boundary.
+        Collisions never purge another record or broaden the acquisition set.
+        """
+        paper = self.get(key)
+        if paper is None:
+            return "no_paper"
+        if paper.doi or paper.arxiv_id:
+            return "has_identifier"
+        if not (recovery.doi or recovery.arxiv_id):
+            return "empty_identity"
+        for value, index, normalize in ((recovery.doi, self._by_doi, str.lower),
+                                        (recovery.arxiv_id, self._by_arxiv, _normalize_arxiv)):
+            if value and index.get(normalize(value), key) != key:
+                return "collision"
+        applied = self.fill_verified_identifiers(key, doi=recovery.doi, arxiv_id=recovery.arxiv_id)
+        if not applied:
+            return "collision"
+        paper.identity_recovery = recovery.model_copy(update={
+            "doi": applied.get("doi", ""), "arxiv_id": applied.get("arxiv_id", "")})
+        self.log({"event": "identity_recovered", "key": key,
+                  "recovery": paper.identity_recovery.model_dump()})
+        return "set"
 
     def fill_verified_identifiers(self, key: str, *, doi: str = "",
                                   arxiv_id: str = "") -> dict[str, str]:

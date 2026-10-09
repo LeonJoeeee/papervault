@@ -287,6 +287,10 @@ def _safe_call(fn: Callable[[Paper], Optional[bytes]],
         return None
 
 
+class _SourcePDF(bytes):
+    """Retain a plain-byte group winner's source without changing tier labels."""
+
+
 def _try_concurrent_first_hit(
     paper: Paper,
     members: list[tuple[str, Callable[[Paper], Optional[bytes]]]],
@@ -304,6 +308,9 @@ def _try_concurrent_first_hit(
                     futures, timeout=timeout):
                 data = fut.result()
                 if data:
+                    if type(data) is bytes:
+                        data = _SourcePDF(data)
+                    data.acquisition_source = futures[fut]
                     return data
         except concurrent.futures.TimeoutError:
             pass
@@ -651,7 +658,9 @@ def download_paper(paper: Paper, library: Library) -> bool:
             # D7: status routes, source labels — never fuse them into one cell.
             paper.download_status = DOWNLOAD_STATUS_OK
             paper.download_source = source
+            paper.download_source_member = getattr(data, "acquisition_source", "")
             library.log({"event": "downloaded", "key": paper.key, "source": source,
+                         "member_source": paper.download_source_member,
                          "size": len(data), "verify": verify_reason})
             return True
         if source == "domain_aggregators":

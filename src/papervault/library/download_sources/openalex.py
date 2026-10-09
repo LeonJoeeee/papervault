@@ -162,13 +162,13 @@ class _DeadlineAdapter(requests.adapters.HTTPAdapter):
 
 
 @contextmanager
-def _request(url: str, *, deadline: float):
+def _request(url: str, *, deadline: float, headers: Optional[dict] = None):
     # Adapter.send bypasses Session's ambient netrc auth and eager redirect
     # body consumption. Follow redirects only in the budgeted loop below.
     adapter = _DeadlineAdapter(deadline)
     try:
         request = requests.Request("GET", url, headers={
-            "User-Agent": USER_AGENT, "Accept-Encoding": "identity",
+            "User-Agent": USER_AGENT, **(headers or {}), "Accept-Encoding": "identity",
         }).prepare()
         with adapter.send(request, stream=True,
                           timeout=min(_SOCKET_TIMEOUT, deadline - time.monotonic()),

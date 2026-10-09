@@ -1,12 +1,71 @@
 from __future__ import annotations
 
 import re
+import time
+from html.parser import HTMLParser
 from typing import Optional
+from urllib.parse import urljoin
 
 import requests
 
 from ..models import Paper
 from ._shared import BROWSER_HEADERS, TIMEOUT, USER_AGENT, _is_pdf_bytes
+from .core import _CoreUnavailable, _HTML_LIMIT, _http_url, _read_body
+from .openalex import _request
+
+
+class _CitationMeta(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.values: dict[str, list[str]] = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs = {key.lower(): value or "" for key, value in attrs}
+        name = attrs.get("name", "").lower()
+        if tag == "meta" and name.startswith("citation_") and attrs.get("content"):
+            self.values.setdefault(name, []).append(attrs["content"].strip())
+
+
+def _citation_meta(html: str) -> dict[str, list[str]]:
+    parser = _CitationMeta()
+    parser.feed(html)
+    return parser.values
+
+
+def _fetch_citation_landing(url: str, *, headers: Optional[dict] = None,
+                            metadata_only: bool = False) -> Optional[requests.Response]:
+    """One streamed landing fetch, at most five redirects; no retries on blocks.
+
+    Share CORE's URL validation/body limits and OpenAlex's deadline transport:
+    256 KiB HTML, 32 MiB direct PDF, 40s total including DNS/headers/redirects.
+    Identity inspection skips advertised PDFs and caps every body at 256 KiB.
+    """
+    deadline = time.monotonic() + 40
+    for _ in range(6):
+        url = _http_url(url)
+        if not url or time.monotonic() >= deadline:
+            return None
+        try:
+            with _request(url, deadline=deadline, headers=headers) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("Location")
+                    if not location:
+                        return None
+                    url = urljoin(url, location)
+                    continue
+                if not response.ok or response.status_code == 206 or response.headers.get("Content-Range"):
+                    return response
+                if metadata_only and response.headers.get("Content-Type", "").lower().startswith("application/pdf"):
+                    return None
+                body = _read_body(response, _HTML_LIMIT, origin=not metadata_only)
+                landing = requests.Response()
+                landing.status_code, landing.url = response.status_code, url
+                landing.headers, landing.encoding = response.headers, response.encoding
+                landing._content = body
+                return landing
+        except (requests.RequestException, _CoreUnavailable, ValueError, TypeError):
+            return None
+    return None
 
 
 # Highwire Press <meta name="citation_pdf_url"> is a near-universal
@@ -52,11 +111,11 @@ def _try_citation_pdf_url(paper: Paper) -> Optional[bytes]:
     landing = None
     for ua_kind, ua_headers in (("bare", {"User-Agent": USER_AGENT}),
                                  ("browser", BROWSER_HEADERS)):
-        try:
-            r = requests.get(landing_url, timeout=TIMEOUT,
-                              headers=ua_headers, allow_redirects=True)
-        except Exception:
+        r = _fetch_citation_landing(landing_url, headers=ua_headers)
+        if r is None:
             continue
+        if r.status_code == 429:
+            return None
         if not r.ok:
             continue
         if _is_pdf_bytes(r.content):

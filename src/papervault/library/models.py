@@ -124,6 +124,17 @@ class ADSAvailability(BaseModel):
     existing_assets: list[str] = Field(default_factory=list)
 
 
+class IdentityRecovery(BaseModel):
+    """Verified identifier fill; source bibliography and citation key stay intact."""
+
+    doi: str = ""
+    arxiv_id: str = ""
+    route: str
+    source_url: str
+    verified_title: str
+    observed_at: str
+
+
 class ArxivWithdrawal(BaseModel):
     """Positive evidence about the latest version, never an acquired-file label."""
 
@@ -287,6 +298,7 @@ class Paper(BaseModel):
 
     ads_availability: ADSAvailability = Field(default_factory=ADSAvailability)
     arxiv_withdrawal: Optional[ArxivWithdrawal] = None
+    identity_recovery: Optional[IdentityRecovery] = None
 
     pdf_path: Optional[str] = None
     txt_path: Optional[str] = None
@@ -379,6 +391,7 @@ class Paper(BaseModel):
     insight_invalid_reason: Optional[str] = None
 
     download_source: str = ""         # which strategy succeeded (provenance, D7)
+    download_source_member: str = ""  # winning member of a concurrent aggregator tier
 
     # D9: real on-card extraction attempts. Persisted (survives restart) so
     # "retry a bad block at most 3 times, then give up" holds across daemon

@@ -87,7 +87,7 @@ from .download_sources.elsevier import _try_elsevier_tdm as _try_elsevier_tdm
 from .download_sources.europepmc import _try_europepmc as _try_europepmc
 from .download_sources.firecrawl import _try_firecrawl_text_fallback as _try_firecrawl_text_fallback
 from .download_sources.hal_repository import _try_hal_repository as _try_hal_repository
-from .download_sources.inspire import _try_inspire as _try_inspire
+from .download_sources.inspire import _try_inspire as _try_inspire, inspire_applicable
 from .download_sources.iopscience import _try_iopscience_direct as _try_iopscience_direct
 from .download_sources.known_file_url import (
     _known_file_url as _known_file_url,
@@ -419,7 +419,7 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
     }.get(source)
     if tdm_prefixes and paper.doi.split("/", 1)[0] not in tdm_prefixes:
         return "not_applicable"
-    if source == "domain_aggregators" and not (paper.doi or paper.arxiv_id):
+    if source == "domain_aggregators" and not inspire_applicable(paper):
         if not _ads_bibcode(paper):
             return "missing_identifier"
         if not os.environ.get("ADS_API_TOKEN", "").strip():

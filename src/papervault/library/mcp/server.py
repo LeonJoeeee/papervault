@@ -39,6 +39,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from papervault.library import Library
 from papervault.library import fetch as fetcher
 from papervault.library.llm import get_llm
+from papervault.library.sources.inspire import merge_inspire_fields, retained_inspire_fields
 from papervault.library.models import (
     DOWNLOAD_STATUS_EXTRACT_FAILED,
     DOWNLOAD_STATUS_FAILED,
@@ -1169,6 +1170,7 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         seen: dict[str, dict] = {}                                  # cross-arm fold key → node
         lib_by_key: dict[str, dict] = {}                            # Paper.key → library node
         folded_vouch: dict[str, int] = collections.defaultdict(int)  # lib Paper.key → vouch count
+        inspire_fills: dict[str, dict] = {}  # all original donor evidence, rechecked under lock
         buckets: dict[int, list] = collections.defaultdict(list)    # term_idx → ext node list
         # FULL-iteration invariant: register EVERY library node's identity first
         # (library-FIRST so a library twin wins identity over any external copy).
@@ -1194,10 +1196,19 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                 tr[t] = rank
                 buckets[t].append(node)
                 continue
+            fills = merge_inspire_fields(hit, node)
+            if fills:
+                hit.update(fills)
+                donors = node.get("_inspire_metadata") or [node]
+                hit.setdefault("_inspire_metadata", []).extend(
+                    {field: donor.get(field) for field in ("title", "authors", "year", "doi", "arxiv_id")}
+                    for donor in donors)
             if hit.get("_source_origin") == "library":
                 # External twin folds into a LIBRARY node → vouch (guarded to
                 # library-origin: hit["key"] is the stable Paper.key, real).
                 folded_vouch[hit["key"]] += 1
+                if fills:
+                    inspire_fills[hit["key"]] = dict(hit)
                 continue
             # ext↔ext fold: union this occurrence's vote onto the registered
             # external representative ``hit`` (no Paper.key, no vouch). A
@@ -1282,6 +1293,14 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         ingested_dicts: list[dict] = []
         ingested_keys: set[str] = set()   # same-key collapse → keeps ingested_dicts key-unique
         async with concurrency.lib_write_lock:
+            for key, incoming in inspire_fills.items():
+                existing = library.get(key)
+                if existing is not None:
+                    # Recheck against the current Paper, preserving worker-owned
+                    # status/assets and any source pair another actor filled.
+                    fills = merge_inspire_fields(existing.model_dump(), incoming)
+                    for field, value in fills.items():
+                        setattr(existing, field, value)
             for idx, cand in enumerate(ext_pool):
                 j = ingest_judgments.get(idx)
                 if j is None:
@@ -1304,14 +1323,15 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                 if not is_paper:
                     continue  # non-paper record (dataset / book / errata / …)
                 # PLUG B (junk-ingress fix, 2026-06-03): content floor — a candidate with
-                # no DOI, no arxiv_id, AND no abstract has nothing to fetch and nothing to
+                # no DOI, arxiv_id, INSPIRE recid, or abstract has nothing to fetch and nothing to
                 # index (a pure citation-graph ghost stub). Presence-only floor: every real
-                # keep clears it (paywalled→DOI, preprint→arxiv, no-abstract-real→DOI/arxiv,
+                # keep clears it (paywalled→DOI, preprint→arxiv, INSPIRE→recid,
                 # searchable stub→abstract); rejects ONLY the content-less pathology.
                 if not ((cand.get("doi") or "").strip()
                         or (cand.get("arxiv_id") or "").strip()
+                        or retained_inspire_fields(cand)["inspire_record_id"]
                         or (cand.get("abstract") or "").strip()):
-                    continue  # no DOI / arxiv / abstract → nothing fetchable or indexable
+                    continue  # no identifier / abstract → nothing fetchable or indexable
                 # dict(cand) shallow-copy isolates upsert's TOP-LEVEL mutation
                 # (it writes key/added_at + a None-coercion pass IN PLACE) from
                 # the live ext_pool node still shared with the round-robin

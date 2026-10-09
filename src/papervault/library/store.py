@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .models import DOWNLOAD_STATUS_PENDING, Paper, base_key, normalize_title
+from .sources.inspire import merge_inspire_fields, retained_inspire_fields
 
 
 def _is_nonempty_file(path: Path) -> bool:
@@ -570,6 +571,7 @@ class Library:
         # versions; harmonize on entry.
         if not paper_data.get("download_status"):
             paper_data["download_status"] = DOWNLOAD_STATUS_PENDING
+        paper_data.update(retained_inspire_fields(paper_data))
         paper = Paper(**{k: v for k, v in paper_data.items()
                          if k in Paper.model_fields})
         self._papers[key] = paper
@@ -784,7 +786,11 @@ class Library:
         both sides' field writes land. Fill-blanks semantics are unchanged:
         non-empty incoming only fills a blank existing field (numeric upgrade for
         citation_count, latch is_review)."""
+        for field, value in merge_inspire_fields(existing.model_dump(), incoming).items():
+            setattr(existing, field, value)
         for field, value in incoming.items():
+            if field in {"inspire_record_id", "inspire_document_urls"}:
+                continue  # source identity and links are merged together above
             if field == "key" or field not in Paper.model_fields:
                 continue                       # never reassign the cite key
             if value in (None, "", [], 0):

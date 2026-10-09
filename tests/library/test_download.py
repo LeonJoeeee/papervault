@@ -2506,3 +2506,611 @@ def test_openalex_connect_deducts_tcp_time_before_tls(monkeypatch, elapsed):
         with pytest.raises(requests.Timeout):
             openalex._connect_socket(connection, deadline=0.04)
         assert closed == [True]
+
+
+# CORE source recovery: transport is mocked, while locator selection, budgets,
+# metadata corroboration, PDF parsing, cascade saving and bookkeeping are real.
+@pytest.fixture
+def core_clock(monkeypatch):
+    from papervault.library.download_sources import core
+
+    elapsed = [0.0]
+    waits = []
+
+    def sleep(seconds):
+        waits.append(seconds)
+        elapsed[0] += seconds
+
+    clock = SimpleNamespace(monotonic=lambda: elapsed[0], time=lambda: 1_800_000_000 + elapsed[0],
+                            sleep=sleep, elapsed=elapsed, waits=waits)
+    monkeypatch.setattr(core, "time", clock, raising=False)
+    monkeypatch.setattr(core, "_api_next_at", 0.0, raising=False)
+    monkeypatch.setattr(core, "_api_cooldown_until", 0.0, raising=False)
+    monkeypatch.setenv("CORE_API_KEY", "fixture-core-token")
+    return clock
+
+
+@pytest.fixture
+def core_paper(core_clock):
+    from papervault.library.models import Paper
+
+    return Paper(key="CoreControl", title="Repository recovery for cosmic ray transport",
+                 authors=["Ari Cukierman"], source="core", paper_id="143668999")
+
+
+def _core_metadata(paper, **fields):
+    return {"id": 568416448, "title": paper.title,
+            "authors": [{"name": name} for name in paper.authors],
+            "doi": "", "arxivId": "", "outputs": [], "sourceFulltextUrls": [],
+            "downloadUrl": "", "links": [], **fields}
+
+
+CORE_API = "https://api.core.ac.uk/v3/"
+CORE_PDF_BYTES = b"%PDF-1.4\n%core-control\n%%EOF\n"
+
+
+@pytest.mark.parametrize("url", [
+    "http://core.ac.uk/download/568416448.pdf",
+    "https://core.ac.uk/download/pdf/568416448.pdf",
+    "https://core.ac.uk/outputs/568416448",
+    "https://api.core.ac.uk/v3/outputs/568416448",
+])
+@responses.activate
+def test_core_url_uses_output_namespace_not_stored_work(core_paper, url):
+    paper = core_paper
+    paper.url = url
+    responses.get(CORE_API + "outputs/568416448", json=_core_metadata(
+        paper, fulltextStatus="disabled", sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+
+    assert download._try_core(paper) == CORE_PDF_BYTES
+    assert [c.request.url for c in responses.calls] == [
+        CORE_API + "outputs/568416448", "https://origin.example/file.pdf"]
+    assert paper.doi == paper.arxiv_id == ""
+    assert responses.calls[0].request.headers["Authorization"] == "Bearer fixture-core-token"
+    assert "Authorization" not in responses.calls[1].request.headers
+
+
+@responses.activate
+def test_core_id_only_work_expands_disabled_output(core_paper):
+    paper = core_paper
+    paper.title = "Short"
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        paper, id=143668999, outputs=[CORE_API + "outputs/568416448"]))
+    responses.get(CORE_API + "outputs/568416448", json=_core_metadata(
+        paper, fulltextStatus="disabled", sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+
+    assert download._try_core(paper) == CORE_PDF_BYTES
+    assert download._download_skip_reason("oa_aggregators", paper) is None
+    assert [c.request.url for c in responses.calls] == [
+        CORE_API + "works/143668999", CORE_API + "outputs/568416448",
+        "https://origin.example/file.pdf"]
+
+
+@pytest.mark.parametrize("source,identifier,url", [
+    ("", "143668999", ""), ("semantic_scholar", "143668999", ""),
+    ("core", "", ""), ("core", "0", ""), ("core", "-1", ""),
+    ("core", "١٢٣", ""), ("core", "work:143668999", ""),
+    ("", "", "https://core.ac.uk.evil.example/download/123.pdf"),
+    ("", "", "https://user:password@core.ac.uk/download/123.pdf"),
+    ("", "", "https://core.ac.uk:8443/download/123.pdf"),
+    ("", "", "https://core.ac.uk/download/0.pdf"),
+    ("", "", "https://core.ac.uk/download/123.pdf/extra"),
+])
+@responses.activate
+def test_core_missing_or_wrong_namespace_never_probes_numeric_id(
+        core_paper, source, identifier, url):
+    core_paper.title = "Short"
+    core_paper.source, core_paper.paper_id, core_paper.url = source, identifier, url
+    assert download._try_core(core_paper) is None
+    assert download._download_skip_reason("oa_aggregators", core_paper) == "no_applicable_member"
+    assert not responses.calls
+
+
+@responses.activate
+def test_core_output_expansion_validates_urls_and_caps_distinct_lookups(core_paper):
+    paper = core_paper
+    paper.title = "Short"
+    outputs = ["https://evil.example/v3/outputs/1", CORE_API + "outputs/0",
+               CORE_API + "outputs/1?token=bad", CORE_API + "outputs/1",
+               CORE_API + "outputs/1", CORE_API + "outputs/2", CORE_API + "outputs/3"]
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(paper, outputs=outputs))
+    responses.get(CORE_API + "outputs/1", json=_core_metadata(paper, id=1))
+    responses.get(CORE_API + "outputs/2", json=_core_metadata(paper, id=2))
+    assert download._try_core(paper) is None
+    assert [c.request.url for c in responses.calls] == [
+        CORE_API + "works/143668999", CORE_API + "outputs/1", CORE_API + "outputs/2"]
+
+
+@pytest.mark.parametrize("conflict", [
+    {"title": "A completely different paper"}, {"authors": [{"name": "John Smith"}]},
+    {"doi": "10.1234/other"}, {"arxivId": "2306.99999"},
+])
+@responses.activate
+def test_core_conflicting_metadata_never_fetches_origins(core_paper, conflict):
+    paper = core_paper
+    paper.doi, paper.arxiv_id = "10.1234/requested", "2306.12749"
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        paper, sourceFulltextUrls=["https://origin.example/file.pdf"], **conflict))
+    assert download._try_core(paper) is None
+    assert len(responses.calls) == 1
+    assert paper.doi == "10.1234/requested" and paper.arxiv_id == "2306.12749"
+
+
+@responses.activate
+def test_core_work_output_identifier_conflict_does_not_poison_blank_record(core_paper):
+    paper = core_paper
+    paper.title = "Short"
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        paper, doi="10.1234/work", outputs=[CORE_API + "outputs/568416448"]))
+    responses.get(CORE_API + "outputs/568416448", json=_core_metadata(
+        paper, doi="10.1234/other", sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    assert download._try_core(paper) is None
+    assert len(responses.calls) == 2
+    assert paper.doi == paper.arxiv_id == ""
+
+
+@pytest.mark.parametrize("locator", [True, False])
+@responses.activate
+def test_core_429_stops_metadata_and_search_chain(core_paper, core_clock, locator):
+    paper = core_paper
+    if not locator:
+        paper.source = paper.paper_id = ""
+        paper.doi = "10.1234/requested"
+    endpoint = CORE_API + ("works/143668999" if locator else "search/works/")
+    responses.get(endpoint, status=429, headers={"Retry-After": "120"})
+    assert download._try_core(paper) is None
+    assert len(responses.calls) == 1
+    # A second call during cooldown must not spend another API request or sleep for two minutes.
+    assert download._try_core(paper) is None
+    assert len(responses.calls) == 1 and not core_clock.waits
+    core_clock.elapsed[0] = 121
+    responses.get(endpoint, json={} if locator else {"results": []})
+    paper.title = "Short"
+    assert download._try_core(paper) is None
+    assert len(responses.calls) == 2
+
+
+@pytest.mark.parametrize("headers,release", [
+    ({"Retry-After": "Fri, 15 Jan 2027 08:02:00 GMT"}, 121),
+    ({"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1800000120"}, 121),
+    ({"X-RateLimit-Retry-After": "120"}, 121),
+])
+@responses.activate
+def test_core_server_cooldown_is_shared_across_papers(core_paper, core_clock, headers, release):
+    # 1800000000 == 2027-01-15 08:00:00 UTC.
+    responses.get(CORE_API + "works/143668999", status=429, headers=headers)
+    assert download._try_core(core_paper) is None
+    second = core_paper.model_copy(update={"paper_id": "162638012", "title": "Short"})
+    assert download._try_core(second) is None
+    assert len(responses.calls) == 1
+    core_clock.elapsed[0] = release
+    responses.get(CORE_API + "works/162638012", json={})
+    assert download._try_core(second) is None
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_core_metadata_requests_are_paced(core_paper, core_clock):
+    core_paper.title = "Short"
+    times = []
+    def reply(request):
+        times.append(core_clock.monotonic())
+        return 200, {}, json.dumps(_core_metadata(
+            core_paper, outputs=[CORE_API + "outputs/568416448"] if "works/" in request.url else []))
+    responses.add_callback(responses.GET, CORE_API + "works/143668999", callback=reply)
+    responses.add_callback(responses.GET, CORE_API + "outputs/568416448", callback=reply)
+    assert download._try_core(core_paper) is None
+    assert len(times) == 2 and times[1] - times[0] >= 6
+
+
+@responses.activate
+def test_core_repository_candidates_precede_deduplicated_blocked_core_urls(core_paper):
+    sources = ["http://core.ac.uk/download/568416448.pdf",
+               "https://core.ac.uk/download/pdf/568416448.pdf",
+               "https://core.ac.uk/download/568416448.pdf",
+               "https://origin.example/one.pdf", "https://origin.example/two.pdf"]
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=sources, downloadUrl=sources[0],
+        links=[{"type": "display", "url": "https://ignored.example/display"},
+               {"type": "thumbnail", "url": "https://ignored.example/thumb.pdf"}]))
+    responses.get("https://origin.example/one.pdf", status=403)
+    responses.get("https://origin.example/two.pdf", body=CORE_PDF_BYTES)
+    assert download._try_core(core_paper) == CORE_PDF_BYTES
+    assert [c.request.url for c in responses.calls][1:] == [
+        "https://origin.example/one.pdf", "https://origin.example/two.pdf"]
+
+
+@pytest.mark.parametrize("html,target", [
+    ('<meta content="/file.pdf" name="citation_pdf_url">', "https://origin.example/file.pdf"),
+    ('<a href="/bitstreams/123/download">Download PDF</a>', "https://origin.example/bitstreams/123/download"),
+    ('<link type="application/pdf" href="/paper.pdf" rel="alternate">', "https://origin.example/paper.pdf"),
+    ('<a href="javascript:void(0)">PDF</a><a href="/file.pdf">PDF</a>', "https://origin.example/file.pdf"),
+])
+@responses.activate
+def test_core_explicit_landing_links_reach_pdfs(core_paper, html, target):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["https://origin.example/item/42"]))
+    responses.get("https://origin.example/item/42", body=html, content_type="text/html")
+    responses.get(target, body=CORE_PDF_BYTES)
+    assert download._try_core(core_paper) == CORE_PDF_BYTES
+    assert [c.request.url for c in responses.calls][-1] == target
+
+
+@responses.activate
+def test_core_arxiv_abs_resolves_pdf_without_copying_citeseer_doi(core_paper):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["http://arxiv.org/abs/2306.12749"],
+        identifiers=["oai:arXiv.org:2306.12749", "oai:citeseerx:10.1.1.1041.7506"]))
+    responses.get("https://arxiv.org/pdf/2306.12749", body=CORE_PDF_BYTES)
+    result = download._try_core(core_paper)
+    assert result == CORE_PDF_BYTES
+    assert getattr(result, "arxiv_id", "") == "2306.12749"
+    assert getattr(result, "doi", "") == ""
+    assert core_paper.arxiv_id == ""
+
+
+@pytest.mark.parametrize("status,body,headers", [
+    (202, b'<html><script src="/aws-waf-token.js"></script></html>', {}),
+    (403, CORE_PDF_BYTES, {}), (206, CORE_PDF_BYTES, {}),
+    (200, CORE_PDF_BYTES, {"Content-Range": "bytes 0-20/9999"}),
+    (200, b"%PDF-1.4\nincomplete", {}),
+    (200, CORE_PDF_BYTES, {"Content-Length": "9999"}),
+])
+@responses.activate
+def test_core_challenge_and_incomplete_files_are_misses(core_paper, status, body, headers):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", status=status, body=body, headers=headers)
+    assert download._try_core(core_paper) is None
+    assert core_paper.doi == core_paper.arxiv_id == ""
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_core_three_roots_two_links_and_six_gets_bound_landing_work(core_paper):
+    roots = [f"https://origin.example/item/{n}" for n in range(4)]
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=roots))
+    for n in range(4):
+        responses.get(roots[n], body=''.join(f'<a href="/{n}/{j}.pdf">PDF</a>' for j in range(4)))
+        for j in range(4):
+            responses.get(f"https://origin.example/{n}/{j}.pdf", status=403)
+    assert download._try_core(core_paper) is None
+    urls = [c.request.url for c in responses.calls][1:]
+    assert urls == [roots[0], "https://origin.example/0/0.pdf", "https://origin.example/0/1.pdf",
+                    roots[1], "https://origin.example/1/0.pdf", "https://origin.example/1/1.pdf"]
+
+
+@responses.activate
+def test_core_redirects_are_bounded_and_cannot_send_api_credentials(core_paper):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["https://origin.example/redirect"]))
+    for n in range(12):
+        url = "https://origin.example/redirect" if not n else f"https://origin.example/{n}"
+        responses.get(url, status=302, headers={"Location": f"https://origin.example/{n+1}"})
+    assert download._try_core(core_paper) is None
+    assert len(responses.calls) <= 7  # one metadata GET + six total origin/redirect GETs
+    assert all("Authorization" not in c.request.headers for c in responses.calls[1:])
+
+
+@responses.activate
+def test_core_api_redirect_does_not_follow_with_bearer(core_paper):
+    responses.get(CORE_API + "works/143668999", status=302,
+                  headers={"Location": "https://evil.example/metadata"})
+    assert download._try_core(core_paper) is None
+    assert len(responses.calls) == 1
+
+
+@pytest.mark.parametrize("match", [True, False])
+@responses.activate
+def test_core_cascade_verifies_before_persisting_identifiers(
+        lib, paper, monkeypatch, file_url_identity, core_clock, match):
+    _isolate_tier(monkeypatch, "oa_aggregators")
+    paper.doi = paper.arxiv_id = paper.url = ""
+    paper.source, paper.paper_id = "core", "143668999"
+    data, prompts = file_url_identity
+    if not match:
+        data = _text_pdf("Meeting program and poster listing for the annual cosmic ray meeting.")
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        paper, outputs=[CORE_API + "outputs/568416448"]))
+    responses.get(CORE_API + "outputs/568416448", json=_core_metadata(
+        paper, doi="https://doi.org/10.1234/recovered", arxivId="2306.12749",
+        sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=data)
+    assert download.download_paper(paper, lib) is match
+    outcomes = [e for e in _logged_events(lib) if e.get("source") == "oa_aggregators"]
+    assert [e["event"] for e in outcomes] == ["downloaded" if match else "download_pdf_mismatch"]
+    assert len(prompts) == 1 and "Requested title:" in prompts[0]
+    assert "Requested title: Test paper for download cascade" in prompts[0]
+    if match:
+        assert lib.pdf_path(paper.key).read_bytes() == data
+        assert paper.doi == "10.1234/recovered" and paper.arxiv_id == "2306.12749"
+        assert paper.download_status == "ok" and paper.download_source == "oa_aggregators"
+    else:
+        assert not lib.has_pdf(paper.key)
+        assert paper.doi == paper.arxiv_id == ""
+    lib.save()
+    saved = Library(lib.root).get(paper.key)
+    assert saved.doi == paper.doi and saved.arxiv_id == paper.arxiv_id
+
+
+@responses.activate
+def test_core_id_only_failure_is_miss_and_missing_id_is_skip(lib, paper, monkeypatch, core_clock):
+    _isolate_tier(monkeypatch, "oa_aggregators")
+    paper.doi = paper.arxiv_id = paper.url = ""
+    paper.title, paper.source, paper.paper_id = "Short", "core", "143668999"
+    responses.get(CORE_API + "works/143668999", status=404)
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == "oa_aggregators"]
+    assert [e["event"] for e in events] == ["download_miss"]
+    paper.paper_id = ""
+    assert download.download_paper(paper, lib) is False
+    events = [e for e in _logged_events(lib) if e.get("source") == "oa_aggregators"]
+    assert [e["event"] for e in events] == ["download_miss", "download_skip"]
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_core_losing_concurrent_member_does_not_apply_identifiers(
+        lib, paper, monkeypatch, core_clock, file_url_identity):
+    import threading
+
+    _isolate_tier(monkeypatch, "oa_aggregators")
+    paper.doi, paper.arxiv_id, paper.source, paper.paper_id = "10.1234/known", "", "core", "143668999"
+    data, _ = file_url_identity
+    core_requested = threading.Event()
+    other_finished = threading.Event()
+    def core_reply(_):
+        core_requested.set()
+        assert other_finished.wait(5)
+        return 200, {}, json.dumps(_core_metadata(
+            paper, doi="10.1234/known", arxivId="2306.12749",
+            sourceFulltextUrls=["https://origin.example/core.pdf"]))
+    def other_member(_):
+        assert core_requested.wait(5)
+        return data
+    original_completed = download.concurrent.futures.as_completed
+    def completed(futures, timeout):
+        for future in original_completed(futures, timeout=timeout):
+            if future.result():
+                # Release CORE only once the dispatcher has selected the
+                # other completed member, avoiding a scheduler-dependent race.
+                other_finished.set()
+            yield future
+    monkeypatch.setattr(download.concurrent.futures, "as_completed", completed)
+    monkeypatch.setattr(download, "_try_unpaywall", other_member)
+    monkeypatch.setattr(download, "_try_semantic_scholar_oa", lambda _: None)
+    monkeypatch.setattr(download, "_try_openalex", lambda _: None)
+    responses.add_callback(responses.GET, CORE_API + "works/143668999", callback=core_reply)
+    responses.get("https://origin.example/core.pdf", body=data)
+    assert download.download_paper(paper, lib) is True
+    assert paper.doi == "10.1234/known" and paper.arxiv_id == ""
+    assert lib.pdf_path(paper.key).read_bytes() == data
+
+
+@pytest.mark.parametrize("identifiers", [
+    {"identifiers": {"doi": None, "oai": "oai:arXiv.org:2306.12749"}},
+    {"identifiers": [{"type": "oai_id", "identifier": "oai:arxiv.org:2306.12749"}]},
+    {"oaiIds": ["oai:arxiv.org:2306.12749"]},
+    {"oai": "oai:arxiv.org:2306.12749"},
+])
+@responses.activate
+def test_core_recovers_arxiv_only_from_qualified_oai_namespaces(core_paper, identifiers):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["https://origin.example/file.pdf"], **identifiers))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    result = download._try_core(core_paper)
+    assert result == CORE_PDF_BYTES
+    assert getattr(result, "arxiv_id", "") == "2306.12749"
+    assert core_paper.arxiv_id == ""
+
+
+@responses.activate
+def test_core_malformed_landing_link_does_not_hide_later_valid_file(core_paper):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["https://origin.example/item"]))
+    responses.get("https://origin.example/item", body='<a href="https://[bad">Bad</a>'
+                  '<meta name="citation_pdf_url" content="/file.pdf">')
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    assert download._try_core(core_paper) == CORE_PDF_BYTES
+
+
+@responses.activate
+def test_core_rejects_unrelated_output_even_when_works_are_discovered_by_doi(core_paper):
+    core_paper.source = core_paper.paper_id = ""
+    core_paper.doi = "10.1234/requested"
+    responses.get(CORE_API + "search/works/", json={"results": [_core_metadata(
+        core_paper, doi="10.1234/requested", outputs=[CORE_API + "outputs/568416448"])]})
+    responses.get(CORE_API + "outputs/568416448", json=_core_metadata(
+        core_paper, title="Different result for the same keyword", doi="10.1234/other",
+        sourceFulltextUrls=["https://origin.example/other.pdf"]))
+    assert download._try_core(core_paper) is None
+    assert all("origin.example" not in c.request.url for c in responses.calls)
+    assert len(responses.calls) <= 3  # DOI, its output, then a bounded title query.
+
+
+@responses.activate
+def test_core_title_discovery_resolves_work_outputs_and_preserves_existing_identifiers(core_paper):
+    core_paper.source = core_paper.paper_id = ""
+    core_paper.arxiv_id = "2306.12749v2"
+    responses.get(CORE_API + "search/works/", json={"results": [_core_metadata(
+        core_paper, outputs=[CORE_API + "outputs/568416448"])]})
+    responses.get(CORE_API + "outputs/568416448", json=_core_metadata(
+        core_paper, arxivId="2306.12749", sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    assert download._try_core(core_paper) == CORE_PDF_BYTES
+    assert core_paper.arxiv_id == "2306.12749v2"
+    assert 'q=title%3A' in responses.calls[0].request.url
+
+
+@pytest.mark.parametrize("headers", [
+    {"X-RateLimit-Retry-After": "2027-01-15T08:02:00+0000"},
+    {"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "2027-01-15T08:02:00Z"},
+])
+@responses.activate
+def test_core_timestamp_rate_limit_headers_prevent_more_metadata(core_paper, core_clock, headers):
+    responses.get(CORE_API + "works/143668999", status=429, headers=headers)
+    assert download._try_core(core_paper) is None
+    core_clock.elapsed[0] = 61
+    assert download._try_core(core_paper) is None
+    assert len(responses.calls) == 1
+    core_clock.elapsed[0] = 121
+    core_paper.title = "Short"
+    responses.get(CORE_API + "works/143668999", json={})
+    assert download._try_core(core_paper) is None
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_core_output_429_stops_before_next_output_or_title_query(core_paper):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, outputs=[CORE_API + "outputs/568416448", CORE_API + "outputs/628577550"]))
+    responses.get(CORE_API + "outputs/568416448", status=429, headers={"Retry-After": "120"})
+    assert download._try_core(core_paper) is None
+    assert [c.request.url for c in responses.calls] == [
+        CORE_API + "works/143668999", CORE_API + "outputs/568416448"]
+
+
+@responses.activate
+def test_core_exhausted_successful_response_still_allows_public_origin(core_paper):
+    responses.get(CORE_API + "works/143668999", headers={
+        "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1800000120"},
+        json=_core_metadata(core_paper, sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    assert download._try_core(core_paper) == CORE_PDF_BYTES
+    assert download._try_core(core_paper) is None
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_core_missing_credentials_skips_id_only_records(core_paper, monkeypatch):
+    monkeypatch.delenv("CORE_API_KEY")
+    assert download._try_core(core_paper) is None
+    assert download._download_skip_reason("oa_aggregators", core_paper) == "no_applicable_member"
+    assert not responses.calls
+
+
+@responses.activate
+def test_core_cascade_save_failure_keeps_identifiers_blank(lib, paper, monkeypatch, core_clock):
+    _isolate_tier(monkeypatch, "oa_aggregators")
+    paper.doi = paper.arxiv_id = ""
+    paper.source, paper.paper_id = "core", "143668999"
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        paper, doi="10.1234/recovered", arxivId="2306.12749",
+        sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    def fail_save(*_):
+        raise OSError("fixture write failure")
+    monkeypatch.setattr(download, "_atomic_save", fail_save)
+    with pytest.raises(OSError, match="fixture write failure"):
+        download.download_paper(paper, lib)
+    assert paper.doi == paper.arxiv_id == ""
+    assert not lib.has_pdf(paper.key)
+
+
+@responses.activate
+def test_core_doi_case_variants_are_one_identifier(core_paper):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, doi="10.1234/ABC", identifiers={"doi": "https://doi.org/10.1234/abc"},
+        sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    result = download._try_core(core_paper)
+    assert result == CORE_PDF_BYTES
+    assert getattr(result, "doi", "").lower() == "10.1234/abc"
+
+
+@responses.activate
+def test_core_transport_suppresses_ambient_library_credentials(core_paper, monkeypatch):
+    monkeypatch.setattr(requests.sessions, "get_netrc_auth", lambda _: ("library-user", "library-secret"))
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    assert download._try_core(core_paper) == CORE_PDF_BYTES
+    assert responses.calls[0].request.headers["Authorization"] == "Bearer fixture-core-token"
+    assert "Authorization" not in responses.calls[1].request.headers
+
+
+@responses.activate
+def test_core_exhausted_work_with_outputs_still_uses_known_public_origin(core_paper):
+    responses.get(CORE_API + "works/143668999", headers={
+        "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1800000120"},
+        json=_core_metadata(core_paper, outputs=[CORE_API + "outputs/568416448"],
+                            sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    assert download._try_core(core_paper) == CORE_PDF_BYTES
+    assert [c.request.url for c in responses.calls] == [
+        CORE_API + "works/143668999", "https://origin.example/file.pdf"]
+
+
+@responses.activate
+def test_core_bad_citation_link_does_not_hide_later_file(core_paper):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["https://origin.example/item"]))
+    responses.get("https://origin.example/item", body='<meta name="citation_pdf_url" content="https://[bad">'
+                  '<a href="/file.pdf">Download</a>')
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    assert download._try_core(core_paper) == CORE_PDF_BYTES
+
+
+def test_core_chunked_pdf_header_does_not_apply_html_size_cap(core_clock):
+    from papervault.library.download_sources import core
+    body = b"%PDF-1.4\n" + b"x" * (300 * 1024) + b"\n%%EOF\n"
+    chunks = iter([body[:1], body[1:5], body[5:], b""])
+    response = SimpleNamespace(headers={}, raw=SimpleNamespace(read1=lambda *_, **__: next(chunks)))
+    assert core._read_body(response, 256 * 1024, origin=True) == body
+
+
+@responses.activate
+def test_core_duplicate_origin_merges_output_identifiers(core_paper):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, sourceFulltextUrls=["https://origin.example/file.pdf"],
+        outputs=[CORE_API + "outputs/568416448"]))
+    responses.get(CORE_API + "outputs/568416448", json=_core_metadata(
+        core_paper, doi="10.1234/recovered", arxivId="2306.12749",
+        sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    result = download._try_core(core_paper)
+    assert result == CORE_PDF_BYTES
+    assert getattr(result, "doi", "") == "10.1234/recovered"
+    assert getattr(result, "arxiv_id", "") == "2306.12749"
+    assert core_paper.doi == core_paper.arxiv_id == ""
+
+
+def test_core_body_deadline_checks_between_available_reads(core_clock):
+    from papervault.library.download_sources import core
+    reads = []
+    def drip(*_, **__):
+        core_clock.elapsed[0] += 14
+        reads.append(1)
+        return b"x"
+    def filled(amount):
+        yield b"".join(drip() for _ in range(amount))
+    response = SimpleNamespace(headers={}, raw=SimpleNamespace(read1=drip), iter_content=filled)
+    with pytest.raises(core._CoreUnavailable, match="body limit"):
+        core._read_body(response, 4 * 1024 * 1024)
+    assert len(reads) == 3  # Check the deadline as data arrives, not after a 64 KiB fill.
+
+
+def test_core_refuses_unrequested_compression_before_stream_decode(core_clock):
+    from papervault.library.download_sources import core
+    response = SimpleNamespace(headers={"Content-Encoding": "gzip"},
+                               raw=SimpleNamespace(read1=lambda *_, **__: b""))
+    with pytest.raises(core._CoreUnavailable, match="encoding"):
+        core._read_body(response, 4 * 1024 * 1024)
+
+
+@responses.activate
+def test_core_contradictory_duplicate_origins_are_discarded(core_paper):
+    core_paper.title = "Short"
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, outputs=[CORE_API + "outputs/1", CORE_API + "outputs/2"]))
+    for identifier, doi in [(1, "10.1234/first"), (2, "10.1234/second")]:
+        responses.get(CORE_API + f"outputs/{identifier}", json=_core_metadata(
+            core_paper, id=identifier, doi=doi,
+            sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    assert download._try_core(core_paper) is None
+    assert [c.request.url for c in responses.calls] == [
+        CORE_API + "works/143668999", CORE_API + "outputs/1", CORE_API + "outputs/2"]
+    assert core_paper.doi == core_paper.arxiv_id == ""

@@ -71,7 +71,11 @@ from .download_sources.arxiv import (
     _try_arxiv as _try_arxiv,
     _try_arxiv_by_title as _try_arxiv_by_title,
 )
-from .download_sources.core import _try_core as _try_core
+from .download_sources.core import (
+    _commit_core_identifiers,
+    _core_skip_reason,
+    _try_core as _try_core,
+)
 from .download_sources.crossref import _try_crossref_link as _try_crossref_link
 from .download_sources.elsevier import _try_elsevier_tdm as _try_elsevier_tdm
 from .download_sources.europepmc import _try_europepmc as _try_europepmc
@@ -410,8 +414,7 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
     if source == "domain_aggregators" and not (paper.doi or paper.arxiv_id):
         return "missing_identifier"
     if source == "oa_aggregators" and not (paper.doi or _openalex_work_id(paper)):
-        if not (os.environ.get("CORE_API_KEY", "").strip()
-                and paper.title and len(paper.title) >= 20):
+        if _core_skip_reason(paper):
             return "no_applicable_member"
     if source == "arxiv_by_title":
         if paper.arxiv_id:
@@ -524,6 +527,7 @@ def download_paper(paper: Paper, library: Library) -> bool:
                 continue
             _atomic_save(dest, data)
             _apply_openalex_identifiers(data, paper, library, verify_reason)
+            _commit_core_identifiers(data, paper)
             paper.pdf_path = str(dest.relative_to(library.root))
             # D7: status routes, source labels — never fuse them into one cell.
             paper.download_status = DOWNLOAD_STATUS_OK

@@ -84,7 +84,11 @@ from .download_sources.known_file_url import (
     _try_known_file_url as _try_known_file_url,
 )
 from .download_sources.mdpi import _try_mdpi_scrapling as _try_mdpi_scrapling
-from .download_sources.openalex import _try_openalex as _try_openalex
+from .download_sources.openalex import (
+    _apply_openalex_identifiers,
+    _openalex_work_id,
+    _try_openalex as _try_openalex,
+)
 from .download_sources.publisher import (
     _CITATION_PDF_URL_RE as _CITATION_PDF_URL_RE,
     _CITATION_PDF_URL_RE_REV as _CITATION_PDF_URL_RE_REV,
@@ -412,7 +416,7 @@ def _download_skip_reason(source: str, paper: Paper) -> Optional[str]:
         return "missing_identifier"
     if source == "domain_aggregators" and not (paper.doi or paper.arxiv_id):
         return "missing_identifier"
-    if source == "oa_aggregators" and not paper.doi:
+    if source == "oa_aggregators" and not (paper.doi or _openalex_work_id(paper)):
         if not (os.environ.get("CORE_API_KEY", "").strip()
                 and paper.title and len(paper.title) >= 20):
             return "no_applicable_member"
@@ -527,6 +531,7 @@ def download_paper(paper: Paper, library: Library) -> bool:
                              "reason": verify_reason})
                 continue
             _atomic_save(dest, data)
+            _apply_openalex_identifiers(data, paper, library, verify_reason)
             paper.pdf_path = str(dest.relative_to(library.root))
             # D7: status routes, source labels — never fuse them into one cell.
             paper.download_status = DOWNLOAD_STATUS_OK

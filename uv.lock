@@ -2614,6 +2614,7 @@ dependencies = [
     { name = "requests" },
     { name = "sentence-transformers" },
     { name = "torch" },
+    { name = "urllib3" },
     { name = "uvicorn" },
 ]
 
@@ -2676,6 +2677,7 @@ requires-dist = [
     { name = "sentence-transformers", specifier = ">=3.0" },
     { name = "torch", specifier = ">=2.4" },
     { name = "torchvision", marker = "extra == 'mineru'", specifier = "==0.26.0" },
+    { name = "urllib3", specifier = ">=2.2" },
     { name = "uvicorn", specifier = ">=0.30" },
 ]
 provides-extras = ["grey", "mineru", "zotero", "dev"]

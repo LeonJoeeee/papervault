@@ -14,6 +14,7 @@ import requests
 import responses
 
 from papervault.library import Library, download
+from papervault.library.download_sources import openalex
 from papervault.library.models import Paper
 
 
@@ -904,8 +905,8 @@ def test_openalex_falls_through_when_no_oa_locations(lib, paper, monkeypatch):
 
 
 @responses.activate
-def test_openalex_skipped_without_doi(lib):
-    """No DOI → openalex strategy is a no-op (no API call)."""
+def test_openalex_skipped_without_doi_or_work_id(lib):
+    """No DOI or stored work ID → no OpenAlex API call."""
     p, _ = lib.upsert({"title": "Test paper for download cascade", "authors": ["A"], "year": 2020,
                        "arxiv_id": "2401.0099"})
     responses.add(responses.GET, "https://arxiv.org/pdf/2401.0099",
@@ -1924,3 +1925,488 @@ def test_arxiv_non_404_error_does_not_null(lib):
     responses.add(responses.GET, "https://arxiv.org/pdf/2401.00002", status=403)
     assert download._try_arxiv(p) is None
     assert p.arxiv_id == "2401.00002"   # non-404 leaves it intact
+
+
+# Current OpenAlex work IDs and repository locations (#169).
+_OPENALEX_WORK = "https://api.openalex.org/works/W123"
+
+
+@pytest.fixture
+def openalex_paper(lib, monkeypatch):
+    p, _ = lib.upsert({"title": "A repository thesis about cosmic ray transport",
+                       "authors": ["Researcher"], "year": 2012,
+                       "source": "openalex", "url": "https://openalex.org/W123"})
+    _isolate_tier(monkeypatch, "oa_aggregators")
+    for member in ("_try_unpaywall", "_try_semantic_scholar_oa", "_try_core"):
+        monkeypatch.setattr(download, member, lambda _: None)
+    monkeypatch.delenv("CORE_API_KEY", raising=False)
+    monkeypatch.setattr("papervault.library.llm.get_llm", lambda **_: SimpleNamespace(
+        call=lambda messages: json.dumps({
+            "match": "Meeting program" not in messages[1]["content"],
+            "reason": "identity checked",
+        })))
+    return p
+
+
+@responses.activate
+def test_openalex_work_id_handle_pdf_through_verified_cascade(lib, openalex_paper):
+    p = openalex_paper
+    data = _text_pdf(f"{p.title}. Researcher. Full dissertation about cosmic rays.")
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "locations": [{"pdf_url": "https://hdl.handle.net/1/2"}],
+    })
+    responses.add(responses.GET, "https://hdl.handle.net/1/2", status=302,
+                  headers={"Location": "https://repository.example/items/thesis"})
+    responses.add(responses.GET, "https://repository.example/items/thesis", body=(
+        '<meta content="/files/thesis.pdf" name="citation_pdf_url">'))
+    responses.add(responses.GET, "https://repository.example/files/thesis.pdf", body=data)
+    assert download.download_paper(p, lib)
+    assert lib.pdf_path(p.key).read_bytes() == data
+    assert p.download_source == "oa_aggregators"
+    events = _logged_events(lib)
+    assert any(e["event"] == "downloaded" and e["verify"].startswith("llm_match:")
+               and e["size"] == len(data) for e in events)
+    assert not any(e["event"] == "download_skip" for e in events)
+    # Existing bytes must short-circuit all future network, including stale IDs.
+    before = lib.pdf_path(p.key).stat()
+    count = len(responses.calls)
+    assert download.download_paper(p, lib)
+    assert len(responses.calls) == count
+    assert lib.pdf_path(p.key).stat() == before
+
+
+@responses.activate
+def test_openalex_modern_multiple_locations_and_https(openalex_paper):
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "best_oa_location": {"pdf_url": "https://repo.example/block"},
+        "primary_location": {"landing_page_url": "https://repo.example/metadata"},
+        "locations": [
+            {"pdf_url": "https://repo.example/block"},
+            {"is_oa": False, "pdf_url": None,
+             "landing_page_url": "http://repo.example/alternate.pdf"},
+        ],
+    })
+    responses.add(responses.GET, "https://repo.example/block", status=403)
+    responses.add(responses.GET, "https://repo.example/metadata", body=HTML_BYTES)
+    responses.add(responses.GET, "https://repo.example/alternate.pdf", body=PDF_BYTES)
+    assert download._try_openalex(openalex_paper) == PDF_BYTES
+    assert len(responses.calls) == 4
+
+
+@pytest.mark.parametrize("url, source, paper_id, expected", [
+    ("https://openalex.org/W123", "manual", "", "W123"),
+    ("http://openalex.org/w123", "", "", "W123"),
+    ("", "openalex", "W123", "W123"),
+    ("", "openalex", "https://openalex.org/W123", "W123"),
+    ("", "semantic_scholar", "W123", None),
+    ("https://openalex.org/W123?other=1", "", "", None),
+    ("https://openalex.org/W123/extra", "", "", None),
+    ("https://openalex.org.evil.example/W123", "", "", None),
+    ("https://user@openalex.org/W123", "", "", None),
+    ("https://openalex.org:443/W123", "", "", None),
+    ("https://openalex.org/W123\n", "", "", None),
+    ("https://openalex.org/A123", "", "", None),
+    ("Text https://openalex.org/W123", "", "", None),
+])
+def test_openalex_work_id_eligibility(openalex_paper, url, source, paper_id, expected):
+    p = openalex_paper
+    p.url, p.source, p.paper_id = url, source, paper_id
+    assert openalex._openalex_work_id(p) == expected
+    assert download._download_skip_reason("oa_aggregators", p) == (
+        None if expected else "no_applicable_member")
+
+
+@responses.activate
+@pytest.mark.parametrize("status", [401, 403, 404, 429, 500])
+def test_openalex_api_failure_is_nonmutating_miss(openalex_paper, status):
+    p = openalex_paper
+    before = p.model_dump()
+    responses.add(responses.GET, _OPENALEX_WORK, status=status, json={
+        "doi": "https://doi.org/10.1088/test", "locations": [
+            {"pdf_url": "https://repo.example/untrusted.pdf"}],
+    })
+    assert download._try_openalex(p) is None
+    assert p.model_dump() == before
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_openalex_missing_work_records_actual_miss(lib, openalex_paper):
+    responses.add(responses.GET, _OPENALEX_WORK, status=404)
+    assert not download.download_paper(openalex_paper, lib)
+    assert _logged_events(lib)[0]["event"] == "download_miss"
+
+
+@responses.activate
+def test_openalex_merged_work_redirect(openalex_paper):
+    responses.add(responses.GET, _OPENALEX_WORK, status=301,
+                  headers={"Location": "https://api.openalex.org/works/W456"})
+    responses.add(responses.GET, "https://api.openalex.org/works/W456", json={
+        "locations": [{"landing_page_url": "https://repo.example/thesis.pdf"}],
+    })
+    responses.add(responses.GET, "https://repo.example/thesis.pdf", body=PDF_BYTES)
+    assert download._try_openalex(openalex_paper) == PDF_BYTES
+    assert openalex_paper.url == "https://openalex.org/W123"
+
+
+@responses.activate
+@pytest.mark.parametrize("payload", [
+    {}, {"locations": [{"landing_page_url": "https://repo.example/metadata"}]},
+    {"has_content": {"pdf": True},
+     "content_urls": {"pdf": "https://content.openalex.org/works/W123.pdf"}},
+])
+def test_openalex_metadata_and_content_flags_are_not_downloads(openalex_paper, payload):
+    responses.add(responses.GET, _OPENALEX_WORK, json=payload)
+    responses.add(responses.GET, "https://repo.example/metadata", body=HTML_BYTES)
+    assert download._try_openalex(openalex_paper) is None
+    assert not any("content.openalex.org" in c.request.url for c in responses.calls)
+
+
+@responses.activate
+@pytest.mark.parametrize("route", ["location", "landing", "redirect", "api_redirect"])
+def test_openalex_never_calls_metered_content(openalex_paper, monkeypatch, route):
+    monkeypatch.setenv("OPENALEX_API_KEY", "fixture-token")
+    content = "https://content.openalex.org/works/W123.pdf?api_key=fixture-token"
+    location = content if route == "location" else "https://repo.example/landing"
+    if route == "api_redirect":
+        responses.add(responses.GET, _OPENALEX_WORK, status=301,
+                      headers={"Location": content})
+    else:
+        responses.add(responses.GET, _OPENALEX_WORK, json={
+            "locations": [{"pdf_url": location}], "has_content": {"pdf": True},
+        })
+    if route == "landing":
+        responses.add(responses.GET, location,
+                      body=f'<meta name="citation_pdf_url" content="{content}">')
+    elif route == "redirect":
+        responses.add(responses.GET, location, status=302, headers={"Location": content})
+    assert download._try_openalex(openalex_paper) is None
+    assert not any("content.openalex.org" in c.request.url for c in responses.calls)
+    assert all("fixture-token" not in str(c.request.headers) for c in responses.calls)
+
+
+@responses.activate
+@pytest.mark.parametrize("status, headers, body", [
+    (206, {}, PDF_BYTES), (200, {"Content-Range": "bytes 0-9/100"}, PDF_BYTES),
+    (200, {"Content-Length": "9999"}, PDF_BYTES),
+    (200, {}, PDF_BYTES * 20),
+])
+def test_openalex_partial_or_oversize_pdf_misses(openalex_paper, monkeypatch,
+                                               status, headers, body):
+    monkeypatch.setattr(openalex, "_MAX_PDF_BYTES", 100)
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "locations": [{"pdf_url": "https://repo.example/file.pdf"}],
+    })
+    responses.add(responses.GET, "https://repo.example/file.pdf", status=status,
+                  headers=headers, body=body)
+    assert download._try_openalex(openalex_paper) is None
+
+
+@responses.activate
+def test_openalex_landing_caps_links_and_no_recursion(openalex_paper, monkeypatch):
+    monkeypatch.setattr(openalex, "_MAX_HTML_BYTES", 200)
+    responses.add(responses.GET, _OPENALEX_WORK, json={"locations": [
+        {"landing_page_url": "https://repo.example/item"}],
+    })
+    responses.add(responses.GET, "https://repo.example/item", body=(
+        '<meta name="citation_pdf_url" content="/first.pdf">'
+        '<a href="/first.pdf">PDF</a><a href="/second">Download</a>'
+        + " " * 200 + '<a href="/late.pdf">PDF</a>'))
+    responses.add(responses.GET, "https://repo.example/first.pdf",
+                  body='<meta name="citation_pdf_url" content="/recursive.pdf">')
+    responses.add(responses.GET, "https://repo.example/second", body=HTML_BYTES)
+    assert download._try_openalex(openalex_paper) is None
+    assert len(responses.calls) == 4
+
+
+@responses.activate
+@pytest.mark.parametrize("bound", ["candidates", "requests", "redirects", "time", "metadata"])
+def test_openalex_transport_bounds(openalex_paper, monkeypatch, bound):
+    location_count = 1 if bound == "redirects" else 20
+    responses.add(responses.GET, _OPENALEX_WORK, json={"locations": [
+        {"pdf_url": f"https://repo.example/{i}"} for i in range(location_count)]})
+    for i in range(20):
+        if bound == "redirects":
+            responses.add(responses.GET, f"https://repo.example/{i}", status=302,
+                          headers={"Location": f"https://repo.example/{i + 1}"})
+        else:
+            responses.add(responses.GET, f"https://repo.example/{i}", body=HTML_BYTES)
+    constants = {"candidates": ("_MAX_CANDIDATES", 2),
+                 "requests": ("_MAX_REQUESTS", 3),
+                 "redirects": ("_MAX_REDIRECTS", 1),
+                 "time": ("_TIME_BUDGET", 0),
+                 "metadata": ("_MAX_METADATA_BYTES", 10)}
+    monkeypatch.setattr(openalex, *constants[bound])
+    assert download._try_openalex(openalex_paper) is None
+    if bound == "time":
+        assert not responses.calls
+    elif bound == "metadata":
+        assert len(responses.calls) == 1
+    else:
+        assert len(responses.calls) == 3  # Metadata + two candidates/requests/redirect hops.
+
+
+@responses.activate
+@pytest.mark.parametrize("outcome", ["match", "mismatch", "download_failure", "fail_open"])
+def test_openalex_recovers_identifiers_only_after_affirmative_verification(
+        lib, openalex_paper, monkeypatch, outcome):
+    p = openalex_paper
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "ids": {"doi": "https://doi.org/10.1088/VALID"},
+        "locations": [{"landing_page_url": "https://arxiv.org/pdf/2102.11582v3.pdf"}],
+    })
+    body = _text_pdf(("Meeting program" if outcome == "mismatch" else p.title)
+                     + ". Researcher. Cosmic rays and the complete requested work.")
+    responses.add(responses.GET, "https://arxiv.org/pdf/2102.11582v3.pdf", body=body,
+                  status=403 if outcome == "download_failure" else 200)
+    if outcome == "fail_open":
+        monkeypatch.setattr("papervault.library.llm.get_llm", lambda **_: SimpleNamespace(
+            call=lambda _: "invalid judge output"))
+    assert download.download_paper(p, lib) == (outcome in {"match", "fail_open"})
+    if outcome == "match":
+        assert p.doi == "10.1088/valid"
+        assert p.arxiv_id == "2102.11582v3"
+        assert lib.find(doi=p.doi) is p
+        assert lib.find(arxiv_id="2102.11582") is p
+        lib.save()
+        loaded = Library(lib.root)
+        assert loaded.find(doi=p.doi).arxiv_id == "2102.11582v3"
+    else:
+        assert p.doi == p.arxiv_id == ""
+        assert lib.find(doi="10.1088/valid") is None
+        if outcome == "mismatch":
+            assert any(e["event"] == "download_pdf_mismatch" for e in _logged_events(lib))
+
+
+@responses.activate
+def test_openalex_recovered_doi_can_resolve_landing_without_locations(lib, openalex_paper):
+    p = openalex_paper
+    responses.add(responses.GET, _OPENALEX_WORK,
+                  json={"doi": "https://doi.org/10.1088/valid"})
+    responses.add(responses.GET, "https://doi.org/10.1088/valid", body=(
+        '<a href="/thesis.pdf" type="application/pdf">Full text</a>'))
+    responses.add(responses.GET, "https://doi.org/thesis.pdf", body=_text_pdf(
+        p.title + ". Researcher. A full dissertation about cosmic ray transport."))
+    assert download.download_paper(p, lib)
+    assert p.doi == "10.1088/valid"
+
+
+@responses.activate
+@pytest.mark.parametrize("case", ["supplied", "collision", "invalid"])
+def test_openalex_recovery_preserves_existing_identity(lib, openalex_paper, case):
+    p = openalex_paper
+    doi, arxiv = "10.1088/valid", "2102.11582v3"
+    if case == "supplied":
+        lib.upsert({"title": p.title, "doi": "10.1088/original", "arxiv_id": "2102.11582v1"})
+    elif case == "collision":
+        holder, _ = lib.upsert({"title": "Another paper with its own verified identity",
+                               "authors": ["Holder"], "year": 2020,
+                               "doi": doi, "arxiv_id": arxiv})
+    else:
+        doi = "not-a-doi"
+    before = (p.doi, p.arxiv_id)
+    arxiv_url = ("https://arxiv.org.evil.example/pdf/2102.11582v3.pdf" if case == "invalid"
+                 else f"https://arxiv.org/pdf/{arxiv}.pdf")
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "doi": doi, "locations": [{"pdf_url": arxiv_url}],
+    })
+    if case == "supplied":
+        responses.add(responses.GET, "https://api.openalex.org/works/doi:10.1088/original", json={
+            "doi": doi, "locations": [{"pdf_url": arxiv_url}],
+        })
+    responses.add(responses.GET, arxiv_url, body=_text_pdf(
+        p.title + ". Researcher. Cosmic rays and the complete requested work."))
+    assert download.download_paper(p, lib)
+    assert (p.doi, p.arxiv_id) == before
+    assert lib.get(p.key) is p
+    if case == "collision":
+        assert lib.find(doi=doi) is holder
+        assert lib.find(arxiv_id=arxiv) is holder
+
+
+def test_openalex_slow_stream_deadline_and_response_closure(monkeypatch):
+    now = [0.0]
+    reads = []
+    closed = []
+
+    class Raw:
+        def read1(self, size, decode_content=False):
+            reads.append(size)
+            now[0] += 0.75
+            return b"%PDF-" if len(reads) == 1 else b"body"
+
+    class Response:
+        status_code = 200
+        headers = {}
+        raw = Raw()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            closed.append(True)
+
+        def iter_content(self, chunk_size):
+            # A buffered read can keep waiting as a peer drips bytes.
+            now[0] = 100
+            yield b"%PDF-too-late"
+
+    monkeypatch.setattr(openalex.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(openalex, "_request", lambda *a, **kw: Response())
+    budget = openalex._FetchBudget(deadline=1.0)
+    assert budget.get("https://repo.example/file.pdf") is None
+    assert now[0] < 2.0
+    assert closed == [True]
+
+
+@responses.activate
+def test_openalex_unrequested_compression_is_a_miss(openalex_paper):
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "locations": [{"pdf_url": "https://repo.example/compressed.pdf"}],
+    })
+    responses.add(responses.GET, "https://repo.example/compressed.pdf", body=PDF_BYTES,
+                  headers={"Content-Encoding": "identity-unsupported"})
+    assert download._try_openalex(openalex_paper) is None
+
+
+@responses.activate
+@pytest.mark.parametrize("host", ["content.openalex.org.", "content%2eopenalex.org"])
+def test_openalex_metered_host_aliases_are_blocked(openalex_paper, host):
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "locations": [{"pdf_url": f"https://{host}/works/W123.pdf"}],
+    })
+    assert download._try_openalex(openalex_paper) is None
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+@pytest.mark.parametrize("body", [b"not JSON", b"[]", b"null"])
+def test_openalex_invalid_metadata_is_nonmutating_miss(openalex_paper, body):
+    before = openalex_paper.model_dump()
+    responses.add(responses.GET, _OPENALEX_WORK, body=body)
+    assert download._try_openalex(openalex_paper) is None
+    assert openalex_paper.model_dump() == before
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_openalex_timeout_does_not_retry_or_clear_identity(openalex_paper):
+    before = openalex_paper.model_dump()
+    responses.add(responses.GET, _OPENALEX_WORK, body=requests.Timeout("API timeout"))
+    assert download._try_openalex(openalex_paper) is None
+    assert openalex_paper.model_dump() == before
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_openalex_redirect_body_is_never_buffered(openalex_paper, monkeypatch):
+    original = requests.Response.content.fget
+
+    def content(response):
+        assert response.status_code != 302, "redirect body was buffered"
+        return original(response)
+
+    monkeypatch.setattr(requests.Response, "content", property(content))
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "locations": [{"pdf_url": "https://repo.example/redirect"}]})
+    responses.add(responses.GET, "https://repo.example/redirect", status=302,
+                  headers={"Location": "/file.pdf"}, body=b"x" * (1024 * 1024))
+    responses.add(responses.GET, "https://repo.example/file.pdf", body=PDF_BYTES)
+    assert download._try_openalex(openalex_paper) == PDF_BYTES
+
+
+@responses.activate
+def test_openalex_does_not_send_netrc_auth(openalex_paper, monkeypatch):
+    monkeypatch.setattr(requests.sessions, "get_netrc_auth", lambda _: ("user", "secret"))
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "locations": [{"pdf_url": "https://repo.example/redirect"}]})
+    responses.add(responses.GET, "https://repo.example/redirect", status=302,
+                  headers={"Location": "https://other.example/file.pdf"})
+    responses.add(responses.GET, "https://other.example/file.pdf", body=PDF_BYTES)
+    assert download._try_openalex(openalex_paper) == PDF_BYTES
+    assert all("Authorization" not in c.request.headers for c in responses.calls)
+
+
+@responses.activate
+def test_openalex_preserves_doi_route_when_stored_work_id_is_stale(openalex_paper):
+    openalex_paper.doi = "10.1088/original"
+    responses.add(responses.GET, _OPENALEX_WORK, status=404)
+    responses.add(responses.GET, "https://api.openalex.org/works/doi:10.1088/original", json={
+        "locations": [{"pdf_url": "https://repo.example/file.pdf"}]})
+    responses.add(responses.GET, "https://repo.example/file.pdf", body=PDF_BYTES)
+    assert download._try_openalex(openalex_paper) == PDF_BYTES
+
+
+@responses.activate
+def test_openalex_retains_http_only_repository(openalex_paper):
+    responses.add(responses.GET, _OPENALEX_WORK, json={
+        "locations": [{"pdf_url": "http://repo.example/file.pdf"}]})
+    responses.add(responses.GET, "https://repo.example/file.pdf",
+                  body=requests.ConnectionError("TLS unavailable"))
+    responses.add(responses.GET, "http://repo.example/file.pdf", body=PDF_BYTES)
+    assert download._try_openalex(openalex_paper) == PDF_BYTES
+
+
+@pytest.mark.parametrize("phase", ["headers", "chunk_framing"])
+def test_openalex_deadline_covers_http_framing(monkeypatch, phase):
+    now = [0.0]
+    header = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+
+    class Raw(io.RawIOBase):
+        def readable(self):
+            return True
+
+        def readinto(self, target):
+            if phase == "chunk_framing" and now[0] == 0:
+                chunk = header
+                now[0] = 0.001
+            else:
+                chunk = b"1"
+                now[0] += 0.02
+            target[:len(chunk)] = chunk
+            return len(chunk)
+
+    class Socket:
+        def makefile(self, *args):
+            return io.BufferedReader(Raw())
+
+        def settimeout(self, timeout):
+            assert 0 < timeout <= 0.05
+
+    monkeypatch.setattr(openalex.time, "monotonic", lambda: now[0])
+    response = openalex._deadline_response(Socket(), deadline=0.05)
+    with pytest.raises(TimeoutError):
+        response.begin()
+        response.read1(8192)
+    assert now[0] < 0.08
+    response.close()
+
+
+def test_openalex_writeback_cannot_redirect_to_racing_identifier_owner(lib, openalex_paper):
+    p = openalex_paper
+    holder, _ = lib.upsert({"title": "A separate paper with a separately verified identity",
+                           "authors": ["Holder"], "year": 2020})
+    doi, arxiv = "10.1088/race", "2102.11582v3"
+
+    class RacingIndex(dict):
+        def claim(self, key):
+            if key == doi and key not in self:
+                self[key] = holder.key
+                holder.doi = doi
+
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            self.claim(key)  # Another worker claims the ID after a stale lookup.
+            return value
+
+        def setdefault(self, key, default=None):
+            self.claim(key)
+            return super().setdefault(key, default)
+
+    lib._by_doi = RacingIndex(lib._by_doi)
+    data = openalex._OpenAlexPDF(PDF_BYTES, doi, arxiv)
+    openalex._apply_openalex_identifiers(data, p, lib, "llm_match: same work")
+    assert holder.doi == doi
+    assert holder.arxiv_id == ""
+    assert p.doi == ""
+    assert lib.find(doi=doi) is holder

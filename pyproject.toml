@@ -27,6 +27,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "httpx>=0.27",
     "requests>=2.31",
+    "urllib3>=2.2",           # read1 lets bounded OpenAlex streams check elapsed time per read
     "click>=8.1",
     "filelock>=3.13",
     "mcp>=1.27.1,<2",

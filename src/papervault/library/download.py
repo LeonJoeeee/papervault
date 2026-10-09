@@ -527,7 +527,7 @@ def download_paper(paper: Paper, library: Library) -> bool:
                 continue
             _atomic_save(dest, data)
             _apply_openalex_identifiers(data, paper, library, verify_reason)
-            _commit_core_identifiers(data, paper)
+            _commit_core_identifiers(data, paper, library)
             paper.pdf_path = str(dest.relative_to(library.root))
             # D7: status routes, source labels — never fuse them into one cell.
             paper.download_status = DOWNLOAD_STATUS_OK

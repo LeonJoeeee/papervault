@@ -2836,6 +2836,28 @@ def test_core_cascade_verifies_before_persisting_identifiers(
     assert saved.doi == paper.doi and saved.arxiv_id == paper.arxiv_id
 
 
+@pytest.mark.parametrize("lookup", [
+    {"doi": "10.1234/recovered"},
+    {"arxiv_id": "2306.12749"},
+], ids=["doi", "arxiv"])
+@responses.activate
+def test_core_cascade_indexes_verified_identifiers(
+        lib, paper, monkeypatch, file_url_identity, core_clock, lookup):
+    _isolate_tier(monkeypatch, "oa_aggregators")
+    paper.doi = paper.arxiv_id = paper.url = ""
+    paper.source, paper.paper_id = "core", "143668999"
+    data, _ = file_url_identity
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        paper, id=143668999, doi="10.1234/recovered", arxivId="2306.12749",
+        sourceFulltextUrls=["https://origin.example/file.pdf"]))
+    responses.get("https://origin.example/file.pdf", body=data)
+
+    assert lib.find(**lookup) is None
+    assert download.download_paper(paper, lib) is True
+    assert paper.doi == "10.1234/recovered" and paper.arxiv_id == "2306.12749"
+    assert lib.find(**lookup) is paper
+
+
 @responses.activate
 def test_core_id_only_failure_is_miss_and_missing_id_is_skip(lib, paper, monkeypatch, core_clock):
     _isolate_tier(monkeypatch, "oa_aggregators")
@@ -2901,6 +2923,22 @@ def test_core_recovers_arxiv_only_from_qualified_oai_namespaces(core_paper, iden
     responses.get(CORE_API + "works/143668999", json=_core_metadata(
         core_paper, sourceFulltextUrls=["https://origin.example/file.pdf"], **identifiers))
     responses.get("https://origin.example/file.pdf", body=CORE_PDF_BYTES)
+    result = download._try_core(core_paper)
+    assert result == CORE_PDF_BYTES
+    assert getattr(result, "arxiv_id", "") == "2306.12749"
+    assert core_paper.arxiv_id == ""
+
+
+@pytest.mark.parametrize("url", [
+    "https://arxiv.org/abs/2306.12749v2",
+    "https://arxiv.org/pdf/2306.12749",
+])
+@responses.activate
+def test_core_recovers_arxiv_from_download_url(core_paper, url):
+    responses.get(CORE_API + "works/143668999", json=_core_metadata(
+        core_paper, id=143668999, downloadUrl=url))
+    responses.get("https://arxiv.org/pdf/2306.12749", body=CORE_PDF_BYTES)
+
     result = download._try_core(core_paper)
     assert result == CORE_PDF_BYTES
     assert getattr(result, "arxiv_id", "") == "2306.12749"

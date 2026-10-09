@@ -22,6 +22,7 @@ import requests
 from urllib3.exceptions import HTTPError as _HTTPError
 
 from ..models import Paper, canonicalize_author
+from ..store import Library
 from ._shared import USER_AGENT, _is_pdf_bytes
 
 _API = "https://api.core.ac.uk/v3/"
@@ -63,13 +64,10 @@ class _CorePDF(bytes):
         return result
 
 
-def _commit_core_identifiers(data: bytes, paper: Paper) -> None:
+def _commit_core_identifiers(data: bytes, paper: Paper, library: Library) -> None:
     """Called only after the outer verifier and atomic save succeed."""
     if isinstance(data, _CorePDF):
-        if not paper.doi.strip():
-            paper.doi = data.doi
-        if not paper.arxiv_id.strip():
-            paper.arxiv_id = data.arxiv_id
+        library.fill_verified_identifiers(paper.key, doi=data.doi, arxiv_id=data.arxiv_id)
 
 
 def _http_url(value: object) -> Optional[str]:
@@ -265,7 +263,7 @@ def _metadata_identifiers(metadata: dict) -> Optional[tuple[str, str]]:
         elif kind in {"arxiv", "arxiv_id"} or (kind in {"oai", "oai_id"}
                 and isinstance(value, str) and value.lower().startswith("oai:arxiv.org:")):
             arxivs.add(_arxiv(value))
-    for value in metadata.get("sourceFulltextUrls") or []:
+    for value in [*(metadata.get("sourceFulltextUrls") or []), metadata.get("downloadUrl")]:
         arxivs.add(_url_arxiv(value))
     for value in [metadata.get("oai"), *(metadata.get("oaiIds") or [])]:
         if isinstance(value, str) and value.lower().startswith("oai:arxiv.org:"):

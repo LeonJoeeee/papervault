@@ -124,6 +124,17 @@ class ADSAvailability(BaseModel):
     existing_assets: list[str] = Field(default_factory=list)
 
 
+class ArxivWithdrawal(BaseModel):
+    """Positive evidence about the latest version, never an acquired-file label."""
+
+    requested_id: str
+    latest_id: str
+    evidence: str
+    reason: str
+    evidence_url: str
+    observed_at: str  # ISO-8601 UTC; an unversioned record is a moving reference
+
+
 def slugify_lastname(name: str) -> str:
     """Strip a name down to ASCII letters for use in a citation key."""
     if not name:
@@ -275,6 +286,7 @@ class Paper(BaseModel):
     publication_types: list[str] = Field(default_factory=list)
 
     ads_availability: ADSAvailability = Field(default_factory=ADSAvailability)
+    arxiv_withdrawal: Optional[ArxivWithdrawal] = None
 
     pdf_path: Optional[str] = None
     txt_path: Optional[str] = None

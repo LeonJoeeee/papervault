@@ -305,11 +305,16 @@ def test_known_file_url_keeps_operator_override_priority(lib, paper, monkeypatch
     overrides_path.write_text(overrides)
     paper.url = "https://repository.example/paper.pdf"
     data, _ = file_url_identity
+    responses.get("https://arxiv.org/abs/2401.0001", status=503)
     responses.get("https://operator.example/chosen.pdf", body=data)
 
     assert download.download_paper(paper, lib) is True
     assert paper.download_source == "url_override"
-    assert [c.request.url for c in responses.calls] == ["https://operator.example/chosen.pdf"]
+    # Withdrawal preflight precedes acquisition; override remains the first
+    # file candidate when current withdrawal is not confirmed.
+    assert [c.request.url for c in responses.calls] == [
+        "https://arxiv.org/abs/2401.0001", "https://operator.example/chosen.pdf",
+    ]
     assert overrides_path.read_text() == overrides
 
 
@@ -661,15 +666,19 @@ def test_annas_browser_failure_returns_none(paper, scidb_html, scidb_browser, mo
 @pytest.mark.parametrize("response", [403, 404, requests.ConnectionError("fixture outage")])
 @responses.activate
 def test_attempted_tier_keeps_download_miss(lib, paper, monkeypatch, response):
-    """A 404 can clear the ID, but that network attempt must remain a miss."""
+    """A PDF failure remains a miss after the bounded metadata check."""
     _isolate_tier(monkeypatch, "arxiv")
+    responses.get("https://arxiv.org/abs/2401.0001", status=503)
     kwargs = {"status": response} if isinstance(response, int) else {"body": response}
     responses.get("https://arxiv.org/pdf/2401.0001", **kwargs)
 
     assert download.download_paper(paper, lib) is False
     events = [e for e in _logged_events(lib) if e.get("source") == "arxiv"]
     assert [e["event"] for e in events] == ["download_miss"]
-    assert len(responses.calls) == 1
+    assert [c.request.url for c in responses.calls] == [
+        "https://arxiv.org/abs/2401.0001", "https://arxiv.org/pdf/2401.0001",
+    ]
+    assert paper.arxiv_id == "2401.0001"
 
 
 @responses.activate
@@ -1816,16 +1825,19 @@ def test_researchgate_pdf_link_missing_returns_none(lib):
 
 # ─── issue #62: fabricated arxiv_id nulling ──────────────────────────────
 # The ingest gate emits format-valid-but-nonexistent arxiv ids (~84% of
-# arxiv-bearing metadata_only papers 404 on arxiv.org). _try_arxiv already
-# GETs arxiv.org/pdf/<id>; on a DEFINITIVE 404 it nulls the fake id (keeping
-# the reliable DOI) so it stops misleading cite-check / downstream resolution.
+# arxiv-bearing metadata_only papers 404 on arxiv.org). A PDF 404 alone also
+# occurs for real withdrawn records. Only affirmative base-record absence can
+# null an ID, while retaining the reliable DOI (#170).
 
 @responses.activate
-def test_arxiv_404_nulls_fabricated_id_keeps_doi(lib):
+def test_arxiv_confirmed_missing_base_nulls_fabricated_id_keeps_doi(lib):
     p, _ = lib.upsert({"title": "Paper with a fabricated arxiv id",
                        "authors": ["A"], "year": 2023,
-                       "doi": "10.1/real", "arxiv_id": "8977.2023"})
-    responses.add(responses.GET, "https://arxiv.org/pdf/8977.2023", status=404)
+                       "doi": "10.1/real", "arxiv_id": "1311.9999"})
+    responses.get("https://arxiv.org/abs/1311.9999", status=404, body='''
+      <html><body><main><div id="content"><h1>Article 1311.9999 not found</h1>
+      <p>There is no record of an article with identifier '1311.9999'.</p>
+      </div></main></body></html>''')
     assert download._try_arxiv(p) is None
     assert p.arxiv_id == ""       # fake id dropped
     assert p.doi == "10.1/real"   # DOI never touched

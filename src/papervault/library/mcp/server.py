@@ -1135,7 +1135,8 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         # as params (no backend signature accepts a year bound — §3 reality).
         await _maybe_progress(ctx, 2, 5, "searching external sources")
         ranking_hint = plan.get("ranking_hint", "by_relevance")
-        async with concurrency.network_sem:
+        from ..download_telemetry import network_slot
+        async with network_slot(concurrency.network_sem, library, actor="search"):
             (external_raw, degraded_map), library_papers_obj = await asyncio.gather(
                 search_external_async(search_terms, year_min=year_min,
                                       year_max=year_max, ranking_hint=ranking_hint),

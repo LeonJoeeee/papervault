@@ -53,7 +53,9 @@ def _paper(**fields):
 
 
 def _events(lib):
-    return [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    # These tests assert acquisition outcomes; span records have their own contract tests.
+    return [event for line in lib.manifest_path.read_text().splitlines()
+            if (event := json.loads(line))["event"] != "download_telemetry"]
 
 
 @responses.activate

@@ -263,4 +263,4 @@ def test_hal_normal_cascade_uses_identity_gate_in_memory(paper, monkeypatch, wro
         assert saved["pdf"] == data
         assert paper.download_source == "hal_repository"
         assert paper.download_status == "ok"
-        assert events[-1]["verify"] == "llm_match: same work"
+        assert next(e for e in events if e["event"] == "downloaded")["verify"] == "llm_match: same work"

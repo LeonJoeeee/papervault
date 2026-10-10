@@ -41,9 +41,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Callable, Optional
 
 from ..download import download_paper
+from ..download_telemetry import emit, network_slot, new_run_id, observation, span, utc_now
 from ..models import DOWNLOAD_STATUS_OK, DOWNLOAD_STATUS_PENDING
 from ..store import Library
 from . import concurrency
@@ -124,6 +126,8 @@ class DownloadQueue:
         # re-add AFTER processing starts — the case the persistent
         # firecrawl_pdf_hunt_exhausted stamp bounds — still enqueues).
         self._pending: dict[str, int] = {}
+        # One fixed-size admission stamp per existing queue tuple, pruned on pop.
+        self._queued_timing: dict[int, tuple[str, str, float]] = {}
 
     async def start(self) -> None:
         """Enqueue every paper needing download and spawn worker tasks.
@@ -218,7 +222,11 @@ class DownloadQueue:
             return
         self._pending[key] = priority
         self._seq += 1
+        stamp = (new_run_id(), utc_now(), time.monotonic())
+        self._queued_timing[self._seq] = stamp
         self._queue.put_nowait((priority, self._seq, key))
+        with observation(self.library, key, stamp[0]):
+            emit("enqueue", at=stamp[1], priority=priority, sequence=self._seq)
 
     def qsize(self) -> int:
         return self._queue.qsize()
@@ -227,6 +235,8 @@ class DownloadQueue:
         log.debug("download worker %d starting", worker_id)
         while True:
             priority, _seq, key = await self._queue.get()
+            stamp = self._queued_timing.pop(_seq, None)
+            dequeued_at = utc_now()
             # Pop-time dedup (F7/R1/T1): the in-flight ``_pending`` mark is the
             # single source of truth for "this key's queued work is still
             # outstanding". The FIRST tuple to surface for a key claims it
@@ -242,10 +252,23 @@ class DownloadQueue:
             # while we PROCESS this key re-populates ``_pending`` with a fresh
             # tuple and is still honored (bounded by the firecrawl stamp).
             if self._pending.pop(key, None) is None:
+                with observation(self.library, key, stamp[0] if stamp else None):
+                    emit("queue_drop", at=dequeued_at, dequeued_at=dequeued_at,
+                         enqueued_at=stamp[1] if stamp else "", sequence=_seq,
+                         reason="stale_priority_tuple")
                 self._queue.task_done()
                 continue
             try:
-                await self._process_one(key, priority)
+                with observation(self.library, key, stamp[0] if stamp else None):
+                    emit("dequeue", at=dequeued_at, enqueued_at=stamp[1] if stamp else "",
+                         queue_wait_s=max(0.0, time.monotonic() - stamp[2]) if stamp else None,
+                         worker_id=worker_id, priority=priority, sequence=_seq)
+                    with span("queue_worker") as terminal:
+                        try:
+                            await self._process_one(key, priority)
+                        finally:
+                            paper = self.library.get(key)
+                            terminal["paper_status"] = paper.download_status if paper else "missing"
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -283,8 +306,12 @@ class DownloadQueue:
             self._forward_post_download(paper, priority)
             return
 
-        async with concurrency.network_sem:
-            ok = await asyncio.to_thread(download_paper, paper, self.library)
+        def execute():
+            with span("executor"):
+                return download_paper(paper, self.library)
+
+        async with network_slot(concurrency.network_sem, self.library, key):
+            ok = await asyncio.to_thread(execute)
 
         async with concurrency.lib_write_lock:
             self.library.save()

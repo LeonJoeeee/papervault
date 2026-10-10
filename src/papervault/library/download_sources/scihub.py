@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from contextvars import copy_context
 import os
 import re
 import time
@@ -9,6 +10,7 @@ from typing import Optional
 import requests
 
 from ..models import Paper
+from ..download_telemetry import emit, span
 from ._shared import BROWSER_HEADERS, TIMEOUT, USER_AGENT, _is_pdf_bytes
 
 
@@ -164,6 +166,14 @@ def _scihub_one_mirror(mirror: str, target: str, max_attempts: int = 3) -> Optio
     return None
 
 
+def _timed_mirror(index, mirror, target):
+    # Indices correlate race members without publishing upstream URLs or targets.
+    with span("member", member=f"mirror_{index}") as fields:
+        result = _scihub_one_mirror(mirror, target)
+        fields["pdf_candidate"] = bool(result)
+        return result
+
+
 def _try_scihub(paper: Paper) -> Optional[bytes]:
     """Last-resort fetch via Sci-Hub. Off by default; opt in with
     PAPER_PIPELINE_USE_SCIHUB=1. Be aware this may not be legal in your
@@ -181,12 +191,14 @@ def _try_scihub(paper: Paper) -> Optional[bytes]:
     mirrors = _discover_scihub_mirrors()
     if not mirrors:
         return None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(mirrors)) as ex:
-        futures = [ex.submit(_scihub_one_mirror, m, target) for m in mirrors]
+    with span("group"), concurrent.futures.ThreadPoolExecutor(max_workers=len(mirrors)) as ex:
+        futures = [ex.submit(copy_context().run, _timed_mirror, i, m, target)
+                   for i, m in enumerate(mirrors)]
         try:
             for fut in concurrent.futures.as_completed(futures, timeout=TIMEOUT * 2):
                 data = fut.result()
                 if data:
+                    emit("winner", member=f"mirror_{futures.index(fut)}")
                     for f in futures:
                         if not f.done():
                             f.cancel()

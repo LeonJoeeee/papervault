@@ -199,8 +199,9 @@ def cascade(tmp_path, monkeypatch):
 
 
 def _domain_events(lib):
-    return [json.loads(line) for line in lib.manifest_path.read_text().splitlines()
-            if json.loads(line).get("source") == "domain_aggregators"]
+    return [event for line in lib.manifest_path.read_text().splitlines()
+            if (event := json.loads(line)).get("source") == "domain_aggregators"
+            and event["event"] != "download_telemetry"]
 
 
 @pytest.mark.parametrize("route", ["links", "recid", "title"])

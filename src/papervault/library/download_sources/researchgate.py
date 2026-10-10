@@ -4,6 +4,7 @@ import re
 from typing import Optional
 
 from ..models import Paper
+from ..download_telemetry import browser_fetch
 from ._shared import _is_pdf_bytes, _load_stealthy_fetcher
 
 
@@ -73,7 +74,7 @@ def _try_researchgate(paper: Paper) -> Optional[bytes]:
     scholar_url = (f"https://scholar.google.com/scholar?q="
                     f"{quote_plus(scholar_q)}")
     try:
-        page = StealthyFetcher.fetch(scholar_url, headless=True,
+        page = browser_fetch(StealthyFetcher, scholar_url, headless=True,
                                        solve_cloudflare=True, wait=2500)
     except Exception:
         return None
@@ -114,7 +115,7 @@ def _try_researchgate(paper: Paper) -> Optional[bytes]:
         return page
 
     try:
-        StealthyFetcher.fetch(landing_url, headless=True,
+        browser_fetch(StealthyFetcher, landing_url, headless=True,
                                 solve_cloudflare=True, wait=4000,
                                 page_action=click_download)
     except Exception:

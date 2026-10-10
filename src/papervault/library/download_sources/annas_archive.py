@@ -11,6 +11,7 @@ from urllib.parse import unquote, urljoin, urlsplit
 import requests
 
 from ..models import Paper
+from ..download_telemetry import browser_fetch
 from ._shared import (
     BROWSER_HEADERS,
     TIMEOUT,
@@ -278,7 +279,7 @@ def _try_annas_archive_api(paper: Paper) -> Optional[bytes]:
             rendered_html = page.content()
 
         try:
-            response = StealthyFetcher.fetch(
+            response = browser_fetch(StealthyFetcher,
                 url, headless=True, timeout=60000,
                 cookies=[{"name": "aa_account_id2", "value": api_key, "url": base}],
                 page_action=capture,

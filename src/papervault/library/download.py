@@ -12,6 +12,7 @@ NASA ADS requires ADS_API_TOKEN; silently skipped otherwise.
 from __future__ import annotations
 
 import concurrent.futures
+from contextvars import copy_context
 import json
 import logging
 import os
@@ -43,6 +44,7 @@ from .models import (
     Paper,
 )
 from .store import Library
+from .download_telemetry import emit, span, trace_download
 
 log = logging.getLogger(__name__)
 
@@ -287,6 +289,13 @@ def _safe_call(fn: Callable[[Paper], Optional[bytes]],
         return None
 
 
+def _timed_member(name, fn, paper):
+    with span("member", member=name) as fields:
+        result = _safe_call(fn, paper)
+        fields["pdf_candidate"] = bool(result)
+        return result
+
+
 class _SourcePDF(bytes):
     """Retain a plain-byte group winner's source without changing tier labels."""
 
@@ -299,9 +308,9 @@ def _try_concurrent_first_hit(
     """Run multiple tier callables in parallel; return the first non-None
     result. Members that miss or raise are ignored. Verification of the
     returned bytes happens in the main download loop (same as serial)."""
-    with concurrent.futures.ThreadPoolExecutor(
+    with span("group"), concurrent.futures.ThreadPoolExecutor(
             max_workers=max(2, len(members))) as pool:
-        futures = {pool.submit(_safe_call, fn, paper): name
+        futures = {pool.submit(copy_context().run, _timed_member, name, fn, paper): name
                     for name, fn in members}
         try:
             for fut in concurrent.futures.as_completed(
@@ -310,6 +319,7 @@ def _try_concurrent_first_hit(
                 if data:
                     if type(data) is bytes:
                         data = _SourcePDF(data)
+                    emit("winner", member=futures[fut])
                     data.acquisition_source = futures[fut]
                     return data
         except concurrent.futures.TimeoutError:
@@ -531,6 +541,7 @@ def _prepare_cascade_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
     return record
 
 
+@trace_download
 def download_paper(paper: Paper, library: Library) -> bool:
     """Download a single paper's PDF if missing.
 
@@ -555,8 +566,9 @@ def download_paper(paper: Paper, library: Library) -> bool:
     # Only the enabled arXiv tier owns this observation. Reuse it at its normal
     # position, but confirm withdrawal before an earlier tier or text re-gate
     # can supply/remove an older copy. This is per-call state, not a global cache.
-    arxiv_record = (_prepare_cascade_arxiv(paper) if any(strategy is _try_arxiv for _, strategy in _STRATEGIES)
-                    else None)
+    with span("preflight", source="arxiv"):
+        arxiv_record = (_prepare_cascade_arxiv(paper) if any(strategy is _try_arxiv for _, strategy in _STRATEGIES)
+                        else None)
     if _settle_arxiv_withdrawal(paper, library, attempted=arxiv_record is not None):
         return False
     if _settle_ads_abstract(paper, library):
@@ -617,67 +629,73 @@ def download_paper(paper: Paper, library: Library) -> bool:
             # classify rule 2 rests it served as the gated md — invariant held.
 
     for source, strategy in _STRATEGIES:
-        try:
-            skip_reason = _download_skip_reason(source, paper, arxiv_record=arxiv_record)
-            if skip_reason == "current_arxiv_version_required":
-                data = None
-            elif strategy is _try_arxiv:
-                # The preflight can clear a nonexistent ID, but its attempted
-                # metadata lookup still counts as an arXiv miss, not a skip.
-                if arxiv_record is not None:
-                    skip_reason = None
-                data = _try_arxiv_with_record(paper, arxiv_record)
-            elif strategy is _try_arxiv_by_title:
-                data = _try_arxiv_by_title(paper, record=arxiv_record)
-            elif ads_member is not None and strategy is _try_domain_aggregators:
-                data = _try_domain_aggregators(paper, ads_member=ads_member)
-            else:
-                data = strategy(paper)
-        except Exception as exc:
-            library.log({"event": "download_error", "key": paper.key,
-                         "source": source, "error": repr(exc)[:200]})
-            continue
-        if _settle_arxiv_withdrawal(paper, library, source=source, attempted=not skip_reason):
-            return False
-        if data:
-            ok, verify_reason = _verify_pdf_matches_metadata(data, paper)
-            if source == "domain_aggregators":
-                _record_ads_verification(paper, data, ok)
-                _log_ads_availability(paper, library)
-            if not ok:
-                library.log({"event": "download_pdf_mismatch", "key": paper.key,
-                             "source": source, "size": len(data),
-                             "reason": verify_reason})
-                if source == "domain_aggregators" and _settle_ads_abstract(paper, library):
-                    return False
+        with span("tier", source=source):
+            try:
+                skip_reason = _download_skip_reason(source, paper, arxiv_record=arxiv_record)
+                with span("strategy"):
+                    if skip_reason == "current_arxiv_version_required":
+                        data = None
+                    elif strategy is _try_arxiv:
+                        # The preflight can clear a nonexistent ID, but its attempted
+                        # metadata lookup still counts as an arXiv miss, not a skip.
+                        if arxiv_record is not None:
+                            skip_reason = None
+                        data = _try_arxiv_with_record(paper, arxiv_record)
+                    elif strategy is _try_arxiv_by_title:
+                        data = _try_arxiv_by_title(paper, record=arxiv_record)
+                    elif ads_member is not None and strategy is _try_domain_aggregators:
+                        data = _try_domain_aggregators(paper, ads_member=ads_member)
+                    else:
+                        data = strategy(paper)
+            except Exception as exc:
+                library.log({"event": "download_error", "key": paper.key,
+                             "source": source, "error": repr(exc)[:200]})
                 continue
-            _atomic_save(dest, data)
-            _apply_openalex_identifiers(data, paper, library, verify_reason)
-            _commit_core_identifiers(data, paper, library)
-            paper.pdf_path = str(dest.relative_to(library.root))
-            # D7: status routes, source labels — never fuse them into one cell.
-            paper.download_status = DOWNLOAD_STATUS_OK
-            paper.download_source = source
-            paper.download_source_member = getattr(data, "acquisition_source", "")
-            library.log({"event": "downloaded", "key": paper.key, "source": source,
-                         "member_source": paper.download_source_member,
-                         "size": len(data), "verify": verify_reason})
-            return True
-        if source == "domain_aggregators":
-            _log_ads_availability(paper, library)
-            if _settle_ads_abstract(paper, library):
+            if _settle_arxiv_withdrawal(paper, library, source=source, attempted=not skip_reason):
                 return False
-        if skip_reason:
-            library.log({"event": "download_skip", "key": paper.key,
-                         "source": source, "reason": skip_reason})
-        else:
-            library.log({"event": "download_miss", "key": paper.key, "source": source})
+            if data:
+                with span("verification"):
+                    ok, verify_reason = _verify_pdf_matches_metadata(data, paper)
+                if source == "domain_aggregators":
+                    _record_ads_verification(paper, data, ok)
+                    _log_ads_availability(paper, library)
+                if not ok:
+                    library.log({"event": "download_pdf_mismatch", "key": paper.key,
+                                 "source": source, "size": len(data),
+                                 "reason": verify_reason})
+                    if source == "domain_aggregators" and _settle_ads_abstract(paper, library):
+                        return False
+                    continue
+                with span("pdf_save"):
+                    _atomic_save(dest, data)
+                _apply_openalex_identifiers(data, paper, library, verify_reason)
+                _commit_core_identifiers(data, paper, library)
+                paper.pdf_path = str(dest.relative_to(library.root))
+                # D7: status routes, source labels — never fuse them into one cell.
+                paper.download_status = DOWNLOAD_STATUS_OK
+                paper.download_source = source
+                paper.download_source_member = getattr(data, "acquisition_source", "")
+                library.log({"event": "downloaded", "key": paper.key, "source": source,
+                             "member_source": paper.download_source_member,
+                             "size": len(data), "verify": verify_reason})
+                return True
+            if source == "domain_aggregators":
+                _log_ads_availability(paper, library)
+                if _settle_ads_abstract(paper, library):
+                    return False
+            if skip_reason:
+                library.log({"event": "download_skip", "key": paper.key,
+                             "source": source, "reason": skip_reason})
+            else:
+                library.log({"event": "download_miss", "key": paper.key, "source": source})
 
     # All PDF tiers missed. Try the firecrawl text-only fallback as
     # last resort. On success it writes extracts/md/{key}.md directly and
     # sets paper.download_status = "ok" + download_source = "firecrawl"
     # (D7); we still return False because no PDF binary was obtained.
-    if _try_firecrawl_text_fallback(paper, library):
+    with span("firecrawl", source="firecrawl"):
+        firecrawl_ok = _try_firecrawl_text_fallback(paper, library)
+    if firecrawl_ok:
         # md on disk, no PDF binary → return False (no PDF) but status is
         # now "ok" + source firecrawl. The download queue inspects status to
         # decide chaining.

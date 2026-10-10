@@ -81,6 +81,38 @@ manifest record recovery counts by route, acquisition outcomes, and successful
 sources (including the winning member of aggregator groups). Report that post-deploy
 pass's numbers on [issue #197](https://github.com/LeonJoeeee/papervault/issues/197).
 
+Download telemetry is appended to the same manifest by ordinary acquisitions. Existing
+outcomes retain their fields and gain `timing`: a 32-character `run_id`, UTC `at`,
+and, inside a tier slot, `slot_id`, `slot_started_at`, `slot_ended_at`, and monotonic
+`slot_duration_s`. These slot endpoints describe elapsed time **at outcome emission**;
+use the corresponding completed `tier` span for the full slot including final bookkeeping.
+
+Additional `download_telemetry` records share `run_id`, paper `key`, `actor`
+(`download` or competing `search`), UTC `at`, process/thread IDs, and `phase`/`mark`.
+Spans have `start` and `end` marks with `span_id`, `parent_span_id`, `started_at`,
+`ended_at`, monotonic `duration_s`, and control-flow `status` (`ok`, `error`,
+`cancelled`). Status `ok` means the operation returned; tier success remains the
+existing outcome event. Phases cover `queue_worker`, `network_wait`, `network_hold`,
+actual `executor` work, `cascade`, arXiv `preflight`, `tier`, `strategy`,
+`verification`, `pdf_save`, `firecrawl`, parallel `group`/`member`, and `browser_call`.
+`enqueue`/`dequeue` points pair by queue sequence and run ID; dequeue includes
+`enqueued_at`, `queue_wait_s`, worker ID and priority. `queue_drop` points close
+stale priority-promoted tuples with their sequence and dequeue time. Cascade end carries
+`paper_status`, `outcome_source` and `pdf_returned`; group `winner` points precede
+executor drain. Mirror members use indices, never target URLs. Telemetry stores
+scalar fields only, bounds labels to 64 characters and keys to 128, and retains
+only one admission stamp per queued tuple. New-record failures emit a warning and
+do not change acquisition results. Manifest writes serialize complete JSONL records.
+
+The semaphore spans describe **whole cascade/search admission**, including browser,
+verification and executor drain; member fan-out can issue multiple requests per
+permit. Browser-call spans observe the exposed fetch API, not process creation/exit,
+PSS/RSS or isolated remote latency. Cancellation can release a permit before the
+executor thread ends; measure both timelines. Partial spans at capture boundaries
+must be censored. Request counts/status/rate headers and same-window host process
+memory measurements remain necessary to validate upstream limits and resource costs.
+This instrumentation changes neither the four workers nor the four semaphore permits.
+
 ## Releases
 
 papervault is consumed **by pin** (ADR-0001): deployments track an annotated git tag

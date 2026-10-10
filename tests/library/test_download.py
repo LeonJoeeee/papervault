@@ -37,7 +37,9 @@ def paper(lib):
 def _logged_events(lib: Library) -> list[dict]:
     if not lib.manifest_path.exists():
         return []
-    return [json.loads(line) for line in lib.manifest_path.read_text().splitlines() if line]
+    # These tests assert acquisition outcomes; span records have their own contract tests.
+    return [event for line in lib.manifest_path.read_text().splitlines() if line
+            if (event := json.loads(line))["event"] != "download_telemetry"]
 
 
 def _text_pdf(text: str) -> bytes:

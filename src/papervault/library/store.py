@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from .download_telemetry import enrich, manifest_lock
 from .models import DOWNLOAD_STATUS_PENDING, IdentityRecovery, Paper, base_key, normalize_title
 from .sources.inspire import merge_inspire_fields, retained_inspire_fields
 
@@ -910,8 +911,8 @@ class Library:
         for an unmet prerequisite, without a network attempt. Reconcile
         counts paper routes from status/disk facts, not these tier events.
         """
-        line = json.dumps(event, ensure_ascii=False)
-        with self.manifest_path.open("a") as f:
+        line = json.dumps(enrich(event, self), ensure_ascii=False)
+        with manifest_lock, self.manifest_path.open("a") as f:
             f.write(line + "\n")
 
     # ----- file paths -----

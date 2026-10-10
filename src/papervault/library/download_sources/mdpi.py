@@ -4,6 +4,7 @@ import re
 from typing import Optional
 
 from ..models import Paper
+from ..download_telemetry import browser_fetch
 from ._shared import _is_pdf_bytes, _load_stealthy_fetcher
 
 
@@ -54,7 +55,7 @@ def _try_mdpi_scrapling(paper: Paper) -> Optional[bytes]:
         return page
 
     try:
-        StealthyFetcher.fetch(
+        browser_fetch(StealthyFetcher,
             f"https://doi.org/{doi}",
             solve_cloudflare=True, network_idle=True, timeout=60000,
             humanize=False, geoip=False, page_action=_action)

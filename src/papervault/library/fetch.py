@@ -30,6 +30,9 @@ import requests
 from papervault import config
 from .models import normalize_title
 from .sources.arxiv import search_arxiv
+from .sources.identity import (
+    merge_source_identities, normalized_source_identities, semantic_scholar_identity, source_identity,
+)
 
 
 _DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
@@ -96,6 +99,13 @@ def _fetch_crossref_by_doi(doi: str) -> Optional[dict]:
                 break
         # Crossref returns the canonical (case-corrected) DOI form via msg["DOI"].
         canonical_doi = (msg.get("DOI") or doi).strip()
+        identity = source_identity(
+            "crossref", source_ids={"crossref:doi": msg.get("DOI"),
+                                    "crossref:alternative": msg.get("alternative-id")},
+            dois=msg.get("DOI"),
+            urls=[msg.get("URL"), *(link.get("URL") for link in msg.get("link") or []),
+                  ((msg.get("resource") or {}).get("primary") or {}).get("URL")],
+        )
         return {
             "title": title,
             "authors": authors,
@@ -114,6 +124,7 @@ def _fetch_crossref_by_doi(doi: str) -> Optional[dict]:
             "url": msg.get("URL", "") or "",
             "citation_count": msg.get("is-referenced-by-count", 0) or 0,
             "_abstract_xref": msg.get("abstract", "") or "",  # often empty / XML
+            "source_identities": [identity],
         }
     except Exception:
         return None
@@ -184,6 +195,7 @@ def _fetch_ss_by_doi(doi: str) -> Optional[dict]:
             "publication_types": paper.get("publicationTypes") or [],
             "citation_count": paper.get("citationCount", 0) or 0,
             "url": paper.get("url", "") or "",
+            "source_identities": [semantic_scholar_identity(paper)],
         }
     except Exception:
         return None
@@ -192,9 +204,8 @@ def _fetch_ss_by_doi(doi: str) -> Optional[dict]:
 def _merge_crossref_skeleton_with_ss(xref: dict, ss: Optional[dict]) -> dict:
     """Crossref fields are authoritative; SS fills gaps only.
 
-    Returned dict has the same shape as the legacy ``fetch_by_doi``
-    return value (title, authors, abstract, year, doi, arxiv_id,
-    paper_id, venue, publication_types, citation_count, url, source).
+    Canonical fields retain the legacy ``fetch_by_doi`` merge policy;
+    source identifier observations preserve each contributor separately.
     """
     out = {
         "title": xref["title"],
@@ -214,6 +225,8 @@ def _merge_crossref_skeleton_with_ss(xref: dict, ss: Optional[dict]) -> dict:
         "url": xref.get("url", ""),
         "citation_count": xref.get("citation_count", 0),
         "source": "crossref",
+        "source_identities": [o.model_dump() for o in merge_source_identities(
+            xref.get("source_identities"), (ss or {}).get("source_identities"))],
     }
 
     if ss is None:
@@ -345,12 +358,13 @@ def fetch_by_arxiv(arxiv_id: str) -> Optional[dict]:
                 "abstract": p["abstract"],
                 "year": int(p["year"]) if str(p["year"]).isdigit() else None,
                 "arxiv_id": p["arxiv_id"],
-                "doi": "",
+                "doi": p.get("doi") or "",
                 "url": p["url"],
                 "venue": "arXiv",
                 "publication_types": ["JournalArticle"],
                 "citation_count": 0,
                 "source": "arxiv",
+                "source_identities": normalized_source_identities(p, "arxiv"),
             }
     except Exception:
         pass
@@ -376,6 +390,7 @@ def fetch_by_arxiv(arxiv_id: str) -> Optional[dict]:
                 "citation_count": paper.get("citationCount", 0) or 0,
                 "url": paper.get("url", "") or "",
                 "source": "semantic_scholar",
+                "source_identities": [semantic_scholar_identity(paper)],
             }
     except Exception:
         pass

@@ -259,6 +259,7 @@ def paper_to_dict(paper: Any) -> dict:
         "arxiv_id":       getattr(paper, "arxiv_id", "") or "",
         "inspire_record_id": getattr(paper, "inspire_record_id", "") or "",
         "inspire_document_urls": list(getattr(paper, "inspire_document_urls", []) or []),
+        "source_identities": [o.model_dump() for o in getattr(paper, "source_identities", [])],
         "citation_count": getattr(paper, "citation_count", 0) or 0,
         "is_review":      bool(getattr(paper, "is_review", False)),
         "publication_types": list(getattr(paper, "publication_types", []) or []),

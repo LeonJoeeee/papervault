@@ -1930,3 +1930,94 @@ async def test_inspire_fold_rechecks_original_source_evidence(
     assert paper.inspire_record_id == ""
     assert paper.inspire_document_urls == []
     assert Library(populated_lib.root).get(paper.key).inspire_record_id == ""
+
+
+@pytest.mark.parametrize("origin", ["external", "library"])
+async def test_search_fold_keeps_all_source_identity_observations(
+        server, populated_lib, monkeypatch, origin):
+    """Discarded search representatives must not discard their source identifiers."""
+    from types import SimpleNamespace
+    from papervault.library.search import _normalize_paper
+
+    title = "Namespace capture for cosmic ray transport"
+    target = _normalize_paper({"title": title, "authors": ["Tester, A."], "year": 2024,
+        "doi": "10.1234/capture", "paper_id": "123", "url": "https://core.ac.uk/works/123",
+        "abstract": "A cosmic ray transport study.", "publication_types": ["JournalArticle"]}, "core")
+    twin = _normalize_paper({"title": title, "authors": ["Tester, A."], "year": 2024,
+        "doi": "10.1234/capture", "paper_id": "123", "url": "https://openalex.org/W123",
+        "abstract": "A cosmic ray transport study.", "publication_types": ["JournalArticle"]}, "openalex")
+    existing = None
+    if origin == "library":
+        existing, _ = populated_lib.upsert(dict(target))
+        existing.download_status = "metadata_only"
+        populated_lib.save(force=True)
+    queued = []
+    server._paper_download_queue.add = lambda key, **_: queued.append(key)
+    monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda **_: SimpleNamespace())
+    monkeypatch.setattr("papervault.library.mcp.server.parse_intent",
+        lambda *_, **__: _fake_plan(search_terms=["cosmic ray transport"]))
+
+    async def external(*_, **__):
+        nodes = [_tag(twin, 0, 1), _tag(twin, 0, 2)]
+        if origin == "external":
+            nodes.insert(0, _tag(target, 0, 0))
+        return nodes, {}
+
+    async def ingest(cands, **_):
+        return {i: {"ingest_ok": True, "llm_is_paper": True, "tier": "1A"}
+                for i in range(len(cands))}, 0
+
+    async def ret(cands, *_, **__):
+        return {i: {"score": 0.9, "reason": "same topic"} for i in range(len(cands))}, 0
+
+    monkeypatch.setattr("papervault.library.mcp.server.search_external_async", external)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", ingest)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
+    monkeypatch.setattr("requests.get", lambda *_, **__: pytest.fail("admission made a GET"))
+    result = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    assert result["status"] == "ok"
+    paper = populated_lib.find(doi="10.1234/capture")
+    assert paper is not None
+    observations = [o.model_dump() for o in getattr(paper, "source_identities", [])]
+    assert observations == [
+        {"source": "core", "source_ids": {"core:work": ["123"]},
+         "dois": ["10.1234/capture"], "arxiv_ids": [], "urls": ["https://core.ac.uk/works/123"]},
+        {"source": "openalex", "source_ids": {"openalex:work": ["123"]},
+         "dois": ["10.1234/capture"], "arxiv_ids": [], "urls": ["https://openalex.org/W123"]}]
+    stored = Library(populated_lib.root).get(paper.key)
+    assert [o.model_dump() for o in stored.source_identities] == observations
+    assert paper.source == "core" and paper.paper_id == "123"
+    if existing:
+        assert paper is existing
+        assert paper.download_status == "metadata_only" and queued == []
+    else:
+        assert queued == [paper.key]
+    for item in result["results"]:
+        assert "source_identities" not in item  # Existing minimal MCP contract.
+
+
+async def test_search_rejected_candidate_does_not_store_source_identity(
+        server, populated_lib, monkeypatch):
+    from types import SimpleNamespace
+    from papervault.library.search import _normalize_paper
+
+    cand = _normalize_paper({"title": "Off-domain medical identifier capture study",
+                            "doi": "10.1234/rejected", "paper_id": "123"}, "core")
+    monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda **_: SimpleNamespace())
+    monkeypatch.setattr("papervault.library.mcp.server.parse_intent",
+        lambda *_, **__: _fake_plan(search_terms=["cosmic ray transport"]))
+
+    async def external(*_, **__):
+        return [_tag(cand, 0, 0)], {}
+
+    async def ingest(cands, **_):
+        return {0: {"ingest_ok": False, "llm_is_paper": True, "tier": "3"}}, 0
+
+    async def ret(cands, *_, **__):
+        return {}, 0
+
+    monkeypatch.setattr("papervault.library.mcp.server.search_external_async", external)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", ingest)
+    monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
+    await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    assert populated_lib.find(doi="10.1234/rejected") is None

@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import requests
+from .identity import source_identity
 
 API_URL = "https://inspirehep.net/api/literature"
 FIELDS = ("titles,authors,publication_info,preprint_date,arxiv_eprints,dois,"
@@ -324,6 +325,14 @@ def _paper_from_hit(hit: dict) -> dict:
         url = f"https://arxiv.org/abs/{arxiv_id}"
     elif doi:
         url = f"https://doi.org/{doi}"
+    recids = [inspire_record_id(hit.get("id")), inspire_record_id(meta.get("control_number"))]
+    identity = source_identity(
+        "inspire", source_ids={"inspire:literature": recids},
+        dois=[v.get("value") for v in dois],
+        arxiv_ids=[v.get("value") for v in arxiv_eprints],
+        urls=[url, *(f"https://inspirehep.net/literature/{recid}" for recid in recids if recid),
+              *_document_urls(meta.get("documents"))],
+    )
 
     return {
         "title": title,
@@ -336,4 +345,5 @@ def _paper_from_hit(hit: dict) -> dict:
         "venue": venue,
         "citation_count": citation_count,
         **_record_fields(hit),
+        "source_identities": [identity],
     }

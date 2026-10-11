@@ -816,8 +816,11 @@ class Library:
         citation_count, latch is_review)."""
         for field, value in merge_inspire_fields(existing.model_dump(), incoming).items():
             setattr(existing, field, value)
-        existing.source_identities = merge_source_identities(
-            existing.source_identities, incoming.get("source_identities"))
+        observations = incoming.get("source_identities")
+        if observations:
+            # Metadata-only fills must not overwrite a concurrent admission's observations.
+            existing.source_identities = merge_source_identities(
+                existing.source_identities, observations)
         for field, value in incoming.items():
             if field in {"inspire_record_id", "inspire_document_urls", "source_identities"}:
                 continue  # source identity and links are merged together above

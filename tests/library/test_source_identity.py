@@ -162,6 +162,56 @@ def test_upsert_preserves_source_observations_and_canonical_provenance(tmp_path)
             stored.download_status) == (DOI, "core", "123", PDF, "metadata_only")
 
 
+@pytest.mark.parametrize("no_observations", [
+    {}, {"source_identities": None}, {"source_identities": []},
+], ids=["missing", "none", "empty"])
+def test_no_observation_merge_preserves_concurrent_admission(tmp_path, no_observations):
+    lib = Library(tmp_path)
+    core = {"source": "core", "source_ids": {"core:work": ["123"]},
+            "dois": [], "arxiv_ids": [], "urls": [PDF]}
+    ads = {"source": "ads", "source_ids": {"ads:bibcode": ["2024ApJ...123..456A"]},
+           "dois": [DOI], "arxiv_ids": [ARXIV], "urls": [LANDING]}
+    paper, _ = lib.upsert({"title": TITLE, "source": "core", "source_identities": [core]})
+    admitted = False
+
+    class MetadataDuringAdmission(dict):
+        def get(self, name, default=None):
+            nonlocal admitted
+            if name == "source_identities" and not admitted:
+                admitted = True
+                # Before the fix, _merge has already read the old CORE list
+                # as its first argument. Admission replaces it with CORE+ADS
+                # before the metadata merge can write its stale snapshot.
+                merged, fresh = lib.upsert({"title": TITLE, "source_identities": [ads]})
+                assert merged is paper and not fresh
+                assert [o.source for o in paper.source_identities] == ["core", "ads"]
+            return super().get(name, default)
+
+    merged = lib._merge(paper, MetadataDuringAdmission(doi=DOI, **no_observations))
+    assert merged is paper and paper.doi == DOI
+    assert [o.model_dump() for o in paper.source_identities] == [core, ads]
+
+    observations = paper.source_identities
+    assert lib.fill_verified_identifiers(paper.key, arxiv_id=ARXIV) == {"arxiv_id": ARXIV}
+    assert paper.source_identities is observations
+    lib.save(force=True)
+    stored = Library(tmp_path).get(paper.key)
+    assert [o.model_dump() for o in stored.source_identities] == [core, ads]
+
+
+def test_merge_with_observations_adds_explicit_missing_id(tmp_path):
+    lib = Library(tmp_path)
+    core = {"source": "core", "source_ids": {"core:work": ["123"]},
+            "dois": [], "arxiv_ids": [], "urls": [PDF]}
+    missing_ads = {"source": "ads", "source_ids": {"ads:bibcode": []},
+                   "dois": [], "arxiv_ids": [], "urls": [LANDING]}
+    paper, _ = lib.upsert({"title": TITLE, "source_identities": [core]})
+    for _ in range(2):
+        merged, fresh = lib.upsert({"title": TITLE, "source_identities": [missing_ads, core]})
+        assert merged is paper and not fresh
+    assert [o.model_dump() for o in paper.source_identities] == [core, missing_ads]
+
+
 @responses.activate
 def test_core_output_api_urls_and_typed_identifiers_are_captured(monkeypatch, tmp_path):
     monkeypatch.setenv("CORE_API_KEY", "test-token")

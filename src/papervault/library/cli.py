@@ -60,6 +60,79 @@ def cmd_identity_backfill(args) -> int:
     return 0
 
 
+def _correction_store(args):
+    from papervault.ops_guards import active_service_units
+    if active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES):
+        raise ValueError("papervault.service is running and would overwrite this maintenance pass")
+    return Library()
+
+
+def cmd_correction_event(args) -> int:
+    import asyncio
+    from .services.correction_pipeline import run_event
+    try:
+        keys = _read_key_file(args.keys) if args.keys else None
+        if args.trigger == "identifiers_arrived" and not keys:
+            raise ValueError("identifiers_arrived requires --keys with affected citation keys")
+        routes = json.loads(Path(args.routes).read_text()) if args.routes else None
+        result = asyncio.run(run_event(_correction_store(args), trigger=args.trigger,
+                                       source=args.source, cap=args.cap, keys=keys, route_findings=routes))
+    except (OSError, ValueError) as exc:
+        _err(str(exc))
+        return 2
+    _json(result)
+    return 0
+
+
+def cmd_correction_sweep(args) -> int:
+    import asyncio
+    from .services.correction_pipeline import monthly_sweep
+    try:
+        result = asyncio.run(monthly_sweep(_correction_store(args),
+            per_cohort_cap=args.per_cohort_cap, total_cap=args.total_cap))
+    except (OSError, ValueError) as exc:
+        _err(str(exc))
+        return 2
+    _json(result)
+    return 0
+
+
+def cmd_correction_report(args) -> int:
+    from datetime import datetime, timezone
+    from papervault import config
+    from .services.correction_ledger import CorrectionLedger
+    from .services.correction_pipeline import ledger_report
+    root = Path(os.path.expanduser(os.environ.get("PAPERVAULT_VAULT")
+                or os.environ.get("PAPER_LIBRARY_PATH") or str(config.VAULT_PATH)))
+    ledger = CorrectionLedger(root)
+    try:
+        result = (ledger_report(ledger, args.month or datetime.now(timezone.utc).strftime("%Y-%m"))
+                  if args.kind == "monthly" else ledger.read()[args.kind])
+        if args.manifest:
+            if args.kind != "manifests":
+                raise ValueError("--manifest requires --kind manifests")
+            result = result[args.manifest]
+    except (OSError, ValueError, KeyError) as exc:
+        _err(str(exc))
+        return 2
+    _json(result)
+    return 0
+
+
+def cmd_correction_adjudicate(args) -> int:
+    try:
+        packet = json.loads(Path(args.file).read_text())
+        library = _correction_store(args)
+        library.corrections.adjudicate(packet)
+        library.log({"event": "correction_adjudicated", "manifest_id": packet["manifest_id"],
+                     "conflicts": library.corrections.summary()})
+    except (OSError, ValueError, KeyError) as exc:
+        _err(str(exc))
+        return 2
+    _json(library.corrections.summary())
+    return 0
+
+
 def cmd_add(args) -> int:
     """`python -m papervault.library.cli add <ident>` — enqueue one paper for background ingest.
 
@@ -1070,6 +1143,35 @@ def build_parser() -> argparse.ArgumentParser:
     pib.add_argument("--acquire", action="store_true", help="run the cascade only on newly recovered rows; requires --apply")
     pib.add_argument("--json", action="store_true", help="emit the recorded JSON accounting")
     pib.set_defaults(func=cmd_identity_backfill)
+
+    from .services.correction_pipeline import COHORTS, DEFAULT_COHORT_CAP, MAX_SWEEP_CAP, TRIGGERS
+    pe = sp.add_parser("correction-event", help="notify a bounded cohort of a correction trigger")
+    pe.add_argument("trigger", choices=TRIGGERS)
+    pe.add_argument("--source", choices=COHORTS, required=True)
+    pe.add_argument("--cap", type=identity_cap, required=True)
+    pe.add_argument("--keys", metavar="FILE", help="affected citation keys; required for identifiers_arrived")
+    pe.add_argument("--routes", metavar="FILE", help="verified #205 ADS route findings JSON; keys must be selected")
+    pe.add_argument("--apply", action="store_true", required=True)
+    pe.set_defaults(func=cmd_correction_event)
+    ps = sp.add_parser("correction-sweep", help="run a due monthly correction sweep")
+    ps.add_argument("--per-cohort-cap", type=identity_cap, default=DEFAULT_COHORT_CAP)
+    def sweep_cap(raw):
+        value = int(raw)
+        if not 1 <= value <= MAX_SWEEP_CAP:
+            raise argparse.ArgumentTypeError(f"total cap must be between 1 and {MAX_SWEEP_CAP}")
+        return value
+    ps.add_argument("--total-cap", type=sweep_cap, default=MAX_SWEEP_CAP)
+    ps.add_argument("--apply", action="store_true", required=True)
+    ps.set_defaults(func=cmd_correction_sweep)
+    pr = sp.add_parser("correction-report", help="read monthly aggregates or correction evidence without writes")
+    pr.add_argument("--month", help="UTC month, YYYY-MM (default: current)")
+    pr.add_argument("--kind", choices=("monthly", "manifests", "conflicts", "routes"), default="monthly")
+    pr.add_argument("--manifest", help="select one immutable dispatch manifest")
+    pr.set_defaults(func=cmd_correction_report)
+    pa = sp.add_parser("correction-adjudicate", help="record an investigated batch; omitted answers need a human")
+    pa.add_argument("file", help="JSON manifest_id/results packet")
+    pa.add_argument("--apply", action="store_true", required=True)
+    pa.set_defaults(func=cmd_correction_adjudicate)
 
     # audit
     pau = sp.add_parser("audit", help="check / fix index ↔ disk consistency")

@@ -216,15 +216,16 @@ async def _enrich_sweep(library: Library, *, cap: int) -> int:
     cands = [p for p in library.all_papers() if _needs_enrich(p)][:cap]
     if not cands:
         return 0
-    keys = [p.key for p in cands]
-    results = await asyncio.gather(*(_enrich_one((p.doi or "").strip()) for p in cands))
+    targets = [(p.key, (p.doi or "").strip()) for p in cands]
+    results = await asyncio.gather(*(_enrich_one(doi) for _, doi in targets))
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     filled = 0
     async with concurrency.lib_write_lock:
-        for key, (status, fields) in zip(keys, results):
+        for (key, doi), (status, fields) in zip(targets, results):
             if status == "transient":
                 continue                          # fail-open: do NOT stamp, retry later
-            if library.enrich(key, fields, enriched_at=now):
+            if library.enrich(key, fields, enriched_at=now, provenance={"incoming_source": "crossref",
+                    "lookup_doi": doi, "checked_at": now}):
                 filled += 1
         library.save()
     log.info("reconcile: enrich probed %d -> filled %d", len(cands), filled)

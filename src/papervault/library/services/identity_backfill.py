@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +20,8 @@ from ..sources.inspire import inspire_record_id, lookup_inspire_record
 from ..store import Library
 
 MAX_CAP = 50
+SNAPSHOT_FIELDS = {"title", "authors", "year", "url", "source", "paper_id", "inspire_record_id",
+                   "doi", "arxiv_id", "added_at", "domain_status"}
 _DOI_HOSTS = {"doi.org", "dx.doi.org", "onlinelibrary.wiley.com", "link.springer.com",
               "iopscience.iop.org", "journals.aps.org", "academic.oup.com",
               "pubs.acs.org", "journals.sagepub.com", "www.tandfonline.com"}
@@ -204,10 +207,13 @@ def _selection(papers: list[Paper], cap: int, keys: list[str] | None) -> list[Pa
     return [by_key[key] for key in order if key in by_key][:cap]
 
 
-def inspect_identities(papers: list[Paper], *, cap: int, keys: list[str] | None = None) -> dict:
+def inspect_identities(papers: list[Paper], *, cap: int, keys: list[str] | None = None,
+                       pace_seconds: float = 0) -> dict:
     selected = _selection(papers, cap, keys)
     records, routes = [], Counter()
-    for paper in selected:
+    for index, paper in enumerate(selected):
+        if index and pace_seconds:
+            time.sleep(pace_seconds)
         recovery = recover_identity(paper)
         if recovery:
             routes[recovery.route] += 1
@@ -220,13 +226,24 @@ def inspect_identities(papers: list[Paper], *, cap: int, keys: list[str] | None 
 
 def backfill_identities(library: Library, *, cap: int, keys: list[str] | None = None,
                         acquire: bool = False) -> dict:
-    from ..download import download_paper
-
     papers = library.all_papers()
     selected = _selection(papers, cap, keys)
     library.log({"event": "identity_backfill_start", "cap": cap,
                  "keys": [p.key for p in selected], "acquire": acquire})
     result = inspect_identities(selected, cap=cap, keys=keys)
+    return apply_identity_report(library, result, acquire=acquire)
+
+
+def apply_identity_report(library: Library, result: dict, *, acquire: bool = False,
+                          doi_only: bool = False, snapshots: dict[str, Paper] | None = None) -> dict:
+    """Apply the reviewed inspection path; async callers hold lib_write_lock.
+
+    Splitting verification from application lets the correction pipeline inspect
+    snapshots off-loop without giving a background thread a writable Library.
+    The standing pipeline defers non-DOI claims per #198 Q4.
+    """
+    from ..download import download_paper
+
     result["dry_run"] = False
     routes, sources, outcomes = Counter(), Counter(), Counter()
     result["recovered"] = 0
@@ -234,6 +251,19 @@ def backfill_identities(library: Library, *, cap: int, keys: list[str] | None = 
         if item["recovery"] is None:
             continue
         recovery = IdentityRecovery(**item["recovery"])
+        if snapshots is not None:
+            snapshot, current = snapshots.get(item["key"]), library.get(item["key"])
+            if (snapshot is None or current is None or current.model_dump(include=SNAPSHOT_FIELDS)
+                    != snapshot.model_dump(include=SNAPSHOT_FIELDS)):
+                item["outcome"] = "stale_snapshot"
+                if current is not None and snapshot is not None:
+                    library.corrections.stage_fields(current, snapshot.model_dump(),
+                        operation="stale_identity_backfill", provenance={"recovery": recovery.model_dump()},
+                        proposals={k: v for k, v in {"doi": recovery.doi, "arxiv_id": recovery.arxiv_id}.items() if v})
+                continue
+        if doi_only and not recovery.doi:
+            item["outcome"] = "deferred_non_doi"
+            continue
         item["outcome"] = library.set_recovered_identity(item["key"], recovery)
         if item["outcome"] != "set":
             continue

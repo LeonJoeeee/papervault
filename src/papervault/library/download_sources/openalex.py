@@ -351,7 +351,8 @@ def _apply_openalex_identifiers(data: bytes, paper: Paper, library: Library,
                                 verify_reason: str) -> None:
     if not isinstance(data, _OpenAlexPDF) or not verify_reason.startswith("llm_match:"):
         return
-    incoming = library.fill_verified_identifiers(paper.key, doi=data.doi, arxiv_id=data.arxiv_id)
+    incoming = library.fill_verified_identifiers(paper.key, doi=data.doi, arxiv_id=data.arxiv_id,
+        provenance={"incoming_source": "openalex", "verification": verify_reason, "source_url": paper.url})
     if incoming:
         library.log({"event": "openalex_identifiers_recovered", "key": paper.key,
                      **incoming})

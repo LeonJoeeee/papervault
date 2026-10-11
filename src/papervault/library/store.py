@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as _dt
+import asyncio
 import json
 import os
 import re
@@ -236,6 +237,10 @@ class Library:
         self._index_dirty = False
         self._bib_min_interval = float(os.environ.get("PAPERVAULT_BIB_MIN_INTERVAL_S", "60"))
         self._last_bib_save = 0.0
+        from .services.correction_ledger import CorrectionLedger
+        self.corrections = CorrectionLedger(self.root)
+        self.correction_run_lock = asyncio.Lock()
+        self.correction_next_at = 0.0
         self._load()
 
     # ----- load / save -----
@@ -627,7 +632,7 @@ class Library:
     # year/doi — those already passed ingest). Fill-blanks only.
     _ENRICH_FIELDS = ("venue", "volume", "pages", "issue")
 
-    def enrich(self, key: str, fields: dict, *, enriched_at: str) -> bool:
+    def enrich(self, key: str, fields: dict, *, enriched_at: str, provenance: dict | None = None) -> bool:
         """Targeted same-key metadata fill for the enrich queue (NOT upsert).
 
         Fill-blanks-merges ONLY ``venue/volume/pages/issue`` onto the existing
@@ -642,6 +647,8 @@ class Library:
         p = self._papers.get(key)
         if p is None:
             return False
+        self.corrections.stage_fields(p, {f: fields[f] for f in self._ENRICH_FIELDS if f in fields},
+                                      operation="enrich", provenance=provenance)
         changed = False
         for f in self._ENRICH_FIELDS:
             val = fields.get(f)
@@ -730,14 +737,21 @@ class Library:
         if paper is None:
             return "no_paper"
         if paper.doi or paper.arxiv_id:
+            self.corrections.stage_fields(paper, {"doi": recovery.doi, "arxiv_id": recovery.arxiv_id},
+                                          operation="identity_backfill", provenance={"recovery": recovery.model_dump()})
             return "has_identifier"
         if not (recovery.doi or recovery.arxiv_id):
             return "empty_identity"
         for value, index, normalize in ((recovery.doi, self._by_doi, str.lower),
                                         (recovery.arxiv_id, self._by_arxiv, _normalize_arxiv)):
             if value and index.get(normalize(value), key) != key:
+                holder = self.get(index[normalize(value)])
+                self.corrections.stage_identity(paper, recovery.model_dump(), holder,
+                    provenance={"operation": "identity_backfill", "recovery": recovery.model_dump()})
                 return "collision"
-        applied = self.fill_verified_identifiers(key, doi=recovery.doi, arxiv_id=recovery.arxiv_id)
+        applied = self.fill_verified_identifiers(key, doi=recovery.doi, arxiv_id=recovery.arxiv_id,
+            provenance={"recovery": recovery.model_dump(), "verification": recovery.route,
+                        "source_url": recovery.source_url})
         if not applied:
             return "collision"
         paper.identity_recovery = recovery.model_copy(update={
@@ -747,7 +761,7 @@ class Library:
         return "set"
 
     def fill_verified_identifiers(self, key: str, *, doi: str = "",
-                                  arxiv_id: str = "") -> dict[str, str]:
+                                  arxiv_id: str = "", provenance: dict | None = None) -> dict[str, str]:
         """Fill verified blanks on this row; never redirect a merge to a twin.
 
         Atomic dictionary claims arbitrate concurrent download workers before
@@ -757,6 +771,8 @@ class Library:
         paper = self.get(key)
         if paper is None:
             return {}
+        self.corrections.stage_fields(paper, {"doi": doi, "arxiv_id": arxiv_id},
+                                      operation="verified_identifiers", provenance=provenance)
         incoming = {}
         for name, value, index, normalized in (
             ("doi", doi, self._by_doi, doi.lower()),
@@ -765,7 +781,10 @@ class Library:
             if value and not getattr(paper, name):
                 if index.setdefault(normalized, key) == key:
                     incoming[name] = value
-        self._merge(paper, incoming)
+                else:
+                    self.corrections.stage_identity(paper, {name: value}, self.get(index[normalized]),
+                        provenance={"operation": "verified_identifiers", **(provenance or {})})
+        self._merge(paper, incoming, provenance={"operation": "verified_identifiers", **(provenance or {})})
         applied = {}
         for name, value in incoming.items():
             current = getattr(paper, name)
@@ -799,8 +818,7 @@ class Library:
         text = "\n\n".join(p.to_bibtex() for p in ordered) + ("\n" if ordered else "")
         return text, missing
 
-    @staticmethod
-    def _merge(existing: Paper, incoming: dict) -> Paper:
+    def _merge(self, existing: Paper, incoming: dict, *, provenance: dict | None = None) -> Paper:
         """Fill-blanks merge of ``incoming`` INTO ``existing``, IN PLACE — the
         SAME object identity is returned, never a fresh Paper.
 
@@ -814,6 +832,7 @@ class Library:
         both sides' field writes land. Fill-blanks semantics are unchanged:
         non-empty incoming only fills a blank existing field (numeric upgrade for
         citation_count, latch is_review)."""
+        self.corrections.stage_fields(existing, incoming, provenance=provenance)
         for field, value in merge_inspire_fields(existing.model_dump(), incoming).items():
             setattr(existing, field, value)
         observations = incoming.get("source_identities")

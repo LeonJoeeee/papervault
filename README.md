@@ -81,6 +81,68 @@ manifest record recovery counts by route, acquisition outcomes, and successful
 sources (including the winning member of aggregator groups). Report that post-deploy
 pass's numbers on [issue #197](https://github.com/LeonJoeeee/papervault/issues/197).
 
+The standing correction pipeline uses that same verification/application path with
+acquisition disabled. Notify it explicitly after a credential becomes available or
+an affected source is repaired/deployed, in an authorized maintenance window:
+
+```bash
+python -m papervault.library.cli correction-event credential_arrived --source ads --cap 20 --apply
+python -m papervault.library.cli correction-event source_repaired --source core --cap 10 --apply
+python -m papervault.library.cli correction-event identifiers_arrived --source ads --keys affected.keys --cap 10 --apply
+```
+
+These commands are the operator notification points; they do not watch credentials
+or poll source health. Source adapters can use the same async `run_event` interface
+with the running library. `identifiers_arrived` requires explicit stored citation
+keys whose source identifiers or locator URLs gained evidence. Each event intersects
+keys with its source cohort, then caps selection at the required `--cap` (1–50).
+Without keys, only identifierless rows and unrecorded verified routes consume the cap.
+Known identifiers remain intact. The standing pipeline applies DOI recoveries;
+non-DOI claims are recorded as deferred because #198's lower identity ladder is TBD.
+Requests are serial, with at least one second between inspected records and sweep
+cohorts; the reviewed source helpers retain their timeouts, limits and cooldowns.
+
+Library background boot owns a monthly correction task. Its durable due time has
+a 30-day floor, survives restart, and starts 30 days after first activation. An
+operator may run the first sweep earlier with `correction-sweep --apply`; subsequent
+sweeps respect that floor. Each cohort defaults to 20 selected papers (hard maximum
+50); the whole sweep defaults to and cannot exceed 100. Both citation-key and cohort
+cursors rotate so capped misses and later cohorts progress. CORE starts last per
+its measured ceiling. Override the defaults downward with `--per-cohort-cap` and
+`--total-cap`. The constants and validation live in `services/correction_pipeline.py`;
+the reviewed backfill's record ceiling remains in `services/identity_backfill.py`.
+
+`correction-ledger.json`, beside the vault's `index.json`, keeps conflicts, immutable
+batch manifests, adjudications, route findings, scheduling and monthly aggregates.
+The library manifest records every pass and monthly report. Merge/enrichment and
+verified-identity claim hooks stage conflicting fields with both original sides and
+provenance; they retain existing fill-blanks behavior. The backfill still never
+merges or purges a collision (the older title-based DOI resolver keeps its existing
+merge behavior, with field conflicts staged before merging).
+
+At ten distinct pending subject papers, one atomic ledger write emits and assigns
+a manifest for an **orchestrator-dispatched Codex CLI `gpt-6-luna` / `max`** agent.
+Each manifest contains ten papers and at most fifty conflicts. No agent is launched
+by the library. Export its actual evidence with `correction-report --kind manifests
+--manifest ID`. Import an investigation using `correction-adjudicate results.json
+--apply`, where JSON contains `manifest_id` and `results` entries with `conflict_id`,
+`status` (`resolved` or `needs_human`), `decision`, and `evidence`. Resolved answers
+require evidence; omitted/unadjudicable answers become retained `needs_human`.
+Identical replay is idempotent; foreign/duplicate answers fail atomically. Adjudication
+records a decision and does not apply field changes. Those require separate scoped
+authorization. `correction-report --month YYYY-MM` reports aggregate counts and current
+unresolved dispositions; `--kind conflicts` exports the retained evidence. All report
+exports are read-only; maintenance writes refuse while the service is running.
+
+Verified stored ADS full-text observations are copied into the route ledger. A #205
+survey packet may also be supplied to a key-scoped ADS event using `--routes FILE`:
+a JSON list of `{key, url, source_identifier, provenance}` objects, with the exact
+stored ADS bibcode and provenance containing timezone-aware `checked_at`,
+`verification: "remote_pdf"`, and the survey's evidence (for example `issue: 205` and
+`status_code: 200`). Imports require selected keys and at most three routes per paper.
+`correction-report --kind routes` is the #174 scoped re-open's selection interface.
+The correction pipeline downloads no assets and changes no terminal states.
+
 Download telemetry is appended to the same manifest by ordinary acquisitions. Existing
 outcomes retain their fields and gain `timing`: a 32-character `run_id`, UTC `at`,
 and, inside a tier slot, `slot_id`, `slot_started_at`, `slot_ended_at`, and monotonic

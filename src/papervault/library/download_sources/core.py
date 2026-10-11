@@ -67,7 +67,8 @@ class _CorePDF(bytes):
 def _commit_core_identifiers(data: bytes, paper: Paper, library: Library) -> None:
     """Called only after the outer verifier and atomic save succeed."""
     if isinstance(data, _CorePDF):
-        library.fill_verified_identifiers(paper.key, doi=data.doi, arxiv_id=data.arxiv_id)
+        library.fill_verified_identifiers(paper.key, doi=data.doi, arxiv_id=data.arxiv_id,
+            provenance={"incoming_source": "core", "verification": "verified_pdf", "source_url": paper.url})
 
 
 def _http_url(value: object) -> Optional[str]:

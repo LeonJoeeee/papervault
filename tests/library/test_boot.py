@@ -25,6 +25,18 @@ from papervault.mcp.server import build_server
 log = logging.getLogger("test.boot")
 
 
+def test_monthly_correction_task_is_owned_and_cancelled_by_boot(tmp_path):
+    async def scenario():
+        server = build_server(library_path=str(tmp_path))
+        shutdown = await start_background(server, log)
+        await server._paper_boot_task
+        task = server._paper_correction_task
+        assert not task.done()
+        await shutdown()
+        assert task.done()
+    asyncio.run(scenario())
+
+
 def _make_extract_paper(tmp_path) -> None:
     """Seed the vault at ``tmp_path`` with ONE EXTRACT-routed paper (status ok +
     a PDF on disk + no md), so the boot recovery scan enqueues it and a worker

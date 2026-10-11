@@ -6,7 +6,7 @@ Given an already-built server (from :func:`build_server`, which stashes the
 Library + both queues on the instance), this:
   1. runs the one-time download_status migration (idempotent),
   2. starts the extract then download queues (downstream-first),
-  3. launches the reconcile sweep + on-demand MinerU idle monitor,
+  3. launches reconcile, monthly corrections, and the on-demand MinerU idle monitor,
 and returns an async ``shutdown()`` that tears them down in reverse.
 
 **Bind-the-port-before-the-sweep (issue #34 remaining scope).** Steps 1-3 include
@@ -64,6 +64,7 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
     # Handles filled in by the background boot; shutdown reads whatever exists.
     reconcile_task: asyncio.Task | None = None
     mineru_monitor_task: asyncio.Task | None = None
+    correction_task: asyncio.Task | None = None
 
     # Boot-failure signal (monitored by the heavy MCP tools). None while the boot
     # is healthy / in-flight; set to a short exception summary if _deferred_boot
@@ -88,7 +89,7 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
 
     async def _deferred_boot() -> None:
         """The potentially-long library warm-up — runs AFTER the port binds."""
-        nonlocal reconcile_task, mineru_monitor_task
+        nonlocal reconcile_task, mineru_monitor_task, correction_task
         try:
             # One-time download_status migration — normalize every legacy status to
             # the clean routing enum BEFORE the queues' recovery scans read a
@@ -119,6 +120,11 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
                 name="paper-reconcile-loop",
             )
             log.info("paper-reconcile loop started")
+
+            from ..services.correction_pipeline import monthly_loop
+            correction_task = asyncio.create_task(monthly_loop(library, log),
+                                                  name="paper-monthly-correction")
+            server._paper_correction_task = correction_task  # type: ignore[attr-defined]
 
             from ..services.mineru_server import get_server_controller
             mineru_monitor_task = asyncio.create_task(
@@ -151,11 +157,11 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
         except (asyncio.CancelledError, Exception):
             pass
         flusher_task.cancel()
-        for _t in (flusher_task, reconcile_task, mineru_monitor_task):
+        for _t in (flusher_task, reconcile_task, mineru_monitor_task, correction_task):
             if _t is None:
                 continue
             _t.cancel()
-        for _t in (flusher_task, reconcile_task, mineru_monitor_task):
+        for _t in (flusher_task, reconcile_task, mineru_monitor_task, correction_task):
             if _t is None:
                 continue
             try:

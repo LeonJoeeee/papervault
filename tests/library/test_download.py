@@ -2372,9 +2372,9 @@ def test_openalex_recovery_removes_unused_claims_on_same_row_update(
     p = openalex_paper
     merge = lib._merge
 
-    def intervening_update(paper, incoming):
+    def intervening_update(paper, incoming, **kwargs):
         lib.set_resolved_doi(p.key, "10.1088/other")
-        return merge(paper, incoming)
+        return merge(paper, incoming, **kwargs)
 
     monkeypatch.setattr(lib, "_merge", intervening_update)
     changed = lib.fill_verified_identifiers(p.key, doi="10.1088/recovered")
@@ -2389,10 +2389,10 @@ def test_openalex_recovery_preserves_intervening_arxiv_version_index(
     p = openalex_paper
     merge = lib._merge
 
-    def intervening_update(paper, incoming):
+    def intervening_update(paper, incoming, **kwargs):
         merge(paper, {"arxiv_id": "2102.11582v1"})
         lib._reindex(paper)
-        return merge(paper, incoming)
+        return merge(paper, incoming, **kwargs)
 
     monkeypatch.setattr(lib, "_merge", intervening_update)
     assert lib.fill_verified_identifiers(p.key, arxiv_id="2102.11582v3") == {}

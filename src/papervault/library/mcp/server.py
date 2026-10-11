@@ -40,6 +40,7 @@ from papervault.library import Library
 from papervault.library import fetch as fetcher
 from papervault.library.llm import get_llm
 from papervault.library.sources.inspire import merge_inspire_fields, retained_inspire_fields
+from papervault.library.sources.identity import merge_source_identities
 from papervault.library.models import (
     DOWNLOAD_STATUS_EXTRACT_FAILED,
     DOWNLOAD_STATUS_FAILED,
@@ -1172,6 +1173,7 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         lib_by_key: dict[str, dict] = {}                            # Paper.key → library node
         folded_vouch: dict[str, int] = collections.defaultdict(int)  # lib Paper.key → vouch count
         inspire_fills: dict[str, dict] = {}  # all original donor evidence, rechecked under lock
+        identity_fills: dict[str, list] = {}  # source observations for existing library twins
         buckets: dict[int, list] = collections.defaultdict(list)    # term_idx → ext node list
         # FULL-iteration invariant: register EVERY library node's identity first
         # (library-FIRST so a library twin wins identity over any external copy).
@@ -1197,6 +1199,11 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                 tr[t] = rank
                 buckets[t].append(node)
                 continue
+            if node.get("source_identities"):
+                hit["source_identities"] = [o.model_dump() for o in merge_source_identities(
+                    hit.get("source_identities"), node["source_identities"])]
+                if hit.get("_source_origin") == "library":
+                    identity_fills[hit["key"]] = hit["source_identities"]
             fills = merge_inspire_fields(hit, node)
             if fills:
                 hit.update(fills)
@@ -1294,6 +1301,11 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         ingested_dicts: list[dict] = []
         ingested_keys: set[str] = set()   # same-key collapse → keeps ingested_dicts key-unique
         async with concurrency.lib_write_lock:
+            for key, observations in identity_fills.items():
+                existing = library.get(key)
+                if existing is not None:
+                    existing.source_identities = merge_source_identities(
+                        existing.source_identities, observations)
             for key, incoming in inspire_fills.items():
                 existing = library.get(key)
                 if existing is not None:

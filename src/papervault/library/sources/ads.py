@@ -19,6 +19,7 @@ from typing import Any
 import requests
 
 from .exceptions import BackendDegraded
+from .identity import source_identity
 
 API_URL = "https://api.adsabs.harvard.edu/v1/search/query"
 FIELDS = ("title,author,year,abstract,doi,identifier,bibcode,pub,"
@@ -176,6 +177,14 @@ def search_ads(query: str, max_results: int = 30) -> list[dict[str, Any]]:
             url = f"https://ui.adsabs.harvard.edu/abs/{bibcode}/abstract"
         elif doi:
             url = f"https://doi.org/{doi}"
+        identity = source_identity(
+            "ads", source_ids={"ads:bibcode": bibcode, "ads:identifier": identifiers},
+            dois=doi_list,
+            arxiv_ids=[ident.split(":", 1)[1] for ident in identifiers
+                       if isinstance(ident, str) and ident.lower().startswith("arxiv:")]
+                      or [arxiv_id],
+            urls=url,
+        )
 
         papers.append({
             "title": title,
@@ -188,6 +197,7 @@ def search_ads(query: str, max_results: int = 30) -> list[dict[str, Any]]:
             "url": url,
             "venue": venue,
             "citation_count": citation_count,
+            "source_identities": [identity],
         })
 
     return papers

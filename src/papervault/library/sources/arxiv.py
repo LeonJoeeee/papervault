@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from .exceptions import BackendDegraded
+from .identity import source_identity
 
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
 NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
@@ -78,6 +79,11 @@ def search_arxiv(query: str, max_results: int = 30, *,
         year = published[:4]
         url = entry.find("atom:id", NS).text.strip()
         arxiv_id = url.split("/abs/")[-1]
+        doi = (entry.findtext("arxiv:doi", "", NS) or "").strip()
+        identity = source_identity(
+            "arxiv", source_ids={"arxiv:paper": arxiv_id}, dois=doi, arxiv_ids=arxiv_id,
+            urls=[url, *(link.get("href") for link in entry.findall("atom:link", NS))],
+        )
 
         authors = []
         for author_elem in entry.findall("atom:author", NS):
@@ -91,6 +97,8 @@ def search_arxiv(query: str, max_results: int = 30, *,
             "year": year,
             "url": url,
             "arxiv_id": arxiv_id,
+            "doi": doi,
+            "source_identities": [identity],
         })
 
     return papers

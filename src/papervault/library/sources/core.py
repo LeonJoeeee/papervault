@@ -14,12 +14,14 @@ so the upstream blend can no-op past this backend.
 """
 
 import os
+import re
 import time
 from typing import Any
 
 import requests
 
 from .exceptions import BackendDegraded
+from .identity import identity_values, source_identity
 
 API_URL = "https://api.core.ac.uk/v3/search/works/"
 TIMEOUT = 30
@@ -108,6 +110,47 @@ def search_core(query: str, max_results: int = 30) -> list[dict[str, Any]]:
             if isinstance(sf, list) and sf:
                 url = sf[0] if isinstance(sf[0], str) else ""
 
+        outputs = identity_values(work.get("outputs"))
+        # Work responses also carry output API URLs. Label the numeric output
+        # IDs separately from the work ID, while preserving the supplied URLs.
+        output_ids = [re.sub(r"^https://api\.core\.ac\.uk/v3/outputs/([0-9]+)/?$", r"\1", v)
+                      for v in outputs]
+        ids = {"core:work": work.get("id"), "core:output": output_ids}
+        for field, namespace in (("magId", "core:mag"), ("pubmedId", "core:pubmed")):
+            if field in work:
+                ids[namespace] = work[field]
+        dois, arxivs = [doi], [arxiv_id]
+        identifiers = work.get("identifiers") or []
+        if isinstance(identifiers, dict):
+            identifiers = [{"type": kind, "identifier": value}
+                           for kind, value in identifiers.items()]
+        for entry in identifiers:
+            if not isinstance(entry, dict):
+                ids.setdefault("core:identifier", []).extend(identity_values(entry))
+                arxivs.extend(v for v in identity_values(entry)
+                              if v.lower().startswith(("arxiv:", "oai:arxiv.org:")))
+                continue
+            kind, value = entry.get("type") or "unknown", entry.get("identifier")
+            ids.setdefault(f"core:identifier:{kind}", []).extend(identity_values(value))
+            if str(kind).lower() == "doi":
+                dois.extend(identity_values(value))
+            elif str(kind).lower() in {"arxiv", "arxiv_id"}:
+                arxivs.extend(identity_values(value))
+            elif str(kind).lower() in {"oai", "oai_id"}:
+                arxivs.extend(v for v in identity_values(value)
+                              if v.lower().startswith("oai:arxiv.org:"))
+        oai = identity_values([work.get("oai"), *(work.get("oaiIds") or [])])
+        if oai:
+            ids["core:oai"] = oai
+            arxivs.extend(v for v in oai if v.lower().startswith("oai:arxiv.org:"))
+        identity = source_identity(
+            "core", source_ids=ids, dois=dois, arxiv_ids=arxivs,
+            urls=[work.get("downloadUrl"), *(work.get("sourceFulltextUrls") or []),
+                  *(v for v in outputs if v.startswith("https://")),
+                  *(link.get("url") for link in work.get("links") or []
+                    if isinstance(link, dict))],
+        )
+
         out.append({
             "title": (work.get("title") or "").strip(),
             "authors": authors,
@@ -115,11 +158,12 @@ def search_core(query: str, max_results: int = 30) -> list[dict[str, Any]]:
             "year": year,
             "doi": doi,
             "arxiv_id": arxiv_id,
-            "paper_id": str(work.get("id") or ""),  # CORE internal id
+            "paper_id": str(work.get("id") or ""),  # CORE work id, never an output id
             "venue": venue,
             "publication_types": [],  # CORE doesn't expose this field
             "citation_count": int(work.get("citationCount") or 0),
             "url": url,
+            "source_identities": [identity],
         })
 
     return out

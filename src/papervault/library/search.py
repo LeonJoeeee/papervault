@@ -34,6 +34,7 @@ from .sources.inspire import retained_inspire_fields
 from .sources.ads import search_ads  # noqa: F401
 from .sources.core import search_core  # noqa: F401
 from .sources.exceptions import BackendDegraded
+from .sources.identity import normalized_source_identities, source_identity
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,12 @@ def search_openalex(query: str, *, max_results: int = 30,
         if not venue:
             venue = ((w.get("host_venue") or {}).get("display_name") or "").strip()
         doi = (w.get("doi") or "").replace("https://doi.org/", "").strip()
+        location = w.get("primary_location") or {}
+        identity = source_identity(
+            "openalex", source_ids={"openalex:work": (w.get("id") or "").rsplit("/", 1)[-1]},
+            dois=doi, urls=[w.get("doi"), w.get("id"), location.get("landing_page_url"),
+                            location.get("pdf_url"), (w.get("open_access") or {}).get("oa_url")],
+        )
         out.append({
             "title": title,
             "authors": authors,
@@ -180,6 +187,7 @@ def search_openalex(query: str, *, max_results: int = 30,
                 {"title": title, "publication_types": [w.get("type") or ""]}
             ),
             "source": "openalex",
+            "source_identities": [identity],
         })
     return out
 
@@ -228,6 +236,7 @@ def _normalize_paper(p: dict, source: str) -> dict:
         "publication_types": p.get("publication_types") or [],
         "is_review": _looks_like_review(p),
         "source": source,
+        "source_identities": normalized_source_identities(p, source),
     }
 
 

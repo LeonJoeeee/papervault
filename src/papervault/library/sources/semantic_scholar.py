@@ -7,6 +7,7 @@ from typing import Any
 import requests
 
 from .exceptions import BackendDegraded
+from .identity import semantic_scholar_identity
 
 API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
 FIELDS = ("title,authors,year,abstract,citationCount,externalIds,"
@@ -74,6 +75,7 @@ def search_semantic_scholar(query: str, max_results: int = 30) -> list[dict[str,
             "venue": venue,
             "publication_types": paper.get("publicationTypes") or [],
             "url": paper.get("url", "") or "",
+            "source_identities": [semantic_scholar_identity(paper)],
         })
 
     return papers

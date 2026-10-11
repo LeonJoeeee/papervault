@@ -13,6 +13,7 @@ from typing import Optional
 from .download_telemetry import enrich, manifest_lock
 from .models import DOWNLOAD_STATUS_PENDING, IdentityRecovery, Paper, base_key, normalize_title
 from .sources.inspire import merge_inspire_fields, retained_inspire_fields
+from .sources.identity import merge_source_identities
 
 
 def _is_nonempty_file(path: Path) -> bool:
@@ -815,8 +816,10 @@ class Library:
         citation_count, latch is_review)."""
         for field, value in merge_inspire_fields(existing.model_dump(), incoming).items():
             setattr(existing, field, value)
+        existing.source_identities = merge_source_identities(
+            existing.source_identities, incoming.get("source_identities"))
         for field, value in incoming.items():
-            if field in {"inspire_record_id", "inspire_document_urls"}:
+            if field in {"inspire_record_id", "inspire_document_urls", "source_identities"}:
                 continue  # source identity and links are merged together above
             if field == "key" or field not in Paper.model_fields:
                 continue                       # never reassign the cite key

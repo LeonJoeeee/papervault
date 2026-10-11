@@ -261,6 +261,21 @@ def normalize_title(title: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (title or "").lower()).strip()
 
 
+class SourceIdentity(BaseModel):
+    """Identifiers observed in one source result, without an identity verdict.
+
+    The primary source namespace is always present: an empty list records an
+    observed absence. DOI > arXiv > source ID > URL can be read from these
+    separate fields without assigning fusion rules to the lower rungs.
+    """
+
+    source: str
+    source_ids: dict[str, list[str]] = Field(default_factory=dict)
+    dois: list[str] = Field(default_factory=list)
+    arxiv_ids: list[str] = Field(default_factory=list)
+    urls: list[str] = Field(default_factory=list)
+
+
 class Paper(BaseModel):
     """One paper in the library. The citation key is the primary identifier."""
 
@@ -287,10 +302,12 @@ class Paper(BaseModel):
 
     doi: str = ""
     arxiv_id: str = ""
-    paper_id: str = ""  # source-qualified ID: Semantic Scholar paperId or ADS bibcode
+    paper_id: str = ""  # Legacy unqualified source ID; retained for existing consumers.
     inspire_record_id: str = ""  # INSPIRE literature recid (separate namespace)
     inspire_document_urls: list[str] = Field(default_factory=list)
     url: str = ""
+    # [] on an old row means capture was never observed, not that IDs are absent.
+    source_identities: list[SourceIdentity] = Field(default_factory=list)
 
     citation_count: int = 0
     is_review: bool = False

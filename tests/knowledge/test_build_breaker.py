@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import datetime
 
 import httpx
 import openai
@@ -433,3 +434,311 @@ async def test_graph_uses_role_level_over_inherited_model(breaker, monkeypatch, 
     kwargs = {"response_format": {"type": "json_object"}} if keyword else {}
     assert await graph.build_llm("prompt", model="pro", **kwargs) == "ok"
     assert fake.calls == [{"model": want, **kwargs}]
+
+
+# ---------------------------------------------------------------- #209 off-peak schedule
+
+
+class WallClock:
+    def __init__(self, value="2026-10-12T10:30:00+08:00"):
+        self.set(value)
+
+    def set(self, value):
+        self.value = datetime.fromisoformat(value)
+
+    def __call__(self):
+        return self.value
+
+
+def _scheduled_breaker(wall_clock, *, env=None, clock=None, threshold=3, cooldown_s=600):
+    schedule = bb.BuildSchedule.from_env(
+        {"KS_BUILD_OFFPEAK_ONLY": "true", **(env or {})}, now=wall_clock)
+    return BuildBreaker(schedule=schedule, clock=clock or FakeClock(), threshold=threshold,
+                        cooldown_s=cooldown_s)
+
+
+@pytest.mark.parametrize("value,allowed", [
+    ("2026-10-12T08:59:59+08:00", True),
+    ("2026-10-12T09:00:00+08:00", False),
+    ("2026-10-12T10:30:00+08:00", False),
+    ("2026-10-12T11:59:59+08:00", False),
+    ("2026-10-12T12:00:00+08:00", True),
+    ("2026-10-12T13:00:00+08:00", True),
+    ("2026-10-12T14:00:00+08:00", False),
+    ("2026-10-12T17:59:59+08:00", False),
+    ("2026-10-12T18:00:00+08:00", True),
+    ("2026-10-17T10:30:00+08:00", True),
+    ("2026-10-18T10:30:00+08:00", True),
+    ("2026-10-12T02:30:00+00:00", False),  # UTC clock must convert to Beijing time
+    ("2026-10-12T04:00:00+00:00", True),
+])
+def test_schedule_default_windows_and_boundaries(value, allowed):
+    b = _scheduled_breaker(WallClock(value))
+    assert b.allows() is allowed
+    if allowed:
+        b.before_call()
+    else:
+        with pytest.raises(BuildPausedError, match="DeepSeek peak window"):
+            b.before_call()
+
+
+@pytest.mark.parametrize("value", ["false", "0", "no", "FALSE"])
+def test_schedule_kill_switch_does_not_check_wall_clock(value):
+    def unused_clock():
+        pytest.fail("disabled schedule must not read the wall clock")
+
+    b = _scheduled_breaker(unused_clock, env={"KS_BUILD_OFFPEAK_ONLY": value})
+    assert b.allows()
+    b.before_call()
+
+
+def test_schedule_default_is_disabled():
+    schedule = bb.BuildSchedule.from_env({}, now=WallClock())
+    b = BuildBreaker(schedule=schedule)
+    assert b.allows()
+    b.before_call()
+
+
+@pytest.mark.parametrize("value", ["true", "1", "yes", " YES "])
+def test_schedule_enable_values(value):
+    assert not _scheduled_breaker(WallClock(), env={"KS_BUILD_OFFPEAK_ONLY": value}).allows()
+
+
+def test_schedule_holidays_excluded_from_peak():
+    wall = WallClock()
+    b = _scheduled_breaker(wall, env={"KS_BUILD_PEAK_HOLIDAYS": "2026-10-12, 2026-10-13"})
+    assert b.allows()
+    b.before_call()
+    wall.set("2026-10-14T10:30:00+08:00")
+    assert not b.allows()
+
+
+def test_schedule_custom_windows_days_and_timezone():
+    wall = WallClock("2026-10-17T10:30:00+00:00")
+    b = _scheduled_breaker(wall, env={"KS_BUILD_PEAK_WINDOWS": "10:00-11:00",
+                                    "KS_BUILD_PEAK_DAYS": "Sat-Sun, Mon",
+                                    "KS_BUILD_PEAK_TZ": "UTC"})
+    assert not b.allows()
+    wall.set("2026-10-17T11:00:00+00:00")
+    assert b.allows()
+    wall.set("2026-10-19T10:30:00+00:00")
+    assert not b.allows()
+    wall.set("2026-10-20T10:30:00+00:00")
+    assert b.allows()
+
+
+@pytest.mark.parametrize("field,value,allowed", [
+    ("KS_BUILD_PEAK_WINDOWS", "garbage", False),
+    ("KS_BUILD_PEAK_WINDOWS", "12:00-09:00", False),
+    ("KS_BUILD_PEAK_WINDOWS", "09:00-09:00", False),
+    ("KS_BUILD_PEAK_WINDOWS", "25:00-26:00", False),
+    ("KS_BUILD_PEAK_WINDOWS", "09:00-12:00,broken", False),
+    ("KS_BUILD_PEAK_WINDOWS", "", False),
+    ("KS_BUILD_PEAK_DAYS", "Monday-Funday", False),
+    ("KS_BUILD_PEAK_DAYS", "", False),
+    ("KS_BUILD_PEAK_TZ", "Unknown/Zone", False),
+    ("KS_BUILD_PEAK_TZ", "", False),
+    ("KS_BUILD_PEAK_TZ", "/etc/localtime", False),
+    ("KS_BUILD_PEAK_HOLIDAYS", "2026-02-30", False),
+    ("KS_BUILD_PEAK_HOLIDAYS", "20261012", False),
+    ("KS_BUILD_PEAK_HOLIDAYS", "2026-10-12,bad-date", False),
+    ("KS_BUILD_OFFPEAK_ONLY", "perhaps", True),
+])
+def test_schedule_malformed_config_uses_documented_defaults(field, value, allowed, caplog):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    wall = WallClock()
+    b = _scheduled_breaker(wall, env={field: value})
+    for _ in range(3):
+        assert b.allows() is allowed
+    warnings = [r for r in caplog.records if r.name == _LOGGER and r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and field in warnings[0].getMessage()
+    wall.set("2026-10-12T13:00:00+08:00")
+    assert b.allows()  # bad configuration never means all-day pause
+
+
+def test_schedule_multiple_invalid_fields_warn_once(caplog):
+    caplog.set_level(logging.WARNING, logger=_LOGGER)
+    b = _scheduled_breaker(WallClock(), env={"KS_BUILD_PEAK_WINDOWS": "bad",
+                                           "KS_BUILD_PEAK_DAYS": "bad",
+                                           "KS_BUILD_PEAK_TZ": "bad"})
+    assert not b.allows()
+    assert len(caplog.records) == 1
+    assert all(name in caplog.text for name in
+               ("KS_BUILD_PEAK_WINDOWS", "KS_BUILD_PEAK_DAYS", "KS_BUILD_PEAK_TZ"))
+
+
+def test_schedule_resume_message_covers_overlapping_windows():
+    b = _scheduled_breaker(WallClock(), env={
+        "KS_BUILD_PEAK_WINDOWS": "11:00-13:00,09:00-12:00,13:00-14:00"})
+    with pytest.raises(BuildPausedError, match="off-peak resumes 14:00 CST"):
+        b.before_call()
+
+
+@pytest.mark.parametrize("offset,abbreviation", [("-04:00", "EDT"), ("-05:00", "EST")])
+def test_schedule_resume_message_preserves_repeated_dst_hour(offset, abbreviation):
+    wall = WallClock(f"2026-11-01T01:30:00{offset}")
+    b = _scheduled_breaker(wall, env={"KS_BUILD_PEAK_WINDOWS": "01:15-01:45",
+                                    "KS_BUILD_PEAK_DAYS": "Sun",
+                                    "KS_BUILD_PEAK_TZ": "America/New_York"})
+    with pytest.raises(BuildPausedError, match=f"off-peak resumes 01:45 {abbreviation}"):
+        b.before_call()
+
+
+@pytest.mark.parametrize("failure_state", ["closed", "open", "half_open"])
+def test_schedule_pause_preserves_failure_state_and_counters(failure_state):
+    wall, clock = WallClock(), FakeClock()
+    b = _scheduled_breaker(wall, clock=clock, threshold=2)
+    b.record_failure()
+    if failure_state != "closed":
+        b.record_failure()
+    if failure_state == "half_open":
+        clock.t += 600
+        assert b.state == "half_open"
+    # In the open case even an expired cooldown must not be polled by the schedule gate.
+    clock.t += 600
+    snapshot = (b._state, tuple(b._failures), b._open_until)
+    for _ in range(5):
+        assert not b.allows()
+        with pytest.raises(BuildPausedError, match="DeepSeek peak window") as exc:
+            b.before_call()
+        assert not is_upstream_failure(exc.value)
+    assert (b._state, tuple(b._failures), b._open_until) == snapshot
+
+
+def test_schedule_resume_still_obeys_failure_cooldown():
+    wall, clock = WallClock("2026-10-12T11:59:59+08:00"), FakeClock()
+    b = _scheduled_breaker(wall, clock=clock, threshold=1)
+    b.record_failure()
+    assert not b.allows()
+    wall.set("2026-10-12T12:00:00+08:00")
+    clock.t += 1
+    assert not b.allows()
+    with pytest.raises(BuildPausedError, match="upstream LLM path"):
+        b.before_call()
+    clock.t += 599
+    assert b.allows() and b.state == "half_open"
+
+
+def test_schedule_is_independent_of_failure_breaker_kill_switch():
+    assert not _scheduled_breaker(WallClock(), threshold=0).allows()
+
+
+def test_schedule_logs_once_per_enter_and_exit(caplog):
+    caplog.set_level(logging.DEBUG, logger=_LOGGER)
+    wall = WallClock("2026-10-12T08:59:59+08:00")
+    b = _scheduled_breaker(wall)
+    assert b.allows()
+    assert caplog.records == []
+    wall.set("2026-10-12T10:30:00+08:00")
+    for _ in range(50):
+        assert not b.allows()
+        with pytest.raises(BuildPausedError):
+            b.before_call()
+    wall.set("2026-10-12T12:00:00+08:00")
+    for _ in range(50):
+        assert b.allows()
+        b.before_call()
+    records = [r for r in caplog.records if r.name == _LOGGER]
+    assert len(records) == 2
+    assert all(r.levelno == logging.INFO for r in records)
+    assert "peak" in records[0].getMessage() and "resum" in records[1].getMessage()
+
+
+def test_schedule_env_is_read_once_at_first_use(monkeypatch):
+    monkeypatch.setattr(bb, "_BREAKER", None)
+    monkeypatch.setattr(bb, "_utc_now", WallClock())
+    monkeypatch.setenv("KS_BUILD_OFFPEAK_ONLY", "yes")
+    b = bb.get_breaker()
+    assert not b.allows()
+    monkeypatch.setenv("KS_BUILD_OFFPEAK_ONLY", "false")
+    assert bb.get_breaker() is b and not b.allows()
+
+
+async def test_schedule_blocks_build_calls_but_allows_query_routes(monkeypatch):
+    wall = WallClock("2026-10-12T08:59:59+08:00")
+    b = _scheduled_breaker(wall)
+    monkeypatch.setattr(bb, "_BREAKER", b)
+    fake = FakeComplete()
+    monkeypatch.setattr(graph, "mimo_complete", fake)
+    assert await graph.build_llm("first chunk") == "ok"
+    wall.set("2026-10-12T09:00:00+08:00")
+    with pytest.raises(BuildPausedError, match="DeepSeek peak window"):
+        await graph.build_llm("next chunk")
+    assert len(fake.calls) == 1
+    assert b._state == "closed" and not b._failures
+    assert await graph.build_llm("keywords", response_format={"type": "json_object"}) == "ok"
+
+    class Pool:
+        async def complete(self, prompt, **kw):
+            return "synth answer"
+
+    monkeypatch.setattr(llm_mod, "get_pool", lambda: Pool())
+    assert await llm_mod.mimo_complete("synthesize") == "synth answer"
+    wall.set("2026-10-12T12:00:00+08:00")
+    assert await graph.build_llm("retry chunk") == "ok"
+
+
+async def test_schedule_rounds_and_operator_pickup_pause_and_resume(fake_ledger, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    wall = WallClock()
+    b = _scheduled_breaker(wall)
+    monkeypatch.setattr(bb, "_BREAKER", b)
+    rag = _vault_with_new_paper(monkeypatch, fake_ledger)
+    drains = []
+
+    async def drain(rag):
+        drains.append(rag)
+
+    async def stop(_s):
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(rnd, "drain_pending", drain)
+    monkeypatch.setattr(rnd.asyncio, "sleep", stop)
+    # Three complete loop iterations pause build work and leave pending docs untouched.
+    for _ in range(3):
+        with pytest.raises(asyncio.CancelledError):
+            await rnd.main_loop(rag)
+    assert not drains
+    assert not any(k in ("enqueue", "delete", "process") for k, _ in rag.calls)
+    assert fake_ledger.rows["DONE"].status == "done"
+    assert "GONE" in fake_ledger.rows
+    paused_logs = [r for r in caplog.records if r.name == "ks.scheduler.round"
+                   and "paused" in r.getMessage()]
+    assert len(paused_logs) == 3 and all(r.levelno == logging.DEBUG for r in paused_logs)
+    assert len([r for r in caplog.records if r.name == _LOGGER]) == 1
+    wall.set("2026-10-12T13:00:00+08:00")
+    with pytest.raises(asyncio.CancelledError):
+        await rnd.main_loop(rag)
+    assert drains == [rag]
+    assert all(k in [kind for kind, _ in rag.calls] for k in ("enqueue", "delete", "process"))
+    assert len([r for r in caplog.records if r.name == _LOGGER]) == 2
+
+
+async def test_schedule_boundary_round_preserves_pending_paper(fake_ledger, monkeypatch, caplog):
+    caplog.set_level(logging.DEBUG)
+    wall = WallClock("2026-10-12T08:59:59+08:00")
+    b = _scheduled_breaker(wall)
+    monkeypatch.setattr(bb, "_BREAKER", b)
+    monkeypatch.setattr(rnd, "load_clean_index", lambda: {"NEW": _rec("NEW")})
+    monkeypatch.setattr(rnd, "fingerprint", lambda _: "fNEW")
+    monkeypatch.setattr(distill, "read_extract_raw", lambda _: "body of NEW")
+    rag = FakeRag()
+    process = rag.apipeline_process_enqueue_documents
+
+    async def boundary_pause():
+        wall.set("2026-10-12T09:00:00+08:00")
+        b.before_call()
+
+    monkeypatch.setattr(rag, "apipeline_process_enqueue_documents", boundary_pause)
+    result = await rnd.run_round(rag)
+    assert result["paused"]
+    assert (fake_ledger.rows["NEW"].status, fake_ledger.rows["NEW"].attempts) == ("processing", 0)
+    assert rag.rows["paper:NEW"]["status"] == "pending"
+    paused_logs = [r for r in caplog.records if r.name == "ks.scheduler.round"
+                   and "paused" in r.getMessage()]
+    assert paused_logs and all(r.levelno == logging.DEBUG for r in paused_logs)
+    wall.set("2026-10-12T12:00:00+08:00")
+    monkeypatch.setattr(rag, "apipeline_process_enqueue_documents", process)
+    result = await rnd.run_round(rag)
+    assert not result.get("paused")
+    assert not any(kind == "delete" for kind, _ in rag.calls)

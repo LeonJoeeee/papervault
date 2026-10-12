@@ -30,6 +30,8 @@ upstream LLM path failed persistently — a round stops after the reconcile step
 LLM): no diff-driven REMOVE / REDISTILL / DISTILL and no tail process, since each of them drives
 LLM calls. The main loop also defers the operator-doc pickup. After the cool-down the next round
 runs whole as the probe; the breaker logs its own transitions, a paused round logs only at DEBUG.
+The opt-in off-peak schedule (#209) uses the same gates before failure-state checks: new build
+work and operator-doc pickup wait through peak windows, then resume on the next off-peak round.
 
 Prod-safety: get_graph() (passed in as `rag`) already gated by assert_safe_workspace().
 This module never opens a graph itself; the caller owns the instance + workspace gate.
@@ -207,7 +209,7 @@ async def run_round(
     # 免得 error 行被 redistill 删掉好 doc)。
     healed = await reconcile_healed(rag, only_keys=only)
 
-    # #143: upstream LLM path failing persistently → start no build work this round (the breaker
+    # #143/#209: upstream failure or peak window → start no build work this round (the gate
     # already logged the transition; the reconcile writes above needed no LLM).
     if not get_breaker().allows():
         summary = {"terminal": term, "healed": healed, "paused": True}
@@ -264,7 +266,10 @@ async def run_round(
     }
     if paused:
         summary["paused"] = True
-    log.info("run_round: %s", summary)
+    if paused:
+        log.debug("run_round: %s", summary)
+    else:
+        log.info("run_round: %s", summary)
 
     # OPTIONAL global gate (#84, nice-to-have): a round that ATTEMPTED builds (to_distill/to_redistill
     # non-empty) but landed ZERO progress AND saw batch-level (F17) enqueue/process failures is the

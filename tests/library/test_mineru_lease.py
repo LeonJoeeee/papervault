@@ -168,11 +168,18 @@ async def test_lease_appearing_during_probe_guards_next_action(lane, monkeypatch
 @pytest.mark.parametrize("verb", ["stop", "restart"])
 async def test_lease_appearing_while_waiting_for_lock_guards_action(lane, monkeypatch, verb):
     controller, calls, lease = lane
-    real_sleep = asyncio.sleep
     await controller._lock.acquire()
+    waiting = asyncio.Event()
+    real_acquire = controller._lock.acquire
+
+    async def acquire():
+        waiting.set()
+        return await real_acquire()
+
+    monkeypatch.setattr(controller._lock, "acquire", acquire)
     action = asyncio.create_task(_act(controller, verb, monkeypatch))
     try:
-        await real_sleep(0)  # The transition now waits on the already-held lock.
+        await asyncio.wait_for(waiting.wait(), 1)
         assert not action.done()
         _write_lease(lease)
     finally:

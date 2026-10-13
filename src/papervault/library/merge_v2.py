@@ -75,12 +75,15 @@ def blocked(paper) -> bool:
 def guard_execution(work):
     """Count the actual executor lifetime, including threads whose awaiter left.
 
-    This is a merge-specific fence, not a replacement acquisition predicate.
+    Format refusal is independent of merge tracking and feature flags.
+    Lifetime tracking remains a merge-specific fence, not an admission predicate.
     Cancelled async extraction is uncertain, so its merge stays quarantined.
     """
     def enter(paper, library):
         tracked = merge_v2_enabled() or paper.merge_budget is not None or blocked(paper)
         if not tracked:
+            # Kill switches cannot authorize an old writer to downgrade newer data.
+            check_index_readable(library.root)
             return False
         with library._merge_execution_lock:
             check_index_readable(library.root)

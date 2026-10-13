@@ -35,6 +35,123 @@ def vault(tmp_path):
     return lib
 
 
+@pytest.fixture(params=["mixed", "merge", "off"])
+def writer_flags(request, monkeypatch):
+    enabled = {"TERMINAL", "IDENTITY", "REOPEN"} if request.param != "off" else set()
+    if request.param == "merge":
+        enabled.add("MERGE")
+    for name in ("TERMINAL", "IDENTITY", "REOPEN", "MERGE", "STOPRULES"):
+        monkeypatch.setenv(f"PAPERVAULT_{name}_V2", "1" if name in enabled else "0")
+    return request.param
+
+
+@pytest.mark.parametrize("version", [1, 2])
+async def test_queue_format_fence_independent_of_merge_tracking(vault, monkeypatch, writer_flags, version):
+    from papervault.library import download
+    from papervault.library.compat_v2 import CompatibilityError
+    from papervault.library.services.download_queue import DownloadQueue
+
+    # An existing readable ledger avoids the missing-ledger fallback's index check.
+    BudgetLedger(vault.root, clock=lambda: 100.0).start_campaign(cap=1, keys=vault.keys())
+    data = json.loads(vault.index_path.read_text())
+    data["acquisition_versions"] = {"index": version}
+    vault.index_path.write_text(json.dumps(data))
+    library = Library(vault.root)  # Keep the legacy reader's semantics in this probe.
+    paper = library.get(vault.keys()[0])
+    before = {path: contents for path, contents in tree_bytes(library.root).items()
+              if path != "manifest.log"}  # Refusal may still emit diagnostic telemetry.
+    strategy_calls, save_calls = [], []
+    pdf = b"%PDF-1.4\n%offline format fence fixture"
+
+    def retrieve(candidate):
+        strategy_calls.append(candidate.key)
+        return pdf
+
+    save = library.save
+    def observed_save(**kwargs):
+        save_calls.append(paper.key)
+        return save(**kwargs)
+
+    monkeypatch.setattr(download, "_STRATEGIES", [("offline_fixture", retrieve)])
+    monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (True, "fixture"))
+    monkeypatch.setattr(library, "save", observed_save)
+    queue = DownloadQueue(library, num_workers=0)
+    if version == 2:
+        with pytest.raises(CompatibilityError, match="index"):
+            await queue._process_one_inner(paper.key, 5)
+        assert strategy_calls == save_calls == []
+        assert not library.pdf_path(paper.key).exists()
+        after = {path: contents for path, contents in tree_bytes(library.root).items()
+                 if path != "manifest.log"}
+        assert after == before
+        assert json.loads(library.index_path.read_text())["acquisition_versions"] == {"index": 2}
+    else:
+        await queue._process_one_inner(paper.key, 5)
+        assert library.pdf_path(paper.key).read_bytes() == pdf
+        assert Library(library.root).get(paper.key).download_status == "ok"
+        assert strategy_calls == save_calls == [paper.key]
+
+
+@pytest.mark.parametrize("header", [{"version": 2}, {"acquisition_versions": {"index": 2}}])
+def test_save_refuses_future_index_before_backup_rotation(vault, writer_flags, header):
+    from papervault.library.compat_v2 import CompatibilityError
+    library = Library(vault.root)
+    library.upsert({"doi": "10.1234/compat", "year": 2026})
+    data = json.loads(vault.index_path.read_text())
+    data.update(header)
+    vault.index_path.write_text(json.dumps(data))
+    before = tree_bytes(library.root)
+    with pytest.raises(CompatibilityError, match="index"):
+        library.save(force=True)
+    assert tree_bytes(library.root) == before
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+async def test_future_format_executor_refuses_before_entry(vault, writer_flags, asynchronous):
+    from papervault.library.compat_v2 import CompatibilityError
+    from papervault.library.merge_v2 import guard_execution
+    data = json.loads(vault.index_path.read_text())
+    data["acquisition_versions"] = {"index": 2}
+    vault.index_path.write_text(json.dumps(data))
+    before = tree_bytes(vault.root)
+    entered = []
+
+    async def async_work(candidate, library):
+        entered.append(candidate.key)
+
+    def sync_work(candidate, library):
+        entered.append(candidate.key)
+
+    paper = vault.get(vault.keys()[0])
+    with pytest.raises(CompatibilityError, match="index"):
+        if asynchronous:
+            await guard_execution(async_work)(paper, vault)
+        else:
+            guard_execution(sync_work)(paper, vault)
+    assert entered == []
+    assert tree_bytes(vault.root) == before
+
+
+async def test_current_format_executor_checks_are_byte_identical(vault, writer_flags):
+    from papervault.library.merge_v2 import guard_execution
+    BudgetLedger(vault.root, clock=lambda: 100.0).start_campaign(cap=1, keys=vault.keys())
+    paper = vault.get(vault.keys()[0])
+    before = tree_bytes(vault.root)
+
+    @guard_execution
+    def synchronous(candidate, library):
+        return candidate.doi
+
+    @guard_execution
+    async def asynchronous(candidate, library):
+        return candidate.doi
+
+    assert synchronous(paper, vault) == "10.1234/compat"
+    assert await asynchronous(paper, vault) == "10.1234/compat"
+    assert not vault._merge_active
+    assert tree_bytes(vault.root) == before
+
+
 @pytest.mark.parametrize("surface", ["index", "identity", "budget", "claims", "lease", "queue"])
 @pytest.mark.parametrize("entry", [ClaimStore, MergeStore])
 def test_future_index_surface_refuses_v2_entry_without_writes(vault, surface, entry):

@@ -195,8 +195,11 @@ is forbidden. Disabling a v2 flag alone does not stop these producers.
    format. Future format writers must stamp bumped surfaces in the index or
    JSONL event's `acquisition_versions` header; bump the index/ledger `version`
    too when its container changes. Unmarked surfaces retain the slices 1–6
-   versions. Checks are always-on and read-only for current formats; v2 feature
-   flags keep their existing defaults. Politeness accounting is process-local,
+   versions. Checks are always-on and read-only for current formats. Download
+   and extraction executors check before entry independently of merge tracking;
+   index saves check before backup rotation. Turning off v2 flags cannot bypass
+   newer-format refusal; the legacy index reader is unchanged. Feature flags
+   keep their existing defaults. Politeness accounting is process-local,
    with no independent durable format.
 2. **Stop intake:** disable old writer restart policies, timers and launchers;
    seal MCP acquisition, reconcile/correction producers, metadata jobs and new

@@ -8,6 +8,10 @@ queue is idle almost always, so a 24/7-resident server wastes the card. This
 controller makes the server **on-demand**: started on the worker critical path
 right before an extract, and stopped after the queue has been idle for
 ``IDLE_TIMEOUT``, freeing the GPU (e.g. for a future KS embedding co-tenant).
+Idle measures this controller's activity, not the unit's uptime or external
+HTTP traffic. The monitor also stops externally started instances; a stop does
+not reset the activity timestamp, so an external restart can be stopped on the
+next ``_CHECK_INTERVAL`` sweep once that idle window has elapsed.
 
 **OPT-IN** via ``PAPER_LIBRARY_MINERU_ONDEMAND=1``. Default OFF ⇒ every method is
 a strict no-op and the persistent always-on deploy is byte-unchanged.
@@ -36,16 +40,24 @@ Key review-driven invariants baked in here:
     until a parse succeeds again. With on-demand OFF the controller never touches
     systemd: it logs one ERROR naming the cause and the unit to restart.
 The in-process ``asyncio.Lock`` serializes only this daemon's transitions; it
-does not guard a manual ``systemctl`` or a separate OCR process. Keep on-demand
-OFF for independent OCR scripts that use the same server.
+does not guard a manual ``systemctl`` or a separate OCR process. Independent
+consumers can hold ``$XDG_RUNTIME_DIR/paper-library-mineru.lease`` (override:
+``PAPER_LIBRARY_MINERU_LEASE_FILE``), a JSON object with ``holder`` (str), ``pid``
+(int), and ``expires_at`` (UTC ISO-8601). A fresh read under the transition lock
+just before each stop/restart defers that action while the lease is unexpired.
+Missing/expired leases leave the lifecycle unchanged; malformed leases warn
+and allow the action. No other path reads the lease.
 """
 
 from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+import json
 import logging
 import os
+from pathlib import Path
 import time
 from typing import Optional
 
@@ -70,6 +82,10 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, "") or default)
     except (TypeError, ValueError):
         return default
+
+
+def _reject_lease_constant(value: str) -> None:
+    raise ValueError(f"invalid JSON constant: {value}")
 
 
 # Readiness wait ≥ unit TimeoutStartSec=300 + margin (review fix #4).
@@ -285,6 +301,10 @@ class MineruServerController:
             if not await self._bus_available():
                 self._alert_stale_server("systemctl --user is unavailable (no D-Bus)")
                 return
+            if self._lease_held("restart"):
+                # No restart was spent: a later failure can retry after expiry.
+                self._heal_spent = False
+                return
             log.warning(
                 "mineru self-heal: %d consecutive 'Failed to load image' parses — "
                 "restarting %s (likely a stale server process)",
@@ -346,6 +366,8 @@ class MineruServerController:
                         # entered. No await separates this final check from
                         # setting _stopping, while the controller lock is held.
                         if self._past_idle(extract_queue):
+                            if self._lease_held("stop"):
+                                continue
                             self._stopping = True
                             try:
                                 await self._systemctl("stop")
@@ -368,6 +390,33 @@ class MineruServerController:
         if extract_queue.qsize() != 0 or self._active_ocr:
             return False
         return not any(k.startswith(_EXTRACT_PREFIX) for k in concurrency.in_flight_keys())
+
+    def _lease_held(self, verb: str) -> bool:
+        """Read the cooperative lease at execution time, under the transition lock."""
+        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+        path = Path(os.environ.get("PAPER_LIBRARY_MINERU_LEASE_FILE")
+                    or str(Path(runtime_dir) / "paper-library-mineru.lease"))
+        try:
+            lease = json.loads(path.read_text(encoding="utf-8"),
+                               parse_constant=_reject_lease_constant)
+            if (not isinstance(lease, dict)
+                    or not isinstance(lease.get("holder"), str)
+                    or type(lease.get("pid")) is not int
+                    or not isinstance(lease.get("expires_at"), str)):
+                raise ValueError("expected holder (str), pid (int), expires_at (UTC ISO-8601)")
+            expires_at = datetime.fromisoformat(lease["expires_at"])
+            if expires_at.utcoffset() != timedelta(0):
+                raise ValueError("expires_at must include a UTC timezone")
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError, RecursionError) as exc:
+            log.warning("malformed MinerU lease %s: %s; proceeding with %s", path, exc, verb)
+            return False
+        if expires_at <= datetime.now(timezone.utc):
+            return False
+        log.info("lease held by %s until %s; skipping %s",
+                 lease["holder"], lease["expires_at"], verb)
+        return True
 
     # ------------------------------- probes -----------------------------------
     async def _ready(self) -> bool:

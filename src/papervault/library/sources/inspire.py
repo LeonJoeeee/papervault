@@ -181,13 +181,17 @@ def inspire_title_eligible(data: dict) -> bool:
 
 
 def lookup_inspire_record(reference: dict, *, recid: str = "", timeout: int = 30,
-                          headers: dict | None = None) -> dict | None:
+                          headers: dict | None = None, collect_only: bool = False) -> dict | None:
     """One bounded GET: exact record, or complete unique bibliographic title match.
 
     Empty documents still return the validated identity; an absent link is
     an unknown source-route miss, never a claim that full text does not exist.
     No retries, arbitrary first hit, or DOI/arXiv fabrication.
+    collect_only returns exact-record evidence for P2 without a bibliography
+    verdict; it cannot broaden collection to title search or adopt an identity.
     """
+    if collect_only and not recid:
+        return None
     if recid:
         recid = inspire_record_id(recid)
         if not recid:
@@ -221,6 +225,8 @@ def lookup_inspire_record(reference: dict, *, recid: str = "", timeout: int = 30
             candidate_id = candidate["inspire_record_id"]
             if recid and candidate_id != recid:
                 return None
+            if recid and collect_only:
+                return candidate
             if (_exact_title(reference.get("title")) == _exact_title(candidate.get("title"))
                     and not _author_signatures(candidate.get("authors"))):
                 return None  # a same-title incomplete twin cannot be ruled out

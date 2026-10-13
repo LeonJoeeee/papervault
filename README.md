@@ -71,6 +71,31 @@ clear that policy. New status writes record dimensions and cause; legacy dimensi
 are persisted only when their record is next changed. Existing artifacts remain
 available through the ordinary serving path.
 
+`PAPERVAULT_IDENTITY_V2=1` opts into slice 2 (default off). Its pure identity
+ladder selects DOI, then a namespaced source ID, then a URL; CORE work and output
+IDs stay distinct. The ladder selects a canonical identity without merging
+records or changing download order. URL recovery checks correspondence again
+before adopting a DOI: unresolved evidence stays retryable, and a contradiction
+records a rejection of that route while retaining the paper and other routes.
+Redirects retain the final evidence-bearing URL; supplied landing/source
+bibliography participates in the decision, and raw evidence types survive adoption.
+Existing identity records remain readable; optional evidence is omitted when absent.
+
+Correspondence uses a minimum normalized title length of 25, title sequence
+similarity ≥0.92 (≥0.97 without a reference year), title token Jaccard ≥0.90,
+author surname Jaccard ≥0.50 plus reference first-surname agreement, and a year
+difference ≤1. Missing or malformed required evidence stays unresolved. DOI
+resolver forms and supported publisher DOI paths are compared canonically;
+supplied contradictory bibliography rejects the route even when DOI forms agree.
+
+With the identity flag on, `domain_status` markers `off_domain`, `non_paper`,
+and `bad_extract` project to excluded policy with the same reason; unknown markers
+project to unknown policy. Retrieval state and existing artifacts are retained.
+Existing scoped policy overrides are retained and must cover the domain reason.
+This applies to legacy and stored dimensions at read time. The terminal-v2 flag
+still controls the acquisition admission gate; enable both flags to enforce this
+projection at download dispatch.
+
 ## URL identity backfill
 
 For records with a URL but no DOI or arXiv ID, inspect a bounded sample without

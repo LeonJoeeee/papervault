@@ -13,9 +13,12 @@ from urllib.parse import quote, unquote, urlsplit
 
 import requests
 
+from papervault.config import identity_v2_enabled
+
 from .. import fetch
 from ..download_sources import ads, arxiv, core, openalex, publisher
 from ..models import IdentityRecovery, Paper
+from ..identity_v2 import Outcome, RouteRejection, correspondence_decision
 from ..sources.inspire import inspire_record_id, lookup_inspire_record
 from ..store import Library
 
@@ -66,10 +69,25 @@ def _bibliography_matches(paper: Paper, metadata: dict, *, require_authors=False
     return year is None or fetch._safe_year_match(paper.year, year)
 
 
-def _verify(paper: Paper, doi: str, arxiv_id: str, route: str) -> IdentityRecovery | None:
+def _verify(paper: Paper, doi: str, arxiv_id: str, route: str, *, source_url: str | None = None,
+            route_metadata: dict | None = None, registry_cache: dict | None = None) -> IdentityRecovery | None:
     doi, arxiv_id = core._doi(doi), core._arxiv(arxiv_id)
     if doi:
-        metadata = fetch._fetch_crossref_by_doi(doi)
+        if registry_cache is not None:
+            if doi not in registry_cache:
+                registry_cache[doi] = fetch._fetch_crossref_by_doi(doi)
+            metadata = registry_cache[doi]
+        else:
+            metadata = fetch._fetch_crossref_by_doi(doi)
+        if identity_v2_enabled():
+            observed = {name: (metadata or {}).get(name) for name in ("doi", "title", "authors", "year")}
+            url = paper.url if source_url is None else source_url
+            decision = correspondence_decision(doi, url, reference=paper, observed=observed,
+                                                route_metadata=route_metadata)
+            return IdentityRecovery(doi=doi, route=route, source_url=url,
+                verified_title=observed["title"] if isinstance(observed["title"], str) else "",
+                observed_metadata=observed, route_metadata=route_metadata,
+                correspondence=decision, observed_at=datetime.now(timezone.utc).isoformat())
         if (not metadata or core._doi(metadata.get("doi")) != doi
                 or not _bibliography_matches(paper, metadata, require_authors=True)):
             return None
@@ -94,14 +112,24 @@ def _single(values, normalize) -> str:
     return next(iter(clean)) if len(clean) == 1 else ""
 
 
-def _source_identity(paper: Paper) -> tuple[str, str, str] | None:
-    """One exact source lookup; source title must agree before registry verification."""
-    if ads._ads_bibcode(paper):
+def _source_identity(paper: Paper, *, collect_evidence: bool = False) -> tuple | None:
+    """One exact source lookup; v2 leaves DOI bibliography decisions to P2."""
+    def candidate(doi, identifier, route, evidence, url):
+        return (doi, identifier, route, evidence, url) if collect_evidence else (doi, identifier, route)
+
+    bibcode = ads._ads_bibcode(paper)
+    if bibcode:
         metadata, _ = ads._fetch_ads_metadata(paper)
-        if metadata and _bibliography_matches(paper, {
-                "title": " ".join(metadata.get("title") or []), "authors": metadata.get("author") or []}):
-            return (_single(metadata.get("doi"), core._doi),
-                    _single(metadata.get("identifier"), core._arxiv), "ads_api")
+        if metadata:
+            doi = _single(metadata.get("doi"), core._doi)
+            evidence = {"title": " ".join(metadata.get("title") or []),
+                        "authors": metadata.get("author") or []}
+            if (collect_evidence and doi) or _bibliography_matches(paper, evidence):
+                if collect_evidence:
+                    evidence.update(doi=doi, year=metadata.get("year"))
+                query = quote(f'bibcode:"{bibcode}"', safe="")
+                return candidate(doi, _single(metadata.get("identifier"), core._arxiv), "ads_api", evidence,
+                                 f"https://api.adsabs.harvard.edu/v1/search/query?q={query}")
         return None
     locator = core._core_locator(paper)
     parts = urlsplit(paper.url)
@@ -119,8 +147,18 @@ def _source_identity(paper: Paper) -> tuple[str, str, str] | None:
         metadata = core._api_get("/".join(locator), key)
         if not metadata or core._decimal(metadata.get("id")) != locator[1]:
             return None
-        ids = core._corroborate(paper, metadata) if metadata else None
-        return (*ids, "core_api") if ids else None
+        ids = core._metadata_identifiers(metadata) if collect_evidence else core._corroborate(paper, metadata)
+        if ids and collect_evidence and not ids[0]:
+            ids = core._corroborate(paper, metadata)  # preserve non-DOI verification
+        if not ids:
+            return None
+        if not collect_evidence:
+            return *ids, "core_api"
+        authors = [a.get("name", "") if isinstance(a, dict) else a
+                   for a in metadata.get("authors") or []]
+        evidence = {"doi": ids[0], "title": metadata.get("title"), "authors": authors,
+                    "year": metadata.get("yearPublished", metadata.get("year"))}
+        return candidate(*ids, "core_api", evidence, f"https://api.core.ac.uk/v3/{'/'.join(locator)}")
     work = openalex._openalex_work_id(paper)
     if work:
         mailto = os.environ.get("OPENALEX_MAILTO", "research@example.invalid")
@@ -133,10 +171,14 @@ def _source_identity(paper: Paper) -> tuple[str, str, str] | None:
             return None
         authors = [(item.get("author") or {}).get("display_name", "")
                    for item in metadata.get("authorships") or [] if isinstance(item, dict)]
-        if not _bibliography_matches(paper, {"title": metadata.get("title") or metadata.get("display_name"),
-                                            "authors": authors, "year": metadata.get("publication_year")}):
+        evidence = {"title": metadata.get("title") or metadata.get("display_name"),
+                    "authors": authors, "year": metadata.get("publication_year")}
+        doi = openalex._doi(metadata)
+        if not ((collect_evidence and doi) or _bibliography_matches(paper, evidence)):
             return None
-        return openalex._doi(metadata), "", "openalex_api"
+        if collect_evidence:
+            evidence["doi"] = doi
+        return candidate(doi, "", "openalex_api", evidence, f"https://api.openalex.org/works/{work}")
     recid = inspire_record_id(paper.inspire_record_id)
     if parts.hostname == "inspirehep.net":
         match = re.fullmatch(r"/literature/([0-9]+)/?", parts.path)
@@ -146,9 +188,16 @@ def _source_identity(paper: Paper) -> tuple[str, str, str] | None:
         recid = recid or url_recid
     if recid:
         metadata = lookup_inspire_record(paper.model_dump(), recid=recid,
-                                         headers={"User-Agent": fetch._UA})
+            headers={"User-Agent": fetch._UA}, **({"collect_only": True} if collect_evidence else {}))
         if metadata:
-            return metadata.get("doi", ""), metadata.get("arxiv_id", ""), "inspire_api"
+            doi = metadata.get("doi", "")
+            if collect_evidence and not doi:
+                from ..sources.inspire import inspire_identity_matches
+                if not inspire_identity_matches(paper.model_dump(), metadata):
+                    return None
+            evidence = {name: metadata.get(name) for name in ("doi", "title", "authors", "year")}
+            return candidate(doi, metadata.get("arxiv_id", ""), "inspire_api", evidence,
+                             f"https://inspirehep.net/api/literature/{recid}")
     return None
 
 
@@ -156,24 +205,63 @@ def eligible(paper: Paper) -> bool:
     return not (paper.doi or paper.arxiv_id or paper.domain_status) and bool(core._http_url(paper.url))
 
 
+def _landing_bibliography(values: dict) -> dict | None:
+    """Retain supplied citation fields, including ambiguity/invalid field types."""
+    evidence = {}
+    for field in ("doi", "title"):
+        raw = values.get(f"citation_{field}") or []
+        if raw:
+            value = _single(raw, core._doi if field == "doi" else lambda text: text.strip())
+            evidence[field] = value or raw
+    if values.get("citation_author"):
+        evidence["authors"] = values["citation_author"]
+    dates = [value for name in ("citation_year", "citation_date", "citation_publication_date")
+             for value in values.get(name, [])]
+    if dates:
+        def year(value):
+            match = re.match(r"^([0-9]{4})(?:[-/]|$)", value)
+            return match[1] if match else value
+        value = _single(dates, year)
+        evidence["year"] = int(value) if re.fullmatch(r"[0-9]{4}", value) else value
+    return evidence or None
+
+
 def recover_identity(paper: Paper) -> IdentityRecovery | None:
     """Pattern → one landing page → exact source API. All fills fail closed.
 
     Pattern parsing requires no discovery fetch. DOI verification uses the
     existing Crossref authority and title/author screen; arXiv verification
-    uses its bounded current-page resolver. Never mutates the supplied card.
+    uses its bounded current-page resolver. V2 retains raw P1 observations and
+    evaluates each actual route at P2, sharing registry lookups within this pass.
+    Never mutates the supplied card.
     """
     if not eligible(paper):
         return None
     tried = set()
+    rejections: list[RouteRejection] = []
+    undecided: list[IdentityRecovery] = []
+    registry_cache = {} if identity_v2_enabled() else None
 
-    def verify_once(doi, identifier, route):
+    def verify_once(doi, identifier, route, *, source_url=None, route_metadata=None):
         for identity in ((core._doi(doi), ""), ("", core._arxiv(identifier))):
-            if identity == ("", "") or identity in tried:
+            marker = (identity, route, source_url or paper.url) if identity_v2_enabled() else identity
+            if identity == ("", "") or marker in tried:
                 continue
-            tried.add(identity)
-            result = _verify(paper, *identity, route)
+            tried.add(marker)
+            result = _verify(paper, *identity, route, source_url=source_url,
+                             route_metadata=route_metadata, registry_cache=registry_cache)
             if result:
+                if identity_v2_enabled() and result.correspondence is not None:
+                    if result.correspondence.outcome != Outcome.RESOLVED:
+                        undecided.append(result)
+                        if result.correspondence.outcome == Outcome.CONTRADICTED:
+                            rejection = RouteRejection(result.source_url, result.route,
+                                                       result.correspondence.reason)
+                            if rejection not in rejections:
+                                rejections.append(rejection)
+                        continue
+                if rejections:
+                    result = result.model_copy(update={"route_rejections": list(rejections)})
                 return result
         return None
 
@@ -182,21 +270,38 @@ def recover_identity(paper: Paper) -> IdentityRecovery | None:
         return result
     landing = publisher._fetch_citation_landing(paper.url, metadata_only=True)
     if landing is not None and landing.ok and not publisher._is_pdf_bytes(landing.content):
+        values = publisher._citation_meta(landing.text) if identity_v2_enabled() else None
+        evidence = _landing_bibliography(values) if values is not None else None
         if landing.url != paper.url:
-            result = verify_once(*_url_identity(landing.url), "url_redirect")
+            result = verify_once(*_url_identity(landing.url), "url_redirect",
+                source_url=landing.url if identity_v2_enabled() else None, route_metadata=evidence)
             if result:
                 return result
-        values = publisher._citation_meta(landing.text)
+        values = publisher._citation_meta(landing.text) if values is None else values
         result = verify_once(_single(values.get("citation_doi", []), core._doi),
                              _single(values.get("citation_arxiv", []) + values.get("citation_arxiv_id", []),
-                                     core._arxiv), "citation_meta")
+                                     core._arxiv), "citation_meta",
+            source_url=landing.url if identity_v2_enabled() else None, route_metadata=evidence)
         if result:
             return result
     try:
-        candidate = _source_identity(paper)
-        return verify_once(*candidate) if candidate else None
+        candidate = (_source_identity(paper, collect_evidence=True) if identity_v2_enabled()
+                     else _source_identity(paper))
+        result = (verify_once(*candidate[:3], route_metadata=candidate[3], source_url=candidate[4])
+                  if candidate and len(candidate) == 5
+                  else verify_once(*candidate) if candidate else None)
+        if result:
+            return result
     except (requests.RequestException, core._CoreUnavailable, ValueError, TypeError, AttributeError):
-        return None
+        pass
+    # Preserve the failed decision for P3, after trying independent identities.
+    # Positive contradiction takes precedence in the report; unavailable routes
+    # are still retryable and no paper status is written here.
+    if undecided:
+        result = next((item for item in undecided
+                       if item.correspondence.outcome == Outcome.CONTRADICTED), undecided[0])
+        return result.model_copy(update={"route_rejections": rejections})
+    return None
 
 
 def _selection(papers: list[Paper], cap: int, keys: list[str] | None) -> list[Paper]:
@@ -215,9 +320,13 @@ def inspect_identities(papers: list[Paper], *, cap: int, keys: list[str] | None 
         if index and pace_seconds:
             time.sleep(pace_seconds)
         recovery = recover_identity(paper)
-        if recovery:
+        outcome = "verified" if recovery else "abstained"
+        if identity_v2_enabled() and recovery and recovery.correspondence is not None:
+            if recovery.correspondence.outcome != Outcome.RESOLVED:
+                outcome = recovery.correspondence.outcome.value
+        if recovery and outcome == "verified":
             routes[recovery.route] += 1
-        records.append({"key": paper.key, "outcome": "verified" if recovery else "abstained",
+        records.append({"key": paper.key, "outcome": outcome,
                         "recovery": recovery.model_dump() if recovery else None})
     return {"dry_run": True, "cap": cap, "scanned": len(selected), "recovered": sum(routes.values()),
             "recovered_by_route": dict(routes), "records": records,
@@ -260,6 +369,33 @@ def apply_identity_report(library: Library, result: dict, *, acquire: bool = Fal
                     library.corrections.stage_fields(current, snapshot.model_dump(),
                         operation="stale_identity_backfill", provenance={"recovery": recovery.model_dump()},
                         proposals={k: v for k, v in {"doi": recovery.doi, "arxiv_id": recovery.arxiv_id}.items() if v})
+                continue
+        if identity_v2_enabled():
+            paper = library.get(item["key"])
+            if paper is None:
+                item["outcome"] = "no_paper"
+                continue
+            rejections = list(recovery.route_rejections)
+            if recovery.doi:
+                # Recheck the current bibliography at the adoption boundary;
+                # never trust a precomputed verdict from an inspection report.
+                decision = correspondence_decision(recovery.doi, recovery.source_url,
+                    reference=paper, observed=(recovery.observed_metadata if recovery.observed_metadata is not None
+                                              else {"title": recovery.verified_title}),
+                    route_metadata=recovery.route_metadata)
+                recovery = recovery.model_copy(update={"correspondence": decision})
+                item["recovery"] = recovery.model_dump()
+                if decision.outcome == Outcome.CONTRADICTED:
+                    rejections.append(RouteRejection(recovery.source_url, recovery.route, decision.reason))
+            changed = False
+            for rejection in rejections:
+                if rejection not in paper.identity_route_rejections:
+                    paper.identity_route_rejections.append(rejection)
+                    changed = True
+            if changed:
+                library.save(force=True)
+            if recovery.doi and decision.outcome != Outcome.RESOLVED:
+                item["outcome"] = decision.outcome.value
                 continue
         if doi_only and not recovery.doi:
             item["outcome"] = "deferred_non_doi"

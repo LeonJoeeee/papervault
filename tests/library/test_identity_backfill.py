@@ -19,11 +19,11 @@ def _paper(**fields):
                  year=2012, **fields)
 
 
-def _registry(doi=DOI, *, title=TITLE, family="Strauss", canonical=None):
+def _registry(doi=DOI, *, title=TITLE, family="Strauss", canonical=None, year=2012):
     responses.get(f"https://api.crossref.org/works/{doi}", json={"message": {
         "DOI": canonical or doi, "title": [title],
         "author": [{"given": "R. D.", "family": family}],
-        "issued": {"date-parts": [[2012]]}}})
+        "issued": {"date-parts": [[year]]}}})
 
 
 def _arxiv_page(*, withdrawn=False):
@@ -469,3 +469,292 @@ def test_apply_refuses_a_running_co_writer_before_loading_vault(tmp_path, monkey
     assert cli.main(["identity-backfill", "--cap", "1", "--apply"]) == 2
     assert "overwrite" in capsys.readouterr().err
     assert not root.exists()
+
+
+@pytest.mark.parametrize("flag", [None, "0"])
+@responses.activate
+def test_identity_v2_off_preserves_legacy_recovery_snapshot(flag, monkeypatch):
+    from papervault.library.services.identity_backfill import inspect_identities
+    if flag is None:
+        monkeypatch.delenv("PAPERVAULT_IDENTITY_V2", raising=False)
+    else:
+        monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", flag)
+    _registry()
+    result = inspect_identities([_paper(url=f"https://doi.org/{DOI}")], cap=1)
+    record = result["records"][0]
+    recovery = record["recovery"]
+    assert isinstance(recovery.pop("observed_at"), str)
+    assert result == {"dry_run": True, "cap": 1, "scanned": 1, "recovered": 1,
+        "recovered_by_route": {"url_pattern": 1}, "records": [{"key": "Strauss2012",
+            "outcome": "verified", "recovery": {"doi": DOI, "arxiv_id": "",
+                "route": "url_pattern", "source_url": f"https://doi.org/{DOI}", "verified_title": TITLE}}],
+        "acquisition": {"attempted": 0, "by_source": {}, "outcomes": {}}}
+
+
+@pytest.mark.parametrize("failure,outcome,reason", [
+    ("title", "contradicted", "title_mismatch"),
+    ("author", "contradicted", "author_mismatch"),
+    ("doi", "contradicted", "doi_mismatch"),
+    ("unavailable", "unresolved", "insufficient_evidence"),
+])
+@responses.activate
+def test_v2_recovery_preserves_correspondence_failures_for_application(failure, outcome, reason, monkeypatch):
+    from papervault.library.services.identity_backfill import inspect_identities
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    url = f"https://doi.org/{DOI}"
+    if failure == "unavailable":
+        responses.get(f"https://api.crossref.org/works/{DOI}", status=429)
+    else:
+        _registry(title="Galactic Cosmic Rays in the Dynamic Heliosphere" if failure == "title" else TITLE,
+                  family="Potgieter" if failure == "author" else "Strauss",
+                  canonical="10.1234/other" if failure == "doi" else DOI)
+    responses.get(url, body="<html></html>")
+    result = inspect_identities([_paper(url=url)], cap=1)
+    assert result["recovered"] == 0
+    assert result["records"][0]["outcome"] == outcome
+    decision = result["records"][0]["recovery"]["correspondence"]
+    assert decision["outcome"] == outcome and decision["reason"] == reason
+
+
+def _report(key, recovery):
+    return {"dry_run": True, "records": [{"key": key, "outcome": "verified",
+            "recovery": recovery.model_dump()}], "recovered": 1,
+            "acquisition": {"attempted": 0, "by_source": {}, "outcomes": {}}}
+
+
+@pytest.mark.parametrize("case,outcome", [("matched", "set"), ("missing", "unresolved"),
+                                             ("contradicted", "contradicted")])
+def test_v2_adoption_rechecks_evidence_and_only_resolved_can_set(tmp_path, monkeypatch, case, outcome):
+    from papervault.library import download
+    from papervault.library.identity_v2 import CorrespondenceDecision, Outcome, Reason
+    from papervault.library.services.identity_backfill import apply_identity_report, eligible
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    monkeypatch.setattr(download, "download_paper", lambda *_: True)
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url="https://publisher.example/item",
+                               download_status="metadata_only").model_dump())
+    before = paper.model_dump()
+    recovery = _recovery().model_copy(update={
+        "source_url": "https://doi.org/10.1234/wrong" if case == "contradicted" else paper.url,
+        "observed_metadata": {"title": TITLE, "doi": DOI, "year": 2012,
+                              "authors": [] if case == "missing" else ["R. D. Strauss"]},
+        # A stale/precomputed verdict cannot smuggle an adoption through P3.
+        "correspondence": CorrespondenceDecision(Outcome.RESOLVED, Reason.DOI_EQUIVALENT)})
+    result = apply_identity_report(lib, _report(paper.key, recovery), acquire=case != "matched")
+    assert result["records"][0]["outcome"] == outcome
+    assert result["acquisition"]["attempted"] == 0
+    if case != "matched":
+        assert paper.doi == "" and paper.identity_recovery is None
+        assert paper.download_status == before["download_status"]
+        assert paper.terminal_state == before.get("terminal_state")
+        assert paper.resolve_attempted_at is None and eligible(paper)
+        assert lib.get(paper.key) is paper
+    else:
+        assert paper.doi == DOI
+        assert lib.find(doi=DOI) is paper
+
+
+def test_rejected_route_persists_and_second_route_can_still_adopt(tmp_path, monkeypatch):
+    from papervault.library import download
+    from papervault.library.services.identity_backfill import apply_identity_report
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    monkeypatch.setattr(download, "download_paper", lambda *_: True)
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url="https://publisher.example/item").model_dump())
+    recovery = _recovery().model_copy(update={"observed_metadata": {
+        "title": TITLE, "authors": ["Strauss"], "year": 2012, "doi": DOI},
+        "source_url": "https://doi.org/10.1234/wrong"})
+    result = apply_identity_report(lib, _report(paper.key, recovery), acquire=True)
+    assert result["records"][0]["outcome"] == "contradicted"
+    reloaded = Library(tmp_path)
+    retained = reloaded.get(paper.key)
+    assert retained.download_status == "pending" and retained.doi == ""
+    assert retained.identity_route_rejections[0].reason.value == "doi_mismatch"
+    assert retained.identity_route_rejections[0].kind.value == "route_rejected"
+    second = recovery.model_copy(update={"source_url": f"https://doi.org/{DOI}"})
+    result = apply_identity_report(reloaded, _report(paper.key, second))
+    assert result["records"][0]["outcome"] == "set"
+    assert retained.doi == DOI and retained.download_status == "pending"
+    assert len(retained.identity_route_rejections) == 1
+
+
+@responses.activate
+def test_v2_recovery_keeps_rejected_route_while_trying_another_identity(monkeypatch):
+    from papervault.library.services.identity_backfill import recover_identity
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    _registry(title="Galactic Cosmic Rays in the Dynamic Heliosphere")
+    responses.get(f"https://doi.org/{DOI}", body='<meta name="citation_arxiv" content="1201.12345">')
+    responses.get("https://arxiv.org/abs/1201.12345", body=_arxiv_page())
+    recovery = recover_identity(_paper(url=f"https://doi.org/{DOI}"))
+    assert recovery.arxiv_id == "1201.12345" and recovery.doi == ""
+    assert recovery.route_rejections[0].reason.value == "title_mismatch"
+
+
+def test_old_format_models_omit_new_evidence_fields():
+    recovery = _recovery()
+    assert set(recovery.model_dump()) == {"doi", "arxiv_id", "route", "source_url",
+                                          "verified_title", "observed_at"}
+    assert "identity_route_rejections" not in _paper().model_dump()
+    from papervault.library.models import IdentityRecovery
+    assert IdentityRecovery.model_validate_json(recovery.model_dump_json()) == recovery
+
+
+@responses.activate
+def test_v2_redirect_keeps_valid_final_route_after_rejecting_original(tmp_path, monkeypatch):
+    from papervault.library.services.identity_backfill import backfill_identities
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    old = "https://doi.org/10.1234/wrong"
+    final = f"https://doi.org/{DOI}"
+    _registry("10.1234/wrong", title="Galactic Cosmic Rays in the Dynamic Heliosphere")
+    _registry()
+    responses.get(old, status=302, headers={"Location": final})
+    responses.get(final, body="<html></html>")
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url=old).model_dump())
+    result = backfill_identities(lib, cap=1)
+    assert result["recovered"] == 1 and paper.doi == DOI
+    assert paper.identity_recovery.source_url == final
+    assert paper.identity_route_rejections[0].url == old
+
+
+@responses.activate
+def test_v2_opaque_redirect_cannot_hide_final_url_contradiction(tmp_path, monkeypatch):
+    from papervault.library.services.identity_backfill import backfill_identities
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    old = "https://publisher.example/item"
+    final = "https://doi.org/10.1234/wrong"
+    responses.get(old, status=302, headers={"Location": final})
+    responses.get(final, body=f'<meta name="citation_doi" content="{DOI}">')
+    _registry("10.1234/wrong", title="Galactic Cosmic Rays in the Dynamic Heliosphere")
+    _registry()
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url=old).model_dump())
+    result = backfill_identities(lib, cap=1)
+    assert result["recovered"] == 0 and paper.doi == ""
+    assert paper.download_status == "pending"
+    assert any(r.url == final and r.reason.value == "doi_mismatch"
+               for r in paper.identity_route_rejections)
+
+
+@pytest.mark.parametrize("title,outcome", [(TITLE, "set"),
+    ("Galactic Cosmic Rays in the Dynamic Heliosphere", "contradicted")])
+@responses.activate
+def test_v2_checks_available_landing_bibliography(tmp_path, monkeypatch, title, outcome):
+    from papervault.library.services.identity_backfill import backfill_identities
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    url = "https://publisher.example/item"
+    responses.get(url, body=f'<meta name="citation_doi" content="{DOI}">'
+                  f'<meta name="citation_title" content="{title}">')
+    _registry()
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url=url).model_dump())
+    result = backfill_identities(lib, cap=1)
+    assert result["records"][0]["outcome"] == outcome
+    assert paper.doi == (DOI if outcome == "set" else "")
+    if outcome == "contradicted":
+        assert paper.identity_route_rejections[0].reason.value == "title_mismatch"
+
+
+@pytest.mark.parametrize("year", ["2012", "not-a-year", True, {"value": 2012}])
+@responses.activate
+def test_v2_malformed_year_stays_unresolved_through_apply(tmp_path, monkeypatch, year):
+    from papervault.library.services.identity_backfill import backfill_identities
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    _registry(year=year)
+    responses.get(f"https://doi.org/{DOI}", body="<html></html>")
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url=f"https://doi.org/{DOI}").model_dump())
+    result = backfill_identities(lib, cap=1)
+    assert result["records"][0]["outcome"] == "unresolved"
+    assert paper.doi == "" and paper.resolve_attempted_at is None
+
+
+@responses.activate
+def test_v2_doi_only_deferral_still_records_rejected_routes(tmp_path, monkeypatch):
+    from papervault.library.services.identity_backfill import apply_identity_report, inspect_identities
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    _registry(title="Galactic Cosmic Rays in the Dynamic Heliosphere")
+    responses.get(f"https://doi.org/{DOI}", body='<meta name="citation_arxiv" content="1201.12345">')
+    responses.get("https://arxiv.org/abs/1201.12345", body=_arxiv_page())
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url=f"https://doi.org/{DOI}").model_dump())
+    result = apply_identity_report(lib, inspect_identities([paper], cap=1), doi_only=True)
+    assert result["records"][0]["outcome"] == "deferred_non_doi"
+    assert paper.doi == paper.arxiv_id == ""
+    assert Library(tmp_path).get(paper.key).identity_route_rejections[0].reason.value == "title_mismatch"
+
+
+@pytest.mark.parametrize("source", ["ads", "core", "openalex", "inspire"])
+@responses.activate
+def test_v2_source_bibliography_contradiction_is_recorded(source, tmp_path, monkeypatch):
+    from papervault.library.download_sources import core
+    from papervault.library.services.identity_backfill import backfill_identities
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    monkeypatch.setenv("CORE_API_KEY", "fixture")
+    monkeypatch.setenv("ADS_API_TOKEN", "fixture")
+    monkeypatch.setattr(core, "_api_next_at", 0)
+    monkeypatch.setattr(core, "_api_cooldown_until", 0)
+    wrong_title = "Galactic Cosmic Rays in the Dynamic Heliosphere"
+    urls = {"ads": "https://ui.adsabs.harvard.edu/abs/2012ApJ...750....1S/abstract",
+            "core": "https://core.ac.uk/works/123", "openalex": "https://openalex.org/W123",
+            "inspire": "https://inspirehep.net/literature/123"}
+    responses.get(urls[source], body="<html></html>")
+    if source == "ads":
+        responses.get("https://api.adsabs.harvard.edu/v1/search/query", json={"response": {"docs": [{
+            "bibcode": "2012ApJ...750....1S", "title": [wrong_title], "author": ["Strauss, R. D."],
+            "doi": [DOI], "identifier": [], "doctype": "article", "pub": "ApJ", "esources": []}]}})
+    elif source == "core":
+        responses.get("https://api.core.ac.uk/v3/works/123", json={"id": 123, "doi": DOI,
+            "title": wrong_title, "authors": ["Strauss"]})
+    elif source == "openalex":
+        responses.get("https://api.openalex.org/works/W123", json={"id": urls[source], "doi": DOI,
+            "title": wrong_title, "publication_year": 2012,
+            "authorships": [{"author": {"display_name": "Strauss"}}]})
+    else:
+        responses.get("https://inspirehep.net/api/literature/123", json={"id": "123", "metadata": {
+            "titles": [{"title": wrong_title}], "authors": [{"full_name": "Strauss, R. D."}],
+            "publication_info": [{"year": 2012}], "dois": [{"value": DOI}]}})
+    _registry()
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url=urls[source], source=source).model_dump())
+    result = backfill_identities(lib, cap=1)
+    assert result["records"][0]["outcome"] == "contradicted"
+    assert paper.doi == "" and paper.download_status == "pending"
+    assert paper.identity_route_rejections[0].reason.value == "title_mismatch"
+
+
+@pytest.mark.parametrize("source", ["core", "openalex", "inspire"])
+@responses.activate
+def test_v2_valid_source_route_survives_rejected_original_url(source, tmp_path, monkeypatch):
+    from papervault.library.download_sources import core
+    from papervault.library.services.identity_backfill import backfill_identities
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    monkeypatch.setenv("CORE_API_KEY", "fixture")
+    monkeypatch.setattr(core, "_api_next_at", 0)
+    monkeypatch.setattr(core, "_api_cooldown_until", 0)
+    original = "https://doi.org/10.1234/wrong"
+    responses.get(original, body="<html></html>")
+    _registry("10.1234/wrong", title="Galactic Cosmic Rays in the Dynamic Heliosphere")
+    _registry()
+    urls = {"core": "https://api.core.ac.uk/v3/works/123",
+            "openalex": "https://api.openalex.org/works/W123",
+            "inspire": "https://inspirehep.net/api/literature/123"}
+    if source == "core":
+        responses.get(urls[source], json={"id": 123, "doi": DOI, "title": TITLE, "authors": ["Strauss"]})
+        fields = {"paper_id": "123"}
+    elif source == "openalex":
+        responses.get(urls[source], json={"id": "https://openalex.org/W123", "doi": DOI,
+            "title": TITLE, "publication_year": 2012,
+            "authorships": [{"author": {"display_name": "Strauss"}}]})
+        fields = {"paper_id": "W123"}
+    else:
+        responses.get(urls[source], json={"id": "123", "metadata": {
+            "titles": [{"title": TITLE}], "authors": [{"full_name": "Strauss, R. D."}],
+            "publication_info": [{"year": 2012}], "dois": [{"value": DOI}]}})
+        fields = {"inspire_record_id": "123"}
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(_paper(url=original, source=source, **fields).model_dump())
+    result = backfill_identities(lib, cap=1)
+    assert result["recovered"] == 1 and paper.doi == DOI
+    assert paper.identity_recovery.source_url == urls[source]
+    assert paper.identity_route_rejections[0].url == original

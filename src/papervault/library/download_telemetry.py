@@ -148,15 +148,15 @@ async def network_slot(semaphore, library, key: str = "", *, actor: str = "downl
 
 def trace_download(fn):
     @wraps(fn)
-    def traced(paper, library):
+    def traced(paper, library, **kwargs):
         # Preserve the established no-log/no-fetch idempotence path.
         if library.has_pdf(paper.key) and paper.arxiv_withdrawal is None:
-            return fn(paper, library)
+            return fn(paper, library, **kwargs)
         current = _current.get()
         with observation(library, paper.key, current.run_id if current else None):
             with span("cascade") as terminal:
                 try:
-                    result = fn(paper, library)
+                    result = fn(paper, library, **kwargs)
                     terminal["pdf_returned"] = result
                     return result
                 finally:

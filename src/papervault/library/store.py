@@ -8,13 +8,17 @@ import json
 import os
 import re
 import time
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
+
+from papervault.config import terminal_v2_enabled
 
 from .download_telemetry import enrich, manifest_lock
 from .models import DOWNLOAD_STATUS_PENDING, IdentityRecovery, Paper, base_key, normalize_title
 from .sources.inspire import merge_inspire_fields, retained_inspire_fields
 from .sources.identity import merge_source_identities
+from .state_v2 import Policy, TerminalState, after_status_write, retain_observed_restrictions
 
 
 def _is_nonempty_file(path: Path) -> bool:
@@ -225,6 +229,9 @@ class Library:
             d.mkdir(parents=True, exist_ok=True)
 
         self._papers: dict[str, Paper] = {}
+        # Compact in-process fingerprints detect touches, including nested edits.
+        # They are not persisted and never authorize a bulk legacy backfill.
+        self._state_v2_fingerprints: dict[str, int] = {}
         self._by_doi: dict[str, str] = {}
         self._by_arxiv: dict[str, str] = {}
         self._by_title: dict[str, str] = {}
@@ -312,6 +319,7 @@ class Library:
                           "error": repr(exc)[:200]})
                 continue
             self._papers[key] = paper
+            self._state_v2_fingerprints[key] = hash(paper.model_dump_json())
             self._reindex(paper)
         if bad:
             self.log({"event": "index_load_skipped_records", "count": bad})
@@ -354,8 +362,20 @@ class Library:
                 # Sanity gate failed: primary corrupted out-of-band. PRESERVE .bak
                 # (do not rotate) and fall back to full validation on the next save.
                 self._rotation_validated = False
-        data = {"version": 1, "papers": {k: p.model_dump() for k, p in self._papers.items()}}
+        records, fingerprints = {}, {}
+        enabled = terminal_v2_enabled()
+        for key, paper in self._papers.items():
+            fingerprint = hash(paper.model_dump_json())
+            if (enabled and paper.terminal_state is None
+                    and self._state_v2_fingerprints.get(key) != fingerprint):
+                # Write-through only for a row actually changed since load/save.
+                paper.terminal_state = paper.acquisition_state
+                fingerprint = hash(paper.model_dump_json())
+            records[key] = paper.model_dump()
+            fingerprints[key] = fingerprint
+        data = {"version": 1, "papers": records}
         _atomic_write(self.index_path, json.dumps(data, ensure_ascii=False, indent=2))
+        self._state_v2_fingerprints = fingerprints
 
     def _primary_sane(self) -> bool:
         """Cheap structural check (no full parse) that the primary index looks like a
@@ -581,6 +601,9 @@ class Library:
         paper_data.update(retained_inspire_fields(paper_data))
         paper = Paper(**{k: v for k, v in paper_data.items()
                          if k in Paper.model_fields})
+        if terminal_v2_enabled() and paper.terminal_state is None:
+            # This is a new ingress observation, not a cause-unrecorded legacy row.
+            paper.terminal_state = after_status_write(TerminalState(policy=Policy.CLEAR), paper)
         self._papers[key] = paper
         self._reindex(paper)
         return paper, True
@@ -840,8 +863,21 @@ class Library:
             # Metadata-only fills must not overwrite a concurrent admission's observations.
             existing.source_identities = merge_source_identities(
                 existing.source_identities, observations)
+        state_observation = incoming.get("terminal_state")
+        if state_observation:
+            current_state = existing.acquisition_state
+            if isinstance(state_observation, dict):
+                # Partial observations do not erase unobserved fields.
+                fields = asdict(current_state)
+                grant_observation = state_observation.get("override")
+                if isinstance(grant_observation, dict) and current_state.override is not None:
+                    state_observation = {**state_observation,
+                                         "override": {**asdict(current_state.override), **grant_observation}}
+                state_observation = {**fields, **state_observation}
+            observed = Paper(key=existing.key, terminal_state=state_observation).terminal_state
+            existing.terminal_state = retain_observed_restrictions(current_state, observed)
         for field, value in incoming.items():
-            if field in {"inspire_record_id", "inspire_document_urls", "source_identities"}:
+            if field in {"inspire_record_id", "inspire_document_urls", "source_identities", "terminal_state"}:
                 continue  # source identity and links are merged together above
             if field == "key" or field not in Paper.model_fields:
                 continue                       # never reassign the cite key

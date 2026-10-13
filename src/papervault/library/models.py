@@ -6,7 +6,11 @@ import re
 import unicodedata
 from typing import Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_serializer
+
+from papervault.config import terminal_v2_enabled
+
+from .state_v2 import TerminalState, after_status_write, derive_legacy
 
 # Forward ref: Paper.insight is Optional[Insight], retained as a
 # read-only field after Phase 28 (route B). The schema lives in
@@ -19,7 +23,8 @@ from .insight.schema import Insight  # noqa: E402  (intentional pre-class import
 
 # Paper.download_status canonical routing enum (D7).
 #
-# This is the SINGLE field that decides "what happens next" for a paper.
+# This field selects the legacy routing rules. With terminal v2 enabled,
+# independent acquisition dimensions also guard DOWNLOAD admission.
 # Provenance ("which strategy got the bytes") lives in the SEPARATE
 # ``download_source`` field — status routes, source labels. The five
 # values are TOTAL and mutually exclusive; ``services.classify.classify``
@@ -334,6 +339,32 @@ class Paper(BaseModel):
     # index.json with a legacy "ok:<src>" value still loads; the one-time
     # migrate_status() normalizes it before any worker runs.
     download_status: str = DOWNLOAD_STATUS_PENDING
+
+    # Optional on disk. Absent legacy dimensions are derived without a write.
+    terminal_state: Optional[TerminalState] = None
+
+    @property
+    def acquisition_state(self) -> TerminalState:
+        return self.terminal_state if self.terminal_state is not None else derive_legacy(self)
+
+    def __setattr__(self, name, value):
+        # All status writers share this boundary, including CLI and tier helpers.
+        # Capture policy BEFORE changing a legacy terminal's status; resetting
+        # retrieval must never silently resolve its unknown policy.
+        # Already-observed fields stay consistent while the kill switch is off.
+        synchronize = name == "download_status" and (
+            self.terminal_state is not None or terminal_v2_enabled())
+        state = self.acquisition_state if synchronize else None
+        super().__setattr__(name, value)
+        if state is not None:
+            super().__setattr__("terminal_state", after_status_write(state, self))
+
+    @model_serializer(mode="wrap")
+    def _serialize_optional_state(self, handler):
+        record = handler(self)
+        if self.terminal_state is None:
+            record.pop("terminal_state", None)
+        return record
 
     # Metadata-enrichment guard — WORKER-OWNED (never source-supplied). ISO-8601
     # UTC stamp the enrich queue writes by DIRECT mutation on EVERY Crossref

@@ -42,9 +42,16 @@ hit, so each paper lands in exactly one Action (SDD §5 ``post``):
                   it MUST extract, not black-hole — restart-safety §8 inv #4)
   5. TERMINAL  ⟸ otherwise (e.g. has_pdf ∧ attempts≥MAX with status not yet
                  flipped; reconcile treats it as terminal pending audit)
+
+With PAPERVAULT_TERMINAL_V2 enabled, an existing DOWNLOAD decision must also
+pass the single v2 admission predicate. download_paper asks this router again
+immediately before dispatch. EXTRACT is a separate axis; neither routing nor
+admission mutates policy. With the flag off, these rules are unchanged.
 """
 
 from __future__ import annotations
+
+from papervault.config import terminal_v2_enabled
 
 from ..models import (
     DOWNLOAD_STATUS_OK,
@@ -53,6 +60,7 @@ from ..models import (
     MAX_EXTRACT_ATTEMPTS,
     Paper,
 )
+from ..state_v2 import admitted_budget, admission, resolved_identity, valid_lease
 
 # Action labels. Plain strings (not an enum) to stay trivially comparable
 # and JSON-loggable; callers branch on equality.
@@ -63,7 +71,23 @@ TERMINAL = "TERMINAL"
 Action = str
 
 
-def classify(paper: Paper, library) -> Action:
+def classify(paper: Paper, library, *, identity_provider=resolved_identity,
+             lease_provider=valid_lease, budget_provider=admitted_budget) -> Action:
+    """Route by the existing rules, with opt-in acquisition admission.
+
+    Providers are evaluated again at the actual download dispatch boundary.
+    The router never changes policy or any other persisted dimension.
+    """
+    action = _classify_legacy(paper, library)
+    if action == DOWNLOAD and terminal_v2_enabled():
+        allowed = admission(paper.acquisition_state, key=paper.key,
+                            identity_resolved=identity_provider(paper),
+                            lease_ok=lease_provider(paper), budget_ok=budget_provider(paper))
+        return DOWNLOAD if allowed else TERMINAL
+    return action
+
+
+def _classify_legacy(paper: Paper, library) -> Action:
     """Return the one next Action for ``paper`` (DOWNLOAD / EXTRACT / TERMINAL).
 
     Pure + total + mutually exclusive. See module docstring for the rules.

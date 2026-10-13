@@ -63,10 +63,13 @@ async def test_quiesce_persists_intent_and_blocks_new_claims(pair):
     assert ledger.spent(campaign) == 0
 
 
-async def test_queued_and_dispatched_claims_block_until_drained(pair):
+@pytest.mark.parametrize("result_kind", ["failed", "pdf", "verified_fill"])
+async def test_queued_and_dispatched_claims_block_until_drained(pair, result_kind):
+    from papervault.library.reopen_v2 import StagedAttempt
     lib, left, right, ledger, _ = pair
     store, (queued, dispatched) = await claims(pair)
     assert await store.pre_dispatch(dispatched)
+    stage = StagedAttempt(lib, dispatched)
     merge = coordinator(pair)
     intent = await merge.quiesce(left.key, right.key)
     assert not await merge.drain_ready(intent)
@@ -74,21 +77,44 @@ async def test_queued_and_dispatched_claims_block_until_drained(pair):
     assert left.arxiv_id == ""
     assert await store.not_sent(queued)
     assert not await merge.drain_ready(intent)
-    ledger.complete(dispatched)
-    right.reopen_claim = right.reopen_claim.model_copy(update={"phase": "completed"})
-    right.download_status = "failed"
+    result = stage.library.get(right.key)
+    if result_kind == "failed":
+        result.download_status = "failed"
+    else:
+        stage.path("pdf").write_bytes(b"settled staged PDF")
+        result.download_status = "ok"
+        if result_kind == "verified_fill":
+            result.doi = "10.1234/verified-preprint"
+    try:
+        assert await stage.writeback(store)
+    finally:
+        stage.cleanup()
+    assert right.reopen_claim.phase == "completed"
+    assert ledger.phase(dispatched) == "complete"
+    assert ledger.outstanding([left.key, right.key]) == []
+    assert right.acquisition_state.quarantine  # New claims remain blocked until merge.
+    assert not right.terminal_state.quarantine  # Settlement is not execution uncertainty.
+    if result_kind == "verified_fill":
+        assert right.doi == "10.1234/verified-preprint"
+        assert lib.find(doi=right.doi) is right
     assert await merge.drain_ready(intent)
     assert await merge.merge_records(left.key, right.key) is left
     assert left.doi == "10.1234/canonical" and left.arxiv_id == "2101.12345"
     assert [o.source for o in left.source_identities] == ["core", "ads"]
     assert lib.get(right.key).acquisition_state.merge == Merge.ALIAS
+    assert not left.acquisition_state.quarantine
+    if result_kind != "failed":
+        assert left.acquisition_state.retrieval == Retrieval.ACQUIRED
+        assert lib.pdf_path(left.key).read_bytes() == b"settled staged PDF"
     assert ledger.spent(dispatched.campaign_id) == 1
 
 
 async def test_expiry_remains_blocked_after_later_drain_and_restart(pair):
+    from papervault.library.reopen_v2 import StagedAttempt
     lib, left, right, ledger, now = pair
     store, (queued, dispatched) = await claims(pair)
     assert await store.pre_dispatch(dispatched)
+    stage = StagedAttempt(lib, dispatched)
     merge = coordinator(pair)
     intent = await merge.quiesce(left.key, right.key, wait_seconds=10)
     now[0] += 10
@@ -96,9 +122,15 @@ async def test_expiry_remains_blocked_after_later_drain_and_restart(pair):
     assert await merge.merge_records(left.key, right.key) is None
     assert ledger.spent(dispatched.campaign_id) == 2
     assert await store.not_sent(queued)
-    ledger.complete(dispatched)
-    right.reopen_claim = right.reopen_claim.model_copy(update={"phase": "completed"})
-    lib.save()
+    stage.library.get(right.key).download_status = "failed"
+    try:
+        assert await stage.writeback(store)
+    finally:
+        stage.cleanup()
+    assert right.reopen_claim.phase == "completed"
+    assert ledger.phase(dispatched) == "complete"
+    assert ledger.outstanding([left.key, right.key]) == []
+    assert not await merge.drain_ready(intent)
     from papervault.library.merge_v2 import MergeStore
     replay = MergeStore(Library(lib.root), ledger=ledger, clock=lambda: now[0])
     assert await replay.merge_records(left.key, right.key) is None
@@ -106,6 +138,169 @@ async def test_expiry_remains_blocked_after_later_drain_and_restart(pair):
         assert paper.merge_intent.status == "expired"
         assert paper.acquisition_state.quarantine
     assert not any(r["event"] == "merge" for r in ledger._read())
+
+
+async def test_lease_expiry_during_quiescence_drops_staged_result(pair):
+    from papervault.library.reopen_v2 import StagedAttempt
+    lib, left, right, ledger, now = pair
+    store, (queued, dispatched) = await claims(pair)
+    assert await store.pre_dispatch(dispatched)
+    stage = StagedAttempt(lib, dispatched)
+    merge = coordinator(pair)
+    intent = await merge.quiesce(left.key, right.key, wait_seconds=7200)
+    assert await store.not_sent(queued)
+    now[0] = dispatched.lease_expiry
+    assert await store.expire(right.key, token=dispatched)
+    stage.path("pdf").write_bytes(b"stale lease result")
+    stage.library.get(right.key).download_status = "ok"
+    restarted = ClaimStore(Library(lib.root), ledger=ledger, clock=lambda: now[0])
+    try:
+        assert not await stage.writeback(restarted)
+    finally:
+        stage.cleanup()
+    row = restarted.library.get(right.key)
+    assert row.terminal_state.quarantine and row.merge_intent.status == "waiting"
+    assert row.reopen_claim.phase == "dispatched" and row.download_status == "pending"
+    assert not lib.has_pdf(right.key)
+    assert ledger.phase(dispatched) == "dispatch"
+    assert ledger.spent(dispatched.campaign_id) == 1
+    assert not await merge.drain_ready(intent)
+    assert await merge.merge_records(left.key, right.key) is None
+
+
+async def test_policy_observation_during_quiescence_still_fences_writeback(pair):
+    from papervault.library.reopen_v2 import StagedAttempt
+    from papervault.library.services import concurrency
+    lib, left, right, ledger, _ = pair
+    store, (dispatched, queued) = await claims(pair)
+    assert await store.pre_dispatch(dispatched)
+    stage = StagedAttempt(lib, dispatched)
+    merge = coordinator(pair)
+    intent = await merge.quiesce(left.key, right.key)
+    assert await store.not_sent(queued)
+    async with concurrency.lib_write_lock:
+        assert merge._merge_records(left.key, right.key, metadata={"doi": left.doi, "arxiv_id": right.arxiv_id,
+                    "terminal_state": {"policy": "excluded", "policy_reasons": ["non_paper"]}}) is None
+    stage.path("pdf").write_bytes(b"policy fenced staged PDF")
+    stage.library.get(left.key).download_status = "ok"
+    try:
+        assert not await stage.writeback(store)
+    finally:
+        stage.cleanup()
+    assert left.acquisition_state.policy == Policy.EXCLUDED
+    assert left.terminal_state.quarantine
+    assert left.reopen_claim.phase == "dispatched" and ledger.phase(dispatched) == "dispatch"
+    assert not lib.has_pdf(left.key) and not await merge.drain_ready(intent)
+
+
+async def test_metadata_observation_during_quiescence_allows_valid_writeback(pair):
+    from papervault.library.reopen_v2 import StagedAttempt
+    from papervault.library.services import concurrency
+    lib, left, right, _, _ = pair
+    store, (dispatched, queued) = await claims(pair)
+    assert await store.pre_dispatch(dispatched)
+    stage = StagedAttempt(lib, dispatched)
+    merge = coordinator(pair)
+    intent = await merge.quiesce(left.key, right.key)
+    assert await store.not_sent(queued)
+    async with concurrency.lib_write_lock:
+        assert merge._merge_records(left.key, right.key, metadata={"doi": left.doi, "arxiv_id": right.arxiv_id,
+                    "terminal_state": {"policy": "clear"},
+                    "abstract": "New metadata retained at settlement"}) is None
+    stage.library.get(left.key).download_status = "failed"
+    try:
+        assert await stage.writeback(store)
+    finally:
+        stage.cleanup()
+    assert left.abstract == "New metadata retained at settlement"
+    assert await merge.drain_ready(intent)
+    assert await merge.merge_records(left.key, right.key) is left
+    assert left.abstract == "New metadata retained at settlement" and not left.acquisition_state.quarantine
+
+
+async def test_real_campaign_finishes_both_dispatched_results_after_quiescence(pair, monkeypatch):
+    import threading
+    from papervault.library.reopen_v2 import run_campaign
+    from papervault.library.services import download_queue
+    lib, left, right, ledger, now = pair
+    started = {paper.key: threading.Event() for paper in (left, right)}
+    finish = threading.Event()
+    def download(paper, stage, **_):
+        started[paper.key].set()
+        assert finish.wait(5), "fixture executor was not released"
+        stage.pdf_path(paper.key).write_bytes(b"campaign settled PDF")
+        paper.download_status = "ok"
+        return True
+    monkeypatch.setattr(download_queue, "download_paper", download)
+    campaign = asyncio.create_task(run_campaign(lib, cap=2, clock=lambda: now[0]))
+    merge = coordinator(pair)
+    try:
+        for event in started.values():
+            assert await asyncio.to_thread(event.wait, 5)
+        intent = await merge.quiesce(left.key, right.key)
+        assert not await merge.drain_ready(intent)
+        assert await merge.merge_records(left.key, right.key) is None
+    finally:
+        finish.set()
+    report = await asyncio.wait_for(campaign, 5)
+    assert report["completed"] == 2
+    assert all(p.reopen_claim.phase == "completed" for p in (left, right))
+    assert ledger.outstanding([left.key, right.key]) == []
+    assert await merge.drain_ready(intent)
+    assert await merge.merge_records(left.key, right.key) is left
+    assert lib.pdf_path(left.key).read_bytes() == b"campaign settled PDF"
+    assert left.merge_budget.generation == 3 and left.merge_budget.spent == 2
+    assert lib.get(right.key).acquisition_state.alias_key == left.key
+
+
+@pytest.mark.parametrize("restore_old_index", [False, True], ids=["current", "stale"])
+async def test_completed_claim_extraction_checks_persisted_merge_generation(pair, monkeypatch, restore_old_index):
+    from papervault.library import extract
+    from papervault.library.claims_v2 import record_generation
+    from papervault.library.reopen_v2 import StagedAttempt
+    lib, left, right, ledger, _ = pair
+    store, tokens = await claims(pair)
+    for token in tokens:
+        assert await store.pre_dispatch(token)
+        stage = StagedAttempt(lib, token)
+        stage.path("pdf").write_bytes(b"settled PDF for extraction")
+        stage.library.get(token.key).download_status = "ok"
+        try:
+            assert await stage.writeback(store)
+        finally:
+            stage.cleanup()
+    ledger.finish_campaign(tokens[0].campaign_id, drained=True)
+    before_merge = lib.index_path.read_bytes()
+    assert await coordinator(pair).merge_records(left.key, right.key) is left
+    assert ledger.latest_generation(left.key) == 3
+    if restore_old_index:
+        lib.index_path.write_bytes(before_merge)
+    extraction_lib = Library(lib.root)
+    paper = extraction_lib.get(left.key)
+    assert paper.reopen_claim.phase == "completed"
+    assert record_generation(paper) == (1 if restore_old_index else 3)
+    body = "Complete fixture paper markdown. " * 30
+    monkeypatch.setattr(extract, "pdf_probe", lambda _: extract.PDFProbe(bad=False, n_pages=1, reason="ok"))
+    async def ocr(*_args, **_kwargs):
+        return body
+    class Controller:
+        async def ensure_ready(self):
+            pass
+        def note_parse_success(self):
+            pass
+    monkeypatch.setattr(extract, "get_server_controller", Controller)
+    monkeypatch.setattr(extract, "extract_mineru", ocr)
+    monkeypatch.setattr(extract, "review_extract", lambda *_args, **_kwargs: {"ok": True})
+    monkeypatch.setattr(extract, "completeness_gate", lambda *_args, **_kwargs: {"complete": True})
+    result = await extract.extract_md(paper, extraction_lib, llm=object())
+    if restore_old_index:
+        assert result is None
+        assert not extraction_lib.has_extract(paper.key, "md")
+        assert paper.md_engine == ""
+    else:
+        assert result == body
+        assert extraction_lib.md_path(paper.key).read_text() == body
+        assert paper.md_engine == "mineru2.5-pro"
 
 
 async def test_alias_restart_and_serialized_second_writer_refusal(pair):

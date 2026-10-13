@@ -380,7 +380,7 @@ class Library:
             if (enabled and paper.terminal_state is None
                     and self._state_v2_fingerprints.get(key) != fingerprint):
                 # Write-through only for a row actually changed since load/save.
-                paper.terminal_state = paper.acquisition_state
+                paper.terminal_state = paper.unquiesced_state
                 fingerprint = hash(paper.model_dump_json())
             records[key] = paper.model_dump()
             fingerprints[key] = fingerprint
@@ -911,6 +911,12 @@ class Library:
         from .merge_v2 import blocked
         if blocked(paper):
             return {}
+        return self._fill_verified_identifiers(paper, doi=doi, arxiv_id=arxiv_id, provenance=provenance)
+
+    def _fill_verified_identifiers(self, paper: Paper, *, doi: str = "",
+                                   arxiv_id: str = "", provenance: dict | None = None) -> dict[str, str]:
+        """Same-row writer shared with fenced staged publication under its lock."""
+        key = paper.key
         self.corrections.stage_fields(paper, {"doi": doi, "arxiv_id": arxiv_id},
                                       operation="verified_identifiers", provenance=provenance)
         incoming = {}
@@ -982,7 +988,7 @@ class Library:
                 existing.source_identities, observations)
         state_observation = incoming.get("terminal_state")
         if state_observation:
-            current_state = existing.acquisition_state
+            current_state = existing.unquiesced_state
             if isinstance(state_observation, dict):
                 # Partial observations do not erase unobserved fields.
                 fields = asdict(current_state)

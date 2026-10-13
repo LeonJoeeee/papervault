@@ -84,7 +84,9 @@ def guard_execution(work):
         with library._merge_execution_lock:
             if blocked(library.get(paper.key) or paper):
                 return None
-            if paper.reopen_claim is None:
+            # Active staged attempts carry a live-ledger capability validated
+            # by ClaimStore; settled claims must obey the ordinary merge fence.
+            if paper.reopen_claim is None or paper.reopen_claim.phase not in {"queued", "dispatched"}:
                 from .claims_v2 import BudgetLedger, LedgerError, record_generation
                 current = library.get(paper.key) or paper
                 try:
@@ -223,7 +225,7 @@ class MergeStore:
         self.library._merge(paper, {k: v for k, v in values.items() if k not in identities})
         if "domain_status" in values:
             observed = project_domain_policy(TerminalState(policy=Policy.CLEAR), values)
-            paper.terminal_state = retain_observed_restrictions(paper.acquisition_state, observed)
+            paper.terminal_state = retain_observed_restrictions(paper.unquiesced_state, observed)
         pending = {**values, **intent.metadata}  # first observed identity value wins
         quarantine = values.get("terminal_state")
         extra_quarantine = (quarantine.get("quarantine") is True if isinstance(quarantine, dict)
@@ -258,8 +260,9 @@ class MergeStore:
         with self.library._merge_execution_lock:
             intent = self._observe(left, intent, metadata)
             for paper in (left, right):
+                # The intent projects an admission quarantine; do not mark
+                # existing dispatched execution as uncertain before it settles.
                 paper.merge_intent = intent
-                paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
             self.library.save(force=True, durable=True)
         return intent
 
@@ -279,7 +282,6 @@ class MergeStore:
             expired = current.model_copy(update={"status": "expired"})
             for paper in papers:
                 paper.merge_intent = expired
-                paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
             self.library.save(force=True, durable=True)
             return False
         keys = (current.canonical_key, current.absorbed_key)
@@ -317,8 +319,8 @@ class MergeStore:
                 if not target.is_file() and source.is_file() and source.stat().st_size:
                     artifacts[kind] = str(source.relative_to(self.library.root))
             state = retain_observed_restrictions(
-                replace(left.acquisition_state, quarantine=intent.canonical_quarantine),
-                replace(right.acquisition_state, quarantine=intent.absorbed_quarantine))
+                replace(left.unquiesced_state, quarantine=left.unquiesced_state.quarantine or intent.canonical_quarantine),
+                replace(right.unquiesced_state, quarantine=right.unquiesced_state.quarantine or intent.absorbed_quarantine))
             event = self.ledger.append_merge(canonical_key, absorbed_key, merge_id=intent.merge_id)
             budget = MergeBudget(merge_id=intent.merge_id, generation=event["generation_after"],
                                  spent=event["spent"], budget=event["budget"])

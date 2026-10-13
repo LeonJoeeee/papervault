@@ -154,6 +154,10 @@ consolidation and preprint/journal promotion persist a paired merge intent,
 refuse new claims on both keys, and wait for queued work, live executors and
 durable campaign claims to drain. Each checkpoint uses the existing library
 write lock; it releases the lock between checkpoints so executors can finish.
+The merge intent projects quarantine for new admission without marking existing
+execution as uncertain. Dispatched campaign results still pass the normal
+generation, lease, policy, identity and budget publication checks and settle their
+claims. Lease-expiry or execution-uncertainty quarantine continues to drop results.
 The default wait is 60 seconds (`MergeStore.quiesce(..., wait_seconds=...)`).
 An expired or uncertain wait stays quarantined and blocked after restart;
 expiry never permits a merge or refunds uncertain consumption. The operator

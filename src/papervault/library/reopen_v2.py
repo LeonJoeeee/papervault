@@ -101,7 +101,7 @@ class StagedAttempt:
         shutil.rmtree(self.root)
 
     def _publication_refusal(self, store, paper, result):
-        state = paper.acquisition_state
+        state = paper.unquiesced_state
         if (state.quarantine or state.retrieval != Retrieval.IN_PROGRESS
                 or state.merge != Merge.CANONICAL or state.alias_key
                 or not effective_policy(state, key=paper.key) or not resolved_identity(paper)
@@ -145,7 +145,9 @@ class StagedAttempt:
             fills = {name: getattr(result, name) for name in ("doi", "arxiv_id")
                      if not getattr(self.before, name) and getattr(result, name)}
             if fills:
-                applied = self.live.fill_verified_identifiers(paper.key, **fills,
+                # The publication fences above authorize only this existing
+                # dispatched result, including same-row verified blank fills.
+                applied = self.live._fill_verified_identifiers(paper, **fills,
                     provenance={"operation": "reopen", "generation": self.token.generation})
                 if applied != fills:
                     store._quarantine(paper, "identity fill refused at publication")

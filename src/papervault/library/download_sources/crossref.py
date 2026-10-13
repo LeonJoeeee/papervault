@@ -6,6 +6,7 @@ from typing import Optional
 import requests
 
 from ..models import Paper
+from ..polite_http import polite_get
 from ._shared import TIMEOUT, USER_AGENT, _is_pdf_bytes
 
 
@@ -28,7 +29,8 @@ def _try_crossref_link(paper: Paper) -> Optional[bytes]:
     email = os.environ.get("UNPAYWALL_EMAIL", "research@example.invalid")
     api = f"https://api.crossref.org/works/{paper.doi}"
     try:
-        meta = requests.get(
+        meta = polite_get(
+            requests.get,
             api, timeout=TIMEOUT,
             headers={"User-Agent": f"paper-library/0.1 (mailto:{email})"},
         ).json()

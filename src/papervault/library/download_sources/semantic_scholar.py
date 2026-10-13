@@ -5,6 +5,7 @@ from typing import Optional
 import requests
 
 from ..models import Paper
+from ..polite_http import polite_get
 from ._shared import BROWSER_HEADERS, TIMEOUT, USER_AGENT, _is_pdf_bytes
 
 
@@ -22,7 +23,7 @@ def _try_semantic_scholar_oa(paper: Paper) -> Optional[bytes]:
         "?fields=openAccessPdf"
     )
     try:
-        r = requests.get(api, timeout=TIMEOUT,
+        r = polite_get(requests.get, api, timeout=TIMEOUT,
                          headers={"User-Agent": USER_AGENT})
         if not r.ok:
             return None

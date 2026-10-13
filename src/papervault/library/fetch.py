@@ -27,6 +27,8 @@ from typing import Optional
 
 import requests
 
+from .polite_http import polite_get
+
 from papervault import config
 from .models import normalize_title
 from .sources.arxiv import search_arxiv
@@ -77,7 +79,8 @@ def _fetch_crossref_by_doi(doi: str) -> Optional[dict]:
     title, year, venue, doi (canonical), authors (truncated), publication_types.
     Returns None on failure / 404."""
     try:
-        r = requests.get(
+        r = polite_get(
+            requests.get,
             f"https://api.crossref.org/works/{doi}",
             timeout=30,
             headers={"User-Agent": _UA},
@@ -145,7 +148,8 @@ def crossref_enrich_lookup(doi: str) -> tuple[str, dict]:
     un-enrichable. ``page`` falls back to ``article-number`` (ApJ/PRD/JHEP use it).
     """
     try:
-        r = requests.get(
+        r = polite_get(
+            requests.get,
             f"https://api.crossref.org/works/{doi}",
             timeout=30,
             headers={"User-Agent": _UA},
@@ -176,7 +180,7 @@ def _fetch_ss_by_doi(doi: str) -> Optional[dict]:
         url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
         params = {"fields": ("title,authors,year,abstract,citationCount,externalIds,"
                              "publicationTypes,venue,publicationVenue,url")}
-        r = requests.get(url, params=params, timeout=30)
+        r = polite_get(requests.get, url, params=params, timeout=30)
         if not r.ok:
             return None
         paper = r.json()
@@ -320,10 +324,10 @@ def fetch_abstract_by_doi(doi: str) -> str:
     try:
         url = f"https://api.openalex.org/works/https://doi.org/{doi}"
         params = {"mailto": config.CONTACT_EMAIL}
-        r = requests.get(url, params=params, timeout=30, headers={"User-Agent": _UA})
+        r = polite_get(requests.get, url, params=params, timeout=30, headers={"User-Agent": _UA})
         if r.status_code in (429, 409):
             time.sleep(2.0)
-            r = requests.get(url, params=params, timeout=30, headers={"User-Agent": _UA})
+            r = polite_get(requests.get, url, params=params, timeout=30, headers={"User-Agent": _UA})
         if r.ok:
             inv = (r.json() or {}).get("abstract_inverted_index") or {}
             if inv:
@@ -372,7 +376,7 @@ def fetch_by_arxiv(arxiv_id: str) -> Optional[dict]:
     # Fallback: also try Semantic Scholar's arxiv prefix
     try:
         url = f"https://api.semanticscholar.org/graph/v1/paper/ARXIV:{base}"
-        r = requests.get(url, timeout=30,
+        r = polite_get(requests.get, url, timeout=30,
                          params={"fields": "title,authors,year,abstract,citationCount,externalIds,venue,url"})
         if r.ok:
             paper = r.json()
@@ -541,7 +545,8 @@ def _crossref_title_candidates(title: str, first_surname: str,
     if first_surname:
         params["query.author"] = first_surname
     try:
-        r = requests.get(
+        r = polite_get(
+            requests.get,
             "https://api.crossref.org/works",
             params=params,
             timeout=30,

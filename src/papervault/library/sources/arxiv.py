@@ -7,6 +7,8 @@ from typing import Any
 
 import requests
 
+from ..polite_http import polite_get
+
 from .exceptions import BackendDegraded
 from .identity import source_identity
 
@@ -52,7 +54,7 @@ def search_arxiv(query: str, max_results: int = 30, *,
     resp = None
     for attempt in range(_MAX_RETRIES):
         try:
-            resp = requests.get(ARXIV_API_URL, params=params, timeout=30)
+            resp = polite_get(requests.get, ARXIV_API_URL, params=params, timeout=30)
         except (requests.exceptions.ConnectionError,
                 requests.exceptions.Timeout):
             time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)

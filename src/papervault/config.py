@@ -48,6 +48,11 @@ def reopen_v2_enabled() -> bool:
     """Opt into bounded campaigns and durable campaign acquisition at use time."""
     return os.environ.get("PAPERVAULT_REOPEN_V2", "").strip().lower() in {"1", "true", "yes"}
 
+
+def polite_v2_enabled() -> bool:
+    """Opt into scope accounting immediately before each migrated API send."""
+    return os.environ.get("PAPERVAULT_POLITE_V2", "").strip().lower() in {"1", "true", "yes"}
+
 # LightRAG's Postgres storage reads POSTGRES_DATABASE (defaulting to 'postgres'), while the
 # ingest ledger reads POSTGRES_DB — leave them unbridged and the knowledge graph's KV/vector/
 # doc_status store silently targets a DIFFERENT database than the ledger. Bridge them: the graph

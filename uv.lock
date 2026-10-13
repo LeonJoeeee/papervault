@@ -2576,7 +2576,7 @@ wheels = [
 
 [[package]]
 name = "papervault"
-version = "0.7.17"
+version = "0.7.18"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },

@@ -54,6 +54,23 @@ instruction text — lives in editable config files (`src/papervault/domain/`). 
 another field means editing those files; quality outside the shipped domain is the adapting
 operator's responsibility.
 
+## Acquisition state v2
+
+`PAPERVAULT_TERMINAL_V2=1` opts into the first acquisition-pipeline v2 slice
+(default off). Acquisition checks retrieval eligibility, canonical identity,
+policy permission, and the independent quarantine marker immediately before
+download dispatch. Lease and budget providers currently admit by default;
+their real machinery and re-open operations belong to later slices.
+
+Legacy dimensions are derived without rewriting the index: `metadata_only` and
+`failed` map to exhausted retrieval, while `ok` and `extract_failed` map to
+acquired retrieval (`ok` becomes verified only with a recorded, labelled extract).
+All cause-unrecorded terminals retain unknown policy and cannot acquire again
+until a separate policy ruling. A status reset or identity backfill alone cannot
+clear that policy. New status writes record dimensions and cause; legacy dimensions
+are persisted only when their record is next changed. Existing artifacts remain
+available through the ordinary serving path.
+
 ## URL identity backfill
 
 For records with a URL but no DOI or arXiv ID, inspect a bounded sample without

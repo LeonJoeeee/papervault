@@ -34,6 +34,7 @@ from urllib.parse import (
 
 import requests as requests
 
+from papervault.config import terminal_v2_enabled
 from papervault.llm_routing import route
 
 from .models import (
@@ -45,6 +46,7 @@ from .models import (
 )
 from .store import Library
 from .download_telemetry import emit, span, trace_download
+from .state_v2 import admitted_budget, resolved_identity, valid_lease
 
 log = logging.getLogger(__name__)
 
@@ -542,7 +544,8 @@ def _prepare_cascade_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
 
 
 @trace_download
-def download_paper(paper: Paper, library: Library) -> bool:
+def download_paper(paper: Paper, library: Library, *, identity_provider=resolved_identity,
+                   lease_provider=valid_lease, budget_provider=admitted_budget) -> bool:
     """Download a single paper's PDF if missing.
 
     Returns True iff a PDF binary was successfully obtained and written to
@@ -558,6 +561,16 @@ def download_paper(paper: Paper, library: Library) -> bool:
 
     Idempotent: if the file exists, returns True without re-fetching.
     """
+    if terminal_v2_enabled():
+        from .services.classify import DOWNLOAD, classify
+        # Queue workers reach this after their network-slot wait; synchronous
+        # batch/correction callers share the same final dispatch recheck.
+        current = library.get(paper.key)
+        if current is None or classify(current, library, identity_provider=identity_provider,
+                                        lease_provider=lease_provider,
+                                        budget_provider=budget_provider) != DOWNLOAD:
+            return False
+        paper = current
     dest = library.pdf_path(paper.key)
     if _settle_arxiv_withdrawal(paper, library):
         return False

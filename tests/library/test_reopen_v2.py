@@ -47,6 +47,51 @@ def test_cli_dry_run_end_to_end_writes_nothing(vault):
     assert tree_bytes(lib.root) == before
 
 
+@pytest.mark.parametrize("override", [False, True], ids=["excluded", "scoped_override"])
+def test_cli_dry_run_and_apply_agree_on_off_domain_policy(vault, monkeypatch, capsys, override):
+    from papervault import ops_guards
+    from papervault.library import download
+    from papervault.library.cli import main
+    lib, paper = vault
+    paper.domain_status = "off_domain"
+    if override:
+        paper.terminal_state = replace(paper.acquisition_state, policy=state_v2.Policy.OVERRIDE,
+            required_revision=4, override=state_v2.PolicyOverride(
+                scope=("acquire",), reasons=("off_domain",), revision=4, key=paper.key))
+    lib.save()
+    expected = [paper.key] if override else []
+    attempted = []
+    def tier(candidate):
+        attempted.append(candidate.key)
+        assert Library(lib.root).get(candidate.key).reopen_claim.phase == "dispatched"
+        return None
+    monkeypatch.setattr(ops_guards, "active_service_units", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(download, "_STRATEGIES", [("fixture", tier)])
+    monkeypatch.setattr(download, "_try_firecrawl_text_fallback", lambda *_: False)
+    args = ["--library-path", str(lib.root), "reopen-campaign", "--cap", "1", "--json"]
+    before = tree_bytes(lib.root)
+    assert main([*args, "--dry-run"]) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["keys"] == expected and preview["selected"] == len(expected)
+    assert tree_bytes(lib.root) == before and attempted == []
+    assert main(args) == 0
+    applied = json.loads(capsys.readouterr().out)
+    assert applied["keys"] == preview["keys"]
+    assert applied["selected"] == preview["selected"]
+    assert applied["completed"] == len(expected) and attempted == expected
+    persisted = Library(lib.root).get(paper.key)
+    if override:
+        assert persisted.reopen_claim.phase == "completed"
+        assert persisted.reopen_claim.generation == 1
+    else:
+        assert persisted.reopen_claim is None
+        assert not (lib.root / "reopen-budget.jsonl").exists()
+    assert persisted.acquisition_state.retrieval == state_v2.Retrieval.EXHAUSTED
+    assert persisted.acquisition_state.policy == (state_v2.Policy.OVERRIDE if override else state_v2.Policy.EXCLUDED)
+    assert persisted.acquisition_state.override == paper.acquisition_state.override
+    assert persisted.domain_status == "off_domain"
+
+
 def test_dry_run_missing_index_never_creates_vault(tmp_path, monkeypatch):
     from papervault.library.cli import main
     monkeypatch.setenv("PAPERVAULT_REOPEN_V2", "1")

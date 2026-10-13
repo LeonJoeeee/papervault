@@ -29,8 +29,12 @@ def _require_enabled():
         raise ValueError("PAPERVAULT_REOPEN_V2 is disabled")
 
 
-def _selection(papers, cap):
-    return sorted((paper for paper in papers if reopenable(paper)), key=lambda paper: paper.key)[:cap]
+def _selection(root, cap):
+    # Both modes inspect the complete snapshot; domain exclusions and scoped
+    # overrides are decided by reopenable(), rather than the library clean view.
+    papers = read_identity_records(Path(root))
+    selected = sorted((paper for paper in papers if reopenable(paper)), key=lambda paper: paper.key)[:cap]
+    return papers, selected
 
 
 def inspect_campaign(root: Path, *, cap: int, clock=time.time) -> dict:
@@ -38,8 +42,7 @@ def inspect_campaign(root: Path, *, cap: int, clock=time.time) -> dict:
     _require_enabled()
     ledger = BudgetLedger(root, clock=clock)
     ledger.check_campaign(cap=cap)
-    papers = read_identity_records(Path(root))
-    selected = _selection(papers, cap)
+    papers, selected = _selection(root, cap)
     if any(p.reopen_claim and p.reopen_claim.phase in {"queued", "dispatched"} for p in papers):
         raise LedgerError("unsettled campaign claims require recovery")
     for paper in selected:
@@ -266,10 +269,9 @@ async def run_campaign(library: Library, *, cap: int, queue=None, clock=time.tim
     store = ClaimStore(library, clock=clock)
     async with store.lock:
         store.ledger.check_campaign(cap=cap)
-        papers = library.all_papers()
+        papers, selected = _selection(library.root, cap)
         if any(p.reopen_claim and p.reopen_claim.phase in {"queued", "dispatched"} for p in papers):
             raise LedgerError("unsettled campaign claims require recovery")
-        selected = _selection(papers, cap)
         if any(concurrency.is_in_flight(f"dl:{p.key}") for p in selected):
             raise LedgerError("duplicate in-flight identity; campaign halted")
         if not selected:

@@ -218,7 +218,8 @@ async def test_metadata_observation_during_quiescence_allows_valid_writeback(pai
     assert left.abstract == "New metadata retained at settlement" and not left.acquisition_state.quarantine
 
 
-async def test_real_campaign_finishes_both_dispatched_results_after_quiescence(pair, monkeypatch):
+@pytest.mark.parametrize("result_kind", ["pdf", "cascade"])
+async def test_real_campaign_finishes_both_dispatched_results_after_quiescence(pair, monkeypatch, result_kind):
     import threading
     from papervault.library.reopen_v2 import run_campaign
     from papervault.library.services import download_queue
@@ -231,7 +232,16 @@ async def test_real_campaign_finishes_both_dispatched_results_after_quiescence(p
         stage.pdf_path(paper.key).write_bytes(b"campaign settled PDF")
         paper.download_status = "ok"
         return True
-    monkeypatch.setattr(download_queue, "download_paper", download)
+    if result_kind == "pdf":
+        monkeypatch.setattr(download_queue, "download_paper", download)
+    else:
+        from papervault.library import download as cascade
+        def tier(paper):
+            started[paper.key].set()
+            assert finish.wait(5), "fixture executor was not released"
+            return None
+        monkeypatch.setattr(cascade, "_STRATEGIES", [("fixture", tier)])
+        monkeypatch.setattr(cascade, "_try_firecrawl_text_fallback", lambda *_: False)
     campaign = asyncio.create_task(run_campaign(lib, cap=2, clock=lambda: now[0]))
     merge = coordinator(pair)
     try:
@@ -248,20 +258,28 @@ async def test_real_campaign_finishes_both_dispatched_results_after_quiescence(p
     assert ledger.outstanding([left.key, right.key]) == []
     assert await merge.drain_ready(intent)
     assert await merge.merge_records(left.key, right.key) is left
-    assert lib.pdf_path(left.key).read_bytes() == b"campaign settled PDF"
+    if result_kind == "pdf":
+        assert lib.pdf_path(left.key).read_bytes() == b"campaign settled PDF"
+    else:
+        assert left.download_status == "failed" and not lib.has_pdf(left.key)
     assert left.merge_budget.generation == 3 and left.merge_budget.spent == 2
     assert lib.get(right.key).acquisition_state.alias_key == left.key
 
 
-@pytest.mark.parametrize("restore_old_index", [False, True], ids=["current", "stale"])
-async def test_completed_claim_extraction_checks_persisted_merge_generation(pair, monkeypatch, restore_old_index):
+@pytest.mark.parametrize("restore_old_index,snapshot_phase", [
+    (False, "completed"), (True, "queued"), (True, "dispatched"), (True, "completed"),
+], ids=["current", "stale-queued", "stale-dispatched", "stale-completed"])
+async def test_extraction_checks_persisted_merge_generation_in_every_claim_phase(pair, monkeypatch, restore_old_index, snapshot_phase):
     from papervault.library import extract
     from papervault.library.claims_v2 import record_generation
     from papervault.library.reopen_v2 import StagedAttempt
     lib, left, right, ledger, _ = pair
     store, tokens = await claims(pair)
+    snapshots = {"queued": lib.index_path.read_bytes()}
     for token in tokens:
         assert await store.pre_dispatch(token)
+    snapshots["dispatched"] = lib.index_path.read_bytes()
+    for token in tokens:
         stage = StagedAttempt(lib, token)
         stage.path("pdf").write_bytes(b"settled PDF for extraction")
         stage.library.get(token.key).download_status = "ok"
@@ -270,14 +288,14 @@ async def test_completed_claim_extraction_checks_persisted_merge_generation(pair
         finally:
             stage.cleanup()
     ledger.finish_campaign(tokens[0].campaign_id, drained=True)
-    before_merge = lib.index_path.read_bytes()
+    snapshots["completed"] = lib.index_path.read_bytes()
     assert await coordinator(pair).merge_records(left.key, right.key) is left
     assert ledger.latest_generation(left.key) == 3
     if restore_old_index:
-        lib.index_path.write_bytes(before_merge)
+        lib.index_path.write_bytes(snapshots[snapshot_phase])
     extraction_lib = Library(lib.root)
     paper = extraction_lib.get(left.key)
-    assert paper.reopen_claim.phase == "completed"
+    assert paper.reopen_claim.phase == (snapshot_phase if restore_old_index else "completed")
     assert record_generation(paper) == (1 if restore_old_index else 3)
     body = "Complete fixture paper markdown. " * 30
     monkeypatch.setattr(extract, "pdf_probe", lambda _: extract.PDFProbe(bad=False, n_pages=1, reason="ok"))

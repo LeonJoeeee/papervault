@@ -83,6 +83,9 @@ class StagedAttempt:
         self.root = library.root / ".reopen-staging" / token.lease_id
         self.root.mkdir(parents=True, exist_ok=False)
         self.library = Library(self.root)
+        # The isolated artifacts do not own accounting. Merge generation
+        # fencing must consult the same durable history as the live executor.
+        self.library._merge_ledger = BudgetLedger(library.root)
         candidate = self.before.model_copy(deep=True)
         candidate.terminal_state = replace(candidate.acquisition_state, retrieval=Retrieval.ELIGIBLE)
         self.library._papers[candidate.key] = candidate

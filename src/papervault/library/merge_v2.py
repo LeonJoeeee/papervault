@@ -84,19 +84,18 @@ def guard_execution(work):
         with library._merge_execution_lock:
             if blocked(library.get(paper.key) or paper):
                 return None
-            # Active staged attempts carry a live-ledger capability validated
-            # by ClaimStore; settled claims must obey the ordinary merge fence.
-            if paper.reopen_claim is None or paper.reopen_claim.phase not in {"queued", "dispatched"}:
-                from .claims_v2 import BudgetLedger, LedgerError, record_generation
-                current = library.get(paper.key) or paper
-                try:
-                    ledger = BudgetLedger(library.root)
-                    owned = (not ledger.merged_into(paper.key)
-                             and ledger.latest_generation(paper.key) == record_generation(current))
-                except LedgerError:
-                    owned = False
-                if not owned:
-                    return None
+            from .claims_v2 import BudgetLedger, LedgerError, record_generation
+            current = library.get(paper.key) or paper
+            try:
+                # Detached campaign staging uses its live vault's ledger;
+                # persisted claim phases never substitute for current ownership.
+                ledger = getattr(library, "_merge_ledger", None) or BudgetLedger(library.root)
+                owned = (not ledger.merged_into(paper.key)
+                         and ledger.latest_generation(paper.key) == record_generation(current))
+            except LedgerError:
+                owned = False
+            if not owned:
+                return None
             library._merge_active[paper.key] = library._merge_active.get(paper.key, 0) + 1
         return True
 

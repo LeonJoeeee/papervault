@@ -22,7 +22,8 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from papervault.config import reopen_v2_enabled
 
-from .state_v2 import Merge, Retrieval, admission, effective_policy, resolved_identity
+from .compat_v2 import BUDGET_LEDGER_FORMAT_VERSION, check_readable, check_versions
+from .state_v2 import Merge, Retrieval, admission, check_index_readable, effective_policy, resolved_identity
 
 MAX_CAMPAIGN_CAP = 200
 WEEK_SECONDS = 7 * 86400
@@ -58,6 +59,7 @@ class BudgetLedger:
             # A removed ledger must never reset budgets or weekly authorization.
             for name in ("index.json", "index.json.bak"):
                 try:
+                    check_index_readable(self.path.parent)
                     index = json.loads((self.path.parent / name).read_text(encoding="utf-8"))
                     if any(row.get("reopen_claim") is not None or row.get("merge_budget") is not None
                            for row in index.get("papers", {}).values()):
@@ -77,8 +79,11 @@ class BudgetLedger:
             aliases, merged_keys = set(), set()
             history = []
             for row in rows:
-                if (not isinstance(row, dict) or type(row.get("version")) is not int or row["version"] != 1
-                        or type(row.get("at")) not in (int, float)
+                if not isinstance(row, dict):
+                    raise ValueError("unsupported ledger format")
+                check_readable(row.get("version"), current_version=BUDGET_LEDGER_FORMAT_VERSION, surface="budget")
+                check_versions(row.get("acquisition_versions", {}))
+                if (type(row.get("at")) not in (int, float)
                         or not math.isfinite(row["at"])):
                     raise ValueError("unsupported ledger format")
                 event = row["event"]
@@ -168,7 +173,8 @@ class BudgetLedger:
             raise LedgerError(f"unreadable budget ledger: {exc}") from exc
 
     def _append(self, event: str, campaign_id: str, **fields) -> None:
-        row = {"version": 1, "event": event, "at": self.clock(),
+        self._read()  # refuse a newer format at the append boundary too
+        row = {"version": BUDGET_LEDGER_FORMAT_VERSION, "event": event, "at": self.clock(),
                "campaign_id": campaign_id, **fields}
         data = (json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n").encode()
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
@@ -407,9 +413,11 @@ class ClaimStore:
         from .services import concurrency
         self.lock = concurrency.lib_write_lock
         self.library, self.clock = library, clock
+        check_index_readable(library.root)
         self.ledger = ledger or BudgetLedger(library.root, clock=clock)
 
     def save(self) -> None:
+        check_index_readable(self.library.root)
         self.library.save(force=True, durable=True)
 
     async def claim(self, key: str, *, expected_state, expected_generation: int,
@@ -419,6 +427,7 @@ class ClaimStore:
         if not math.isfinite(ttl) or ttl <= 0:
             raise ValueError("lease TTL must be positive and finite")
         async with self.lock:
+            check_index_readable(self.library.root)
             paper = self.library.get(key)
             generation = record_generation(paper)
             if (paper is None or paper.acquisition_state != expected_state
@@ -476,6 +485,7 @@ class ClaimStore:
     async def pre_dispatch(self, token: ReopenClaim) -> bool:
         from .telemetry_v2 import admission_denied
         async with self.lock:
+            check_index_readable(self.library.root)
             paper = self.current(token)
             if paper is None:
                 admission_denied(self.library, token, "stale_attempt")
@@ -503,6 +513,7 @@ class ClaimStore:
             return True
 
     def _not_sent(self, paper, token: ReopenClaim) -> bool:
+        check_index_readable(self.library.root)
         if not self.ledger.refund_if_not_sent(token, proven_not_sent=True):
             return False
         paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "not_sent"})
@@ -525,6 +536,7 @@ class ClaimStore:
     async def release_quarantine(self, key: str, *, drained_lease_id: str = "",
                                  human_reason: str = "") -> bool:
         async with self.lock:
+            check_index_readable(self.library.root)
             paper = self.library.get(key)
             if (paper is None or paper.reopen_claim is None or not paper.acquisition_state.quarantine
                     or not (human_reason.strip() or drained_lease_id == paper.reopen_claim.lease_id)):

@@ -12,8 +12,28 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from .compat_v2 import INDEX_FORMAT_VERSION, check_readable, check_versions
+
 if TYPE_CHECKING:
     from .models import Paper
+
+
+def check_index_readable(root) -> None:
+    """Fence v2 entry points using the raw primary/last-good index headers.
+
+    This does not change the legacy index reader or rewrite any fields. Checking
+    before typed records are used also prevents an unsupported v2 field from
+    being treated as a corrupt row and silently omitted by the legacy loader.
+    """
+    from pathlib import Path
+    from .store import Library
+    root = Path(root)
+    data = (Library._read_index_file(root / "index.json")
+            or Library._read_index_file(root / "index.json.bak"))
+    if data is None:
+        return  # absence/corruption remains the existing reader's responsibility
+    check_readable(data.get("version", INDEX_FORMAT_VERSION), surface="index")
+    check_versions(data.get("acquisition_versions", {}))
 
 
 class Retrieval(str, Enum):

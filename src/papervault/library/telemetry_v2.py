@@ -17,8 +17,8 @@ from functools import wraps
 from papervault.config import stoprules_v2_enabled
 
 from .claims_v2 import record_generation
+from .compat_v2 import IDENTITY_VERSION
 
-IDENTITY_VERSION = 2
 log = logging.getLogger(__name__)
 _attempt = ContextVar("pipeline_attempt", default=None)
 _scope = ContextVar("pipeline_request_scope", default=None)

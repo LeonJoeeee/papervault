@@ -36,6 +36,34 @@ def _json(obj) -> None:
 # ------------------------------- handlers ----------------------------------
 
 
+def cmd_reopen_campaign(args) -> int:
+    """Explicit capped maintenance pass; dry-run never constructs a writable store."""
+    import asyncio
+    from papervault import config
+    from .reopen_v2 import inspect_campaign, run_campaign
+    try:
+        if not config.reopen_v2_enabled():
+            raise ValueError("PAPERVAULT_REOPEN_V2 is disabled")
+        root = Path(os.path.expanduser(os.environ.get("PAPERVAULT_VAULT")
+                    or os.environ.get("PAPER_LIBRARY_PATH") or str(config.VAULT_PATH)))
+        if args.dry_run:
+            result = inspect_campaign(root, cap=args.cap)
+        else:
+            from filelock import FileLock
+            from papervault.ops_guards import active_service_units
+            if active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES, strict=True):
+                raise ValueError("papervault.service is running and would overwrite this campaign")
+            # Validate read-only first so invalid caps/accounting cannot create a vault.
+            inspect_campaign(root, cap=args.cap)
+            with FileLock(str(root / ".reopen-campaign.lock"), timeout=0):
+                result = asyncio.run(run_campaign(Library(root), cap=args.cap))
+    except (OSError, ValueError, RuntimeError) as exc:
+        _err(str(exc))
+        return 2
+    _json(result) if args.json else print(f"selected {result['selected']}; completed {result['completed']}")
+    return 0
+
+
 def cmd_identity_backfill(args) -> int:
     """Inspect without filesystem writes; apply through the normal library store."""
     from papervault import config
@@ -1143,6 +1171,12 @@ def build_parser() -> argparse.ArgumentParser:
     pib.add_argument("--acquire", action="store_true", help="run the cascade only on newly recovered rows; requires --apply")
     pib.add_argument("--json", action="store_true", help="emit the recorded JSON accounting")
     pib.set_defaults(func=cmd_identity_backfill)
+
+    prc = sp.add_parser("reopen-campaign", help="run an explicit bounded re-open campaign (v2 opt-in)")
+    prc.add_argument("--cap", type=int, required=True, help="maximum papers in this campaign (1..200)")
+    prc.add_argument("--dry-run", action="store_true", help="select and validate without writes or requests")
+    prc.add_argument("--json", action="store_true", help="emit campaign accounting as JSON")
+    prc.set_defaults(func=cmd_reopen_campaign)
 
     from .services.correction_pipeline import COHORTS, DEFAULT_COHORT_CAP, MAX_SWEEP_CAP, TRIGGERS
     pe = sp.add_parser("correction-event", help="notify a bounded cohort of a correction trigger")

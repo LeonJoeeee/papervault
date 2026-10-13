@@ -12,7 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-from papervault.config import terminal_v2_enabled
+from papervault.config import reopen_v2_enabled, terminal_v2_enabled
 
 from .download_telemetry import enrich, manifest_lock
 from .models import DOWNLOAD_STATUS_PENDING, IdentityRecovery, Paper, base_key, normalize_title
@@ -112,7 +112,7 @@ def _validate_paper_metadata(paper_data: dict) -> tuple[bool, str]:
     return True, ''
 
 
-def _atomic_write(path: Path, text: str) -> None:
+def _atomic_write(path: Path, text: str, *, durable: bool = False) -> None:
     """Durable atomic write: tmp file → fsync(tmp) → rename → fsync(parent).
 
     D14: the rename is atomic so a reader never sees a half-written file, but
@@ -124,6 +124,7 @@ def _atomic_write(path: Path, text: str) -> None:
     directories (rare on the deploy target) degrades to the old behavior rather
     than raising, since the rename itself already gives the reader-atomicity we
     rely on at runtime.
+    ``durable=True`` propagates both fsync failures for campaign claim barriers.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -133,21 +134,25 @@ def _atomic_write(path: Path, text: str) -> None:
         try:
             os.fsync(fh.fileno())
         except OSError:
-            pass
+            if durable:
+                raise
     tmp.replace(path)
-    _fsync_dir(path.parent)
+    _fsync_dir(path.parent, durable=durable)
 
 
-def _fsync_dir(directory: Path) -> None:
+def _fsync_dir(directory: Path, *, durable: bool = False) -> None:
     """fsync a directory so a rename into it is durable (D14). Best-effort."""
     try:
         fd = os.open(str(directory), os.O_RDONLY)
     except OSError:
+        if durable:
+            raise
         return
     try:
         os.fsync(fd)
     except OSError:
-        pass
+        if durable:
+            raise
     finally:
         os.close(fd)
 
@@ -333,7 +338,7 @@ class Library:
         if nt:
             self._by_title[nt] = p.key
 
-    def _save_index(self) -> None:
+    def _save_index(self, *, durable: bool = False) -> None:
         # D14: rotate the current on-disk index into ``.bak`` BEFORE overwriting
         # it, so a known-good copy survives a crash mid-write of the new index.
         # We only rotate a copy that actually parses — never overwrite a good
@@ -363,7 +368,7 @@ class Library:
                 # (do not rotate) and fall back to full validation on the next save.
                 self._rotation_validated = False
         records, fingerprints = {}, {}
-        enabled = terminal_v2_enabled()
+        enabled = terminal_v2_enabled() or reopen_v2_enabled()
         for key, paper in self._papers.items():
             fingerprint = hash(paper.model_dump_json())
             if (enabled and paper.terminal_state is None
@@ -374,7 +379,7 @@ class Library:
             records[key] = paper.model_dump()
             fingerprints[key] = fingerprint
         data = {"version": 1, "papers": records}
-        _atomic_write(self.index_path, json.dumps(data, ensure_ascii=False, indent=2))
+        _atomic_write(self.index_path, json.dumps(data, ensure_ascii=False, indent=2), durable=durable)
         self._state_v2_fingerprints = fingerprints
 
     def _primary_sane(self) -> bool:
@@ -408,7 +413,7 @@ class Library:
                    if p.domain_status is None]
         _atomic_write(self.bib_path, "\n\n".join(entries) + "\n" if entries else "")
 
-    def save(self, *, force: bool = False, lock_timeout: float = 30.0) -> None:
+    def save(self, *, force: bool = False, lock_timeout: float = 30.0, durable: bool = False) -> None:
         """Persist index (+ BibTeX on its own cadence) under a process write lock.
 
         Debounced (issue #34): within ``PAPERVAULT_SAVE_MIN_INTERVAL_S`` (default 5 s)
@@ -422,6 +427,8 @@ class Library:
         The lock prevents two MCP server instances (or pipeline + MCP) from
         racing on index.json. Reads are unsynchronized — they always see a
         fully-written file because writes are atomic (.tmp → rename).
+        Campaign callers pass ``force=True, durable=True`` to bypass debounce and
+        require a stable-storage acknowledgment for the index.
         """
         now = time.monotonic()
         if (not force and self._save_min_interval > 0
@@ -432,7 +439,7 @@ class Library:
         lock_path = self.root / ".write.lock"
         try:
             with FileLock(str(lock_path), timeout=lock_timeout):
-                self._save_index()
+                self._save_index(durable=durable)
                 self._last_index_save = time.monotonic()
                 self._index_dirty = False
                 if force or (now - self._last_bib_save) >= self._bib_min_interval:
@@ -600,8 +607,8 @@ class Library:
             paper_data["download_status"] = DOWNLOAD_STATUS_PENDING
         paper_data.update(retained_inspire_fields(paper_data))
         paper = Paper(**{k: v for k, v in paper_data.items()
-                         if k in Paper.model_fields})
-        if terminal_v2_enabled() and paper.terminal_state is None:
+                         if k in Paper.model_fields and k != "reopen_claim"})
+        if (terminal_v2_enabled() or reopen_v2_enabled()) and paper.terminal_state is None:
             # This is a new ingress observation, not a cause-unrecorded legacy row.
             paper.terminal_state = after_status_write(TerminalState(policy=Policy.CLEAR), paper)
         self._papers[key] = paper
@@ -877,7 +884,7 @@ class Library:
             observed = Paper(key=existing.key, terminal_state=state_observation).terminal_state
             existing.terminal_state = retain_observed_restrictions(current_state, observed)
         for field, value in incoming.items():
-            if field in {"inspire_record_id", "inspire_document_urls", "source_identities", "terminal_state"}:
+            if field in {"inspire_record_id", "inspire_document_urls", "source_identities", "terminal_state", "reopen_claim"}:
                 continue  # source identity and links are merged together above
             if field == "key" or field not in Paper.model_fields:
                 continue                       # never reassign the cite key

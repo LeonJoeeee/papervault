@@ -44,6 +44,8 @@ import logging
 import time
 from typing import Callable, Optional
 
+from papervault.config import reopen_v2_enabled
+
 from ..download import download_paper
 from ..download_telemetry import emit, network_slot, new_run_id, observation, span, utc_now
 from ..models import DOWNLOAD_STATUS_OK, DOWNLOAD_STATUS_PENDING
@@ -128,8 +130,12 @@ class DownloadQueue:
         self._pending: dict[str, int] = {}
         # One fixed-size admission stamp per existing queue tuple, pruned on pop.
         self._queued_timing: dict[int, tuple[str, str, float]] = {}
+        self._queued_claims: dict[int, object] = {}
+        self._pending_claims: dict[str, str] = {}
+        self._reopen_clock = time.time
+        self._reopen_halted: set[str] = set()
 
-    async def start(self) -> None:
+    async def start(self, *, recover: bool = True) -> None:
         """Enqueue every paper needing download and spawn worker tasks.
 
         Recovery criterion: ``status == "pending"`` AND ``not has_pdf``.
@@ -147,7 +153,27 @@ class DownloadQueue:
         self._started = True
 
         recovered = 0
-        for paper in self.library.all_papers():
+        if recover and reopen_v2_enabled():
+            # Reconstruct stop actuators BEFORE any recovered worker can dispatch.
+            # Include domain-excluded rows: they still own uncertain resources.
+            self._reopen_halted.update(
+                paper.reopen_claim.campaign_id
+                for paper in self.library.all_papers(include_quarantined=True)
+                if paper.reopen_claim is not None and (
+                    paper.reopen_claim.phase in {"dispatched", "released"}
+                    or paper.acquisition_state.quarantine))
+        for paper in self.library.all_papers(include_quarantined=reopen_v2_enabled()) if recover else []:
+            if paper.reopen_claim is not None:
+                if reopen_v2_enabled() and paper.reopen_claim.phase in {"queued", "dispatched"}:
+                    from ..claims_v2 import ClaimStore
+                    store = ClaimStore(self.library)
+                    if paper.reopen_claim.phase == "dispatched":
+                        await store.quarantine(paper.reopen_claim, reason="restart without executor drain evidence")
+                    elif not await store.expire(paper.key) and not paper.acquisition_state.quarantine:
+                        self.add_reopen(paper.reopen_claim)
+                continue
+            if paper.domain_status is not None:
+                continue
             if paper.download_status != DOWNLOAD_STATUS_PENDING:
                 continue
             if self.library.has_pdf(paper.key):
@@ -172,6 +198,8 @@ class DownloadQueue:
         await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
         self._pending.clear()  # F7: drop stale in-flight marks (queue is gone)
+        self._pending_claims.clear()
+        self._queued_claims.clear()
         self._started = False
 
     def add(self, key: str, priority: int = concurrency.PRIORITY_NORMAL) -> None:
@@ -210,7 +238,11 @@ class DownloadQueue:
         """
         self._enqueue(key, priority)
 
-    def _enqueue(self, key: str, priority: int) -> None:
+    def add_reopen(self, claim, priority: int = concurrency.PRIORITY_NORMAL) -> None:
+        """Bind a queue entry to its durable generation and lease capability."""
+        self._enqueue(claim.key, priority, claim=claim)
+
+    def _enqueue(self, key: str, priority: int, *, claim=None) -> None:
         # In-flight dedup (F7), priority-aware (R1): a key already waiting in the
         # queue is deduped ONLY for a same-or-lower-priority re-add (lower
         # urgency = larger number). A strictly-MORE-urgent re-add falls through
@@ -218,12 +250,19 @@ class DownloadQueue:
         # the stale lower-prio tuple it leaves behind is dropped at pop time
         # (T1: the worker only processes the first tuple to claim _pending[key]).
         queued = self._pending.get(key)
-        if queued is not None and priority >= queued:
+        paper = self.library.get(key)
+        if claim is None and paper and paper.reopen_claim is not None:
+            return
+        same_claim = claim is None or self._pending_claims.get(key) == claim.lease_id
+        if queued is not None and priority >= queued and same_claim:
             return
         self._pending[key] = priority
         self._seq += 1
         stamp = (new_run_id(), utc_now(), time.monotonic())
         self._queued_timing[self._seq] = stamp
+        if claim is not None:
+            self._queued_claims[self._seq] = claim
+            self._pending_claims[key] = claim.lease_id
         self._queue.put_nowait((priority, self._seq, key))
         with observation(self.library, key, stamp[0]):
             emit("enqueue", at=stamp[1], priority=priority, sequence=self._seq)
@@ -236,6 +275,7 @@ class DownloadQueue:
         while True:
             priority, _seq, key = await self._queue.get()
             stamp = self._queued_timing.pop(_seq, None)
+            claim = self._queued_claims.pop(_seq, None)
             dequeued_at = utc_now()
             # Pop-time dedup (F7/R1/T1): the in-flight ``_pending`` mark is the
             # single source of truth for "this key's queued work is still
@@ -251,13 +291,16 @@ class DownloadQueue:
             # re-run all 18 PDF tiers a second time (T1). A re-add that arrives
             # while we PROCESS this key re-populates ``_pending`` with a fresh
             # tuple and is still honored (bounded by the firecrawl stamp).
-            if self._pending.pop(key, None) is None:
+            expected_claim = self._pending_claims.get(key)
+            stale_claim = expected_claim is not None and (claim is None or claim.lease_id != expected_claim)
+            if stale_claim or self._pending.pop(key, None) is None:
                 with observation(self.library, key, stamp[0] if stamp else None):
                     emit("queue_drop", at=dequeued_at, dequeued_at=dequeued_at,
                          enqueued_at=stamp[1] if stamp else "", sequence=_seq,
                          reason="stale_priority_tuple")
                 self._queue.task_done()
                 continue
+            self._pending_claims.pop(key, None)
             try:
                 with observation(self.library, key, stamp[0] if stamp else None):
                     emit("dequeue", at=dequeued_at, enqueued_at=stamp[1] if stamp else "",
@@ -265,7 +308,10 @@ class DownloadQueue:
                          worker_id=worker_id, priority=priority, sequence=_seq)
                     with span("queue_worker") as terminal:
                         try:
-                            await self._process_one(key, priority)
+                            if claim is None:
+                                await self._process_one(key, priority)
+                            else:
+                                await self._process_one(key, priority, claim=claim)
                         finally:
                             paper = self.library.get(key)
                             terminal["paper_status"] = paper.download_status if paper else "missing"
@@ -280,7 +326,7 @@ class DownloadQueue:
                 self._queue.task_done()
 
     async def _process_one(self, key: str,
-                           priority: int = concurrency.PRIORITY_NORMAL) -> None:
+                           priority: int = concurrency.PRIORITY_NORMAL, *, claim=None) -> None:
         # Cross-actor per-key mutual exclusion (verified drill finding: the
         # pop-time _pending dedup does NOT cover a re-add that arrives WHILE a
         # worker is processing this key — a second worker then runs download_paper
@@ -288,14 +334,24 @@ class DownloadQueue:
         # processing of the same key SUBSCRIBE to the in-flight run instead of
         # running a duplicate. Stage-scoped key ("dl:") so the download and the
         # chained extract stage of the same paper are NOT collapsed together.
+        if claim is not None and concurrency.is_in_flight(f"dl:{key}"):
+            return  # Durable duplicates cannot subscribe to an uncertain executor.
         await concurrency.with_dedup(
-            f"dl:{key}", lambda: self._process_one_inner(key, priority))
+            f"dl:{key}", lambda: self._process_one_inner(key, priority, claim=claim))
 
-    async def _process_one_inner(self, key: str, priority: int) -> None:
+    async def _process_one_inner(self, key: str, priority: int, *, claim=None) -> None:
         paper = self.library.get(key)
         if paper is None:
             log.warning("download queue: %s not in library, dropping", key)
             return
+        if paper.reopen_claim is not None:
+            from ..claims_v2 import same_attempt
+            if claim is not None and reopen_v2_enabled() and same_attempt(paper.reopen_claim, claim):
+                from ..reopen_v2 import process_attempt
+                await process_attempt(self, claim, priority)
+            return
+        if claim is not None:
+            return  # A stale queue capability must never adopt an ordinary row.
         # Idempotence — paper may already have a PDF (concurrent
         # foreground materialize, prior worker, etc.). In that case
         # short-circuit but still forward to the next stage if md is

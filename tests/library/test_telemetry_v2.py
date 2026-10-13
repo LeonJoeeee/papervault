@@ -121,6 +121,57 @@ def test_fail_open_download_never_reports_verified_success(vault, monkeypatch):
     assert not any(r.get("phase") == "verified-success" for r in records(lib))
 
 
+@pytest.mark.parametrize("field,value", [
+    ("arxiv_id", ""), ("arxiv_id", "2601.00002v3"), ("paper_id", "repaired-source-id"),
+    ("inspire_record_id", "456"), ("url", "https://example.org/repaired-route"),
+    ("source", "inspire"), ("doi", "https://doi.org/10.1234/TELEMETRY"),
+])
+def test_canonical_doi_publication_ignores_secondary_identifier_repairs(vault, field, value):
+    from papervault.library.telemetry_v2 import identity_snapshot, publication_fields
+    _, paper = vault
+    paper.arxiv_id = "2601.00001v1"
+    paper.paper_id = "original-source-id"
+    paper.inspire_record_id = "123"
+    paper.url = "https://example.org/original-route"
+    before = identity_snapshot(paper)
+    setattr(paper, field, value)
+    assert publication_fields(before, paper, verified=True) == {
+        "identity_matches": True, "identity_verified": True}
+
+
+def test_canonical_arxiv_publication_normalizes_version_and_ignores_secondary_route(vault):
+    from papervault.library.telemetry_v2 import identity_snapshot, publication_fields
+    _, paper = vault
+    paper.doi = ""
+    paper.arxiv_id = "2601.00001v1"
+    paper.url = "https://example.org/original-route"
+    before = identity_snapshot(paper)
+    paper.arxiv_id = "2601.00001v3"
+    paper.url = "https://example.org/repaired-route"
+    assert publication_fields(before, paper, verified=True)["identity_matches"] is True
+    paper.arxiv_id = "2601.00002"
+    assert publication_fields(before, paper, verified=True)["identity_matches"] is False
+
+
+def test_publication_identity_resolves_persisted_merge_aliases(vault):
+    from dataclasses import replace
+    from papervault.library.state_v2 import Merge
+    from papervault.library.telemetry_v2 import identity_snapshot, publication_fields
+    lib, canonical = vault
+    alias, _ = lib.upsert({"title": "An absorbed record with stale secondary identity",
+                           "doi": "10.1234/absorbed"})
+    alias.terminal_state = replace(alias.acquisition_state, merge=Merge.ALIAS, alias_key=canonical.key)
+    lib.save()
+    lib = Library(lib.root)
+    alias, canonical = lib.get(alias.key), lib.get(canonical.key)
+    before = identity_snapshot(alias, library=lib)
+    assert before == identity_snapshot(canonical)
+    alias.doi = "10.1234/stale"
+    assert publication_fields(before, alias, library=lib, verified=True)["identity_matches"] is True
+    canonical.doi = "10.1234/different"
+    assert publication_fields(before, alias, library=lib, verified=True)["identity_matches"] is False
+
+
 def test_request_denial_records_scope_without_emitting_a_send(vault, monkeypatch):
     from papervault.library import polite_http
     from papervault.library.politeness_v2 import Ledger, Policy, Scope, Window
@@ -189,6 +240,109 @@ async def test_staged_success_is_reported_after_live_fenced_publication(vault, m
     assert success["attempt_generation"] == complete["attempt_generation"] == 1
     assert success["lease_id"] == paper.reopen_claim.lease_id
     assert lib.has_pdf(paper.key)
+
+
+@pytest.mark.parametrize("source", ["openalex", "core"])
+@pytest.mark.parametrize("staged", [False, True])
+async def test_verified_blank_fill_promotes_canonical_identity_without_stop(vault, monkeypatch, source, staged):
+    from papervault.library import download
+    from papervault.library.claims_v2 import BudgetLedger
+    from papervault.library.download_sources.core import _CorePDF
+    from papervault.library.download_sources.openalex import _OpenAlexPDF
+    from papervault.library.reopen_v2 import run_campaign
+    from papervault.library.state_v2 import Policy, Retrieval, TerminalState
+    from papervault.library.stop_rules import evaluate_round
+    lib, paper = vault
+    paper.reopen_claim = None
+    paper.doi = ""
+    paper.arxiv_id = "2601.00001"
+    ledger = BudgetLedger(lib.root)
+    if staged:
+        monkeypatch.setenv("PAPERVAULT_REOPEN_V2", "1")
+        paper.download_status = "failed"
+        paper.terminal_state = TerminalState(retrieval=Retrieval.EXHAUSTED, policy=Policy.CLEAR)
+    else:
+        ledger.start_campaign(cap=1, keys=[paper.key])
+    lib.save()
+    pdf_type = _OpenAlexPDF if source == "openalex" else _CorePDF
+    data = pdf_type(b"%PDF-fixture", "10.1234/adopted", paper.arxiv_id)
+    monkeypatch.setattr(download, "_STRATEGIES", [(source, lambda _: data)])
+    monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (True, "llm_match: fixture"))
+    if staged:
+        await run_campaign(lib, cap=1)
+    else:
+        assert download.download_paper(paper, lib)
+    publications = [event for event in records(lib) if event["event"] in {"downloaded", "reopen_complete"}]
+    assert publications and all(event["identity_matches"] for event in publications)
+    assert paper.doi == "10.1234/adopted"
+    assert len([event for event in records(lib) if event.get("phase") == "verified-success"]) == 1
+    assert await evaluate_round(lib, ledger=ledger) == ()
+    assert not any(event["event"] == "campaign_halt" for event in ledger.events())
+    assert not paper.acquisition_state.quarantine
+
+
+@pytest.mark.parametrize("route", ["preflight", "title", "title_thread"])
+def test_arxiv_adoption_from_url_identity_is_a_clean_publication(vault, monkeypatch, route):
+    from papervault.library import download
+    from papervault.library.download_sources import arxiv
+    from papervault.library.sources import arxiv as arxiv_search
+    lib, paper = vault
+    paper.reopen_claim = None
+    paper.doi = ""
+    paper.url = "https://arxiv.org/abs/2601.00001" if route == "preflight" else "https://example.org/paper"
+    monkeypatch.setattr(arxiv, "_lookup_arxiv_record", lambda identifier: arxiv._ArxivRecord(
+        requested_id=identifier, status="found", latest_id="2601.00001v2"))
+    monkeypatch.setattr(arxiv, "_try_arxiv_with_record", lambda *_: b"%PDF-fixture")
+    monkeypatch.setattr(download, "_try_arxiv_with_record", arxiv._try_arxiv_with_record)
+    monkeypatch.setattr(arxiv_search, "search_arxiv", lambda *_args, **_kwargs: [
+        {"title": paper.title, "arxiv_id": "2601.00001"}])
+    strategy = download._try_arxiv if route == "preflight" else download._try_arxiv_by_title
+    if route == "title_thread":
+        def strategy(candidate):
+            return download._try_concurrent_first_hit(candidate, [("arxiv_title", download._try_arxiv_by_title)])
+    monkeypatch.setattr(download, "_STRATEGIES", [("arxiv", strategy)])
+    monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (True, "llm_match: fixture"))
+    assert download.download_paper(paper, lib)
+    assert paper.arxiv_id == "2601.00001"
+    publication = next(event for event in records(lib) if event["event"] == "downloaded")
+    assert publication["identity_matches"] is True
+    assert any(event.get("phase") == "verified-success" for event in records(lib))
+
+
+def test_acknowledged_fill_can_change_selected_source_namespace(vault, monkeypatch):
+    from papervault.library import download
+    from papervault.library.download_sources.openalex import _OpenAlexPDF
+    lib, paper = vault
+    paper.reopen_claim = None
+    paper.doi = ""
+    paper.inspire_record_id = "123"
+    data = _OpenAlexPDF(b"%PDF-fixture", "", "2601.00001")
+    monkeypatch.setattr(download, "_STRATEGIES", [("openalex", lambda _: data)])
+    monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (True, "llm_match: fixture"))
+    assert download.download_paper(paper, lib)
+    publication = next(event for event in records(lib) if event["event"] == "downloaded")
+    assert paper.arxiv_id == "2601.00001" and paper.inspire_record_id == "123"
+    assert publication["identity_matches"] is True
+
+
+def test_acknowledged_secondary_fill_never_masks_competing_canonical_doi_change(vault, monkeypatch):
+    from papervault.library import download
+    from papervault.library.download_sources.openalex import _OpenAlexPDF
+    lib, paper = vault
+    paper.reopen_claim = None
+    merge = lib._merge
+    def competing_writer(current, incoming, **kwargs):
+        result = merge(current, incoming, **kwargs)
+        current.doi = "10.1234/different"
+        return result
+    monkeypatch.setattr(lib, "_merge", competing_writer)
+    data = _OpenAlexPDF(b"%PDF-fixture", "", "2601.00001")
+    monkeypatch.setattr(download, "_STRATEGIES", [("openalex", lambda _: data)])
+    monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (True, "llm_match: fixture"))
+    assert download.download_paper(paper, lib)
+    publication = next(event for event in records(lib) if event["event"] == "downloaded")
+    assert publication["identity_matches"] is False
+    assert not any(event.get("phase") == "verified-success" for event in records(lib))
 
 
 def test_cancelled_queue_remains_censored_after_real_executor_finishes(vault, monkeypatch):

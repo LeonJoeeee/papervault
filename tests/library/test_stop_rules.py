@@ -3,6 +3,7 @@
 import json
 
 import pytest
+import responses
 
 from papervault.library.claims_v2 import BudgetLedger, ClaimStore
 from papervault.library.politeness_v2 import Ledger, Policy, Scope, Window
@@ -188,6 +189,68 @@ async def test_ordinary_published_mismatch_halts_active_campaign_and_quarantines
     await evaluate_round(library, ledger=ledger, accounting=None)
     assert ledger.campaign_halted(token.campaign_id)
     assert Library(library.root).get(ordinary.key).acquisition_state.quarantine
+
+
+@pytest.mark.parametrize("scenario", ["clean", "secondary_missing", "canonical_changed"])
+@responses.activate
+async def test_verified_doi_pipeline_stops_only_for_canonical_identity_change(
+        campaign, monkeypatch, caplog, scenario):
+    from papervault.library import download
+    from papervault.library.services import concurrency
+    from papervault.library.stop_rules import evaluate_round
+    library, _, ledger, _, now = campaign
+    token = await reserve(campaign)
+    ordinary, _ = library.upsert({"title": "Canonical DOI publication after secondary route repair",
+                                 "doi": "10.1234/ordinary",
+                                 "arxiv_id": "1311.9999v7" if scenario == "secondary_missing" else ""})
+    scope = Scope("doi-fixture")
+    accounting = Ledger({scope: Policy((Window(2, 1), Window(3, 600)), quiet_seconds=30)},
+                        clock=lambda: now[0])
+    monkeypatch.setattr(concurrency, "_vault_path", lambda: library.root)
+    if scenario == "secondary_missing":
+        responses.get("https://arxiv.org/abs/1311.9999", status=404, body='''
+            <html><body><main><div id="content"><h1>Article 1311.9999 not found</h1>
+            <p>There is no record of an article with identifier '1311.9999'.</p>
+            </div></main></body></html>''')
+
+    def doi_download(paper):
+        # The real preflight must clear the secondary ID before the DOI tier.
+        assert paper.arxiv_id == ""
+        ticket = accounting.note_sent(scope)
+        accounting.note_result(ticket, status_code=200)
+        if scenario == "canonical_changed":
+            paper.doi = "10.1234/different"
+        return b"%PDF-fixture"
+
+    monkeypatch.setattr(download, "_STRATEGIES", [("arxiv", download._try_arxiv),
+                                                   ("doi-fixture", doi_download)])
+    monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (True, "llm_match: fixture"))
+    assert download.download_paper(ordinary, library)
+    if scenario == "secondary_missing":
+        assert [call.request.url for call in responses.calls] == ["https://arxiv.org/abs/1311.9999"]
+    events = [json.loads(line) for line in library.manifest_path.read_text().splitlines()]
+    publication = next(event for event in events if event["event"] == "downloaded")
+    mismatch = scenario == "canonical_changed"
+    assert publication["identity_matches"] is not mismatch
+    assert publication["identity_verified"] is True
+    assert any(event.get("phase") == "verified-success" for event in events) is not mismatch
+
+    before = {path.name: path.read_bytes() for path in library.root.glob("*") if path.is_file()}
+    scope_events = accounting.snapshot(scope).events
+    findings = await evaluate_round(library, ledger=ledger, accounting=accounting)
+    if mismatch:
+        assert [finding.rule for finding in findings] == ["identity_mismatched_publication"]
+        assert ledger.campaign_halted(token.campaign_id)
+        assert Library(library.root).get(ordinary.key).acquisition_state.quarantine
+    else:
+        assert findings == ()  # All three detectors run against clean fixture state.
+        assert not ledger.campaign_halted(token.campaign_id)
+        assert not ordinary.acquisition_state.quarantine
+        assert ordinary.doi == "10.1234/ordinary"
+        assert {path.name: path.read_bytes() for path in library.root.glob("*") if path.is_file()} == before
+        assert not any(record.name == "papervault.library.stop_rules" for record in caplog.records)
+    assert accounting.snapshot(scope).events == scope_events
+    assert accounting.snapshot(scope).cooldown_until == 0
 
 
 async def test_ordinary_executor_collision_is_detected_without_merge_flag(campaign, monkeypatch):

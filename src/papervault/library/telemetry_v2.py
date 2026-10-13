@@ -22,6 +22,7 @@ IDENTITY_VERSION = 2
 log = logging.getLogger(__name__)
 _attempt = ContextVar("pipeline_attempt", default=None)
 _scope = ContextVar("pipeline_request_scope", default=None)
+_identity_adoptions = ContextVar("pipeline_identity_adoptions", default=None)
 
 
 @contextmanager
@@ -96,18 +97,66 @@ def duration_fields(phase, elapsed, *, incomplete=False):
     return fields
 
 
-def identity_snapshot(paper):
-    from .identity_v2 import canonical_doi
-    return {"doi": canonical_doi(paper.doi), "arxiv_id": paper.arxiv_id,
-            "paper_id": paper.paper_id, "inspire_record_id": paper.inspire_record_id,
-            "url": paper.url}
+def _identity_fields(paper):
+    return {name: getattr(paper, name) for name in
+            ("doi", "arxiv_id", "inspire_record_id", "paper_id", "source", "url")}
 
 
-def publication_fields(before, paper, *, verified=False):
+def identity_snapshot(paper, *, library=None):
+    """Snapshot the adopted canonical identity, excluding secondary evidence."""
+    from .identity_v2 import select_canonical
+    from .state_v2 import Merge
+    if library is not None and (paper.acquisition_state.merge == Merge.ALIAS
+                                or paper.acquisition_state.alias_key):
+        from .merge_v2 import resolve_alias
+        paper = resolve_alias(library, paper.key)
+        if paper is None:
+            return None
+    # Source observations can contain unadopted/conflicting evidence. Use only
+    # the record's adopted fields, as the in-flight identity detector does.
+    return select_canonical(_identity_fields(paper))
+
+
+def begin_identity_measurement(paper, *, library):
+    before = identity_snapshot(paper, library=library)
+    adoptions = _identity_adoptions.get()
+    if adoptions is not None:
+        adoptions[paper.key] = {"initial": before, "recognized": {before}, "fields": _identity_fields(paper)}
+    return before
+
+
+def adoption_snapshot(paper):
+    return identity_snapshot(paper) if _identity_adoptions.get() is not None else None
+
+
+def acknowledge_identity_adoption(paper, before, fields):
+    """Project acknowledged blank fills; never bless an intervening mismatch."""
+    adoptions = _identity_adoptions.get()
+    if adoptions is None or not fields:
+        return
+    from .download_telemetry import manifest_lock
+    from .identity_v2 import select_canonical
+    with manifest_lock:
+        state = adoptions.get(paper.key)
+        if state is None or before not in state["recognized"]:
+            return
+        expected = state["fields"]
+        for name, value in fields.items():
+            if name in expected and not expected[name]:
+                expected[name] = value
+        state["recognized"].add(select_canonical(expected))
+
+
+def publication_fields(before, paper, *, verified=False, library=None):
     if not stoprules_v2_enabled():
         return {}
-    after = identity_snapshot(paper)
-    return {"identity_matches": all(not value or after[name] == value for name, value in before.items()),
+    adoptions = _identity_adoptions.get()
+    state = adoptions.get(paper.key) if adoptions is not None else None
+    if state is not None and before == state["initial"]:
+        from .identity_v2 import select_canonical
+        before = select_canonical(state["fields"])
+    after = identity_snapshot(paper, library=library)
+    return {"identity_matches": before is None or before == after,
             "identity_verified": verified}
 
 
@@ -156,9 +205,12 @@ def track_execution(work):
                 if active is None:
                     active = owner._stoprule_active = {}
                 active[paper.key] = active.get(paper.key, 0) + 1
+        measurement_token = _identity_adoptions.set({}) if stoprules_v2_enabled() else None
         try:
             return work(paper, library, *args, **kwargs)
         finally:
+            if measurement_token is not None:
+                _identity_adoptions.reset(measurement_token)
             if counted:
                 with owner._merge_execution_lock:
                     remaining = active[paper.key] - 1

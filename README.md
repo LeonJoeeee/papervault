@@ -232,6 +232,11 @@ Named thresholds in `library/stop_rules.py` are zero: duplicate in-flight
 identity halts the campaign; an exceeded quota window cools the scope and halts
 active campaigns; identity-mismatched publication halts its campaign (or active
 campaigns for unclaimed work) and quarantines the current record.
+Publication comparison uses the adopted DOI-first canonical identity and resolves
+merge aliases. Clearing or repairing a secondary identifier or route leaves a
+matching canonical identity intact and does not trigger a stop.
+Verified blank identifier fills keep their existing promotion behavior; the
+comparison advances only for fills acknowledged by the existing writers.
 `SIGNIFICANT_REGRESSION_FRACTION=0.20` defines
 the measurement term; it does not enforce a fourth rule without measurements.
 

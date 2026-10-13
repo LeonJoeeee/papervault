@@ -6,6 +6,7 @@ from typing import Optional
 import requests
 
 from ..models import Paper
+from ..telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
 from ..sources.inspire import (
     API_URL,
     _document_urls,
@@ -47,8 +48,10 @@ def _try_inspire(paper: Paper) -> Optional[bytes]:
                 or not inspire_identity_matches(paper.model_dump(), candidate)):
             return None
         fields = merge_inspire_fields(paper.model_dump(), candidate)
+        before = adoption_snapshot(paper)
         for key, value in fields.items():
             setattr(paper, key, value)
+        acknowledge_identity_adoption(paper, before, fields)
         urls = candidate["inspire_document_urls"]
     elif not recid and (paper.arxiv_id or paper.doi):
         # Preserve the existing identifier query. Older API fixtures/cached
@@ -73,8 +76,10 @@ def _try_inspire(paper: Paper) -> Optional[bytes]:
         fields = merge_inspire_fields(paper.model_dump(), candidate)
         if not fields:
             return None
+        before = adoption_snapshot(paper)
         for key, value in fields.items():
             setattr(paper, key, value)
+        acknowledge_identity_adoption(paper, before, fields)
         urls = candidate["inspire_document_urls"]
     for url in urls:
         try:

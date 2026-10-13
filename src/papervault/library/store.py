@@ -916,6 +916,8 @@ class Library:
     def _fill_verified_identifiers(self, paper: Paper, *, doi: str = "",
                                    arxiv_id: str = "", provenance: dict | None = None) -> dict[str, str]:
         """Same-row writer shared with fenced staged publication under its lock."""
+        from .telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
+        before = adoption_snapshot(paper)
         key = paper.key
         self.corrections.stage_fields(paper, {"doi": doi, "arxiv_id": arxiv_id},
                                       operation="verified_identifiers", provenance=provenance)
@@ -944,6 +946,7 @@ class Library:
             normalized = normalize(value)
             if normalize(current) != normalized and index.get(normalized) == key:
                 index.pop(normalized, None)
+        acknowledge_identity_adoption(paper, before, applied)
         return applied
 
     def export_bibtex(self, keys: Optional[list[str]] = None) -> tuple[str, list[str]]:

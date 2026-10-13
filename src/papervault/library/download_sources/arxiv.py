@@ -246,6 +246,7 @@ def _remember_withdrawal(paper: Paper, record: _ArxivRecord) -> None:
 
 
 def _prepare_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
+    from ..telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
     identifier = _arxiv_input(paper)
     if not identifier:
         return None
@@ -256,7 +257,9 @@ def _prepare_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
         paper.arxiv_id = ""
     elif record.status == "found":
         if not paper.arxiv_id:
+            before = adoption_snapshot(paper)
             paper.arxiv_id = identifier
+            acknowledge_identity_adoption(paper, before, {"arxiv_id": identifier})
         if record.withdrawn:
             _remember_withdrawal(paper, record)
     return record
@@ -374,5 +377,8 @@ def _try_arxiv_by_title(paper: Paper, *, record: Optional[_ArxivRecord] = None) 
         return None
     data = _try_arxiv_with_record(candidate, record)
     if data:
+        from ..telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
+        before = adoption_snapshot(paper)
         paper.arxiv_id = discovered_arxiv_id
+        acknowledge_identity_adoption(paper, before, {"arxiv_id": discovered_arxiv_id})
     return data

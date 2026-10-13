@@ -35,7 +35,8 @@ from urllib.parse import (
 import requests as requests
 
 from papervault.config import terminal_v2_enabled, stoprules_v2_enabled
-from .telemetry_v2 import identity_snapshot, publication_fields, track_execution
+from .telemetry_v2 import (acknowledge_identity_adoption, adoption_snapshot,
+                           begin_identity_measurement, publication_fields, track_execution)
 from papervault.llm_routing import route
 
 from .models import (
@@ -547,8 +548,10 @@ def _prepare_cascade_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
     candidate.arxiv_id = identifier
     record = _prepare_arxiv(candidate)
     if record is not None and record.status == "found":
+        before = adoption_snapshot(paper)
         paper.arxiv_id = candidate.arxiv_id
         paper.arxiv_withdrawal = candidate.arxiv_withdrawal
+        acknowledge_identity_adoption(paper, before, {"arxiv_id": candidate.arxiv_id})
     return record
 
 
@@ -589,7 +592,7 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                 emit("admission-denied", reason="acquisition_guard")
             return False
         paper = current
-    measurement_identity = identity_snapshot(paper) if stoprules_v2_enabled() else None
+    measurement_identity = begin_identity_measurement(paper, library=library) if stoprules_v2_enabled() else None
     dest = library.pdf_path(paper.key)
     if _settle_arxiv_withdrawal(paper, library):
         return False
@@ -713,7 +716,8 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                 library.log({"event": "downloaded", "key": paper.key, "source": source,
                              "member_source": paper.download_source_member,
                              "size": len(data), "verify": verify_reason,
-                             **publication_fields(measurement_identity, paper, verified=positively_verified)})
+                             **publication_fields(measurement_identity, paper, verified=positively_verified,
+                                                  library=library)})
                 return True
             if source == "domain_aggregators":
                 _log_ads_availability(paper, library)

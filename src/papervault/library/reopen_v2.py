@@ -150,6 +150,7 @@ class StagedAttempt:
                     changed[kind] = digest
             fills = {name: getattr(result, name) for name in ("doi", "arxiv_id")
                      if not getattr(self.before, name) and getattr(result, name)}
+            measurement_identity = identity_snapshot(self.before, library=self.live) if stoprules_v2_enabled() else None
             if fills:
                 # The publication fences above authorize only this existing
                 # dispatched result, including same-row verified blank fills.
@@ -158,6 +159,10 @@ class StagedAttempt:
                 if applied != fills:
                     store._quarantine(paper, "identity fill refused at publication")
                     return False
+                if stoprules_v2_enabled():
+                    # Advance only after the fenced writer acknowledges every
+                    # authorized blank fill, preserving existing adoption.
+                    measurement_identity = identity_snapshot(self.before.model_copy(update=applied))
             for kind, digest in changed.items():
                 live_path = getattr(self.live, f"{kind}_path")(paper.key)
                 if digest is None:
@@ -180,8 +185,9 @@ class StagedAttempt:
             store.ledger.complete(self.token)
             self.live.log({"event": "reopen_complete", "key": paper.key,
                            "generation": self.token.generation, "lease_id": self.token.lease_id,
-                           **publication_fields(identity_snapshot(self.before), paper,
-                               verified=getattr(self.library, "_stoprule_identity_verified", False))})
+                           **publication_fields(measurement_identity, paper,
+                               verified=getattr(self.library, "_stoprule_identity_verified", False),
+                               library=self.live)})
             return True
 
 

@@ -47,9 +47,8 @@ class Finding:
 
 def adopted_identity(paper) -> str:
     """Compare already-adopted identities; this never resolves new evidence."""
-    from .identity_v2 import select_canonical
-    identity = select_canonical({name: getattr(paper, name) for name in
-                                 ("doi", "arxiv_id", "inspire_record_id", "paper_id", "source", "url")})
+    from .telemetry_v2 import identity_snapshot
+    identity = identity_snapshot(paper)
     return f"{identity.rung.name.lower()}:{identity.key}" if identity else "key:" + paper.key
 
 

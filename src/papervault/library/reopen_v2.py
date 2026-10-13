@@ -13,7 +13,7 @@ from pathlib import Path
 
 from papervault.config import reopen_v2_enabled
 
-from .claims_v2 import BudgetLedger, ClaimStore, LedgerError, reopenable
+from .claims_v2 import BudgetLedger, ClaimStore, LedgerError, record_generation, reopenable
 from .services import concurrency
 from .services.identity_backfill import read_identity_records
 from .state_v2 import Merge, Retrieval, effective_policy, resolved_identity
@@ -29,11 +29,20 @@ def _require_enabled():
         raise ValueError("PAPERVAULT_REOPEN_V2 is disabled")
 
 
-def _selection(root, cap):
+def _selection(root, cap, ledger):
     # Both modes inspect the complete snapshot; domain exclusions and scoped
     # overrides are decided by reopenable(), rather than the library clean view.
     papers = read_identity_records(Path(root))
-    selected = sorted((paper for paper in papers if reopenable(paper)), key=lambda paper: paper.key)[:cap]
+    eligible = []
+    for paper in papers:
+        if not reopenable(paper):
+            continue
+        if paper.merge_budget is not None:
+            account = ledger.key_budget(paper.key)
+            if account["spent"] >= account["budget"]:
+                continue
+        eligible.append(paper)
+    selected = sorted(eligible, key=lambda paper: paper.key)[:cap]
     return papers, selected
 
 
@@ -42,11 +51,11 @@ def inspect_campaign(root: Path, *, cap: int, clock=time.time) -> dict:
     _require_enabled()
     ledger = BudgetLedger(root, clock=clock)
     ledger.check_campaign(cap=cap)
-    papers, selected = _selection(root, cap)
+    papers, selected = _selection(root, cap, ledger)
     if any(p.reopen_claim and p.reopen_claim.phase in {"queued", "dispatched"} for p in papers):
         raise LedgerError("unsettled campaign claims require recovery")
     for paper in selected:
-        generation = paper.reopen_claim.generation if paper.reopen_claim else 0
+        generation = record_generation(paper)
         if generation != ledger.latest_generation(paper.key):
             raise LedgerError("index generation disagrees with the budget ledger")
     return {"dry_run": True, "cap": cap, "keys": [paper.key for paper in selected],
@@ -74,6 +83,9 @@ class StagedAttempt:
         self.root = library.root / ".reopen-staging" / token.lease_id
         self.root.mkdir(parents=True, exist_ok=False)
         self.library = Library(self.root)
+        # The isolated artifacts do not own accounting. Merge generation
+        # fencing must consult the same durable history as the live executor.
+        self.library._merge_ledger = BudgetLedger(library.root)
         candidate = self.before.model_copy(deep=True)
         candidate.terminal_state = replace(candidate.acquisition_state, retrieval=Retrieval.ELIGIBLE)
         self.library._papers[candidate.key] = candidate
@@ -92,7 +104,7 @@ class StagedAttempt:
         shutil.rmtree(self.root)
 
     def _publication_refusal(self, store, paper, result):
-        state = paper.acquisition_state
+        state = paper.unquiesced_state
         if (state.quarantine or state.retrieval != Retrieval.IN_PROGRESS
                 or state.merge != Merge.CANONICAL or state.alias_key
                 or not effective_policy(state, key=paper.key) or not resolved_identity(paper)
@@ -136,7 +148,9 @@ class StagedAttempt:
             fills = {name: getattr(result, name) for name in ("doi", "arxiv_id")
                      if not getattr(self.before, name) and getattr(result, name)}
             if fills:
-                applied = self.live.fill_verified_identifiers(paper.key, **fills,
+                # The publication fences above authorize only this existing
+                # dispatched result, including same-row verified blank fills.
+                applied = self.live._fill_verified_identifiers(paper, **fills,
                     provenance={"operation": "reopen", "generation": self.token.generation})
                 if applied != fills:
                     store._quarantine(paper, "identity fill refused at publication")
@@ -269,7 +283,7 @@ async def run_campaign(library: Library, *, cap: int, queue=None, clock=time.tim
     store = ClaimStore(library, clock=clock)
     async with store.lock:
         store.ledger.check_campaign(cap=cap)
-        papers, selected = _selection(library.root, cap)
+        papers, selected = _selection(library.root, cap, store.ledger)
         if any(p.reopen_claim and p.reopen_claim.phase in {"queued", "dispatched"} for p in papers):
             raise LedgerError("unsettled campaign claims require recovery")
         if any(concurrency.is_in_flight(f"dl:{p.key}") for p in selected):
@@ -284,7 +298,7 @@ async def run_campaign(library: Library, *, cap: int, queue=None, clock=time.tim
     try:
         for paper in selected:
             token = await store.claim(paper.key, expected_state=paper.acquisition_state,
-                expected_generation=paper.reopen_claim.generation if paper.reopen_claim else 0,
+                expected_generation=record_generation(paper),
                 campaign_id=campaign, ttl=lease_seconds)
             if token is None:
                 raise LedgerError("claim lost; campaign halted")

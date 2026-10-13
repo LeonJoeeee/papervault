@@ -180,7 +180,23 @@ gate_sem = asyncio.Semaphore(_GATE_CONCURRENCY)
 # Library write serialization at the asyncio level. Pairs with the
 # filelock at the filesystem level (which serializes across processes);
 # this lock prevents in-process re-entrancy on Library.save().
-lib_write_lock = asyncio.Lock()
+class LibraryWriteLock(asyncio.Lock):
+    """Track ownership so synchronous consolidation cannot borrow another task's lock."""
+
+    async def acquire(self):
+        result = await super().acquire()
+        self._owner = asyncio.current_task()
+        return result
+
+    def release(self):
+        self._owner = None
+        super().release()
+
+    def owned(self) -> bool:
+        return self.locked() and getattr(self, "_owner", None) is asyncio.current_task()
+
+
+lib_write_lock = LibraryWriteLock()
 
 
 # ---------- Per-key in-flight registry ----------

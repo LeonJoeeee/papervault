@@ -58,6 +58,7 @@ from .models import (
     Paper,
 )
 from .store import Library
+from .merge_v2 import guard_execution
 
 # Below this many chars an extraction's text is treated as essentially blank —
 # the engine produced nothing readable (a refused / blank rendering), a CLARITY
@@ -564,6 +565,7 @@ def _save_md(paper: Paper, library: Library, engine: str, text: str) -> None:
 # ------------------------- main entry point --------------------------------
 
 
+@guard_execution
 async def extract_md(paper: Paper, library: Library, *,
                      force: bool = False,
                      llm=None,

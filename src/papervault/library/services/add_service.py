@@ -155,6 +155,11 @@ class AddService:
         else:
             assert existing is not None
             paper, was_new = existing, False
+        from ..merge_v2 import blocked
+        if blocked(paper):
+            return {"status": "blocked", "key": paper.key,
+                    "metadata": _paper_metadata_dict(paper, self.library), "candidates": None,
+                    "message": "identity consolidation is blocked; drain or operator recovery is required"}
         if not was_new and not force_refresh and _is_complete(paper):
             self.library.save()
             return self._exists_response(paper)

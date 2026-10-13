@@ -149,6 +149,34 @@ campaign executor is drained/fenced, `BudgetLedger.finish_campaign(...,
 drained=True)` records closure. These are single-writer operations, matching the
 existing process model in `services/concurrency.py`; they are not scheduler tasks.
 
+`PAPERVAULT_MERGE_V2=1` opts into slice 5 (default off). Duplicate identity
+consolidation and preprint/journal promotion persist a paired merge intent,
+refuse new claims on both keys, and wait for queued work, live executors and
+durable campaign claims to drain. Each checkpoint uses the existing library
+write lock; it releases the lock between checkpoints so executors can finish.
+The merge intent projects quarantine for new admission without marking existing
+execution as uncertain. Dispatched campaign results still pass the normal
+generation, lease, policy, identity and budget publication checks and settle their
+claims. Lease-expiry or execution-uncertainty quarantine continues to drop results.
+The default wait is 60 seconds (`MergeStore.quiesce(..., wait_seconds=...)`).
+An expired or uncertain wait stays quarantined and blocked after restart;
+expiry never permits a merge or refunds uncertain consumption. The operator
+or orchestrator must decide recovery explicitly.
+
+The canonical record retains the union of restrictions, intersection of grants,
+and source observations. The absorbed record remains an alias; `resolve_alias`
+returns its canonical record. Existing artifacts remain in this vault and are
+read through retained paths. `reopen-budget.jsonl` receives an explicit `merge`
+event with both keys, generations before/after and drain evidence, before the
+index is saved. Spent budgets sum, ceilings take the minimum of the affected
+keys' campaign caps (the standing 200-paper cap for keys with no history), and
+generations re-sequence to their sum plus one. A ledger/index disagreement fails
+closed and requires operator repair; an uncertain commit is never replayed.
+Disabling the flag retains fences on persisted intents and merged records.
+Plain metadata fills use their existing path; untouched legacy rows gain no
+merge fields. Standalone synchronous consolidations use the same write lock;
+runtime callers must own it on the server's event loop.
+
 `PAPERVAULT_POLITE_V2=1` opts into slice 4 (default off). API sends for Wiley,
 Crossref, Unpaywall, Semantic Scholar, OpenAlex and arXiv share one process ledger
 per service, combining credentials, IPs and endpoints conservatively. Every

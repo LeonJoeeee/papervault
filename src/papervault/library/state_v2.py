@@ -233,17 +233,23 @@ def valid_lease(paper: Paper, *, lease_id: str = "", now: float | None = None) -
 
 def admitted_budget(paper: Paper, *, library=None) -> bool:
     """Campaign consumption must be readable in the independent durable ledger."""
-    from papervault.config import reopen_v2_enabled
-    from .claims_v2 import BudgetLedger, LedgerError
+    from papervault.config import merge_v2_enabled, reopen_v2_enabled
+    from .claims_v2 import BudgetLedger, LedgerError, record_generation
     if paper.reopen_claim is None:
-        if not reopen_v2_enabled():
+        if not reopen_v2_enabled() and not merge_v2_enabled() and paper.merge_budget is None:
             return True
         if library is None or getattr(library, "root", None) is None:
             return False
         try:
             # Index rollback cannot turn a campaign-owned generation into
             # ordinary in-memory work. Initial/no-history normal keys still admit.
-            return BudgetLedger(library.root).latest_generation(paper.key) == 0
+            ledger = BudgetLedger(library.root)
+            if ledger.merged_into(paper.key) or ledger.latest_generation(paper.key) != record_generation(paper):
+                return False
+            if paper.merge_budget is not None:
+                account = ledger.key_budget(paper.key)
+                return account["spent"] < account["budget"]
+            return True
         except LedgerError:
             return False
     return bool(reopen_v2_enabled() and library is not None

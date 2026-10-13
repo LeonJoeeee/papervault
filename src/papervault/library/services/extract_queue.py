@@ -96,6 +96,7 @@ class ExtractQueue:
                 no-op. Tests may still pass a stub to observe completion.
         """
         self.library = library
+        library._merge_queues.add(self)
         self._on_success = on_success
         # PriorityQueue items: (priority, seq, key). See concurrency.PRIORITY_*.
         self._queue: asyncio.PriorityQueue = asyncio.PriorityQueue()
@@ -218,6 +219,9 @@ class ExtractQueue:
         self._enqueue(key, priority)
 
     def _enqueue(self, key: str, priority: int) -> None:
+        from ..merge_v2 import blocked
+        if blocked(self.library.get(key)):
+            return
         # In-flight dedup (F7), priority-aware (R1): a still-waiting key is
         # deduped ONLY for a same-or-lower-priority re-add (larger number = less
         # urgent). A strictly-more-urgent re-add falls through to a fresh
@@ -323,6 +327,9 @@ class ExtractQueue:
 
     async def _process_one_inner(self, key: str, priority: int) -> None:
         paper = self.library.get(key)
+        from ..merge_v2 import blocked
+        if blocked(paper):
+            return
         if paper is None:
             log.warning("extract queue: %s not in library, dropping", key)
             return

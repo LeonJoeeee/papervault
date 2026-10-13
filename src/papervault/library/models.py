@@ -4,15 +4,17 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import replace
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_serializer
 
-from papervault.config import identity_v2_enabled, reopen_v2_enabled, terminal_v2_enabled
+from papervault.config import identity_v2_enabled, merge_v2_enabled, reopen_v2_enabled, terminal_v2_enabled
 
 from .state_v2 import TerminalState, after_status_write, derive_legacy, project_domain_policy
 from .identity_v2 import CorrespondenceDecision, RouteRejection
 from .claims_v2 import ReopenClaim
+from .merge_v2 import MergeBudget, MergeIntent
 
 # Forward ref: Paper.insight is Optional[Insight], retained as a
 # read-only field after Phase 28 (route B). The schema lives in
@@ -364,13 +366,26 @@ class Paper(BaseModel):
     terminal_state: Optional[TerminalState] = None
     # Worker-owned; absent legacy rows retain exactly their original serialization.
     reopen_claim: Optional[ReopenClaim] = None
+    merge_intent: Optional[MergeIntent] = None
+    merge_budget: Optional[MergeBudget] = None
+
+    @property
+    def unquiesced_state(self) -> TerminalState:
+        """Acquisition dimensions without the merge-intent admission fence.
+
+        Execution uncertainty remains quarantined here. A merge intent blocks
+        new work through acquisition_state, but permits existing work to settle.
+        """
+        if self.terminal_state is not None:
+            return (project_domain_policy(self.terminal_state, self)
+                     if identity_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled()
+                     else self.terminal_state)
+        return derive_legacy(self, include_domain=identity_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled())
 
     @property
     def acquisition_state(self) -> TerminalState:
-        if self.terminal_state is not None:
-            return (project_domain_policy(self.terminal_state, self) if identity_v2_enabled() or reopen_v2_enabled()
-                    else self.terminal_state)
-        return derive_legacy(self, include_domain=identity_v2_enabled() or reopen_v2_enabled())
+        state = self.unquiesced_state
+        return replace(state, quarantine=True) if self.merge_intent is not None else state
 
     def __setattr__(self, name, value):
         # All status writers share this boundary, including CLI and tier helpers.
@@ -378,8 +393,8 @@ class Paper(BaseModel):
         # retrieval must never silently resolve its unknown policy.
         # Already-observed fields stay consistent while the kill switch is off.
         synchronize = name == "download_status" and (
-            self.terminal_state is not None or terminal_v2_enabled() or reopen_v2_enabled())
-        state = self.acquisition_state if synchronize else None
+            self.terminal_state is not None or terminal_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled())
+        state = self.unquiesced_state if synchronize else None
         super().__setattr__(name, value)
         if state is not None:
             super().__setattr__("terminal_state", after_status_write(state, self))
@@ -391,6 +406,10 @@ class Paper(BaseModel):
             record.pop("terminal_state", None)
         if self.reopen_claim is None:
             record.pop("reopen_claim", None)
+        if self.merge_intent is None:
+            record.pop("merge_intent", None)
+        if self.merge_budget is None:
+            record.pop("merge_budget", None)
         if not self.identity_route_rejections:
             record.pop("identity_route_rejections", None)
         return record

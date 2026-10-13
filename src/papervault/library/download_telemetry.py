@@ -87,6 +87,8 @@ def emit(phase: str, mark: str = "point", **fields) -> None:
 
 
 def enrich(event: dict, library) -> dict:
+    from .telemetry_v2 import enrich_event
+    event = enrich_event(event, library)
     current = _current.get()
     if (current is None or current.library is not library
             or event.get("key") != current.key or event.get("event") == "download_telemetry"):
@@ -124,8 +126,9 @@ def span(phase: str, *, source: str = "", member: str = ""):
     finally:
         ended_at = utc_now()
         duration = max(0.0, time.monotonic() - state.clock)
+        from .telemetry_v2 import duration_fields
         emit(phase, "end", **common, ended_at=ended_at, duration_s=duration,
-             status=status, **fields)
+             status=status, **duration_fields(phase, duration, incomplete=status != "ok"), **fields)
         if slot_token is not None:
             _slot.reset(slot_token)
         _span.reset(token)

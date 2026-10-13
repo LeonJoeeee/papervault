@@ -114,7 +114,12 @@ class BudgetLedger:
                     if sum(row["at"] - WEEK_SECONDS < item["at"] <= row["at"]
                            for item in campaigns.values()) >= 3:
                         raise ValueError("weekly authorization exceeded")
-                    campaigns[campaign] = {**row, "finished": False, "count": 0}
+                    campaigns[campaign] = {**row, "finished": False, "halted": False, "count": 0}
+                elif event == "campaign_halt":
+                    if (campaign not in campaigns or campaigns[campaign]["halted"]
+                            or not isinstance(row.get("reason"), str) or not row["reason"].strip()):
+                        raise ValueError("invalid campaign halt")
+                    campaigns[campaign]["halted"] = True
                 elif event == "campaign_finish":
                     if campaign not in campaigns or campaigns[campaign]["finished"]:
                         raise ValueError("invalid campaign finish")
@@ -127,7 +132,7 @@ class BudgetLedger:
                     if event == "reserve":
                         authorization = campaigns[campaign]
                         account = _key_budget(history, token.key)
-                        if (identifier in reservations or authorization["finished"]
+                        if (identifier in reservations or authorization["finished"] or authorization["halted"]
                                 or token.key not in authorization["keys"]
                                 or authorization["count"] >= authorization["cap"]
                                 or token.key in aliases or token.generation <= account["generation"]
@@ -150,6 +155,8 @@ class BudgetLedger:
                                    "complete": {"dispatch"}}
                         if previous not in allowed[event]:
                             raise ValueError("invalid reservation transition")
+                        if event == "dispatch" and campaigns[campaign]["halted"]:
+                            raise ValueError("dispatch after campaign halt")
                         if event == "refund" and row.get("proven_not_sent") is not True:
                             raise ValueError("refund without proof")
                         phases[identifier] = event
@@ -210,6 +217,27 @@ class BudgetLedger:
         with _ledger_lock:
             return _key_budget(self._read(), key)["generation"]
 
+    def halt_campaign(self, campaign_id: str, reason: str) -> None:
+        """Stop new work durably; this supplies no executor drain or refund proof."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("campaign halt requires a reason")
+        with _ledger_lock:
+            rows = self._read()
+            if not any(r["event"] == "campaign_start" and r["campaign_id"] == campaign_id for r in rows):
+                raise LedgerError("unknown campaign")
+            if not any(r["event"] == "campaign_halt" and r["campaign_id"] == campaign_id for r in rows):
+                self._append("campaign_halt", campaign_id, reason=reason)
+
+    def campaign_halted(self, campaign_id: str) -> bool:
+        with _ledger_lock:
+            return any(r["event"] == "campaign_halt" and r["campaign_id"] == campaign_id
+                       for r in self._read())
+
+    def events(self) -> tuple[dict, ...]:
+        """One locked replay for an entire round; callers own the detached rows."""
+        with _ledger_lock:
+            return tuple(self._read())
+
     def key_budget(self, key: str) -> dict[str, int]:
         """Campaign caps supply the conservative ceiling; merges retain ancestry."""
         with _ledger_lock:
@@ -261,7 +289,7 @@ class BudgetLedger:
                     or self.merged_into(token.key)
                     or (any(r["event"] == "merge" and r["canonical_key"] == token.key for r in rows)
                         and _key_budget(rows, token.key)["spent"] >= _key_budget(rows, token.key)["budget"])
-                    or any(row["campaign_id"] == token.campaign_id and row["event"] == "campaign_finish"
+                    or any(row["campaign_id"] == token.campaign_id and row["event"] in {"campaign_finish", "campaign_halt"}
                            for row in rows)):
                 raise LedgerError("paper refused by campaign budget")
             self._append("reserve", token.campaign_id, claim=token.model_dump(),
@@ -270,7 +298,9 @@ class BudgetLedger:
     def admitted(self, token: ReopenClaim) -> bool:
         try:
             with _ledger_lock:
-                return (self.phase(token) in {"reserve", "dispatch"}
+                phase = self.phase(token)
+                return (phase in {"reserve", "dispatch"}
+                        and (phase == "dispatch" or not self.campaign_halted(token.campaign_id))
                         and token.generation == self.latest_generation(token.key)
                         and any(same_attempt(ReopenClaim.model_validate(row["claim"]), token)
                                 for row in self._read() if row["event"] == "reserve"))
@@ -287,7 +317,15 @@ class BudgetLedger:
         if proven_not_sent is not True:
             return False
         with _ledger_lock:
-            if not self.admitted(token):
+            # Halt denies admission, not proof-based settlement of queued work.
+            try:
+                valid = (self.phase(token) in {"reserve", "dispatch"}
+                         and token.generation == self.latest_generation(token.key)
+                         and any(same_attempt(ReopenClaim.model_validate(r["claim"]), token)
+                                 for r in self._read() if r["event"] == "reserve"))
+            except LedgerError:
+                return False
+            if not valid:
                 return False
             self._append("refund", token.campaign_id, claim=token.model_dump(), proven_not_sent=True)
             return True
@@ -416,7 +454,7 @@ class ClaimStore:
         paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
         self.save()
         self.library.log({"event": "reopen_quarantine", "key": paper.key, "reason": reason,
-                          "generation": paper.reopen_claim.generation})
+                          "generation": record_generation(paper)})
 
     async def quarantine(self, token: ReopenClaim, *, reason: str) -> None:
         async with self.lock:
@@ -436,20 +474,26 @@ class ClaimStore:
             return True
 
     async def pre_dispatch(self, token: ReopenClaim) -> bool:
+        from .telemetry_v2 import admission_denied
         async with self.lock:
             paper = self.current(token)
             if paper is None:
+                admission_denied(self.library, token, "stale_attempt")
                 return False
             phase = self.ledger.phase(token)  # Corruption raises; no request/refund.
             if paper.reopen_claim.phase not in {"queued", "dispatched"}:
+                admission_denied(self.library, token, "settled_attempt")
                 return False
             if paper.reopen_claim.phase == "dispatched" or phase == "dispatch":
                 self._quarantine(paper, "dispatch outcome uncertain; refusing replay")
+                admission_denied(self.library, token, "uncertain_dispatch")
                 return False
             if self.clock() >= paper.reopen_claim.lease_expiry:
                 self._quarantine(paper, "lease expired before dispatch")
+                admission_denied(self.library, token, "expired_lease")
                 return False
             if not self.allowed(token):
+                admission_denied(self.library, token, "acquisition_guard")
                 self._not_sent(paper, token)
                 return False
             self.ledger.dispatch(token)

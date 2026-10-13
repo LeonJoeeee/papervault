@@ -8,16 +8,18 @@ import hashlib
 import os
 import shutil
 import time
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 
-from papervault.config import reopen_v2_enabled
+from papervault.config import reopen_v2_enabled, stoprules_v2_enabled
 
 from .claims_v2 import BudgetLedger, ClaimStore, LedgerError, record_generation, reopenable
 from .services import concurrency
 from .services.identity_backfill import read_identity_records
 from .state_v2 import Merge, Retrieval, effective_policy, resolved_identity
 from .store import Library, _fsync_dir
+from .telemetry_v2 import identity_snapshot, publication_fields, record_censored
 
 _IDENTITY_FIELDS = {"key", "doi", "arxiv_id", "paper_id", "inspire_record_id", "url", "title", "authors", "year"}
 _RESULT_FIELDS = {"download_source", "download_source_member", "ads_availability", "arxiv_withdrawal",
@@ -83,6 +85,7 @@ class StagedAttempt:
         self.root = library.root / ".reopen-staging" / token.lease_id
         self.root.mkdir(parents=True, exist_ok=False)
         self.library = Library(self.root)
+        self.library._telemetry_live = library
         # The isolated artifacts do not own accounting. Merge generation
         # fencing must consult the same durable history as the live executor.
         self.library._merge_ledger = BudgetLedger(library.root)
@@ -176,20 +179,23 @@ class StagedAttempt:
             store.save()
             store.ledger.complete(self.token)
             self.live.log({"event": "reopen_complete", "key": paper.key,
-                           "generation": self.token.generation, "lease_id": self.token.lease_id})
+                           "generation": self.token.generation, "lease_id": self.token.lease_id,
+                           **publication_fields(identity_snapshot(self.before), paper,
+                               verified=getattr(self.library, "_stoprule_identity_verified", False))})
             return True
 
 
 async def process_attempt(queue, token, priority):
     """Recheck after the slot wait, then stage execution and fence publication."""
     from .state_v2 import valid_lease
-    from .download_telemetry import network_slot
+    from .download_telemetry import network_slot, span
     from .services import download_queue
 
     store = ClaimStore(queue.library, clock=queue._reopen_clock)
     stage = None
     drained = False
     expiry = None
+    drain_started = None
     try:
         async with network_slot(concurrency.network_sem, queue.library, token.key):
             if token.campaign_id in queue._reopen_halted:
@@ -202,15 +208,17 @@ async def process_attempt(queue, token, priority):
                 await asyncio.sleep(max(0, token.lease_expiry - store.clock()))
                 if await store.expire(token.key, token=token):
                     queue._reopen_halted.add(token.campaign_id)
+                    record_censored(queue.library, token.key, reason="lease expired without executor drain evidence")
             expiry = asyncio.create_task(watch_lease())
             def execute():
                 # Scheduling may outlast the async recheck. This last read emits
                 # no upstream call if the current claim ceased to admit.
                 if token.campaign_id in queue._reopen_halted or not store.allowed(token, executing=True):
                     return False
-                download_queue.download_paper(stage.library.get(token.key), stage.library,
-                    lease_provider=lambda p: valid_lease(p, lease_id=token.lease_id, now=store.clock()),
-                    budget_provider=lambda p: store.ledger.admitted(token))
+                with span("executor") if stoprules_v2_enabled() else nullcontext():
+                    download_queue.download_paper(stage.library.get(token.key), stage.library,
+                        lease_provider=lambda p: valid_lease(p, lease_id=token.lease_id, now=store.clock()),
+                        budget_provider=lambda p: store.ledger.admitted(token))
                 return True
             context = contextvars.copy_context()
             executor = asyncio.get_running_loop().run_in_executor(None, context.run, execute)
@@ -226,6 +234,9 @@ async def process_attempt(queue, token, priority):
                     # still consumes it. Quarantine promptly, then await real
                     # drain, including repeated cancellation during shutdown.
                     cancelled = True
+                    if stoprules_v2_enabled() and drain_started is None:
+                        drain_started = time.monotonic()
+                        record_censored(queue.library, token.key, reason="cancelled executor awaiting drain")
                     queue._reopen_halted.add(token.campaign_id)
                     quarantine = asyncio.create_task(store.quarantine(token, reason="cancelled executor awaiting drain"))
                     while not quarantine.done():
@@ -265,9 +276,14 @@ async def process_attempt(queue, token, priority):
             queue._reopen_halted.add(token.campaign_id)
     except BaseException:
         queue._reopen_halted.add(token.campaign_id)
+        record_censored(queue.library, token.key, reason="executor/publication outcome uncertain")
         await store.quarantine(token, reason="executor/publication outcome uncertain")
         raise
     finally:
+        if drain_started is not None and drained:
+            queue.library.log({"event": "download_telemetry", "key": token.key,
+                               "phase": "executor_drain", "mark": "end",
+                               "drain_s": max(0.0, time.monotonic() - drain_started)})
         if expiry is not None:
             expiry.cancel()
             await asyncio.gather(expiry, return_exceptions=True)
@@ -306,6 +322,9 @@ async def run_campaign(library: Library, *, cap: int, queue=None, clock=time.tim
             queue.add_reopen(token)
         await queue.start(recover=False)
         await queue._queue.join()
+        if stoprules_v2_enabled():
+            from .stop_rules import evaluate_round
+            await evaluate_round(library, ledger=store.ledger)
         if any(store.current(t) is None or store.current(t).reopen_claim.phase not in {"completed", "not_sent", "released"}
                for t in tokens):
             raise LedgerError("campaign has uncertain attempts; drain/fencing recovery required")

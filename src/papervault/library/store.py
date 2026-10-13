@@ -1098,9 +1098,17 @@ class Library:
         for an unmet prerequisite, without a network attempt. Reconcile
         counts paper routes from status/disk facts, not these tier events.
         """
+        from papervault.config import stoprules_v2_enabled
+        if stoprules_v2_enabled() and hasattr(self, "_telemetry_live"):
+            # Preserve staged observations in the live manifest, with an
+            # explicit stage marker; they are not live publication evidence.
+            self._telemetry_live.log({**enrich(event, self), "staged": True})
+            return
         line = json.dumps(enrich(event, self), ensure_ascii=False)
         with manifest_lock, self.manifest_path.open("a") as f:
             f.write(line + "\n")
+        from .telemetry_v2 import observe_publication
+        observe_publication(event, self)
 
     # ----- file paths -----
 

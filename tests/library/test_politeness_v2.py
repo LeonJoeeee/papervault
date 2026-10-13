@@ -280,3 +280,25 @@ def test_clock_reversal_and_nonfinite_time_fail_closed():
         clock.now = bad
         with pytest.raises(ValueError):
             ledger.note_sent(SCOPE)
+
+
+def test_explicit_cooldown_keeps_tickets_windows_and_stops_resume_ramp():
+    from papervault.library.politeness_v2 import Envelope, Ledger, Scope, Window
+    now = [10.0]
+    scope = Scope("fixture")
+    envelope = Envelope((Window(10, 1),), (Window(2, 1),), (Window(5, 1),),
+                        "fixture authority", quiet_seconds=30)
+    ledger = Ledger({scope: envelope}, clock=lambda: now[0])
+    ticket = ledger.note_sent(scope)
+    ledger.enter_cooldown(scope, "quota_window_violation")
+    snapshot = ledger.snapshot(scope)
+    assert snapshot.sent == 1 and snapshot.in_flight == 1
+    assert snapshot.cooldown_until == 40.0 and snapshot.windows == (Window(2, 1),)
+    assert snapshot.events[-1].kind == "quota_window_violation"
+    assert ledger.gate(scope).reason == "cooldown"
+    ledger.note_result(ticket, status_code=200)
+    now[0] = 40.0
+    assert ledger.gate(scope).allowed
+    assert ledger.snapshot(scope).events[-1].kind == "resume"
+    now[0] += 86400
+    assert not ledger.increase(scope, (Window(3, 1),))

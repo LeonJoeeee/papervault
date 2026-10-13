@@ -232,3 +232,78 @@ async def test_quarantine_release_preserves_independent_retrieval(machinery, ret
     assert await store.release_quarantine(paper.key, human_reason="owner fenced executor")
     assert paper.acquisition_state == replace(before, quarantine=False)
     assert paper.download_status == status
+
+
+async def test_halt_survives_replay_blocks_new_work_but_preserves_inflight(machinery):
+    from papervault.library.claims_v2 import BudgetLedger, LedgerError, ReopenClaim
+    lib, paper, ledger, store, now = machinery
+    token = await claim_one(machinery)
+    assert await store.pre_dispatch(token)
+    ledger.halt_campaign(token.campaign_id, "duplicate_inflight_identity")
+    before = ledger.path.read_bytes()
+    ledger.halt_campaign(token.campaign_id, "duplicate_inflight_identity")
+    assert ledger.path.read_bytes() == before
+    replay = BudgetLedger(lib.root, clock=lambda: now[0])
+    assert replay.campaign_halted(token.campaign_id)
+    assert replay.admitted(token)  # existing execution/publication keeps its semantics
+    assert replay.spent(token.campaign_id) == 1
+    assert replay.outstanding([paper.key]) == [token]
+    with pytest.raises(LedgerError):
+        replay.reserve(ReopenClaim(key=paper.key, generation=2, lease_id="new-lease",
+                                   lease_expiry=now[0] + 60, campaign_id=token.campaign_id))
+    with pytest.raises(LedgerError, match="active"):
+        replay.check_campaign(cap=1)
+    replay.complete(token)
+    assert replay.phase(token) == "complete" and replay.spent(token.campaign_id) == 1
+    replay.finish_campaign(token.campaign_id, drained=True)
+    assert replay.campaign_halted(token.campaign_id)
+
+
+async def test_halted_queued_claim_cannot_dispatch_but_can_prove_not_sent(machinery):
+    from papervault.library.claims_v2 import LedgerError
+    _, paper, ledger, store, _ = machinery
+    token = await claim_one(machinery)
+    ledger.halt_campaign(token.campaign_id, "quota_window_violation")
+    assert not ledger.admitted(token)
+    with pytest.raises(LedgerError):
+        ledger.dispatch(token)
+    assert not await store.pre_dispatch(token)
+    assert paper.reopen_claim.phase == "not_sent"
+    assert ledger.spent(token.campaign_id) == 0
+    assert not ledger.refund_if_not_sent(token, proven_not_sent=True)
+
+
+@pytest.mark.parametrize("event", ["reserve", "dispatch"])
+async def test_replay_rejects_work_appended_after_halt(machinery, event):
+    from papervault.library.claims_v2 import LedgerError
+    _, _, ledger, _, now = machinery
+    token = await claim_one(machinery)
+    ledger.halt_campaign(token.campaign_id, "stop")
+    forged = {"version": 1, "event": event, "at": now[0],
+              "campaign_id": token.campaign_id, "claim": token.model_dump()}
+    if event == "reserve":
+        forged["claim"].update(generation=2, lease_id="second")
+    with ledger.path.open("a") as stream:
+        stream.write(json.dumps(forged) + "\n")
+    with pytest.raises(LedgerError):
+        ledger.spent(token.campaign_id)
+
+
+async def test_halt_refuses_unknown_campaign_and_empty_reason(machinery):
+    from papervault.library.claims_v2 import LedgerError
+    _, _, ledger, _, _ = machinery
+    token = await claim_one(machinery)
+    before = ledger.path.read_bytes()
+    with pytest.raises(LedgerError):
+        ledger.halt_campaign("unknown", "stop")
+    with pytest.raises(ValueError):
+        ledger.halt_campaign(token.campaign_id, " ")
+    assert ledger.path.read_bytes() == before
+
+
+async def test_unreadable_refund_accounting_keeps_original_noop_behavior(machinery):
+    _, _, ledger, _, _ = machinery
+    token = await claim_one(machinery)
+    ledger.path.write_bytes(b"{}")
+    assert not ledger.refund_if_not_sent(token, proven_not_sent=True)
+    assert ledger.path.read_bytes() == b"{}"

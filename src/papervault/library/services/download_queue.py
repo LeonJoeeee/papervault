@@ -44,12 +44,13 @@ import logging
 import time
 from typing import Callable, Optional
 
-from papervault.config import reopen_v2_enabled
+from papervault.config import reopen_v2_enabled, stoprules_v2_enabled
 
 from ..download import download_paper
 from ..download_telemetry import emit, network_slot, new_run_id, observation, span, utc_now
 from ..models import DOWNLOAD_STATUS_OK, DOWNLOAD_STATUS_PENDING
 from ..store import Library
+from ..telemetry_v2 import attempt, record_censored
 from . import concurrency
 
 log = logging.getLogger("papervault.library.download_queue")
@@ -268,7 +269,7 @@ class DownloadQueue:
             self._queued_claims[self._seq] = claim
             self._pending_claims[key] = claim.lease_id
         self._queue.put_nowait((priority, self._seq, key))
-        with observation(self.library, key, stamp[0]):
+        with attempt(claim), observation(self.library, key, stamp[0]):
             emit("enqueue", at=stamp[1], priority=priority, sequence=self._seq)
 
     def qsize(self) -> int:
@@ -298,7 +299,7 @@ class DownloadQueue:
             expected_claim = self._pending_claims.get(key)
             stale_claim = expected_claim is not None and (claim is None or claim.lease_id != expected_claim)
             if stale_claim or self._pending.pop(key, None) is None:
-                with observation(self.library, key, stamp[0] if stamp else None):
+                with attempt(claim), observation(self.library, key, stamp[0] if stamp else None):
                     emit("queue_drop", at=dequeued_at, dequeued_at=dequeued_at,
                          enqueued_at=stamp[1] if stamp else "", sequence=_seq,
                          reason="stale_priority_tuple")
@@ -306,10 +307,15 @@ class DownloadQueue:
                 continue
             self._pending_claims.pop(key, None)
             try:
-                with observation(self.library, key, stamp[0] if stamp else None):
+                with attempt(claim), observation(self.library, key, stamp[0] if stamp else None):
+                    if stoprules_v2_enabled():
+                        from ..stop_rules import evaluate_round
+                        await evaluate_round(self.library)
                     emit("dequeue", at=dequeued_at, enqueued_at=stamp[1] if stamp else "",
                          queue_wait_s=max(0.0, time.monotonic() - stamp[2]) if stamp else None,
-                         worker_id=worker_id, priority=priority, sequence=_seq)
+                         worker_id=worker_id, priority=priority, sequence=_seq,
+                         **({"wait_s": max(0.0, time.monotonic() - stamp[2]) if stamp else None}
+                            if stoprules_v2_enabled() else {}))
                     with span("queue_worker") as terminal:
                         try:
                             if claim is None:
@@ -319,9 +325,16 @@ class DownloadQueue:
                         finally:
                             paper = self.library.get(key)
                             terminal["paper_status"] = paper.download_status if paper else "missing"
+                    if stoprules_v2_enabled():
+                        from ..stop_rules import evaluate_round
+                        await evaluate_round(self.library)
             except asyncio.CancelledError:
+                with attempt(claim):
+                    record_censored(self.library, key, reason="queue awaiter cancelled without terminal evidence")
                 raise
             except Exception:
+                with attempt(claim):
+                    record_censored(self.library, key, reason="queue attempt outcome uncertain")
                 log.exception(
                     "download worker %d crashed processing %s",
                     worker_id, key,
@@ -339,6 +352,11 @@ class DownloadQueue:
         # running a duplicate. Stage-scoped key ("dl:") so the download and the
         # chained extract stage of the same paper are NOT collapsed together.
         if claim is not None and concurrency.is_in_flight(f"dl:{key}"):
+            if stoprules_v2_enabled():
+                from ..stop_rules import evaluate_round
+                await evaluate_round(self.library)
+                with attempt(claim), observation(self.library, key):
+                    emit("admission-denied", reason="duplicate_queue_capability")
             return  # Durable duplicates cannot subscribe to an uncertain executor.
         await concurrency.with_dedup(
             f"dl:{key}", lambda: self._process_one_inner(key, priority, claim=claim))

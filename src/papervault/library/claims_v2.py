@@ -454,7 +454,7 @@ class ClaimStore:
         paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
         self.save()
         self.library.log({"event": "reopen_quarantine", "key": paper.key, "reason": reason,
-                          "generation": record_generation(paper)})
+                          "generation": paper.reopen_claim.generation if paper.reopen_claim else record_generation(paper)})
 
     async def quarantine(self, token: ReopenClaim, *, reason: str) -> None:
         async with self.lock:

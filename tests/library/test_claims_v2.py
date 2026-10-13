@@ -307,3 +307,15 @@ async def test_unreadable_refund_accounting_keeps_original_noop_behavior(machine
     ledger.path.write_bytes(b"{}")
     assert not ledger.refund_if_not_sent(token, proven_not_sent=True)
     assert ledger.path.read_bytes() == b"{}"
+
+
+async def test_quarantine_keeps_existing_claim_event_generation_when_flag_off(machinery, monkeypatch):
+    from papervault.library.merge_v2 import MergeBudget
+    lib, paper, _, store, _ = machinery
+    monkeypatch.delenv("PAPERVAULT_STOPRULES_V2", raising=False)
+    token = await claim_one(machinery)
+    paper.merge_budget = MergeBudget(merge_id="fixture-merge", generation=9, spent=1, budget=2)
+    await store.quarantine(token, reason="existing claim fence")
+    event = json.loads(lib.manifest_path.read_text().splitlines()[-1])
+    assert event == {"event": "reopen_quarantine", "key": paper.key,
+                     "reason": "existing claim fence", "generation": 1}

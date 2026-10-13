@@ -1,4 +1,4 @@
-"""Campaign-only durable claims and append-only budgets (spec A3).
+"""Durable campaign claims and append-only merge accounting (spec A3).
 
 Record mutations use the existing async library write-lock. Like concurrency.py,
 this assumes one library writer process; standalone campaigns refuse a live
@@ -59,7 +59,8 @@ class BudgetLedger:
             for name in ("index.json", "index.json.bak"):
                 try:
                     index = json.loads((self.path.parent / name).read_text(encoding="utf-8"))
-                    if any(row.get("reopen_claim") is not None for row in index.get("papers", {}).values()):
+                    if any(row.get("reopen_claim") is not None or row.get("merge_budget") is not None
+                           for row in index.get("papers", {}).values()):
                         raise LedgerError("budget ledger missing for persisted claims")
                 except FileNotFoundError:
                     continue
@@ -73,6 +74,8 @@ class BudgetLedger:
                 raise ValueError("empty or truncated ledger")
             rows = [json.loads(line) for line in raw.splitlines()]
             campaigns, reservations, phases = {}, {}, {}
+            aliases, merged_keys = set(), set()
+            history = []
             for row in rows:
                 if (not isinstance(row, dict) or type(row.get("version")) is not int or row["version"] != 1
                         or type(row.get("at")) not in (int, float)
@@ -82,7 +85,26 @@ class BudgetLedger:
                 campaign = row["campaign_id"]
                 if not isinstance(campaign, str) or not campaign:
                     raise ValueError("missing campaign")
-                if event == "campaign_start":
+                if event == "merge":
+                    left, right = row["canonical_key"], row["absorbed_key"]
+                    if (not isinstance(left, str) or not left or not isinstance(right, str) or not right
+                            or left == right or left in aliases or right in aliases
+                            or not isinstance(row.get("merge_id"), str) or not row["merge_id"]
+                            or campaign != "merge:" + row["merge_id"]
+                            or any(r.get("merge_id") == row["merge_id"] for r in history)):
+                        raise ValueError("invalid merge identity")
+                    before = [_key_budget(history, key) for key in (left, right)]
+                    if (row["generations_before"] != [a["generation"] for a in before]
+                            or type(row["generation_after"]) is not int
+                            or row["generation_after"] != sum(a["generation"] for a in before) + 1
+                            or type(row["spent"]) is not int or row["spent"] != sum(a["spent"] for a in before)
+                            or type(row["budget"]) is not int or row["budget"] != min(a["budget"] for a in before)
+                            or row.get("drain_evidence") != {"claims": "settled", "queue": "drained", "executors": "drained"}
+                            or _outstanding(history, (left, right))):
+                        raise ValueError("merge without conservative accounting or drain evidence")
+                    aliases.add(right)
+                    merged_keys.add(left)
+                elif event == "campaign_start":
                     if (campaign in campaigns or type(row["cap"]) is not int
                             or not 1 <= row["cap"] <= MAX_CAMPAIGN_CAP
                             or not isinstance(row["keys"], list)
@@ -104,9 +126,12 @@ class BudgetLedger:
                     identifier = token.lease_id
                     if event == "reserve":
                         authorization = campaigns[campaign]
+                        account = _key_budget(history, token.key)
                         if (identifier in reservations or authorization["finished"]
                                 or token.key not in authorization["keys"]
                                 or authorization["count"] >= authorization["cap"]
+                                or token.key in aliases or token.generation <= account["generation"]
+                                or (token.key in merged_keys and account["spent"] >= account["budget"])
                                 or any(r.key == token.key and r.generation >= token.generation
                                        for r in reservations.values())):
                             raise ValueError("invalid reservation")
@@ -130,6 +155,7 @@ class BudgetLedger:
                         phases[identifier] = event
                 else:
                     raise ValueError("unknown ledger event")
+                history.append(row)
             return rows
         except (ValueError, KeyError, TypeError) as exc:
             raise LedgerError(f"unreadable budget ledger: {exc}") from exc
@@ -182,8 +208,38 @@ class BudgetLedger:
 
     def latest_generation(self, key: str) -> int:
         with _ledger_lock:
-            return max((row["claim"]["generation"] for row in self._read()
-                        if "claim" in row and row["claim"]["key"] == key), default=0)
+            return _key_budget(self._read(), key)["generation"]
+
+    def key_budget(self, key: str) -> dict[str, int]:
+        """Campaign caps supply the conservative ceiling; merges retain ancestry."""
+        with _ledger_lock:
+            return _key_budget(self._read(), key)
+
+    def outstanding(self, keys) -> list[ReopenClaim]:
+        with _ledger_lock:
+            return _outstanding(self._read(), keys)
+
+    def merged_into(self, key: str) -> str:
+        with _ledger_lock:
+            return next((r["canonical_key"] for r in self._read()
+                         if r["event"] == "merge" and r["absorbed_key"] == key), "")
+
+    def append_merge(self, canonical_key: str, absorbed_key: str, *, merge_id: str) -> dict:
+        """Append before index publication; an uncertain index write never replays it."""
+        with _ledger_lock:
+            rows = self._read()
+            if (canonical_key == absorbed_key or self.merged_into(canonical_key)
+                    or self.merged_into(absorbed_key) or _outstanding(rows, (canonical_key, absorbed_key))
+                    or any(r.get("merge_id") == merge_id for r in rows)):
+                raise LedgerError("merge already committed or claims have not drained")
+            before = [_key_budget(rows, key) for key in (canonical_key, absorbed_key)]
+            fields = dict(merge_id=merge_id, canonical_key=canonical_key, absorbed_key=absorbed_key,
+                          generations_before=[a["generation"] for a in before],
+                          generation_after=sum(a["generation"] for a in before) + 1,
+                          spent=sum(a["spent"] for a in before), budget=min(a["budget"] for a in before),
+                          drain_evidence={"claims": "settled", "queue": "drained", "executors": "drained"})
+            self._append("merge", "merge:" + merge_id, **fields)
+            return fields
 
     def phase(self, token: ReopenClaim) -> str:
         with _ledger_lock:
@@ -202,6 +258,9 @@ class BudgetLedger:
             count = sum(row["campaign_id"] == token.campaign_id and row["event"] == "reserve" for row in rows)
             if (start is None or token.key not in start["keys"] or count >= start["cap"]
                     or token.generation <= self.latest_generation(token.key)
+                    or self.merged_into(token.key)
+                    or (any(r["event"] == "merge" and r["canonical_key"] == token.key for r in rows)
+                        and _key_budget(rows, token.key)["spent"] >= _key_budget(rows, token.key)["budget"])
                     or any(row["campaign_id"] == token.campaign_id and row["event"] == "campaign_finish"
                            for row in rows)):
                 raise LedgerError("paper refused by campaign budget")
@@ -257,9 +316,49 @@ def same_attempt(left: ReopenClaim | None, right: ReopenClaim) -> bool:
                             for field in ("key", "generation", "lease_id", "campaign_id", "scope")))
 
 
+def record_generation(paper) -> int:
+    if paper is None:
+        return 0
+    return max(paper.reopen_claim.generation if paper.reopen_claim else 0,
+               paper.merge_budget.generation if paper.merge_budget else 0)
+
+
+def _key_budget(rows, key: str) -> dict[str, int]:
+    account = {"spent": 0, "budget": MAX_CAMPAIGN_CAP, "generation": 0}
+    for row in rows:
+        event = row["event"]
+        if event == "campaign_start" and key in row["keys"]:
+            account["budget"] = min(account["budget"], row["cap"])
+        if "claim" in row and row["claim"]["key"] == key:
+            account["generation"] = max(account["generation"], row["claim"]["generation"])
+            if event == "reserve":
+                account["spent"] += 1
+            elif event == "refund":
+                account["spent"] -= 1
+        if event == "merge" and key in (row["canonical_key"], row["absorbed_key"]):
+            account = {"spent": row["spent"], "budget": row["budget"], "generation": row["generation_after"]}
+    return account
+
+
+def _outstanding(rows, keys) -> list[ReopenClaim]:
+    pending = {}
+    for row in rows:
+        claim = row.get("claim")
+        if not claim or claim["key"] not in keys:
+            continue
+        if row["event"] == "reserve":
+            pending[claim["lease_id"]] = ReopenClaim.model_validate(claim)
+        elif row["event"] in {"refund", "complete"}:
+            pending.pop(claim["lease_id"], None)
+        elif row["event"] == "fence":
+            pending = {lease: token for lease, token in pending.items()
+                       if token.key != claim["key"] or token.generation >= claim["generation"]}
+    return list(pending.values())
+
+
 def reopenable(paper) -> bool:
     state = paper.acquisition_state
-    return (state.retrieval == Retrieval.EXHAUSTED and not state.quarantine
+    return (paper.merge_intent is None and state.retrieval == Retrieval.EXHAUSTED and not state.quarantine
             and state.merge == Merge.CANONICAL and not state.alias_key
             and effective_policy(state, key=paper.key) and resolved_identity(paper)
             and (paper.reopen_claim is None or paper.reopen_claim.phase in {"completed", "not_sent", "released"}))
@@ -283,7 +382,7 @@ class ClaimStore:
             raise ValueError("lease TTL must be positive and finite")
         async with self.lock:
             paper = self.library.get(key)
-            generation = paper.reopen_claim.generation if paper and paper.reopen_claim else 0
+            generation = record_generation(paper)
             if (paper is None or paper.acquisition_state != expected_state
                     or generation != expected_generation or not reopenable(paper)
                     or generation != self.ledger.latest_generation(key)):

@@ -47,6 +47,7 @@ from .models import (
 from .store import Library
 from .download_telemetry import emit, span, trace_download
 from .state_v2 import admitted_budget, resolved_identity, valid_lease
+from .merge_v2 import guard_execution
 from papervault.config import reopen_v2_enabled
 
 log = logging.getLogger(__name__)
@@ -544,6 +545,7 @@ def _prepare_cascade_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
     return record
 
 
+@guard_execution
 @trace_download
 def download_paper(paper: Paper, library: Library, *, identity_provider=resolved_identity,
                    lease_provider=valid_lease, budget_provider=admitted_budget) -> bool:
@@ -564,7 +566,8 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
     """
     if paper.reopen_claim is not None and (not reopen_v2_enabled() or lease_provider is valid_lease):
         return False  # Persisted campaign ownership survives the kill switch.
-    if terminal_v2_enabled() or reopen_v2_enabled():
+    from papervault.config import merge_v2_enabled
+    if terminal_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled() or paper.merge_budget is not None:
         from .services.classify import DOWNLOAD, classify
         # Queue workers reach this after their network-slot wait; synchronous
         # batch/correction callers share the same final dispatch recheck.

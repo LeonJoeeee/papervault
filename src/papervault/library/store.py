@@ -12,7 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
-from papervault.config import reopen_v2_enabled, terminal_v2_enabled
+from papervault.config import merge_v2_enabled, reopen_v2_enabled, terminal_v2_enabled
 
 from .download_telemetry import enrich, manifest_lock
 from .models import DOWNLOAD_STATUS_PENDING, IdentityRecovery, Paper, base_key, normalize_title
@@ -210,6 +210,11 @@ class Library:
     """A directory holding library.bib + index.json + pdfs/ + extracts/."""
 
     def __init__(self, root: Optional[str | Path] = None):
+        import threading
+        import weakref
+        self._merge_execution_lock = threading.RLock()
+        self._merge_active: dict[str, int] = {}
+        self._merge_queues = weakref.WeakSet()
         # Vault root = the library's on-disk store. Read the env LIVE at construction
         # (not the import-frozen config value) so a runtime override — e.g. the CLI's
         # --library-path, which sets PAPER_LIBRARY_PATH — is honored. config.VAULT_PATH
@@ -330,13 +335,14 @@ class Library:
             self.log({"event": "index_load_skipped_records", "count": bad})
 
     def _reindex(self, p: Paper) -> None:
+        key = (p.acquisition_state.alias_key or p.key) if merge_v2_enabled() or p.merge_budget else p.key
         if p.doi:
-            self._by_doi[p.doi.lower()] = p.key
+            self._by_doi[p.doi.lower()] = key
         if p.arxiv_id:
-            self._by_arxiv[_normalize_arxiv(p.arxiv_id)] = p.key
+            self._by_arxiv[_normalize_arxiv(p.arxiv_id)] = key
         nt = normalize_title(p.title)
         if nt:
-            self._by_title[nt] = p.key
+            self._by_title[nt] = key
 
     def _save_index(self, *, durable: bool = False) -> None:
         # D14: rotate the current on-disk index into ``.bak`` BEFORE overwriting
@@ -368,7 +374,7 @@ class Library:
                 # (do not rotate) and fall back to full validation on the next save.
                 self._rotation_validated = False
         records, fingerprints = {}, {}
-        enabled = terminal_v2_enabled() or reopen_v2_enabled()
+        enabled = terminal_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled()
         for key, paper in self._papers.items():
             fingerprint = hash(paper.model_dump_json())
             if (enabled and paper.terminal_state is None
@@ -456,15 +462,18 @@ class Library:
         if doi:
             k = self._by_doi.get(doi.lower())
             if k:
-                return self._papers[k]
+                from .merge_v2 import resolve_alias
+                return resolve_alias(self, k) if merge_v2_enabled() or self._papers[k].merge_budget else self._papers[k]
         if arxiv_id:
             k = self._by_arxiv.get(_normalize_arxiv(arxiv_id))
             if k:
-                return self._papers[k]
+                from .merge_v2 import resolve_alias
+                return resolve_alias(self, k) if merge_v2_enabled() or self._papers[k].merge_budget else self._papers[k]
         if title:
             k = self._by_title.get(normalize_title(title))
             if k:
-                return self._papers[k]
+                from .merge_v2 import resolve_alias
+                return resolve_alias(self, k) if merge_v2_enabled() or self._papers[k].merge_budget else self._papers[k]
         return None
 
     def get(self, key: str) -> Optional[Paper]:
@@ -479,7 +488,8 @@ class Library:
         dedup/persistence, which use ``self._papers`` directly anyway)."""
         if include_quarantined:
             return list(self._papers.values())
-        return [p for p in self._papers.values() if p.domain_status is None]
+        return [p for p in self._papers.values() if p.domain_status is None
+                and not ((merge_v2_enabled() or p.merge_budget) and p.acquisition_state.alias_key)]
 
     def keys(self) -> list[str]:
         return list(self._papers.keys())
@@ -549,6 +559,9 @@ class Library:
             title=paper_data.get("title", "") or "",
         )
         if existing:
+            consolidated = self._consolidate_identity(existing, paper_data)
+            if consolidated is not None:
+                return consolidated, False
             updated = self._merge(existing, paper_data)
             self._papers[existing.key] = updated
             self._reindex(updated)
@@ -557,6 +570,9 @@ class Library:
         # Step 4: fuzzy preprint ↔ journal merge (D7).
         fuzzy_existing = self._find_preprint_journal_dup(paper_data)
         if fuzzy_existing is not None:
+            consolidated = self._consolidate_identity(fuzzy_existing, paper_data, fuzzy=True)
+            if consolidated is not None:
+                return consolidated, False
             updated = self._merge(fuzzy_existing, paper_data)
             self._papers[fuzzy_existing.key] = updated
             self._reindex(updated)
@@ -607,13 +623,72 @@ class Library:
             paper_data["download_status"] = DOWNLOAD_STATUS_PENDING
         paper_data.update(retained_inspire_fields(paper_data))
         paper = Paper(**{k: v for k, v in paper_data.items()
-                         if k in Paper.model_fields and k != "reopen_claim"})
-        if (terminal_v2_enabled() or reopen_v2_enabled()) and paper.terminal_state is None:
+                         if k in Paper.model_fields and k not in {"reopen_claim", "merge_intent", "merge_budget"}})
+        if (terminal_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled()) and paper.terminal_state is None:
             # This is a new ingress observation, not a cause-unrecorded legacy row.
             paper.terminal_state = after_status_write(TerminalState(policy=Policy.CLEAR), paper)
         self._papers[key] = paper
         self._reindex(paper)
         return paper, True
+
+    def _consolidate_identity(self, existing: Paper, incoming: dict, *, fuzzy=False):
+        """Only stored twins/cross-identifier promotion take the new drain barrier."""
+        if existing.merge_intent and not merge_v2_enabled():
+            return existing
+        if not merge_v2_enabled():
+            return None
+        from .merge_v2 import MergeStore, resolve_alias, write_locked
+        if existing.merge_intent:
+            intent = existing.merge_intent
+            return write_locked(lambda: MergeStore(self)._merge_records(
+                intent.canonical_key, intent.absorbed_key, metadata=incoming)) or existing
+        twin = None
+        for value, index, normalize in ((incoming.get("doi"), self._by_doi, str.lower),
+                                        (incoming.get("arxiv_id"), self._by_arxiv, _normalize_arxiv)):
+            if value:
+                other = resolve_alias(self, index.get(normalize(value), ""))
+                if other and other.key != existing.key and not other.acquisition_state.alias_key:
+                    twin = other
+                    break
+        source_key = incoming.get("key")
+        if twin is None and source_key and source_key != existing.key:
+            other = resolve_alias(self, source_key)
+            if other and not other.acquisition_state.alias_key:
+                twin = other
+        promoting = fuzzy or any(incoming.get(name) and not getattr(existing, name)
+                                 for name in ("doi", "arxiv_id"))
+        if twin is None and not promoting:
+            return None
+
+        def consolidate():
+            nonlocal twin
+            merger = MergeStore(self)
+            if existing.merge_intent:
+                intent = existing.merge_intent
+                return merger._merge_records(intent.canonical_key, intent.absorbed_key, metadata=incoming) or existing
+            if merger._can_quiesce(existing.key) is None:
+                return existing
+            if twin is not None and (merger._can_quiesce(twin.key) is None or twin.merge_intent is not None):
+                return existing
+            if twin is None and all(not incoming.get(name) or normalize(incoming[name]) == normalize(getattr(existing, name))
+                                    for name, normalize in (("doi", str.lower), ("arxiv_id", _normalize_arxiv))):
+                self._merge(existing, incoming)
+                self._reindex(existing)
+                return existing
+            if twin is None:
+                # Persist the second observation before quiescing, so deferred
+                # promotions survive restart and have two auditable source keys.
+                payload = {k: v for k, v in incoming.items() if k in Paper.model_fields and v is not None
+                           and k not in {"key", "reopen_claim", "merge_intent", "merge_budget"}}
+                payload.setdefault("title", existing.title)
+                payload.setdefault("authors", existing.authors)
+                authors = payload.get("authors") or existing.authors
+                key = self.allocate_key(authors[0] if authors else "", payload.get("year", existing.year))
+                twin = Paper(key=key, **payload)
+                self._papers[key] = twin
+                self._reindex(twin)
+            return merger._merge_records(existing.key, twin.key, metadata=incoming) or existing
+        return write_locked(consolidate)
 
     def purge(self, key: str, reason: str = "") -> dict:
         """Remove a paper from the library. Breaks the append-only invariant —
@@ -711,6 +786,11 @@ class Library:
                               overwritten. ``detail`` is the existing DOI.
           * ``"no_paper"``  — no such key.
 
+        With PAPERVAULT_MERGE_V2 enabled, collisions use the persisted drain
+        barrier and retain the stub as an alias. ``"merge_waiting"`` means no
+        identity was written; ``"alias"`` returns an already absorbed key's
+        canonical destination. Persisted intents remain fenced with the flag off.
+
         Does NOT call ``save()`` — the caller batches the save under the write
         lock. The ``_by_doi`` write here is the load-bearing difference from
         the ``_try_arxiv_by_title`` precedent's raw ``paper.arxiv_id = ...``
@@ -719,6 +799,20 @@ class Library:
         p = self._papers.get(key)
         if p is None:
             return ("no_paper", "")
+        if p.merge_budget and p.acquisition_state.alias_key:
+            from .merge_v2 import resolve_alias
+            canonical = resolve_alias(self, key)
+            return ("alias", canonical.key if canonical else "")
+        if p.merge_intent:
+            intent = p.merge_intent
+            holder = self.find(doi=(doi or "").strip())
+            if (merge_v2_enabled() and holder is not None
+                    and holder.key in {intent.canonical_key, intent.absorbed_key}):
+                from .merge_v2 import MergeStore, write_locked
+                merged = write_locked(lambda: MergeStore(self)._merge_records(
+                    intent.canonical_key, intent.absorbed_key))
+                return ("collision" if merged is not None else "merge_waiting", intent.canonical_key)
+            return ("merge_waiting", intent.canonical_key)
         if (p.doi or "").strip():
             return ("has_doi", p.doi)  # never overwrite a real DOI
         doi = (doi or "").strip()
@@ -726,6 +820,12 @@ class Library:
             return ("no_paper", "empty doi")
 
         holder_key = self._by_doi.get(doi.lower())
+        if holder_key is not None and (merge_v2_enabled() or self._papers[holder_key].merge_budget):
+            from .merge_v2 import resolve_alias
+            holder = resolve_alias(self, holder_key)
+            if holder is None:
+                return ("merge_waiting", holder_key)
+            holder_key = holder.key
         if holder_key is not None and holder_key != key:
             # A twin already owns this DOI. Merge the stub's blank-fill fields
             # into the holder (journal-DOI side wins identity), then purge the
@@ -733,6 +833,12 @@ class Library:
             # leave _by_doi[doi] still pointing at the holder while a second row
             # silently carries the same DOI.
             holder = self._papers.get(holder_key)
+            if holder is not None and holder.merge_intent:
+                return ("merge_waiting", holder_key)
+            if holder is not None and merge_v2_enabled():
+                from .merge_v2 import MergeStore, write_locked
+                merged = write_locked(lambda: MergeStore(self)._merge_records(holder_key, key))
+                return ("collision" if merged is not None else "merge_waiting", holder_key)
             if holder is not None:
                 merged = self._merge(holder, p.model_dump())
                 self._papers[holder_key] = merged
@@ -797,9 +903,13 @@ class Library:
         Atomic dictionary claims arbitrate concurrent download workers before
         the existing in-place merge. Unlike upsert/set_resolved_doi this never
         selects or purges another row. The normal caller still batches save().
+        A merge-intent or absorbed alias refuses all fills.
         """
         paper = self.get(key)
         if paper is None:
+            return {}
+        from .merge_v2 import blocked
+        if blocked(paper):
             return {}
         self.corrections.stage_fields(paper, {"doi": doi, "arxiv_id": arxiv_id},
                                       operation="verified_identifiers", provenance=provenance)
@@ -884,7 +994,8 @@ class Library:
             observed = Paper(key=existing.key, terminal_state=state_observation).terminal_state
             existing.terminal_state = retain_observed_restrictions(current_state, observed)
         for field, value in incoming.items():
-            if field in {"inspire_record_id", "inspire_document_urls", "source_identities", "terminal_state", "reopen_claim"}:
+            if field in {"inspire_record_id", "inspire_document_urls", "source_identities", "terminal_state",
+                         "reopen_claim", "merge_intent", "merge_budget"}:
                 continue  # source identity and links are merged together above
             if field == "key" or field not in Paper.model_fields:
                 continue                       # never reassign the cite key
@@ -935,6 +1046,8 @@ class Library:
             return None
 
         for cand in self._papers.values():
+            if (merge_v2_enabled() or cand.merge_budget) and cand.acquisition_state.alias_key:
+                continue
             cand_doi = (cand.doi or "").strip()
             cand_arxiv = _normalize_arxiv(cand.arxiv_id or "")
             # Candidate must have the OPPOSITE identifier from the new paper
@@ -986,13 +1099,25 @@ class Library:
     # ----- file paths -----
 
     def pdf_path(self, key: str) -> Path:
-        return self.pdfs_dir / f"{key}.pdf"
+        return self._artifact_path(key, "pdf", self.pdfs_dir / f"{key}.pdf")
 
     def md_path(self, key: str) -> Path:
-        return self.md_dir / f"{key}.md"
+        return self._artifact_path(key, "md", self.md_dir / f"{key}.md")
 
     def txt_path(self, key: str) -> Path:
-        return self.txt_dir / f"{key}.txt"
+        return self._artifact_path(key, "txt", self.txt_dir / f"{key}.txt")
+
+    def _artifact_path(self, key: str, kind: str, default: Path) -> Path:
+        """Merged rows may retain an absorbed artifact within this same vault."""
+        paper = self.get(key)
+        if paper is None or paper.merge_budget is None or _is_nonempty_file(default):
+            return default
+        stored = getattr(paper, kind + "_path")
+        if stored:
+            candidate = self.root / stored
+            if candidate.resolve().is_relative_to(self.root.resolve()) and _is_nonempty_file(candidate):
+                return candidate
+        return default
 
     def has_pdf(self, key: str) -> bool:
         return _is_nonempty_file(self.pdf_path(key))

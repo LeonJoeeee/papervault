@@ -98,6 +98,7 @@ class DownloadQueue:
                 same ``on_success`` chain.
         """
         self.library = library
+        library._merge_queues.add(self)
         self.num_workers = num_workers
         self._on_success = on_success
         self._on_text_only = on_success
@@ -243,6 +244,9 @@ class DownloadQueue:
         self._enqueue(claim.key, priority, claim=claim)
 
     def _enqueue(self, key: str, priority: int, *, claim=None) -> None:
+        from ..merge_v2 import blocked
+        if blocked(self.library.get(key)):
+            return
         # In-flight dedup (F7), priority-aware (R1): a key already waiting in the
         # queue is deduped ONLY for a same-or-lower-priority re-add (lower
         # urgency = larger number). A strictly-MORE-urgent re-add falls through
@@ -352,6 +356,9 @@ class DownloadQueue:
             return
         if claim is not None:
             return  # A stale queue capability must never adopt an ordinary row.
+        from ..merge_v2 import blocked
+        if blocked(paper):
+            return
         # Idempotence — paper may already have a PDF (concurrent
         # foreground materialize, prior worker, etc.). In that case
         # short-circuit but still forward to the next stage if md is

@@ -47,6 +47,7 @@ from .models import (
 from .store import Library
 from .download_telemetry import emit, span, trace_download
 from .state_v2 import admitted_budget, resolved_identity, valid_lease
+from papervault.config import reopen_v2_enabled
 
 log = logging.getLogger(__name__)
 
@@ -561,7 +562,9 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
 
     Idempotent: if the file exists, returns True without re-fetching.
     """
-    if terminal_v2_enabled():
+    if paper.reopen_claim is not None and (not reopen_v2_enabled() or lease_provider is valid_lease):
+        return False  # Persisted campaign ownership survives the kill switch.
+    if terminal_v2_enabled() or reopen_v2_enabled():
         from .services.classify import DOWNLOAD, classify
         # Queue workers reach this after their network-slot wait; synchronous
         # batch/correction callers share the same final dispatch recheck.

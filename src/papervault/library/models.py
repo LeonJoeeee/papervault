@@ -8,10 +8,11 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_serializer
 
-from papervault.config import identity_v2_enabled, terminal_v2_enabled
+from papervault.config import identity_v2_enabled, reopen_v2_enabled, terminal_v2_enabled
 
 from .state_v2 import TerminalState, after_status_write, derive_legacy, project_domain_policy
 from .identity_v2 import CorrespondenceDecision, RouteRejection
+from .claims_v2 import ReopenClaim
 
 # Forward ref: Paper.insight is Optional[Insight], retained as a
 # read-only field after Phase 28 (route B). The schema lives in
@@ -361,13 +362,15 @@ class Paper(BaseModel):
 
     # Optional on disk. Absent legacy dimensions are derived without a write.
     terminal_state: Optional[TerminalState] = None
+    # Worker-owned; absent legacy rows retain exactly their original serialization.
+    reopen_claim: Optional[ReopenClaim] = None
 
     @property
     def acquisition_state(self) -> TerminalState:
         if self.terminal_state is not None:
-            return (project_domain_policy(self.terminal_state, self) if identity_v2_enabled()
+            return (project_domain_policy(self.terminal_state, self) if identity_v2_enabled() or reopen_v2_enabled()
                     else self.terminal_state)
-        return derive_legacy(self, include_domain=identity_v2_enabled())
+        return derive_legacy(self, include_domain=identity_v2_enabled() or reopen_v2_enabled())
 
     def __setattr__(self, name, value):
         # All status writers share this boundary, including CLI and tier helpers.
@@ -375,7 +378,7 @@ class Paper(BaseModel):
         # retrieval must never silently resolve its unknown policy.
         # Already-observed fields stay consistent while the kill switch is off.
         synchronize = name == "download_status" and (
-            self.terminal_state is not None or terminal_v2_enabled())
+            self.terminal_state is not None or terminal_v2_enabled() or reopen_v2_enabled())
         state = self.acquisition_state if synchronize else None
         super().__setattr__(name, value)
         if state is not None:
@@ -386,6 +389,8 @@ class Paper(BaseModel):
         record = handler(self)
         if self.terminal_state is None:
             record.pop("terminal_state", None)
+        if self.reopen_claim is None:
+            record.pop("reopen_claim", None)
         if not self.identity_route_rejections:
             record.pop("identity_route_rejections", None)
         return record

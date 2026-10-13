@@ -26,6 +26,7 @@ from typing import Iterable, Optional
 def active_service_units(
     units: Optional[Iterable[str]] = None,
     states: Iterable[str] = ("active", "activating"),
+    *, strict: bool = False,
 ) -> list[str]:
     """papervault service units that are systemd-active (or *activating*), else [].
 
@@ -36,6 +37,8 @@ def active_service_units(
     permissively (empty list → callers proceed). A transient probe failure on one unit is
     swallowed and the scan continues, but a positive already in hand is NEVER discarded
     (fail-loud philosophy).
+    ``strict=True`` instead refuses unavailable or ambiguous probes; durable campaigns
+    use this mode because an unobserved co-writer cannot be admitted.
     """
     if units is None:
         units = ("papervault.service",
@@ -46,11 +49,18 @@ def active_service_units(
         try:
             r = subprocess.run(["systemctl", "--user", "is-active", unit],
                                capture_output=True, text=True, timeout=10)
+            if strict and (r.returncode not in (0, 3, 4)
+                           or r.stdout.strip() not in {"active", "activating", "deactivating", "reloading", "inactive", "failed", "unknown"}):
+                raise RuntimeError(f"cannot establish co-writer status for {unit}: {r.stderr.strip()}")
             if r.stdout.strip() in running:
                 active.append(unit)
         except FileNotFoundError:
+            if strict:
+                raise RuntimeError("cannot establish co-writer status: systemctl unavailable") from None
             break  # no systemd at all (CI/container): empty `active` falls through permissively
         except Exception:  # noqa: BLE001 — transient probe failure: keep checking; never
+            if strict:
+                raise
             continue      # discard a positive already in hand (fail-loud philosophy)
     return active
 

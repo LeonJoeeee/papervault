@@ -59,8 +59,8 @@ operator's responsibility.
 `PAPERVAULT_TERMINAL_V2=1` opts into the first acquisition-pipeline v2 slice
 (default off). Acquisition checks retrieval eligibility, canonical identity,
 policy permission, and the independent quarantine marker immediately before
-download dispatch. Lease and budget providers currently admit by default;
-their real machinery and re-open operations belong to later slices.
+download dispatch. Ordinary downloads keep their in-memory coordination;
+campaign re-opens use the durable lease and budget providers described below.
 
 Legacy dimensions are derived without rewriting the index: `metadata_only` and
 `failed` map to exhausted retrieval, while `ok` and `extract_failed` map to
@@ -92,9 +92,62 @@ With the identity flag on, `domain_status` markers `off_domain`, `non_paper`,
 and `bad_extract` project to excluded policy with the same reason; unknown markers
 project to unknown policy. Retrieval state and existing artifacts are retained.
 Existing scoped policy overrides are retained and must cover the domain reason.
-This applies to legacy and stored dimensions at read time. The terminal-v2 flag
-still controls the acquisition admission gate; enable both flags to enforce this
-projection at download dispatch.
+This applies to legacy and stored dimensions at read time. Enable terminal-v2
+to enforce this projection at ordinary download dispatch. Re-open v2 independently
+enforces acquisition admission and domain restrictions for campaigns.
+
+`PAPERVAULT_REOPEN_V2=1` opts into slice 3 (default off). In a maintenance window
+with `papervault.service` stopped, run an explicit bounded campaign:
+
+```bash
+python -m papervault.library.cli reopen-campaign --cap 20 --dry-run --json
+python -m papervault.library.cli reopen-campaign --cap 20 --json
+```
+
+The selector takes exhausted retrieval with allowed policy, canonical resolved
+identity and no quarantine. It changes only retrieval eligibility; unknown or
+excluded policy needs a separate ruling. Dry-run reads the index and validates
+authorization without creating files or sending requests. Apply claims and
+enqueues the selected cohort through the existing download queue, waits for its
+results, and refuses a live service, unavailable service probe, or active campaign.
+An exclusive `.reopen-campaign.lock` prevents concurrent standalone writers.
+It does not recover unrelated pending work. There are no automatic campaigns.
+
+Standing authorization permits at most 200 reservations per campaign and three
+campaign starts in any rolling seven days (UTC wall clock), including interrupted
+starts. Larger campaigns require the owner and are refused by this CLI. The
+append-only `reopen-budget.jsonl`, beside `index.json`, records version-1 JSON
+events for authorization, reservation, dispatch, completion, proven-not-sent
+refunds and fencing. Appends and claim index saves require successful `fsync`;
+unreadable accounting refuses acquisition. A reservation precedes dispatch and
+survives process restart and index rollback. A restored record missing its claim
+cannot acquire through the ordinary path when the ledger records its generation.
+Refunds are compensating events,
+never removal of consumption; uncertainty never refunds or resends.
+
+The optional worker-owned `reopen_claim` record stores generation, lease ID,
+expiry, campaign, scope and phase. Every result uses that exact capability;
+state and PDF/text publication are fenced together under the library write-lock.
+Attempts download into `.reopen-staging/<lease-id>/` inside the vault, with copied
+assets and a detached record. Successful publication checks current policy,
+identity and changed-artifact baselines; it preserves concurrent metadata and
+applies artifact deletions as well as writes. Completed generations apply once.
+Normal legacy records keep their serialization when the flag is off. A publication
+fence failure halts further campaign dispatch; queued attempts refund only when
+the runner proves they were never sent.
+
+Expiry or uncertain execution sets the independent quarantine marker; expiry
+never proves thread termination. Dispatched attempts are quarantined on restart,
+and their resources remain charged. Cancellation quarantines promptly and retains
+the download permit until the executor actually drains. Turning the flag off stops
+new campaigns and does not turn persisted claims into ordinary downloads. Uncertain staging must be
+retained until recovery establishes drain/fencing. The maintenance API
+`ClaimStore.release_quarantine(key, drained_lease_id=...)` requires evidence that
+the exact executor drained, or an explicit `human_reason=...`; it advances the
+durable generation and records the evidence without refunding. After every
+campaign executor is drained/fenced, `BudgetLedger.finish_campaign(...,
+drained=True)` records closure. These are single-writer operations, matching the
+existing process model in `services/concurrency.py`; they are not scheduler tasks.
 
 ## URL identity backfill
 

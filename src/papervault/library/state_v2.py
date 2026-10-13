@@ -2,7 +2,8 @@
 
 These dimensions do not replace the extraction axis or the public statuses.
 Legacy state is a read-time projection, never a migration. Lease and budget
-providers are explicit slice-3 extension points; their current defaults admit.
+providers consult durable campaign claims when present; ordinary acquisition
+keeps its existing in-memory coordination.
 """
 
 from __future__ import annotations
@@ -218,11 +219,32 @@ def admission(state, *, identity_resolved: bool = False, key: str = "",
     )
 
 
-def valid_lease(paper: Paper) -> bool:
-    """Slice-3 placeholder provider: no lease machinery exists in slice 1."""
-    return True
+def valid_lease(paper: Paper, *, lease_id: str = "", now: float | None = None) -> bool:
+    """Only the executor holding a current campaign capability can use its lease."""
+    import time
+    from papervault.config import reopen_v2_enabled
+    claim = paper.reopen_claim
+    if claim is None:
+        return True
+    return bool(reopen_v2_enabled() and lease_id == claim.lease_id
+                and claim.phase in {"queued", "dispatched"}
+                and (time.time() if now is None else now) < claim.lease_expiry)
 
 
-def admitted_budget(paper: Paper) -> bool:
-    """Slice-3 placeholder provider: no budget ledger exists in slice 1."""
-    return True
+def admitted_budget(paper: Paper, *, library=None) -> bool:
+    """Campaign consumption must be readable in the independent durable ledger."""
+    from papervault.config import reopen_v2_enabled
+    from .claims_v2 import BudgetLedger, LedgerError
+    if paper.reopen_claim is None:
+        if not reopen_v2_enabled():
+            return True
+        if library is None or getattr(library, "root", None) is None:
+            return False
+        try:
+            # Index rollback cannot turn a campaign-owned generation into
+            # ordinary in-memory work. Initial/no-history normal keys still admit.
+            return BudgetLedger(library.root).latest_generation(paper.key) == 0
+        except LedgerError:
+            return False
+    return bool(reopen_v2_enabled() and library is not None
+                and BudgetLedger(library.root).admitted(paper.reopen_claim))

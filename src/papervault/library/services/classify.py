@@ -51,7 +51,7 @@ admission mutates policy. With the flag off, these rules are unchanged.
 
 from __future__ import annotations
 
-from papervault.config import terminal_v2_enabled
+from papervault.config import reopen_v2_enabled, terminal_v2_enabled
 
 from ..models import (
     DOWNLOAD_STATUS_OK,
@@ -79,10 +79,12 @@ def classify(paper: Paper, library, *, identity_provider=resolved_identity,
     The router never changes policy or any other persisted dimension.
     """
     action = _classify_legacy(paper, library)
-    if action == DOWNLOAD and terminal_v2_enabled():
+    if action == DOWNLOAD and (terminal_v2_enabled() or reopen_v2_enabled() or paper.reopen_claim is not None):
+        budget_ok = (admitted_budget(paper, library=library) if budget_provider is admitted_budget
+                     else budget_provider(paper))
         allowed = admission(paper.acquisition_state, key=paper.key,
                             identity_resolved=identity_provider(paper),
-                            lease_ok=lease_provider(paper), budget_ok=budget_provider(paper))
+                            lease_ok=lease_provider(paper), budget_ok=budget_ok)
         return DOWNLOAD if allowed else TERMINAL
     return action
 

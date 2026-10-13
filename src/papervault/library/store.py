@@ -916,6 +916,8 @@ class Library:
     def _fill_verified_identifiers(self, paper: Paper, *, doi: str = "",
                                    arxiv_id: str = "", provenance: dict | None = None) -> dict[str, str]:
         """Same-row writer shared with fenced staged publication under its lock."""
+        from .telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
+        before = adoption_snapshot(paper)
         key = paper.key
         self.corrections.stage_fields(paper, {"doi": doi, "arxiv_id": arxiv_id},
                                       operation="verified_identifiers", provenance=provenance)
@@ -944,6 +946,7 @@ class Library:
             normalized = normalize(value)
             if normalize(current) != normalized and index.get(normalized) == key:
                 index.pop(normalized, None)
+        acknowledge_identity_adoption(paper, before, applied)
         return applied
 
     def export_bibtex(self, keys: Optional[list[str]] = None) -> tuple[str, list[str]]:
@@ -1098,9 +1101,17 @@ class Library:
         for an unmet prerequisite, without a network attempt. Reconcile
         counts paper routes from status/disk facts, not these tier events.
         """
+        from papervault.config import stoprules_v2_enabled
+        if stoprules_v2_enabled() and hasattr(self, "_telemetry_live"):
+            # Preserve staged observations in the live manifest, with an
+            # explicit stage marker; they are not live publication evidence.
+            self._telemetry_live.log({**enrich(event, self), "staged": True})
+            return
         line = json.dumps(enrich(event, self), ensure_ascii=False)
         with manifest_lock, self.manifest_path.open("a") as f:
             f.write(line + "\n")
+        from .telemetry_v2 import observe_publication
+        observe_publication(event, self)
 
     # ----- file paths -----
 

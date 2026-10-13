@@ -58,6 +58,11 @@ def merge_v2_enabled() -> bool:
     """Opt into drained identity consolidation at its write points."""
     return os.environ.get("PAPERVAULT_MERGE_V2", "").strip().lower() in {"1", "true", "yes"}
 
+
+def stoprules_v2_enabled() -> bool:
+    """Opt into A5 measurement and executable detectors at each read point."""
+    return os.environ.get("PAPERVAULT_STOPRULES_V2", "").strip().lower() in {"1", "true", "yes"}
+
 # LightRAG's Postgres storage reads POSTGRES_DATABASE (defaulting to 'postgres'), while the
 # ingest ledger reads POSTGRES_DB — leave them unbridged and the knowledge graph's KV/vector/
 # doc_status store silently targets a DIFFERENT database than the ledger. Bridge them: the graph

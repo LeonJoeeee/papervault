@@ -223,6 +223,42 @@ not survive a restart, so restart is not a supported way to clear a live quota
 or cooldown. Browser/stealth, publisher content, redirects and arXiv page/PDF
 paths remain for later slices; existing semaphore and cascade behavior is retained.
 
+`PAPERVAULT_STOPRULES_V2=1` opts into slice 6 (default off). Reconcile evaluates
+the rules before routing; download queue rounds and campaign settlement also
+evaluate them. The detectors consume durable outstanding claims and merge
+redirects, actual scope send timestamps, and explicit publication evidence.
+They never interpret an admission refusal or a rejected PDF tier as a violation.
+Named thresholds in `library/stop_rules.py` are zero: duplicate in-flight
+identity halts the campaign; an exceeded quota window cools the scope and halts
+active campaigns; identity-mismatched publication halts its campaign (or active
+campaigns for unclaimed work) and quarantines the current record.
+Publication comparison uses the adopted DOI-first canonical identity and resolves
+merge aliases. Clearing or repairing a secondary identifier or route leaves a
+matching canonical identity intact and does not trigger a stop.
+Verified blank identifier fills keep their existing promotion behavior; the
+comparison advances only for fills acknowledged by the existing writers.
+`SIGNIFICANT_REGRESSION_FRACTION=0.20` defines
+the measurement term; it does not enforce a fourth rule without measurements.
+
+Campaign halt is an idempotent append-only ledger event, distinct from verified
+finish/drain. Replay denies new reservations and dispatches, while existing
+dispatched work keeps its completion and accounting semantics. Uncertain work
+stays charged; proven-unsent queued work can settle normally. Scope cooldown
+uses the same lock and configured quiet window as 429/timeout cooldown; repeated
+rounds do not extend an active cooldown, and resume never increases the limits.
+Disabling the flag stops evaluation and new measurement fields; persisted
+campaign halts continue to fence admission.
+
+Enabled manifest events add `identity_version` (v2 identity definition),
+`attempt_generation`, `lease_id` and an opaque `request_scope_id`, preserving
+existing fields. Unknown correlation values are null; request scope is distinct
+from the campaign's logical scope. Wait, executor/request service, and actual
+executor drain have separate duration fields. Incomplete attempts are recorded
+as censored, with null unobserved durations, and never back-filled with an
+estimated latency or outcome. `admission-denied` records refused sends;
+`verified-success` requires positive identity verification and live publication,
+so verification fail-open and temporary campaign stages do not count as success.
+
 ## URL identity backfill
 
 For records with a URL but no DOI or arXiv ID, inspect a bounded sample without

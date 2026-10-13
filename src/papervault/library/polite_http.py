@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 import os
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Callable
 from urllib.parse import urlsplit
@@ -18,7 +18,9 @@ from urllib.parse import urlsplit
 import requests
 from urllib3.exceptions import ReadTimeoutError
 
-from papervault.config import polite_v2_enabled
+from papervault.config import polite_v2_enabled, stoprules_v2_enabled
+from .download_telemetry import emit, span
+from .telemetry_v2 import request_scope
 from .politeness_v2 import AdmissionDenied, Envelope, Ledger, Policy, Scope, Window
 
 
@@ -117,8 +119,12 @@ def _account(scope):
             ledger = get_ledger()
             ticket = ledger.note_sent(scope)
     except AdmissionDenied as exc:
+        if stoprules_v2_enabled():
+            emit("admission-denied", reason=exc.decision.reason)
         raise PolitenessDenied(str(exc)) from exc
     except Exception as exc:
+        if stoprules_v2_enabled():
+            emit("admission-denied", reason="accounting_unavailable")
         raise PolitenessUnavailable("politeness accounting unavailable; no request emitted") from exc
     result = _Result()
     def capture(response, **kwargs):
@@ -155,7 +161,7 @@ def polite_get(transport, url, **kwargs):
         return transport(url, **kwargs)
     if kwargs.get("stream"):
         raise PolitenessUnavailable("streaming sends require polite_stream")
-    with _account(scope) as result:
+    with request_scope(scope), (span("request") if stoprules_v2_enabled() else nullcontext()), _account(scope) as result:
         hooks = dict(kwargs.get("hooks") or {})
         previous = hooks.get("response")
         if not previous:
@@ -179,7 +185,7 @@ def polite_stream(transport, target, **kwargs):
         with transport(target, **kwargs) as response:
             yield response
         return
-    with _account(scope) as result:
+    with request_scope(scope), (span("request") if stoprules_v2_enabled() else nullcontext()), _account(scope) as result:
         with transport(target, **kwargs) as response:
             result.capture(response)
             yield response

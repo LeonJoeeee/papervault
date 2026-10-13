@@ -429,6 +429,10 @@ async def reconcile_once(
     ``{"scanned", "download", "extract", "extract_deferred", "extract_canary",
     "terminal", "errors", ...}`` for logging.
     """
+    from papervault.config import stoprules_v2_enabled
+    if stoprules_v2_enabled():
+        from ..stop_rules import evaluate_round
+        await evaluate_round(library)
     counts = {"scanned": 0, "download": 0, "extract": 0,
               "terminal": 0, "errors": 0, "enriched": 0, "doi_resolved": 0,
               "extract_deferred": 0, "extract_canary": 0}

@@ -890,3 +890,24 @@ async def test_acquired_pdf_can_extract_after_merged_download_budget_is_spent(pa
     async def extraction(paper, library):
         return library.pdf_path(paper.key).read_bytes()
     assert await extraction(left, lib) == b"acquired on last admitted download"
+
+
+async def test_stop_rule_identity_follows_durable_merge_redirect_for_late_executor(pair, monkeypatch):
+    from papervault.library.claims_v2 import record_generation
+    from papervault.library.stop_rules import evaluate_round
+    monkeypatch.setenv("PAPERVAULT_STOPRULES_V2", "1")
+    lib, left, right, ledger, now = pair
+    assert await coordinator(pair).merge_records(left.key, right.key) is left
+    assert ledger.merged_into(right.key) == left.key
+    campaign = ledger.start_campaign(cap=2, keys=[left.key])
+    store = ClaimStore(lib, ledger=ledger, clock=lambda: now[0])
+    token = await store.claim(left.key, expected_state=left.acquisition_state,
+                              expected_generation=record_generation(left), campaign_id=campaign)
+    assert token is not None
+    # Inject a late executor on the absorbed key; compare its redirected identity,
+    # not the old arXiv-only identity still stored on the alias record.
+    lib._stoprule_active = {right.key: 1}
+    findings = await evaluate_round(lib, ledger=ledger, accounting=None)
+    assert findings[0].rule == "duplicate_inflight_identity"
+    assert findings[0].keys == tuple(sorted((left.key, right.key)))
+    assert ledger.campaign_halted(campaign)

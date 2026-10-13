@@ -34,7 +34,9 @@ from urllib.parse import (
 
 import requests as requests
 
-from papervault.config import terminal_v2_enabled
+from papervault.config import terminal_v2_enabled, stoprules_v2_enabled
+from .telemetry_v2 import (acknowledge_identity_adoption, adoption_snapshot,
+                           begin_identity_measurement, publication_fields, track_execution)
 from papervault.llm_routing import route
 
 from .models import (
@@ -328,6 +330,12 @@ def _try_concurrent_first_hit(
                     return data
         except concurrent.futures.TimeoutError:
             pass
+        finally:
+            if stoprules_v2_enabled():
+                # Observe the same executor shutdown the context manager owns.
+                # Winner selection is not evidence that losing threads drained.
+                with span("group_drain"):
+                    pool.shutdown(wait=True)
     return None
 
 
@@ -540,13 +548,16 @@ def _prepare_cascade_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
     candidate.arxiv_id = identifier
     record = _prepare_arxiv(candidate)
     if record is not None and record.status == "found":
+        before = adoption_snapshot(paper)
         paper.arxiv_id = candidate.arxiv_id
         paper.arxiv_withdrawal = candidate.arxiv_withdrawal
+        acknowledge_identity_adoption(paper, before, {"arxiv_id": candidate.arxiv_id})
     return record
 
 
 @guard_execution
 @trace_download
+@track_execution
 def download_paper(paper: Paper, library: Library, *, identity_provider=resolved_identity,
                    lease_provider=valid_lease, budget_provider=admitted_budget) -> bool:
     """Download a single paper's PDF if missing.
@@ -565,6 +576,8 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
     Idempotent: if the file exists, returns True without re-fetching.
     """
     if paper.reopen_claim is not None and (not reopen_v2_enabled() or lease_provider is valid_lease):
+        if stoprules_v2_enabled():
+            emit("admission-denied", reason="campaign_ownership")
         return False  # Persisted campaign ownership survives the kill switch.
     from papervault.config import merge_v2_enabled
     if terminal_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled() or paper.merge_budget is not None:
@@ -575,8 +588,11 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
         if current is None or classify(current, library, identity_provider=identity_provider,
                                         lease_provider=lease_provider,
                                         budget_provider=budget_provider) != DOWNLOAD:
+            if stoprules_v2_enabled():
+                emit("admission-denied", reason="acquisition_guard")
             return False
         paper = current
+    measurement_identity = begin_identity_measurement(paper, library=library) if stoprules_v2_enabled() else None
     dest = library.pdf_path(paper.key)
     if _settle_arxiv_withdrawal(paper, library):
         return False
@@ -694,9 +710,14 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                 paper.download_status = DOWNLOAD_STATUS_OK
                 paper.download_source = source
                 paper.download_source_member = getattr(data, "acquisition_source", "")
+                positively_verified = verify_reason.startswith("llm_match:")
+                if stoprules_v2_enabled():
+                    library._stoprule_identity_verified = positively_verified
                 library.log({"event": "downloaded", "key": paper.key, "source": source,
                              "member_source": paper.download_source_member,
-                             "size": len(data), "verify": verify_reason})
+                             "size": len(data), "verify": verify_reason,
+                             **publication_fields(measurement_identity, paper, verified=positively_verified,
+                                                  library=library)})
                 return True
             if source == "domain_aggregators":
                 _log_ads_availability(paper, library)

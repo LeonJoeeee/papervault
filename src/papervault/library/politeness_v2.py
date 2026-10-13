@@ -143,6 +143,16 @@ class Snapshot:
     configuration: Policy | Envelope
 
 
+@dataclass(frozen=True)
+class QuotaSnapshot:
+    at: float
+    windows: tuple[Window, ...]
+    sends: tuple[float, ...]
+    cooldown_until: float
+    violations: int = 0
+    handled: int = 0
+
+
 @dataclass
 class _State:
     config: Policy | Envelope
@@ -158,6 +168,9 @@ class _State:
     cooling: bool = False
     stopped: bool = False
     events: list[Event] = field(default_factory=list)
+    quota_watermarks: dict = field(default_factory=dict)
+    quota_violations: int = 0
+    quota_handled: int = 0
 
 
 class Ledger:
@@ -197,6 +210,16 @@ class Ledger:
         return now
 
     def _refresh(self, state, now):
+        from papervault.config import stoprules_v2_enabled
+        if stoprules_v2_enabled():
+            from .stop_rules import quota_violation_observations
+            # Retain evidence before normal window pruning. Observations are
+            # watermarked, so retained sends cannot relatch an acknowledged fault.
+            for seconds, at, count in quota_violation_observations(state.windows, state.sends):
+                evidence = (at, count)
+                if evidence > state.quota_watermarks.get(seconds, (-math.inf, 0)):
+                    state.quota_watermarks[seconds] = evidence
+                    state.quota_violations += 1
         horizon = max(w.seconds for w in state.windows)
         while state.sends and state.sends[0] <= now - horizon:
             state.sends.popleft()
@@ -261,6 +284,21 @@ class Ledger:
             if status_code == 429:
                 self._cool(state, now, "429")
 
+    def enter_cooldown(self, scope: Scope, reason: str) -> None:
+        """Explicit detector actuator, without inventing a response/send ticket."""
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("cooldown requires a reason")
+        with self._lock:
+            now = self._now()
+            state = self._states[scope]
+            self._refresh(state, now)
+            if not state.cooling:
+                self._cool(state, now, reason)
+            elif state.events[-1].kind != reason:
+                # Already in the resulting state: preserve its quiet deadline.
+                state.events.append(Event(now, reason, state.windows))
+            state.quota_handled = state.quota_violations
+
     def note_result(self, ticket: Ticket, *, status_code: int | None = None,
                     timed_out: bool = False, completed: bool = True) -> None:
         with self._lock:
@@ -318,3 +356,13 @@ class Ledger:
             return Snapshot(state.windows, state.sent, len(state.active), state.positives,
                             state.evidence, state.cooldown_until, state.stopped, tuple(state.events),
                             state.config)
+
+    def quota_snapshots(self) -> dict[Scope, QuotaSnapshot]:
+        """Detached send evidence for pure detectors; denials never debit a window."""
+        with self._lock:
+            now = self._now()
+            for state in self._states.values():
+                self._refresh(state, now)
+            return {scope: QuotaSnapshot(now, state.windows, tuple(state.sends), state.cooldown_until,
+                                         state.quota_violations, state.quota_handled)
+                    for scope, state in self._states.items()}

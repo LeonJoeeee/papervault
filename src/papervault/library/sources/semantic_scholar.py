@@ -6,6 +6,8 @@ from typing import Any
 
 import requests
 
+from ..polite_http import polite_get
+
 from .exceptions import BackendDegraded
 from .identity import semantic_scholar_identity
 
@@ -35,7 +37,7 @@ def search_semantic_scholar(query: str, max_results: int = 30) -> list[dict[str,
     resp = None
     for attempt in range(3):
         try:
-            resp = requests.get(API_URL, params=params, timeout=30)
+            resp = polite_get(requests.get, API_URL, params=params, timeout=30)
             if resp.status_code == 429:
                 time.sleep(min(2.0, 0.5 * (attempt + 1)) + random.random() * 0.5)
                 continue

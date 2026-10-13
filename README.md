@@ -149,6 +149,52 @@ campaign executor is drained/fenced, `BudgetLedger.finish_campaign(...,
 drained=True)` records closure. These are single-writer operations, matching the
 existing process model in `services/concurrency.py`; they are not scheduler tasks.
 
+`PAPERVAULT_POLITE_V2=1` opts into slice 4 (default off). API sends for Wiley,
+Crossref, Unpaywall, Semantic Scholar, OpenAlex and arXiv share one process ledger
+per service, combining credentials, IPs and endpoints conservatively. Every
+configured sliding window must admit the send, with concurrency accounted
+separately. A full window, occupied permit, cooldown or unavailable accounting
+refuses the send; the wrapper does not add retries or waits. With the flag off,
+the original transport receives the same arguments and returns the same response.
+
+Wiley starts at 1 request/second **and** 30/600 seconds, below the issue's
+documented 3/second and 60/600 seconds. Semantic Scholar starts at 1/2 seconds
+(the batch module documents 1/second); arXiv's API retains 1/3 seconds. Each
+service has concurrency 1. Crossref, Unpaywall and OpenAlex have no numeric
+provider limit documented in the current code and remain **disabled** until an
+explicit envelope is configured and authorized. Retry delays, sweep caps and
+the existing network semaphore are not provider windows.
+
+`PAPERVAULT_POLITE_ENVELOPES` accepts a JSON object keyed by `crossref`,
+`unpaywall` or `openalex`. Each entry needs `analogue` (`wiley`,
+`semantic_scholar` or `arxiv`), `initial` and `hard_cap` arrays of
+`[requests, seconds]`, and a nonempty `authorization` reference. An initial
+window must correspond to each analogue window, in increasing duration order;
+its duration may grow, its burst cannot exceed the analogue, and its rate must
+be at most half the analogue. Caps specify maximum counts and minimum durations
+for those corresponding windows. Missing
+fields disable that scope; malformed or changed live configuration fails closed.
+For example, the shape for a separately authorized envelope based on Wiley is:
+
+```json
+{"crossref":{"analogue":"wiley","initial":[[1,1],[30,600]],"hard_cap":[[1,1],[60,600]],"authorization":"owner approval reference"}}
+```
+
+This example records an assumption, not a claim about Crossref's permission.
+The pure `Ledger.increase(scope, windows)` API takes explicitly chosen values:
+at most +25% in rate per window after 24 hours and fresh, completed 2xx evidence.
+Counts may increase or durations shorten, within the configured caps. There
+is no automatic ramp. Configurations, increases, cap freezes, cooldowns and
+resumes are inspectable through `Ledger.snapshot()`. A 429, or three timeouts
+in a rolling 60 seconds, starts a 60-second scope cooldown and stops further
+speed-up. A late timeout extends the quiet window. After it expires, requests
+resume at the same limits. Unread/partially closed streams and unproven raw
+streams without a content length earn no ramp evidence. The ledger is in memory
+under the existing single-process model; envelope state and request windows do
+not survive a restart, so restart is not a supported way to clear a live quota
+or cooldown. Browser/stealth, publisher content, redirects and arXiv page/PDF
+paths remain for later slices; existing semaphore and cascade behavior is retained.
+
 ## URL identity backfill
 
 For records with a URL but no DOI or arXiv ID, inspect a bounded sample without

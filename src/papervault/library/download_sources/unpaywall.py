@@ -6,6 +6,7 @@ from typing import Optional
 import requests
 
 from ..models import Paper
+from ..polite_http import polite_get
 from ._shared import BROWSER_HEADERS, TIMEOUT, USER_AGENT, _is_pdf_bytes
 
 
@@ -24,7 +25,7 @@ def _try_unpaywall(paper: Paper) -> Optional[bytes]:
     email = os.environ.get("UNPAYWALL_EMAIL", "research@example.invalid")
     api = f"https://api.unpaywall.org/v2/{paper.doi}?email={email}"
     try:
-        meta = requests.get(api, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}).json()
+        meta = polite_get(requests.get, api, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}).json()
     except Exception:
         return None
 

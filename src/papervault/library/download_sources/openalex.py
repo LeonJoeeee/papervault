@@ -22,6 +22,7 @@ from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
 from urllib3.exceptions import HTTPError
 
 from ..models import Paper
+from ..polite_http import polite_stream
 from ..store import Library
 from ._shared import USER_AGENT, _is_pdf_bytes, log
 
@@ -170,7 +171,7 @@ def _request(url: str, *, deadline: float, headers: Optional[dict] = None):
         request = requests.Request("GET", url, headers={
             "User-Agent": USER_AGENT, **(headers or {}), "Accept-Encoding": "identity",
         }).prepare()
-        with adapter.send(request, stream=True,
+        with polite_stream(adapter.send, request, stream=True,
                           timeout=min(_SOCKET_TIMEOUT, deadline - time.monotonic()),
                           verify=os.environ.get("REQUESTS_CA_BUNDLE") or True,
                           proxies=requests.utils.get_environ_proxies(url)) as response:

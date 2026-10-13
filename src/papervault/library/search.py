@@ -25,6 +25,8 @@ from typing import Optional
 
 import requests
 
+from .polite_http import polite_get
+
 # Resolved by NAME via module globals() in the backend registry (search_<backend>),
 # so they read as "unused" to the linter — keep them imported.
 from .sources.arxiv import search_arxiv  # noqa: F401
@@ -91,11 +93,11 @@ def fetch_references(paper_id_or_doi: str, *, limit: int = 200) -> list[dict]:
     pid = paper_id_or_doi
     url = f"{_SS_BASE}/{pid}/references"
     try:
-        r = requests.get(url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
+        r = polite_get(requests.get, url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
                          timeout=30)
         if r.status_code == 429:
             time.sleep(5.0)
-            r = requests.get(url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
+            r = polite_get(requests.get, url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
                              timeout=30)
         r.raise_for_status()
     except Exception:
@@ -126,13 +128,13 @@ def search_openalex(query: str, *, max_results: int = 30,
     }
     oa_headers = {"User-Agent": f"paper-pipeline (mailto:{mailto})"}
     try:
-        r = requests.get(url, params=params, timeout=30, headers=oa_headers)
+        r = polite_get(requests.get, url, params=params, timeout=30, headers=oa_headers)
         # Retry on 429 (rate limit) AND 409 (conflict/transient). RE-SEND the
         # mailto/User-Agent header on the retry (the prior single re-issue
         # dropped it, dropping OpenAlex into the slow anonymous pool).
         if r.status_code in (429, 409):
             time.sleep(5.0)
-            r = requests.get(url, params=params, timeout=30, headers=oa_headers)
+            r = polite_get(requests.get, url, params=params, timeout=30, headers=oa_headers)
         r.raise_for_status()
     except Exception:
         return []
@@ -198,11 +200,11 @@ def fetch_citations(paper_id_or_doi: str, *, limit: int = 200) -> list[dict]:
         return []
     url = f"{_SS_BASE}/{paper_id_or_doi}/citations"
     try:
-        r = requests.get(url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
+        r = polite_get(requests.get, url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
                          timeout=30)
         if r.status_code == 429:
             time.sleep(5.0)
-            r = requests.get(url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
+            r = polite_get(requests.get, url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
                              timeout=30)
         r.raise_for_status()
     except Exception:

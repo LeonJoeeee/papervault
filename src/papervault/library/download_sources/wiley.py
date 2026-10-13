@@ -6,6 +6,7 @@ from typing import Optional
 import requests
 
 from ..models import Paper
+from ..polite_http import polite_get
 from ._shared import _is_pdf_bytes, log
 
 
@@ -23,8 +24,8 @@ def _try_wiley_tdm(paper: Paper) -> Optional[bytes]:
     https://onlinelibrary.wiley.com/library-info/resources/text-and-datamining
     Set WILEY_TDM_TOKEN env var.
 
-    The API returns the PDF directly. Has a documented rate limit; we add
-    a small inline sleep to be polite.
+    The API returns the PDF directly. Politeness v2, when enabled, enforces
+    conservative parallel windows at this send point (see polite_http.py).
     """
     token = os.environ.get("WILEY_TDM_TOKEN", "").strip()
     if not token:
@@ -41,7 +42,7 @@ def _try_wiley_tdm(paper: Paper) -> Optional[bytes]:
     encoded_doi = quote(paper.doi, safe="")
     api_url = f"https://api.wiley.com/onlinelibrary/tdm/v1/articles/{encoded_doi}"
     try:
-        r = requests.get(api_url, timeout=60,
+        r = polite_get(requests.get, api_url, timeout=60,
                          headers={"Wiley-TDM-Client-Token": token},
                          allow_redirects=True)
     except Exception as exc:

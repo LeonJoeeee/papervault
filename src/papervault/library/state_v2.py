@@ -66,23 +66,45 @@ def extraction_evidence(paper) -> bool:
     return bool(_field(paper, "md_path") and _field(paper, "md_engine"))
 
 
-def derive_legacy(paper) -> TerminalState:
+def project_domain_policy(state: TerminalState, paper) -> TerminalState:
+    """Project clean-view exclusions into acquisition policy, retaining artifacts.
+
+    The three documented domain markers also exclude identity recovery. Unknown
+    markers fail closed. This pure projection does not clear stored restrictions
+    or quarantine; scoped overrides retain their grant and must cover the added
+    reason. Callers choose the identity-v2 flag at their read boundary.
+    """
+    marker = _field(paper, "domain_status")
+    if marker is None:
+        return state
+    known = isinstance(marker, str) and marker in {"off_domain", "non_paper", "bad_extract"}
+    reason = marker if known else "unknown_domain_status"
+    policy = (Policy.OVERRIDE if state.policy == Policy.OVERRIDE else Policy.EXCLUDED) if known else Policy.UNKNOWN
+    return replace(state, policy=policy,
+                   policy_reasons=tuple(dict.fromkeys((*state.policy_reasons, reason))))
+
+
+def derive_legacy(paper, *, include_domain: bool = False) -> TerminalState:
     """Conservatively project the five live statuses, without mutating a row.
 
     Every cause-unrecorded terminal, including acquired/extract-failed, has
-    unknown policy. Extraction failure never means retrieval failure.
+    unknown policy. Extraction failure never means retrieval failure. With the
+    opt-in domain projection, a recorded domain exclusion establishes policy
+    independently of retrieval (including acquired/verified artifacts).
     """
     status = _field(paper, "download_status")
     if status == "pending":
-        return TerminalState(retrieval=Retrieval.ELIGIBLE, policy=Policy.CLEAR)
-    if status == "ok":
-        return TerminalState(retrieval=(Retrieval.VERIFIED if extraction_evidence(paper)
-                                       else Retrieval.ACQUIRED))
-    if status == "extract_failed":
-        return TerminalState(retrieval=Retrieval.ACQUIRED)
-    if status in ("metadata_only", "failed"):
-        return TerminalState(retrieval=Retrieval.EXHAUSTED)
-    return TerminalState()
+        state = TerminalState(retrieval=Retrieval.ELIGIBLE, policy=Policy.CLEAR)
+    elif status == "ok":
+        state = TerminalState(retrieval=(Retrieval.VERIFIED if extraction_evidence(paper)
+                                        else Retrieval.ACQUIRED))
+    elif status == "extract_failed":
+        state = TerminalState(retrieval=Retrieval.ACQUIRED)
+    elif status in ("metadata_only", "failed"):
+        state = TerminalState(retrieval=Retrieval.EXHAUSTED)
+    else:
+        state = TerminalState()
+    return project_domain_policy(state, paper) if include_domain else state
 
 
 def after_status_write(state: TerminalState, paper) -> TerminalState:

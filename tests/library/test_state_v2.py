@@ -136,3 +136,58 @@ def test_legacy_mapping_is_total_for_missing_or_unknown_input(v2):
         state = v2.derive_legacy(paper)
         assert state.policy == v2.Policy.UNKNOWN
         assert state.retrieval == v2.Retrieval.INELIGIBLE
+
+
+@pytest.mark.parametrize("marker", ["off_domain", "non_paper", "bad_extract"])
+def test_domain_projection_excludes_acquisition_without_changing_retrieval(v2, marker):
+    record = {"download_status": "pending", "domain_status": marker}
+    before = record.copy()
+    state = v2.derive_legacy(record, include_domain=True)
+    assert state.retrieval == v2.Retrieval.ELIGIBLE
+    assert state.policy == v2.Policy.EXCLUDED
+    assert state.policy_reasons == (marker,)
+    assert v2.admission(state, identity_resolved=True, key="K") is False
+    assert record == before
+
+
+@pytest.mark.parametrize("persisted", [False, True])
+def test_identity_flag_gates_domain_projection_including_existing_dimensions(v2, monkeypatch, persisted):
+    paper = Paper(key="K", doi="10.1234/a", domain_status="off_domain",
+                  terminal_state=eligible(v2) if persisted else None)
+    before = paper.model_dump_json()
+    monkeypatch.delenv("PAPERVAULT_IDENTITY_V2", raising=False)
+    assert v2.admission(paper.acquisition_state, identity_resolved=True, key="K") is True
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    assert v2.admission(paper.acquisition_state, identity_resolved=True, key="K") is False
+    assert paper.acquisition_state.policy_reasons == ("off_domain",)
+    assert paper.model_dump_json() == before
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "0")
+    assert v2.admission(paper.acquisition_state, identity_resolved=True, key="K") is True
+
+
+def test_acquired_off_domain_record_retains_artifact_and_retrieval(v2):
+    paper = Paper(key="K", download_status="ok", domain_status="off_domain",
+                  md_path="extracts/md/K.md", md_engine="mineru2.5-pro")
+    state = v2.derive_legacy(paper, include_domain=True)
+    assert state.retrieval == v2.Retrieval.VERIFIED
+    assert state.policy == v2.Policy.EXCLUDED
+    assert paper.md_path == "extracts/md/K.md"
+
+
+def test_unknown_domain_marker_fails_closed(v2):
+    state = v2.derive_legacy({"download_status": "pending", "domain_status": "unknown_marker"},
+                             include_domain=True)
+    assert state.policy == v2.Policy.UNKNOWN
+    assert v2.admission(state, identity_resolved=True) is False
+
+
+@pytest.mark.parametrize("reasons,allowed", [(("off_domain",), True), (("other_reason",), False)])
+def test_domain_projection_preserves_and_checks_scoped_override(v2, monkeypatch, reasons, allowed):
+    monkeypatch.setenv("PAPERVAULT_IDENTITY_V2", "1")
+    grant = v2.PolicyOverride(scope=("acquire",), reasons=reasons, revision=1, key="K")
+    state = replace(eligible(v2, override=grant), policy=v2.Policy.OVERRIDE, required_revision=1)
+    paper = Paper(key="K", domain_status="off_domain", terminal_state=state)
+    projected = paper.acquisition_state
+    assert projected.override == grant
+    assert projected.policy_reasons == ("off_domain",)
+    assert v2.admission(projected, identity_resolved=True, key="K") is allowed

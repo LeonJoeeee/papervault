@@ -38,6 +38,11 @@ def terminal_v2_enabled() -> bool:
     """Read the opt-in acquisition flag at use time, like library tier flags."""
     return os.environ.get("PAPERVAULT_TERMINAL_V2", "").strip().lower() in {"1", "true", "yes"}
 
+
+def identity_v2_enabled() -> bool:
+    """Opt into correspondence adoption and domain policy at their read points."""
+    return os.environ.get("PAPERVAULT_IDENTITY_V2", "").strip().lower() in {"1", "true", "yes"}
+
 # LightRAG's Postgres storage reads POSTGRES_DATABASE (defaulting to 'postgres'), while the
 # ingest ledger reads POSTGRES_DB — leave them unbridged and the knowledge graph's KV/vector/
 # doc_status store silently targets a DIFFERENT database than the ledger. Bridge them: the graph

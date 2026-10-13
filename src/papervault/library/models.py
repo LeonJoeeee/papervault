@@ -8,9 +8,10 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_serializer
 
-from papervault.config import terminal_v2_enabled
+from papervault.config import identity_v2_enabled, terminal_v2_enabled
 
-from .state_v2 import TerminalState, after_status_write, derive_legacy
+from .state_v2 import TerminalState, after_status_write, derive_legacy, project_domain_policy
+from .identity_v2 import CorrespondenceDecision, RouteRejection
 
 # Forward ref: Paper.insight is Optional[Insight], retained as a
 # read-only field after Phase 28 (route B). The schema lives in
@@ -138,6 +139,23 @@ class IdentityRecovery(BaseModel):
     source_url: str
     verified_title: str
     observed_at: str
+    # Optional P2 evidence. Old records and flag-OFF fills keep their exact shape.
+    # Preserve raw field types so validation cannot turn an unresolved P2
+    # observation (e.g. year="2012") into resolved evidence at P3.
+    observed_metadata: dict | None = None
+    route_metadata: dict | None = None
+    correspondence: CorrespondenceDecision | None = None
+    route_rejections: list[RouteRejection] = Field(default_factory=list)
+
+    @model_serializer(mode="wrap")
+    def _serialize_optional_evidence(self, handler):
+        record = handler(self)
+        for field in ("observed_metadata", "route_metadata", "correspondence"):
+            if getattr(self, field) is None:
+                record.pop(field, None)
+        if not self.route_rejections:
+            record.pop("route_rejections", None)
+        return record
 
 
 class ArxivWithdrawal(BaseModel):
@@ -321,6 +339,7 @@ class Paper(BaseModel):
     ads_availability: ADSAvailability = Field(default_factory=ADSAvailability)
     arxiv_withdrawal: Optional[ArxivWithdrawal] = None
     identity_recovery: Optional[IdentityRecovery] = None
+    identity_route_rejections: list[RouteRejection] = Field(default_factory=list)
 
     pdf_path: Optional[str] = None
     txt_path: Optional[str] = None
@@ -345,7 +364,10 @@ class Paper(BaseModel):
 
     @property
     def acquisition_state(self) -> TerminalState:
-        return self.terminal_state if self.terminal_state is not None else derive_legacy(self)
+        if self.terminal_state is not None:
+            return (project_domain_policy(self.terminal_state, self) if identity_v2_enabled()
+                    else self.terminal_state)
+        return derive_legacy(self, include_domain=identity_v2_enabled())
 
     def __setattr__(self, name, value):
         # All status writers share this boundary, including CLI and tier helpers.
@@ -364,6 +386,8 @@ class Paper(BaseModel):
         record = handler(self)
         if self.terminal_state is None:
             record.pop("terminal_state", None)
+        if not self.identity_route_rejections:
+            record.pop("identity_route_rejections", None)
         return record
 
     # Metadata-enrichment guard — WORKER-OWNED (never source-supplied). ISO-8601

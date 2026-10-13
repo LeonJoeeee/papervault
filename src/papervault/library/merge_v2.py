@@ -21,7 +21,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from papervault.config import merge_v2_enabled
 
-from .state_v2 import Merge, Policy, Retrieval, TerminalState, project_domain_policy, retain_observed_restrictions
+from .state_v2 import Merge, Policy, Retrieval, TerminalState, check_index_readable, project_domain_policy, retain_observed_restrictions
 
 _sync_writer_lock = threading.RLock()
 
@@ -49,6 +49,7 @@ class MergeBudget(BaseModel):
 
 def resolve_alias(library, key: str):
     """Return the canonical row, refusing broken or cyclic redirects."""
+    check_index_readable(library.root)
     seen = set()
     while key and key not in seen:
         seen.add(key)
@@ -74,14 +75,18 @@ def blocked(paper) -> bool:
 def guard_execution(work):
     """Count the actual executor lifetime, including threads whose awaiter left.
 
-    This is a merge-specific fence, not a replacement acquisition predicate.
+    Format refusal is independent of merge tracking and feature flags.
+    Lifetime tracking remains a merge-specific fence, not an admission predicate.
     Cancelled async extraction is uncertain, so its merge stays quarantined.
     """
     def enter(paper, library):
         tracked = merge_v2_enabled() or paper.merge_budget is not None or blocked(paper)
         if not tracked:
+            # Kill switches cannot authorize an old writer to downgrade newer data.
+            check_index_readable(library.root)
             return False
         with library._merge_execution_lock:
+            check_index_readable(library.root)
             if blocked(library.get(paper.key) or paper):
                 return None
             from .claims_v2 import BudgetLedger, LedgerError, record_generation
@@ -122,6 +127,7 @@ def guard_execution(work):
                     from .services import concurrency
                     async def persist_uncertainty():
                         async with concurrency.lib_write_lock:
+                            check_index_readable(library.root)
                             current = library.get(paper.key)
                             if current is not None:
                                 intent = current.merge_intent
@@ -185,6 +191,7 @@ class MergeStore:
         from .claims_v2 import BudgetLedger
         from .services import concurrency
         self.library, self.clock = library, clock
+        check_index_readable(library.root)
         self.ledger = ledger or BudgetLedger(library.root, clock=clock)
         self.lock = concurrency.lib_write_lock
 
@@ -193,6 +200,7 @@ class MergeStore:
             raise ValueError("PAPERVAULT_MERGE_V2 is disabled")
         if not self.lock.owned():
             raise RuntimeError("merge writer does not own the library write-lock")
+        check_index_readable(self.library.root)
 
     def _pair(self, intent):
         if intent is None:

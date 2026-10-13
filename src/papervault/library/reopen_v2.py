@@ -17,7 +17,7 @@ from papervault.config import reopen_v2_enabled, stoprules_v2_enabled
 from .claims_v2 import BudgetLedger, ClaimStore, LedgerError, record_generation, reopenable
 from .services import concurrency
 from .services.identity_backfill import read_identity_records
-from .state_v2 import Merge, Retrieval, effective_policy, resolved_identity
+from .state_v2 import Merge, Retrieval, check_index_readable, effective_policy, resolved_identity
 from .store import Library, _fsync_dir
 from .telemetry_v2 import identity_snapshot, publication_fields, record_censored
 
@@ -34,6 +34,7 @@ def _require_enabled():
 def _selection(root, cap, ledger):
     # Both modes inspect the complete snapshot; domain exclusions and scoped
     # overrides are decided by reopenable(), rather than the library clean view.
+    check_index_readable(root)
     papers = read_identity_records(Path(root))
     eligible = []
     for paper in papers:
@@ -80,6 +81,7 @@ class StagedAttempt:
     """
 
     def __init__(self, library: Library, token):
+        check_index_readable(library.root)
         self.live, self.token = library, token
         self.before = library.get(token.key).model_copy(deep=True)
         self.root = library.root / ".reopen-staging" / token.lease_id
@@ -127,6 +129,7 @@ class StagedAttempt:
 
     async def writeback(self, store: ClaimStore) -> bool:
         async with store.lock:
+            check_index_readable(self.live.root)
             paper = store.current(self.token)
             if (not reopen_v2_enabled() or paper is None
                     or paper.reopen_claim.phase != "dispatched"):

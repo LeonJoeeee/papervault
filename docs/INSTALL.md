@@ -175,6 +175,74 @@ Rollback: remove or set `PAPER_LIBRARY_MINERU_ONDEMAND=0` and
 again). Start the configured MinerU user unit so OCR remains resident. Verify
 `/health`, `/v1/models`, and a normal MCP call before closing the change.
 
+## Acquisition-v2 format deploys: drain barrier
+
+For a durable-format change, the barrier is **stop-intake → verify-drain →
+flip** (accepted spec A3/A5). All writers participate: scheduler, metadata
+writer, correction pipeline and standalone campaigns. Mixed old/new writing
+is forbidden. Disabling a v2 flag alone does not stop these producers.
+
+1. **Pre-flight:** prepare the pinned release and its versioned start path
+   (`<release-root>/v0.7.25/.venv/bin/papervault serve`, for example). Verify
+   the supervisor's executable path and installed package version against that
+   pin. Check index and ledger headers before starting a replacement writer.
+   Verify executor lifetime tracking covered **all writers from admission**,
+   including standalone work; enabling flags only now is insufficient. For
+   acquisition workers, keep merge-v2 lifetime tracking enabled from startup.
+   Without that history, the helper cannot certify drain. Current formats
+   are index/budget/claims/lease/queued-claim **1**, identity definition **2**;
+   `compat_v2.COMPATIBILITY_MATRIX` declares each reader's current and preceding
+   format. Future format writers must stamp bumped surfaces in the index or
+   JSONL event's `acquisition_versions` header; bump the index/ledger `version`
+   too when its container changes. Unmarked surfaces retain the slices 1–6
+   versions. Checks are always-on and read-only for current formats. Download
+   and extraction executors check before entry independently of merge tracking;
+   index saves check before backup rotation. Turning off v2 flags cannot bypass
+   newer-format refusal; the legacy index reader is unchanged. Feature flags
+   keep their existing defaults. Politeness accounting is process-local,
+   with no independent durable format.
+2. **Stop intake:** disable old writer restart policies, timers and launchers;
+   seal MCP acquisition, reconcile/correction producers, metadata jobs and new
+   campaigns. Let already admitted work settle. The deployment's seal callback
+   must confirm every producer is stopped and keep intake closed through flip.
+   Pausing extraction alone leaves queued work and does not establish a barrier.
+3. **Verify drain in the owning writer process**, using its live `Library` and
+   registered download/extract queues (a fresh process cannot see its executors):
+
+   ```python
+   from dataclasses import asdict
+   from papervault.library.drain_v2 import verify_drained
+
+   evidence = await verify_drained(
+       library, stop_intake=seal_all_writer_intake,
+       execution_tracking_verified=tracking_verified_from_preflight)
+   # seal_all_writer_intake is the deployment's async callback; return exactly
+   # True only after every producer is sealed, keeping the seal in place.
+   # The tracking argument must be exactly True, backed by the pre-flight above.
+   assert evidence.drained, asdict(evidence)
+   ```
+
+   Record the timestamp and evidence in the deployment record. The helper
+   checks durable claims (including ledger-only reservations), the in-flight
+   registry, merge and ordinary-thread lifetime registries, merge intents and
+   queued/pending/unfinished work.
+   False evidence or unreadable accounting stops cutover. It does not dequeue,
+   refund or release quarantine. Lease expiry and cancellation do not prove
+   execution ended; resolve uncertainty with existing drain/fencing recovery.
+4. **Flip:** stop the drained old writer, select the versioned new start path,
+   then verify path/version and format readability again before admitting work.
+   Keep every old launcher disabled; the supervisor must reject an old-version
+   restart after the barrier. Verify that rejection as a cutover pre-flight item
+   before reopening intake. If the deployment cannot enforce it, do not flip.
+
+Rollback before an irreversible point requires the same barrier and a readable
+matrix. After promotion, merge or an append-only budget decrement, retain
+canonical identities, aliases, restrictions, generations, artifacts and charges;
+use an ad hoc forward fix (short downtime is supported), never restore an old
+index or ledger to erase the operation. The four failure-injected fixture drills
+in `tests/library/test_rollback_drills_v2.py` exercise this retained-data posture;
+they perform no production operations.
+
 ## Connecting an agent
 
 **Claude Code** — install the bundled plugin (points Claude Code at the running

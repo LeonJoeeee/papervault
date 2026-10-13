@@ -345,6 +345,10 @@ class Library:
             self._by_title[nt] = key
 
     def _save_index(self, *, durable: bool = False) -> None:
+        # Metadata/queue saves must not strip an unsupported format header,
+        # even with v2 flags off. Refuse before rotating the last-good index.
+        from .state_v2 import check_index_readable
+        check_index_readable(self.root)
         # D14: rotate the current on-disk index into ``.bak`` BEFORE overwriting
         # it, so a known-good copy survives a crash mid-write of the new index.
         # We only rotate a copy that actually parses — never overwrite a good

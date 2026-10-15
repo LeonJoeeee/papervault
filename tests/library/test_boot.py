@@ -170,6 +170,7 @@ def test_bind_not_gated_on_mineru_reachability(tmp_path):
     async def scenario():
         mineru_server.reset_server_controller_for_test()
         ctrl = mineru_server.get_server_controller()
+        ctrl._bus_ok = False  # This test owns a fresh singleton; never probe the host bus.
 
         release = asyncio.Event()   # never set during the boot window → probe hangs
 

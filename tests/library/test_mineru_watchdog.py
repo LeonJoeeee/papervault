@@ -1,5 +1,7 @@
 """Global vLLM watchdog evidence; metrics, clock, HTTP and systemd stay local fakes."""
 
+import asyncio
+
 import pytest
 
 from papervault.library.services import mineru_server as ms
@@ -87,15 +89,84 @@ class Feed:
         return self.text
 
 
-@pytest.fixture
-def watchdog(monkeypatch, tmp_path):
-    import asyncio
+@pytest.mark.parametrize("value", [None, "1", "", "invalid", "false", "2", " 0 "])
+async def test_watchdog_defaults_enabled_and_stops_on_global_idle(monkeypatch, caplog, value):
+    if value is None:
+        monkeypatch.delenv("PAPER_LIBRARY_MINERU_WATCHDOG", raising=False)
+    else:
+        monkeypatch.setenv("PAPER_LIBRARY_MINERU_WATCHDOG", value)
+    monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys", lambda: [])
+    clock = Clock()
+    with caplog.at_level("INFO", logger=ms.log.name):
+        c = ms.MineruServerController(
+            base_url="http://127.0.0.1:30000", clock=clock, metrics_source=Feed())
+        c._bus_ok = True
+        stops, intervals = [], []
+        ticks = iter([0, 899, 900])
 
-    monkeypatch.setenv("PAPER_LIBRARY_MINERU_LEASE_FILE", str(tmp_path / "lease"))
+        async def sleep(delay):
+            intervals.append(delay)
+            try:
+                clock.now = next(ticks)
+            except StopIteration:
+                raise asyncio.CancelledError
+
+        async def ready():
+            return True
+
+        async def active_age():
+            return True
+
+        async def systemctl(verb):
+            assert verb == "stop" and c._lock.locked() and c._stopping
+            stops.append(clock.now)
+            return 0, ""
+
+        c._ready = ready
+        c._unit_active_long_enough = active_age
+        c._run_systemctl = systemctl
+        monkeypatch.setattr(ms.asyncio, "sleep", sleep)
+        with pytest.raises(asyncio.CancelledError):
+            await c.monitor_loop(asyncio.Queue())
+
+    assert stops == [900]
+    assert intervals == [ms._CHECK_INTERVAL] * 4
+    states = [r for r in caplog.records if r.levelname == "INFO" and "enabled=" in r.message]
+    assert len(states) == 1 and "enabled=True" in states[0].message
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    if value in {None, "1"}:
+        assert warnings == []
+    else:
+        assert len(warnings) == 1
+        assert "PAPER_LIBRARY_MINERU_WATCHDOG" in warnings[0].message
+        assert "enabled" in warnings[0].message
+
+
+async def test_watchdog_zero_disables_monitor_before_any_probe(monkeypatch, caplog):
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_WATCHDOG", "0")
+    c = ms.MineruServerController()
+
+    async def unexpected(*args):
+        pytest.fail("disabled watchdog must not probe, poll metrics, or schedule iterations")
+
+    c._run_systemctl = unexpected
+    c._ready = unexpected
+    c._metrics_source = unexpected
+    monkeypatch.setattr(ms.asyncio, "sleep", unexpected)
+    with caplog.at_level("INFO", logger=ms.log.name):
+        await c.monitor_loop(asyncio.Queue())
+        await c._monitor_once(asyncio.Queue())
+    states = [r for r in caplog.records if r.levelname == "INFO" and "enabled=" in r.message]
+    assert len(states) == 1 and "enabled=False" in states[0].message
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+@pytest.fixture
+def watchdog(monkeypatch):
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys", lambda: [])
     clock, feed = Clock(), Feed()
     controller = ms.MineruServerController(
-        ondemand=True, base_url="http://127.0.0.1:30000", clock=clock, metrics_source=feed)
+        watchdog=True, base_url="http://127.0.0.1:30000", clock=clock, metrics_source=feed)
     controller._bus_ok = True
     calls = []
 
@@ -331,7 +402,7 @@ async def test_watchdog_never_stops_for_another_endpoint(watchdog, base_url):
 
 async def test_off_mode_never_reads_metrics(watchdog):
     c, clock, feed, calls, queue = watchdog
-    c._ondemand = False
+    c._watchdog = False
     feed.error = AssertionError("off mode must not poll")
     await c._monitor_once(queue)
     clock.now = 900
@@ -351,7 +422,7 @@ async def test_metrics_http_uses_only_loopback_port_30000_without_redirects(monk
     client = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient",
                         lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs))
-    c = ms.MineruServerController(ondemand=True, base_url="http://127.0.0.1:30000")
+    c = ms.MineruServerController(base_url="http://127.0.0.1:30000")
     assert await c._fetch_metrics() == metrics()
     assert requested == ["http://127.0.0.1:30000/metrics"]
 
@@ -390,7 +461,7 @@ async def test_metrics_http_errors_and_redirects_are_not_followed(monkeypatch, s
     client = httpx.AsyncClient
     monkeypatch.setattr(httpx, "AsyncClient",
                         lambda **kwargs: client(transport=httpx.MockTransport(handler), **kwargs))
-    c = ms.MineruServerController(ondemand=True, base_url="http://127.0.0.1:30000")
+    c = ms.MineruServerController(base_url="http://127.0.0.1:30000")
     with pytest.raises(httpx.HTTPStatusError):
         await c._fetch_metrics()
     assert requested == ["http://127.0.0.1:30000/metrics"]

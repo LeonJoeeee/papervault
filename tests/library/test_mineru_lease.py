@@ -23,12 +23,17 @@ def lane(monkeypatch, tmp_path):
     lease = tmp_path / "paper-library-mineru.lease"
     monkeypatch.setenv("PAPER_LIBRARY_MINERU_LEASE_FILE", str(lease))
     monkeypatch.setattr(ms, "_IDLE_TIMEOUT", 0.0)
+    monkeypatch.setattr(ms, "_MIN_ACTIVE_TIME", 0.0)
     monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 1)
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys", lambda: [])
+    async def metrics():
+        return ("vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n"
+                "vllm:request_success_total 0\n")
+
     controller = ms.MineruServerController(
         ondemand=True, unit="paper-library-mineru.service", base_url="http://127.0.0.1:30000",
+        metrics_source=metrics,
     )
-    controller._last_activity = 0.0
     calls = []
 
     async def systemctl(verb):
@@ -41,8 +46,12 @@ def lane(monkeypatch, tmp_path):
     async def ready():
         return True
 
+    async def active_age():
+        return True
+
     controller._run_systemctl = systemctl
     controller._ready = ready
+    controller._unit_active_long_enough = active_age
     return controller, calls, lease
 
 

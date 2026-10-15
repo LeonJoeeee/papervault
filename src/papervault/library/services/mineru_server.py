@@ -6,12 +6,16 @@ its whole lifetime (vLLM pre-allocates the KV-cache pool and never releases it
 while running). In steady state the vault is fully extracted and the extract
 queue is idle almost always, so a 24/7-resident server wastes the card. This
 controller makes the server **on-demand**: started on the worker critical path
-right before an extract, and stopped after the queue has been idle for
-``IDLE_TIMEOUT``, freeing the GPU (e.g. for a future KS embedding co-tenant).
-Idle measures this controller's activity, not the unit's uptime or external
-HTTP traffic. The monitor also stops externally started instances; a stop does
-not reset the activity timestamp, so an external restart can be stopped on the
-next ``_CHECK_INTERVAL`` sweep once that idle window has elapsed.
+right before an extract, and stopped after global vLLM activity has been idle
+for ``PAPER_LIBRARY_MINERU_IDLE_TIMEOUT`` (default 900 s), freeing the GPU.
+The watchdog polls this host's :30000 ``/metrics`` every
+``PAPER_LIBRARY_MINERU_IDLE_CHECK`` seconds (default 90, clamped to 60–120).
+Running/waiting requests, their observed clearance, or changed success/token
+counters refresh activity;
+unchanged counters establish idle only after a full observed window. Missing
+readiness/metrics, counter resets, and stop attempts discard that window.
+An instance must also have been observed model-ready for at least 900 s, and
+the managed unit's monotonic active age is checked immediately before stopping.
 
 **OPT-IN** via ``PAPER_LIBRARY_MINERU_ONDEMAND=1``. Default OFF ⇒ every method is
 a strict no-op and the persistent always-on deploy is byte-unchanged.
@@ -24,8 +28,11 @@ Key review-driven invariants baked in here:
     bare ``/health`` 200 can precede the engine being parse-ready (review fix #3).
   * ``READY_TIMEOUT`` ≥ the unit's ``TimeoutStartSec`` (300 s) so a legitimately
     slow cold start isn't abandoned mid-flight (review fix #4).
-  * idle = ``queue.qsize()==0`` AND no ``ex:``-prefixed key in
+  * local drain guard = ``queue.qsize()==0`` AND no ``ex:``-prefixed key in
     ``concurrency.in_flight_keys()`` (a function, ``ex:``-prefixed — review fix #2).
+    Operator OCR sessions also hold the guard. Global metrics are re-read under
+    the transition lock immediately before each idle stop; invalid/unavailable
+    metrics warn once per failed read and keep the server up.
   * a lockless ``ensure_ready`` fast-path checks ``_stopping`` after its
     readiness await, so a concurrent teardown cannot admit OCR.
   * a failed/timeout start enters an exponential cooldown so OOM (e.g. a GPU
@@ -52,14 +59,19 @@ and allow the action. No other path reads the lease.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import json
 import logging
+import math
 import os
 from pathlib import Path
+import re
 import time
 from typing import Optional
+from urllib.parse import urlsplit
 
 from ..mineru_client import MineruTransportError, endpoints_from_env
 
@@ -88,10 +100,77 @@ def _reject_lease_constant(value: str) -> None:
     raise ValueError(f"invalid JSON constant: {value}")
 
 
+_SAMPLE = re.compile(
+    r'([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{(.*)\})?\s+(\S+)(?:\s+\d+)?\s*')
+_LABEL = re.compile(r'\s*([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*"((?:[^"\\]|\\[\\"n])*)"\s*(?:,|$)')
+_GAUGES = {"vllm:num_requests_running", "vllm:num_requests_waiting"}
+_Series = tuple[str, tuple[tuple[str, str], ...]]
+
+
+@dataclass
+class _MetricsSnapshot:
+    busy: bool
+    counters: dict[_Series, float]
+
+
+def _parse_metrics(text: str) -> _MetricsSnapshot:
+    """Read relevant Prometheus samples; incomplete/invalid observations fail shut.
+
+    Keep counter series separate: summing them could hide one series increasing
+    while another resets. Histogram sum/count are valid token-counter backups;
+    bucket and creation-time samples are unnecessary for activity detection.
+    """
+    seen: set[_Series] = set()
+    gauges: set[str] = set()
+    counters: dict[_Series, float] = {}
+    busy = False
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        name = re.split(r"[\s{]", line, maxsplit=1)[0]
+        is_gauge = name in _GAUGES or name == "vllm:num_requests_waiting_by_reason"
+        is_counter = name == "vllm:request_success_total" or (
+            name.startswith("vllm:generation_tokens_")
+            and name.endswith(("_total", "_sum", "_count")))
+        if not is_gauge and not is_counter:
+            continue
+        match = _SAMPLE.fullmatch(line)
+        if match is None:
+            raise ValueError(f"invalid metric sample: {name}")
+        labels = {}
+        raw_labels = (match[2] or "").strip()
+        pos = 0
+        while pos < len(raw_labels):
+            label = _LABEL.match(raw_labels, pos)
+            if label is None or label[1] in labels:
+                raise ValueError(f"invalid metric labels: {name}")
+            labels[label[1]] = label[2]
+            pos = label.end()
+        series = (name, tuple(sorted(labels.items())))
+        value = float(match[3])
+        if not math.isfinite(value) or value < 0 or series in seen:
+            raise ValueError(f"invalid or duplicate metric: {name}")
+        seen.add(series)
+        if is_gauge:
+            gauges.add(name)
+            busy = busy or value > 0
+        else:
+            counters[series] = value
+    if not _GAUGES.issubset(gauges) or not counters:
+        raise ValueError("missing vLLM request gauges or activity counters")
+    return _MetricsSnapshot(busy=busy, counters=counters)
+
+
 # Readiness wait ≥ unit TimeoutStartSec=300 + margin (review fix #4).
 _READY_TIMEOUT = _env_float("PAPER_LIBRARY_MINERU_READY_TIMEOUT", 330.0)
-_CHECK_INTERVAL = _env_float("PAPER_LIBRARY_MINERU_IDLE_CHECK", 60.0)
-_IDLE_TIMEOUT = _env_float("PAPER_LIBRARY_MINERU_IDLE_TIMEOUT", 600.0)
+_CHECK_INTERVAL = _env_float("PAPER_LIBRARY_MINERU_IDLE_CHECK", 90.0)
+_CHECK_INTERVAL = min(120.0, max(60.0, _CHECK_INTERVAL)) if math.isfinite(_CHECK_INTERVAL) else 90.0
+_IDLE_TIMEOUT = _env_float("PAPER_LIBRARY_MINERU_IDLE_TIMEOUT", 900.0)
+if not math.isfinite(_IDLE_TIMEOUT) or _IDLE_TIMEOUT <= 0:
+    _IDLE_TIMEOUT = 900.0
+_MIN_ACTIVE_TIME = 900.0
+_METRICS_URL = "http://127.0.0.1:30000/metrics"
 _HEALTH_POLL = _env_float("PAPER_LIBRARY_MINERU_HEALTH_POLL", 2.0)
 _HEALTH_HTTP_TIMEOUT = 3.0
 _COOLDOWN_MIN = 30.0
@@ -123,6 +202,8 @@ class MineruServerController:
         ondemand: Optional[bool] = None,
         unit: Optional[str] = None,
         base_url: Optional[str] = None,
+        metrics_source: Optional[Callable[[], Awaitable[str]]] = None,
+        clock: Optional[Callable[[], float]] = None,
     ) -> None:
         self._ondemand = _env_flag("PAPER_LIBRARY_MINERU_ONDEMAND") if ondemand is None else ondemand
         self._unit = unit or os.environ.get(
@@ -132,7 +213,11 @@ class MineruServerController:
             base_url = eps[0].url if eps else "http://127.0.0.1:30000"
         self._base = base_url.rstrip("/")
         self._lock = asyncio.Lock()
-        self._last_activity = time.monotonic()
+        self._clock = clock or time.monotonic
+        self._metrics_source = metrics_source or self._fetch_metrics
+        self._previous_metrics: Optional[_MetricsSnapshot] = None
+        self._global_last_activity: Optional[float] = None
+        self._ready_since: Optional[float] = None
         self._stopping = False
         self._cooldown = 0.0          # current backoff length (doubles on each failed start)
         self._cooldown_until = 0.0    # monotonic deadline; ensure_ready short-circuits before it
@@ -152,10 +237,11 @@ class MineruServerController:
 
     # ----------------------------- activity ----------------------------------
     def note_activity(self) -> None:
-        """Stamp 'extract activity happened now'. Cheap, sync. Called on enqueue,
-        on worker pull, and on ensure_ready entry so the idle timer measures time
-        since real activity, not time since enqueue (review fix #5)."""
-        self._last_activity = time.monotonic()
+        """Compatibility hook for enqueue/pull callers; v2 times global metrics.
+
+        Local work is protected by the queue/in-flight/OCR drain guards, rather
+        than the retired timer measuring this process's activity alone.
+        """
 
     @asynccontextmanager
     async def ocr_session(self):
@@ -356,32 +442,80 @@ class MineruServerController:
         while True:
             try:
                 await asyncio.sleep(_CHECK_INTERVAL)
-                if not self._past_idle(extract_queue):
-                    continue
-                async with self._lock:
-                    # Re-check everything UNDER the lock (the fast outer check may
-                    # be stale by the time we acquired it).
-                    if self._past_idle(extract_queue) and await self._ready():
-                        # _ready awaited I/O, during which a worker may have
-                        # entered. No await separates this final check from
-                        # setting _stopping, while the controller lock is held.
-                        if self._past_idle(extract_queue):
-                            if self._lease_held("stop"):
-                                continue
-                            self._stopping = True
-                            try:
-                                await self._systemctl("stop")
-                            finally:
-                                self._stopping = False
+                await self._monitor_once(extract_queue)
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — a monitor hiccup must never kill the loop
                 log.exception("mineru on-demand monitor iteration failed")
 
+    async def _monitor_once(self, extract_queue) -> None:
+        """Observe global activity, then perform a freshly guarded idle stop."""
+        endpoint = urlsplit(self._base)
+        if (not self._ondemand or endpoint.scheme != "http"
+                or endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or endpoint.port != 30000 or endpoint.path
+                or endpoint.query or endpoint.fragment or endpoint.username):
+            return
+        if not await self._ready():
+            self._reset_watchdog()
+            return
+        if not await self._observe_metrics() or not self._past_idle(extract_queue):
+            return
+        async with self._lock:
+            if not self._past_idle(extract_queue):
+                return
+            if not await self._ready():
+                self._reset_watchdog()
+                return
+            if not await self._unit_active_long_enough():
+                self._reset_watchdog()
+                return
+            # Last awaited probe before stopping: global work that arrived since
+            # the outer decision must cancel the stop, even with no local work.
+            if not await self._observe_metrics() or not self._past_idle(extract_queue):
+                return
+            if self._lease_held("stop"):
+                return
+            self._stopping = True
+            try:
+                await self._systemctl("stop")
+            finally:
+                self._stopping = False
+                self._reset_watchdog()
+
+    def _reset_watchdog(self) -> None:
+        self._previous_metrics = None
+        self._global_last_activity = None
+        self._ready_since = None
+
+    async def _observe_metrics(self) -> bool:
+        try:
+            snapshot = _parse_metrics(await self._metrics_source())
+        except Exception as exc:  # noqa: BLE001 — failed observations must never permit a stop
+            self._reset_watchdog()
+            log.warning("mineru watchdog metrics unavailable or invalid: %s; keeping server up", exc)
+            return False
+        now = self._clock()
+        previous = self._previous_metrics
+        if previous is None or snapshot.counters.keys() != previous.counters.keys() or any(
+                value < previous.counters[key] for key, value in snapshot.counters.items()):
+            # A reset/series change can indicate a new engine; do not transfer
+            # the previous instance's readiness grace or activity window to it.
+            self._ready_since = now
+            self._global_last_activity = now
+        if snapshot.busy or previous is None or previous.busy or snapshot.counters != previous.counters:
+            self._global_last_activity = now
+        self._previous_metrics = snapshot
+        return True
+
     def _past_idle(self, extract_queue) -> bool:
+        now = self._clock()
         return (
             self._idle(extract_queue)
-            and (time.monotonic() - self._last_activity) > _IDLE_TIMEOUT
+            and self._ready_since is not None
+            and now - self._ready_since >= _MIN_ACTIVE_TIME
+            and self._global_last_activity is not None
+            and now - self._global_last_activity >= _IDLE_TIMEOUT
         )
 
     def _idle(self, extract_queue) -> bool:
@@ -419,6 +553,35 @@ class MineruServerController:
         return True
 
     # ------------------------------- probes -----------------------------------
+    async def _unit_active_long_enough(self) -> bool:
+        """Guard against external restarts whose counters match the old engine.
+
+        systemd's timestamp is microseconds on this host's CLOCK_MONOTONIC,
+        matching the watchdog clock. An unverified active age never permits stop.
+        """
+        rc, output = await self._run_systemctl("show")
+        try:
+            properties = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+            if rc != 0:
+                raise ValueError(f"systemctl show failed (rc={rc})")
+            if properties["ActiveState"] != "active":
+                return False
+            since = int(properties["ActiveEnterTimestampMonotonic"]) / 1_000_000
+            now = self._clock()
+            if not 0 < since <= now:
+                raise ValueError("missing or invalid monotonic active timestamp")
+        except (KeyError, ValueError, OverflowError) as exc:
+            log.warning("mineru watchdog cannot verify unit active age: %s; keeping server up", exc)
+            return False
+        return now - since >= _MIN_ACTIVE_TIME
+
+    async def _fetch_metrics(self) -> str:
+        import httpx
+        async with httpx.AsyncClient(timeout=_HEALTH_HTTP_TIMEOUT, follow_redirects=False) as client:
+            response = await client.get(_METRICS_URL)
+            response.raise_for_status()
+            return response.text
+
     async def _ready(self) -> bool:
         """Model-ready iff ``/health`` 200 AND ``/v1/models`` lists ≥1 model
         (review fix #3: a bare ``/health`` 200 can precede engine readiness)."""
@@ -447,17 +610,31 @@ class MineruServerController:
         return self._bus_ok
 
     async def _systemctl(self, verb: str) -> Optional[int]:
-        rc, _ = await self._run_systemctl(verb)
-        return rc
+        new_instance = verb in {"start", "restart"}
+        if new_instance:
+            self._reset_watchdog()
+        try:
+            rc, _ = await self._run_systemctl(verb)
+            return rc
+        finally:
+            if new_instance:
+                # An outer probe may finish while the transition is awaited;
+                # neither it nor the old instance can lend the new one grace.
+                self._reset_watchdog()
 
     async def _run_systemctl(self, verb: str) -> tuple[Optional[int], str]:
         """Run ``systemctl --user <verb> <unit>`` off the event loop with a
-        timeout. Returns (rc, stderr); rc None ⇒ systemctl missing or timed out."""
+        timeout. Returns (rc, stderr), or (rc, properties) for ``show``;
+        rc None ⇒ systemctl missing or timed out."""
         timeout = {"start": _START_TIMEOUT,
-                   "restart": _STOP_TIMEOUT + _START_TIMEOUT}.get(verb, _STOP_TIMEOUT)
+                   "restart": _STOP_TIMEOUT + _START_TIMEOUT,
+                   "show": _HEALTH_HTTP_TIMEOUT}.get(verb, _STOP_TIMEOUT)
+        args = ["systemctl", "--user", verb, self._unit]
+        if verb == "show":
+            args.extend(["--property=ActiveState", "--property=ActiveEnterTimestampMonotonic"])
         try:
             proc = await asyncio.create_subprocess_exec(
-                "systemctl", "--user", verb, self._unit,
+                *args,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
         except FileNotFoundError:
             return None, "systemctl not found"
@@ -471,6 +648,8 @@ class MineruServerController:
             log.error("systemctl --user %s %s timed out after %.0fs", verb, self._unit, timeout)
             return None, "timeout"
         err_s = (err or b"").decode("utf-8", "replace")
+        if verb == "show":
+            return proc.returncode, (_out or b"").decode("utf-8", "replace")
         if verb != "is-active":
             log.info("systemctl --user %s %s → rc=%s", verb, self._unit, proc.returncode)
         return proc.returncode, err_s

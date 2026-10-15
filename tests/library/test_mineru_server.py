@@ -34,8 +34,19 @@ class _FakeQueue:
 
 
 def _controller(ondemand=True, **kw):
-    return MineruServerController(ondemand=ondemand, unit="x.service",
-                                  base_url="http://127.0.0.1:30000", **kw)
+    async def metrics():
+        return ("vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n"
+                "vllm:request_success_total 0\n")
+
+    kw.setdefault("metrics_source", metrics)
+    controller = MineruServerController(ondemand=ondemand, unit="x.service",
+                                       base_url="http://127.0.0.1:30000", **kw)
+
+    async def active_age():
+        return True
+
+    controller._unit_active_long_enough = active_age
+    return controller
 
 
 def _stub_systemctl(c):
@@ -199,6 +210,7 @@ def test_not_idle_when_extract_in_flight(monkeypatch):
 def test_monitor_stops_when_idle_past_timeout(monkeypatch):
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys", lambda: [])
     monkeypatch.setattr(ms, "_IDLE_TIMEOUT", 0.0)         # immediately "past idle"
+    monkeypatch.setattr(ms, "_MIN_ACTIVE_TIME", 0.0)      # grace covered by watchdog tests
     monkeypatch.setattr(ms, "_CHECK_INTERVAL", 0.0)
     c = _controller()
     calls = _stub_systemctl(c)
@@ -223,6 +235,7 @@ def test_monitor_does_not_stop_while_extract_in_flight(monkeypatch):
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys",
                         lambda: ["ex:Live2024"])          # extraction running
     monkeypatch.setattr(ms, "_IDLE_TIMEOUT", 0.0)
+    monkeypatch.setattr(ms, "_MIN_ACTIVE_TIME", 0.0)
     monkeypatch.setattr(ms, "_CHECK_INTERVAL", 0.0)
     c = _controller()
     calls = _stub_systemctl(c)
@@ -248,10 +261,10 @@ def test_monitor_rechecks_idle_after_readiness_probe(monkeypatch):
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys",
                         lambda: in_flight.copy())
     monkeypatch.setattr(ms, "_IDLE_TIMEOUT", 0.0)
+    monkeypatch.setattr(ms, "_MIN_ACTIVE_TIME", 0.0)
     monkeypatch.setattr(ms, "_CHECK_INTERVAL", 0.0)
     c = _controller()
     c._bus_ok = True
-    c._last_activity = 0.0
     calls = _stub_systemctl(c)
     probe_entered = asyncio.Event()
     release_probe = asyncio.Event()
@@ -357,6 +370,7 @@ def test_fast_path_waits_when_stop_begins_during_probe():
 def test_operator_ocr_session_keeps_server_active_until_ocr_finishes(monkeypatch):
     monkeypatch.setattr("papervault.library.services.concurrency.in_flight_keys", lambda: [])
     monkeypatch.setattr(ms, "_IDLE_TIMEOUT", 0.0)
+    monkeypatch.setattr(ms, "_MIN_ACTIVE_TIME", 0.0)
     c = _controller()
     probes = []
 
@@ -367,10 +381,9 @@ def test_operator_ocr_session_keeps_server_active_until_ocr_finishes(monkeypatch
     c._ready = ready
 
     async def drive():
+        await c._observe_metrics()
         async with c.ocr_session():
-            c._last_activity = 0.0
             assert c._past_idle(_FakeQueue(0)) is False
-        c._last_activity = 0.0
         assert c._past_idle(_FakeQueue(0)) is True
 
     _run(drive())

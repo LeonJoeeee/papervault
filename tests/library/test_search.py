@@ -831,14 +831,13 @@ def test_fetch_queued_past_the_deadline_degrades_without_calling_the_backend(
 
     fetch_pool(1)
     monkeypatch.setattr(search, "_interval_for", lambda backend: 0.0)
-    monkeypatch.setattr(search, "FETCH_QUEUE_TIMEOUT_S", 0.05)
     holding = threading.Event()
     release = threading.Event()
     called = []
 
     def hung(q, **k):                     # a backend whose socket never gives up
         holding.set()
-        release.wait(5)
+        release.wait()
         return []
 
     def healthy(q, **k):
@@ -852,11 +851,22 @@ def test_fetch_queued_past_the_deadline_degrades_without_calling_the_backend(
         degraded = collections.Counter()
         occupier = asyncio.create_task(
             search._fetch_one_backend("h", "ads", 5, term_idx=0, timeout=60))
-        await asyncio.to_thread(holding.wait, 5)       # the only thread is now held
-        out = await search._fetch_one_backend("q", "inspire", 5, term_idx=1,
-                                              degraded_map=degraded)
-        release.set()
-        await occupier
+        try:
+            assert await asyncio.to_thread(holding.wait, 5)
+            # The short deadline applies to the queued fetch, not occupier startup.
+            monkeypatch.setattr(search, "FETCH_QUEUE_TIMEOUT_S", 0.05)
+            out = await search._fetch_one_backend("q", "inspire", 5, term_idx=1,
+                                                  degraded_map=degraded)
+            # fut.cancel() forwards cancellation to the executor on the next loop
+            # turn. Let that callback withdraw the job before freeing the worker.
+            await asyncio.sleep(0)
+        finally:
+            release.set()
+            await occupier
+            # Drain queued work while the loop is alive, so a missing cancellation
+            # would call healthy rather than fail against a closed event loop.
+            await asyncio.get_running_loop().run_in_executor(
+                search._fetch_executor(), lambda: None)
         return out, degraded
 
     with caplog.at_level(logging.WARNING, logger="papervault.library.search"):

@@ -1,10 +1,10 @@
-"""Tests for the on-demand MinerU server controller (services/mineru_server.py).
+"""Tests for the MinerU server controller (services/mineru_server.py).
 
 The systemctl subprocess and the HTTP readiness probe are stubbed at the
 ``_run_systemctl`` / ``_ready`` seams so no real server or bus is touched. These
 exercise the review-driven invariants: the transport-subclass contract, the
 ``ex:`` in-flight idle predicate, the cold-start wait + cooldown, the
-``_stopping`` fast-path gate, and the OFF=no-op guarantee.
+``_stopping`` fast-path gate, and readiness independent of the watchdog switch.
 """
 
 from __future__ import annotations
@@ -33,13 +33,13 @@ class _FakeQueue:
         return self._n
 
 
-def _controller(ondemand=True, **kw):
+def _controller(**kw):
     async def metrics():
         return ("vllm:num_requests_running 0\nvllm:num_requests_waiting 0\n"
                 "vllm:request_success_total 0\n")
 
     kw.setdefault("metrics_source", metrics)
-    controller = MineruServerController(ondemand=ondemand, unit="x.service",
+    controller = MineruServerController(unit="x.service",
                                        base_url="http://127.0.0.1:30000", **kw)
 
     async def active_age():
@@ -76,33 +76,32 @@ def _stub_ready(c, seq):
     c._ready = fake
 
 
-# --------------------------- OFF = strict no-op ----------------------------
+# ---------------------- watchdog switch only gates monitoring --------------
 
 
-def test_ensure_ready_offmode_is_noop():
-    c = _controller(ondemand=False)
+def test_ensure_ready_starts_and_waits_with_watchdog_disabled(monkeypatch):
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_WATCHDOG", "0")
+    monkeypatch.setattr(ms, "_HEALTH_POLL", 0.0)
+    c = _controller()
     calls = _stub_systemctl(c)
-    _run(c.ensure_ready())                 # must not raise, must not touch systemctl
-    assert calls == []
+    _stub_ready(c, [False, False, False, True])
+    _run(c.ensure_ready())
+    assert calls == ["is-active", "start"]
 
 
-def test_monitor_loop_offmode_returns_immediately():
-    c = _controller(ondemand=False)
+def test_operator_ocr_session_keeps_admission_with_watchdog_disabled(monkeypatch):
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_WATCHDOG", "0")
+    c = _controller()
     calls = _stub_systemctl(c)
-    _run(c.monitor_loop(_FakeQueue(0)))    # returns at once, no bus probe / stop
-    assert calls == []
-
-
-def test_operator_ocr_session_offmode_is_noop():
-    c = _controller(ondemand=False)
-    calls = _stub_systemctl(c)
+    _stub_ready(c, [False, False, True])
 
     async def drive():
         async with c.ocr_session():
-            assert c._active_ocr == 0
+            assert c._active_ocr == 1
+        assert c._active_ocr == 0
 
     _run(drive())
-    assert calls == []
+    assert calls == ["is-active", "start"]
 
 
 # ----------------------------- ensure_ready --------------------------------
@@ -308,7 +307,7 @@ def test_monitor_rechecks_idle_after_readiness_probe(monkeypatch):
     assert "stop" not in calls
 
 
-def test_monitor_forces_off_when_no_bus():
+def test_no_bus_disables_only_monitoring():
     c = _controller()
 
     async def no_bus(verb):
@@ -316,7 +315,11 @@ def test_monitor_forces_off_when_no_bus():
 
     c._run_systemctl = no_bus
     _run(c.monitor_loop(_FakeQueue(0)))                  # returns after the bus probe
-    assert c.ondemand is False                            # degraded to persistent
+    _stub_ready(c, [True])
+    _run(c.ensure_ready())                                # ready persistent server works
+    _stub_ready(c, [False])
+    with pytest.raises(MineruServerUnavailable, match="no D-Bus"):
+        _run(c.ensure_ready())                            # readiness remains enforced
 
 
 # ------------------------------- _stopping gate ----------------------------
@@ -393,8 +396,8 @@ def test_operator_ocr_session_keeps_server_active_until_ocr_finishes(monkeypatch
 # ------------- issue #134: self-heal on server-side image decode -------------
 # A stale MinerU server (still running from a deleted venv) answers every page
 # with 400 "Failed to load image". The client parks those papers uncharged; the
-# controller restarts the unit once after N consecutive occurrences (on-demand
-# ON) or logs one ERROR naming the cause and the unit (on-demand OFF).
+# controller restarts the unit once after N consecutive occurrences, regardless
+# of the watchdog switch, or logs one ERROR if self-healing was already spent.
 
 
 def _record_systemctl(c):
@@ -504,15 +507,18 @@ def test_image_decode_self_heal_waits_for_model_ready(monkeypatch):
     assert c._cooldown_until == 0.0           # became ready → no cooldown
 
 
-def test_image_decode_offmode_logs_one_error_and_never_restarts(monkeypatch, caplog):
+def test_image_decode_self_heal_runs_with_watchdog_disabled(monkeypatch, caplog):
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_WATCHDOG", "0")
     monkeypatch.setattr(ms, "_IMAGE_DECODE_RESTART_AFTER", 3)
-    c = _controller(ondemand=False)
+    c = _controller()
     calls = _record_systemctl(c)
+    _stub_ready(c, [True])
     with caplog.at_level("ERROR", logger=ms.log.name):
         _fail_n(c, 2)
         assert not [r for r in caplog.records if r.levelname == "ERROR"]
         _fail_n(c, 7)
-    assert calls == []                        # OFF never touches systemctl
+        _fail_n(c, 3)                         # still failing after the restart completed
+    assert [verb for verb, _ in calls] == ["is-active", "restart"]
     errors = [r for r in caplog.records if r.levelname == "ERROR"]
     assert len(errors) == 1
     msg = errors[0].getMessage()

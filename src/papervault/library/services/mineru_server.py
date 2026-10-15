@@ -1,12 +1,12 @@
-"""On-demand lifecycle for the persistent MinerU vLLM server unit.
+"""Worker readiness and global-idle watchdog for the MinerU vLLM server unit.
 
 The MinerU server (``papervault-mineru.service``; legacy ``paper-library-mineru.service``
 still selectable via ``PAPER_LIBRARY_MINERU_UNIT``) holds ~9 GB on the 3090 for
-its whole lifetime (vLLM pre-allocates the KV-cache pool and never releases it
+its whole lifetime (vLLM pre-allocates the KV-cache pool and never returns it
 while running). In steady state the vault is fully extracted and the extract
 queue is idle almost always, so a 24/7-resident server wastes the card. This
-controller makes the server **on-demand**: started on the worker critical path
-right before an extract, and stopped after global vLLM activity has been idle
+controller starts the server on the worker critical path
+right before an extract, and stops it after global vLLM activity has been idle
 for ``PAPER_LIBRARY_MINERU_IDLE_TIMEOUT`` (default 900 s), freeing the GPU.
 The watchdog polls this host's :30000 ``/metrics`` every
 ``PAPER_LIBRARY_MINERU_IDLE_CHECK`` seconds (default 90, clamped to 60–120).
@@ -17,8 +17,34 @@ readiness/metrics, counter resets, and stop attempts discard that window.
 An instance must also have been observed model-ready for at least 900 s, and
 the managed unit's monotonic active age is checked immediately before stopping.
 
-**OPT-IN** via ``PAPER_LIBRARY_MINERU_ONDEMAND=1``. Default OFF ⇒ every method is
-a strict no-op and the persistent always-on deploy is byte-unchanged.
+Consumers always confirm presence through ``ensure_ready``: an idempotent start
+when needed, followed by a model-ready wait. The watchdog is enabled by default;
+``PAPER_LIBRARY_MINERU_WATCHDOG=0`` disables only monitoring, for a persistent
+manual/systemd deployment. Readiness and self-healing remain active. Any value
+other than ``0`` or ``1`` warns and defaults to enabled. Monitor entry logs its
+enabled state once at INFO.
+
+State table:
+  | State | Controller behavior |
+  | --- | --- |
+  | Server absent / warming | Worker starts idempotently and waits for model-ready. |
+  | Global requests / counter activity | Watchdog keeps the server up. |
+  | Ready, globally idle for the threshold | Stop under the transition lock after all guards pass. |
+  | Missing readiness / invalid metrics | Discard idle history and keep the server up. |
+  | Watchdog disabled / no user bus | No monitoring; readiness and self-heal still apply. |
+  | Repeated image-decode failures | One guarded self-heal restart per unhealthy stretch. |
+
+Environment table (controller settings):
+  | Variable | Default | Meaning |
+  | --- | --- | --- |
+  | ``PAPER_LIBRARY_MINERU_WATCHDOG`` | ``1`` | ``0`` disables monitoring; malformed values warn and enable. |
+  | ``PAPER_LIBRARY_MINERU_UNIT`` | ``papervault-mineru.service`` | Managed systemd user unit. |
+  | ``MINERU_URL`` | ``http://127.0.0.1:30000`` | Consumer endpoints; first is used for readiness. |
+  | ``PAPER_LIBRARY_MINERU_IDLE_TIMEOUT`` | ``900`` | Global idle threshold in seconds; invalid/nonpositive uses default. |
+  | ``PAPER_LIBRARY_MINERU_IDLE_CHECK`` | ``90`` | Monitor interval in seconds, clamped to 60–120. |
+  | ``PAPER_LIBRARY_MINERU_READY_TIMEOUT`` | ``330`` | Model-ready wait budget in seconds. |
+  | ``PAPER_LIBRARY_MINERU_HEALTH_POLL`` | ``2`` | Readiness polling interval in seconds. |
+  | ``PAPER_LIBRARY_MINERU_IMAGE_DECODE_RESTART_AFTER`` | ``3`` | Consecutive image-decode errors before self-heal, minimum 1. |
 
 Key review-driven invariants baked in here:
   * ``ensure_ready`` raises :class:`MineruServerUnavailable` — a subclass of
@@ -38,22 +64,18 @@ Key review-driven invariants baked in here:
   * a failed/timeout start enters an exponential cooldown so OOM (e.g. a GPU
     co-tenant grabbed the VRAM) doesn't burn ``READY_TIMEOUT`` every sweep
     forever (review fix #7).
-  * if ``systemctl --user`` has no D-Bus (non-systemd host), on-demand force-OFFs
-    to persistent rather than stalling every extract (review fix #8).
+  * if ``systemctl --user`` has no D-Bus (non-systemd host), monitoring stops.
+    An already-ready server remains usable; an unavailable server raises a
+    transport error because it cannot be started here.
   * self-heal (issue #134): N consecutive ``MineruImageDecodeError`` parses (the
     server answers 400 ``Failed to load image`` for the client's own PNGs — a
     stale server process) trigger ONE ``systemctl --user restart`` under the same
     lock / ``_stopping`` / cooldown rules as start and stop. It is not repeated
-    until a parse succeeds again. With on-demand OFF the controller never touches
-    systemd: it logs one ERROR naming the cause and the unit to restart.
+    until a parse succeeds again. Without a user bus it logs one ERROR naming
+    the cause and the unit to restart.
 The in-process ``asyncio.Lock`` serializes only this daemon's transitions; it
-does not guard a manual ``systemctl`` or a separate OCR process. Independent
-consumers can hold ``$XDG_RUNTIME_DIR/paper-library-mineru.lease`` (override:
-``PAPER_LIBRARY_MINERU_LEASE_FILE``), a JSON object with ``holder`` (str), ``pid``
-(int), and ``expires_at`` (UTC ISO-8601). A fresh read under the transition lock
-just before each stop/restart defers that action while the lease is unexpired.
-Missing/expired leases leave the lifecycle unchanged; malformed leases warn
-and allow the action. No other path reads the lease.
+does not guard a manual ``systemctl`` or a separate OCR process. Global vLLM
+metrics account for independent consumers' activity when deciding idle stops.
 """
 
 from __future__ import annotations
@@ -62,12 +84,9 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-import json
 import logging
 import math
 import os
-from pathlib import Path
 import re
 import time
 from typing import Optional
@@ -78,8 +97,11 @@ from ..mineru_client import MineruTransportError, endpoints_from_env
 log = logging.getLogger(__name__)
 
 
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "") == "1"
+def _watchdog_enabled() -> bool:
+    value = os.environ.get("PAPER_LIBRARY_MINERU_WATCHDOG", "1")
+    if value not in {"0", "1"}:
+        log.warning("invalid PAPER_LIBRARY_MINERU_WATCHDOG=%r; defaulting to enabled", value)
+    return value != "0"
 
 
 def _env_float(name: str, default: float) -> float:
@@ -94,10 +116,6 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, "") or default)
     except (TypeError, ValueError):
         return default
-
-
-def _reject_lease_constant(value: str) -> None:
-    raise ValueError(f"invalid JSON constant: {value}")
 
 
 _SAMPLE = re.compile(
@@ -179,7 +197,7 @@ _START_TIMEOUT = 320.0   # ≥ unit TimeoutStartSec=300
 _STOP_TIMEOUT = 70.0     # ≥ unit TimeoutStopSec=60
 _EXTRACT_PREFIX = "ex:"  # concurrency.with_dedup stage key for extraction
 # Consecutive server-side image-decode failures (no success between them) that
-# trigger the self-heal restart (on-demand ON) or the one ERROR (OFF). Issue #134.
+# trigger one self-heal restart per unhealthy stretch. Issue #134.
 _IMAGE_DECODE_RESTART_AFTER = max(1, _env_int(
     "PAPER_LIBRARY_MINERU_IMAGE_DECODE_RESTART_AFTER", 3))
 
@@ -194,18 +212,18 @@ class MineruServerUnavailable(MineruTransportError):
 
 
 class MineruServerController:
-    """Process-wide controller for the MinerU server unit's on-demand lifecycle."""
+    """Process-wide readiness, self-heal and idle-stop controller for MinerU."""
 
     def __init__(
         self,
         *,
-        ondemand: Optional[bool] = None,
+        watchdog: Optional[bool] = None,
         unit: Optional[str] = None,
         base_url: Optional[str] = None,
         metrics_source: Optional[Callable[[], Awaitable[str]]] = None,
         clock: Optional[Callable[[], float]] = None,
     ) -> None:
-        self._ondemand = _env_flag("PAPER_LIBRARY_MINERU_ONDEMAND") if ondemand is None else ondemand
+        self._watchdog = _watchdog_enabled() if watchdog is None else watchdog
         self._unit = unit or os.environ.get(
             "PAPER_LIBRARY_MINERU_UNIT", "papervault-mineru.service")
         if base_url is None:
@@ -231,10 +249,6 @@ class MineruServerController:
         self._heal_alerted = False
         self._heal_task: Optional[asyncio.Task] = None
 
-    @property
-    def ondemand(self) -> bool:
-        return self._ondemand
-
     # ----------------------------- activity ----------------------------------
     def note_activity(self) -> None:
         """Compatibility hook for enqueue/pull callers; v2 times global metrics.
@@ -246,9 +260,6 @@ class MineruServerController:
     @asynccontextmanager
     async def ocr_session(self):
         """Keep MinerU resident for OCR outside the library extract queue."""
-        if not self._ondemand:
-            yield
-            return
         async with self._lock:
             self._active_ocr += 1
             self.note_activity()
@@ -263,14 +274,12 @@ class MineruServerController:
     async def ensure_ready(self) -> None:
         """Block until the MinerU server is model-ready, starting it if needed.
 
-        No-op when on-demand is OFF. On the worker critical path (called from
+        Always active on the worker critical path (called from
         ``extract_md`` INSIDE its C1 try-block). Raises
         :class:`MineruServerUnavailable` (a transport error → no charge) if the
         server can't be made ready within ``READY_TIMEOUT`` or while in
         start-failure cooldown.
         """
-        if not self._ondemand:
-            return
         self.note_activity()
         # The probe awaits I/O: a stop can begin while it is suspended. Check
         # _stopping again after the await before admitting OCR without the lock.
@@ -321,19 +330,16 @@ class MineruServerController:
         """Count one ``MineruImageDecodeError`` parse (a 400 ``Failed to load
         image`` the server returned for the client's own PNG).
 
-        After ``_IMAGE_DECODE_RESTART_AFTER`` consecutive ones: with on-demand ON,
-        schedule ONE background restart of the unit (returned, so a caller or test
-        may await it; the extract worker does not wait on it); with on-demand OFF,
-        or when the restart was already spent this stretch, log one ERROR. Must be
+        After ``_IMAGE_DECODE_RESTART_AFTER`` consecutive ones, schedule ONE
+        background restart of the unit (returned, so a caller or test may await
+        it; the extract worker does not wait on it). When the restart was already
+        spent this stretch, log one ERROR. Independent of the watchdog switch. Must be
         called from a running event loop (``extract_md`` is async)."""
         self._image_decode_streak += 1
         if self._image_decode_streak < _IMAGE_DECODE_RESTART_AFTER:
             return None
         if self._heal_task is not None and not self._heal_task.done():
             return self._heal_task
-        if not self._ondemand:
-            self._alert_stale_server("on-demand is OFF, so papervault will not restart it")
-            return None
         if self._heal_spent:
             self._alert_stale_server("the one self-heal restart did not help")
             return None
@@ -387,10 +393,6 @@ class MineruServerController:
             if not await self._bus_available():
                 self._alert_stale_server("systemctl --user is unavailable (no D-Bus)")
                 return
-            if self._lease_held("restart"):
-                # No restart was spent: a later failure can retry after expiry.
-                self._heal_spent = False
-                return
             log.warning(
                 "mineru self-heal: %d consecutive 'Failed to load image' parses — "
                 "restarting %s (likely a stale server process)",
@@ -427,18 +429,16 @@ class MineruServerController:
 
     # ------------------------ idle monitor (background) -----------------------
     async def monitor_loop(self, extract_queue) -> None:
-        """Stop the server after a sustained idle window. No-op when OFF; if the
-        systemd user bus is absent, force-OFF (degrade to persistent, fix #8)."""
-        if not self._ondemand:
-            return
-        if not await self._bus_available():
+        """Stop after global idle; disabled by the watchdog switch or no user bus."""
+        if self._watchdog and not await self._bus_available():
             log.warning(
-                "mineru on-demand: systemctl --user unavailable (no D-Bus) — "
-                "forcing on-demand OFF; the MinerU server stays persistent")
-            self._ondemand = False
+                "mineru watchdog: systemctl --user unavailable (no D-Bus) — "
+                "disabling monitoring; the MinerU server stays persistent")
+            self._watchdog = False
+        log.info("mineru watchdog monitor enabled=%s (idle_timeout=%.0fs, check=%.0fs)",
+                 self._watchdog, _IDLE_TIMEOUT, _CHECK_INTERVAL)
+        if not self._watchdog:
             return
-        log.info("mineru on-demand monitor started (idle_timeout=%.0fs, check=%.0fs)",
-                 _IDLE_TIMEOUT, _CHECK_INTERVAL)
         while True:
             try:
                 await asyncio.sleep(_CHECK_INTERVAL)
@@ -446,12 +446,12 @@ class MineruServerController:
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — a monitor hiccup must never kill the loop
-                log.exception("mineru on-demand monitor iteration failed")
+                log.exception("mineru watchdog monitor iteration failed")
 
     async def _monitor_once(self, extract_queue) -> None:
         """Observe global activity, then perform a freshly guarded idle stop."""
         endpoint = urlsplit(self._base)
-        if (not self._ondemand or endpoint.scheme != "http"
+        if (not self._watchdog or endpoint.scheme != "http"
                 or endpoint.hostname not in {"127.0.0.1", "localhost", "::1"}
                 or endpoint.port != 30000 or endpoint.path
                 or endpoint.query or endpoint.fragment or endpoint.username):
@@ -473,8 +473,6 @@ class MineruServerController:
             # Last awaited probe before stopping: global work that arrived since
             # the outer decision must cancel the stop, even with no local work.
             if not await self._observe_metrics() or not self._past_idle(extract_queue):
-                return
-            if self._lease_held("stop"):
                 return
             self._stopping = True
             try:
@@ -524,33 +522,6 @@ class MineruServerController:
         if extract_queue.qsize() != 0 or self._active_ocr:
             return False
         return not any(k.startswith(_EXTRACT_PREFIX) for k in concurrency.in_flight_keys())
-
-    def _lease_held(self, verb: str) -> bool:
-        """Read the cooperative lease at execution time, under the transition lock."""
-        runtime_dir = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-        path = Path(os.environ.get("PAPER_LIBRARY_MINERU_LEASE_FILE")
-                    or str(Path(runtime_dir) / "paper-library-mineru.lease"))
-        try:
-            lease = json.loads(path.read_text(encoding="utf-8"),
-                               parse_constant=_reject_lease_constant)
-            if (not isinstance(lease, dict)
-                    or not isinstance(lease.get("holder"), str)
-                    or type(lease.get("pid")) is not int
-                    or not isinstance(lease.get("expires_at"), str)):
-                raise ValueError("expected holder (str), pid (int), expires_at (UTC ISO-8601)")
-            expires_at = datetime.fromisoformat(lease["expires_at"])
-            if expires_at.utcoffset() != timedelta(0):
-                raise ValueError("expires_at must include a UTC timezone")
-        except FileNotFoundError:
-            return False
-        except (OSError, ValueError, RecursionError) as exc:
-            log.warning("malformed MinerU lease %s: %s; proceeding with %s", path, exc, verb)
-            return False
-        if expires_at <= datetime.now(timezone.utc):
-            return False
-        log.info("lease held by %s until %s; skipping %s",
-                 lease["holder"], lease["expires_at"], verb)
-        return True
 
     # ------------------------------- probes -----------------------------------
     async def _unit_active_long_enough(self) -> bool:

@@ -75,7 +75,7 @@ def test_ingest_gate_mineru_unit_active_caught(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(SystemExit):
         ops_guards.require_services_stopped(override_env=INGEST_OVERRIDE, reason=_reason())
-    assert len(calls) == 2  # reached the MinerU unit
+    assert "mineru.service" in calls  # reached the independent backend
 
 
 # --------------------------------------------------------------------------- #

@@ -51,7 +51,7 @@ def test_second_unit_active_still_caught(monkeypatch):
     monkeypatch.setattr(subprocess, "run", fake)
     with pytest.raises(SystemExit):
         run_eval._require_exclusive_gpu()
-    assert len(calls) == 2  # loop reached the second unit
+    assert "mineru.service" in calls  # reached the independent backend
 
 
 def test_positive_detection_survives_later_probe_error(monkeypatch):
@@ -68,13 +68,24 @@ def test_positive_detection_survives_later_probe_error(monkeypatch):
         run_eval._require_exclusive_gpu()
 
 
-def test_mineru_unit_name_honors_operator_override(monkeypatch):
+def test_guard_targets_independent_mineru_unit(monkeypatch):
     monkeypatch.delenv("KS_EVAL_ALLOW_COTENANCY", raising=False)
-    monkeypatch.setenv("PAPER_LIBRARY_MINERU_UNIT", "custom-mineru.service")
     probed = []
     def fake(cmd, capture_output=True, text=True, timeout=10):
         probed.append(cmd[-1])
         return SimpleNamespace(stdout="inactive\n")
     monkeypatch.setattr(subprocess, "run", fake)
     run_eval._require_exclusive_gpu()
-    assert "custom-mineru.service" in probed
+    assert probed == ["papervault.service", "mineru.service", "papervault-mineru.service"]
+
+
+@pytest.mark.parametrize("active_unit", ["mineru.service", "papervault-mineru.service"])
+def test_guard_blocks_either_supported_mineru_unit(monkeypatch, active_unit):
+    monkeypatch.delenv("KS_EVAL_ALLOW_COTENANCY", raising=False)
+
+    def fake(cmd, **kwargs):
+        return SimpleNamespace(stdout="active\n" if cmd[-1] == active_unit else "inactive\n")
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    with pytest.raises(SystemExit):
+        run_eval._require_exclusive_gpu()

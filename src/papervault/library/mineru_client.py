@@ -1,11 +1,9 @@
-"""In-process async client for the persistent MinerU2.5-Pro vLLM server.
+"""In-process async client for the independent MinerU2.5-Pro OCR service.
 
-The daemon talks to a plain ``vllm serve`` of the MinerU2.5-Pro weights
-(path A, §3.1 of the L2 SDD) via mineru's own in-process VLM http-client
-(``aio_do_parse`` with ``backend="vlm-http-client"`` + ``server_url``). The
-model loads ONCE in the server; this module sends one whole-PDF parse per
-call and reads back the markdown that mineru writes to
-``<out_dir>/<stem>/vlm/<stem>.md``.
+The daemon talks through the service gate via mineru's own in-process VLM
+http-client (``aio_do_parse`` with ``backend="vlm-http-client"`` + ``server_url``).
+The service owns backend stop/start; this module sends one whole-PDF parse per
+call and reads back the markdown that mineru writes to ``<out_dir>/<stem>/vlm/<stem>.md``.
 
 **The transport-vs-extraction error split (C1, §2.2).** The single failure
 bucket of the old cascade is split into TWO typed exceptions so the caller
@@ -77,8 +75,7 @@ class MineruImageDecodeError(MineruTransportError):
     running on a deleted venv: Pillow loads its format plugins lazily, the import
     failed, and every ``Image.open`` from then on raised. A ``MineruTransportError``
     subclass so ``extract_md``'s C1 transport arm parks the paper with NO attempt
-    charged; the distinct type lets the caller count consecutive occurrences and
-    trigger the server self-heal (``services.mineru_server``).
+    charged. Recovery belongs to the independent MinerU service.
     """
 
 
@@ -96,8 +93,10 @@ class MineruExtractionError(Exception):
 
 @dataclass(frozen=True)
 class Endpoint:
-    """One MinerU vLLM server URL (e.g. the 3090 at :30000 or the 5090 at
-    :30001). ``label`` is for logging only."""
+    """One MinerU consumer URL (default gate: ``http://127.0.0.1:30000``).
+
+    ``label`` is for logging only.
+    """
 
     label: str
     url: str
@@ -262,7 +261,7 @@ def _status_of(exc: Exception) -> Optional[int]:
 
 def _is_connect_fail(exc: Exception) -> bool:
     """A ``ServerError("Failed to connect to server ...")`` — the server unit is
-    down / starting (the ``systemctl restart`` window, the case that motivates
+    down / starting (a service restart window, the case that motivates
     C1). Also catches generic connect/refused wording."""
     msg = str(exc).lower()
     return ("failed to connect to server" in msg
@@ -774,7 +773,7 @@ async def _extract_mineru_impl(
                 if code == 500:
                     # BARE 500 = AMBIGUOUS → default TRANSPORT (§2.3). Do NOT
                     # charge, do NOT terminalize; budget + reconcile catch a
-                    # genuinely-500ing doc. A systemctl restart returns bare
+                    # genuinely-500ing doc. A service restart returns bare
                     # 500 while weights load — must never condemn a paper.
                     last_transport = exc
                     await _async_sleep_backoff(i, wall_clock_deadline)

@@ -124,17 +124,13 @@ def _patch_extract(monkeypatch, extract: FakeExtract):
     from papervault.library.services.mineru_server import MineruServerController
 
     # Readiness is always active, even when OCR itself is faked. Keep the real
-    # session/admission path while isolating its HTTP and systemd boundaries.
-    controller = MineruServerController(watchdog=False)
+    # session/admission path while isolating its HTTP boundary.
+    controller = MineruServerController()
 
     async def ready():
         return True
 
-    async def systemctl(verb):
-        pytest.fail(f"operator PDF test attempted systemctl {verb}")
-
     controller._ready = ready
-    controller._run_systemctl = systemctl
     monkeypatch.setattr(op, "get_server_controller", lambda: controller)
     monkeypatch.setattr(op, "extract_mineru", extract)
     monkeypatch.setattr(op, "endpoints_from_env", lambda: ["ep0"])

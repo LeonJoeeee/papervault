@@ -869,8 +869,8 @@ def test_confirmed_gate_failopen_second_pass_does_not_overturn():
 #
 # The 09-20..09-25 incident: a stale MinerU server answered every page with HTTP
 # 400 "Failed to load image"; the client charged it as a per-doc defect and 5,828
-# healthy papers went terminal. It is now transport-class (no charge, status kept)
-# and each occurrence is reported to the server controller's self-heal counter.
+# healthy papers went terminal. It is now transport-class (no charge, status kept);
+# the independent MinerU service owns recovery.
 
 _IMAGE_DECODE_400 = (
     'Unexpected status code: [400], response body: {"error":{"message":'
@@ -878,22 +878,16 @@ _IMAGE_DECODE_400 = (
     '"type":"BadRequestError","param":null,"code":400}}')
 
 
-def _install_fake_mineru_raising(monkeypatch, message):
-    """Fake the lazily-imported mineru modules so the REAL ``extract_mineru``
-    runs its classification against an ``aio_do_parse`` that raises ServerError."""
+def _install_fake_mineru(monkeypatch, aio_do_parse):
+    """Replace the external parser imports, keeping the real client wrapper."""
     import sys
     import types
-
-    from papervault.library import mineru_client as mc
 
     class ServerError(RuntimeError):
         pass
 
     class RequestError(ValueError):
         pass
-
-    async def aio_do_parse(**_kw):
-        raise ServerError(message)
 
     common = types.ModuleType("mineru.cli.common")
     common.aio_do_parse = aio_do_parse
@@ -909,6 +903,17 @@ def _install_fake_mineru_raising(monkeypatch, message):
         ("mineru_vl_utils.vlm_client.base_client", base),
     ):
         monkeypatch.setitem(sys.modules, name, mod)
+    return base
+
+
+def _install_fake_mineru_raising(monkeypatch, message):
+    """Run real client classification against a parser that raises ServerError."""
+    from papervault.library import mineru_client as mc
+
+    async def aio_do_parse(**_kw):
+        raise base.ServerError(message)
+
+    base = _install_fake_mineru(monkeypatch, aio_do_parse)
 
     async def _reachable(*_a, **_k):
         return True
@@ -916,18 +921,69 @@ def _install_fake_mineru_raising(monkeypatch, message):
     monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0)
 
 
-class _RecordingController:
-    def __init__(self):
-        self.events = []
+def test_stopped_backend_allows_workload_post_and_extraction(tmp_path, monkeypatch):
+    """Health 200 with no served model must admit the POST that starts OCR."""
+    from pathlib import Path
 
+    import httpx
+
+    from papervault.library import mineru_client as mc
+    from papervault.library.services.mineru_server import MineruServerController
+
+    lib, paper = _pdf_paper(tmp_path)
+    _stub_good_probe(monkeypatch)
+    _stub_judges_pass(monkeypatch)
+    monkeypatch.setenv("MINERU_URL", "http://127.0.0.1:30000")
+    monkeypatch.setattr(mc, "_PRECHECK_ENABLED", True)
+    controller = MineruServerController()
+    monkeypatch.setattr(extract, "get_server_controller", lambda: controller)
+    markdown = "Complete extracted paper body. " * 30
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok", "backend": "stopped"})
+        if request.method == "POST" and request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": markdown}}],
+            })
+        return httpx.Response(503)
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(
+        transport=httpx.MockTransport(handler), **kwargs))
+
+    async def parse(**kwargs):
+        # Simulate only the external OCR adapter; extraction and client admission
+        # still run their real readiness checks before reaching this workload.
+        # mineru-vl-utils 1.0.5 discovers the model via GET /v1/models at client
+        # construction, before any workload POST. This fake bypasses discovery:
+        # the gate must synthesize /v1/models while stopped. Live acceptance must
+        # include the real adapter; this test covers only caller admission.
+        async with httpx.AsyncClient() as http:
+            response = await http.post(f"{kwargs['server_url']}/v1/chat/completions", json={
+                "model": "MinerU2.5-Pro-2605-1.2B", "messages": [],
+            })
+        response.raise_for_status()
+        stem = kwargs["pdf_file_names"][0]
+        outdir = Path(kwargs["output_dir"]) / stem / "vlm"
+        outdir.mkdir(parents=True)
+        (outdir / f"{stem}.md").write_text(response.json()["choices"][0]["message"]["content"])
+
+    _install_fake_mineru(monkeypatch, parse)
+    assert asyncio.run(extract.extract_md(paper, lib, llm=object())) == markdown
+    assert requests == [("GET", "/health"), ("GET", "/health"),
+                        ("POST", "/v1/chat/completions")]
+    assert lib.has_extract(paper.key, "md")
+    assert paper.download_status == "ok"
+    assert paper.extract_attempts == 0
+    assert paper.extract_deferred_sig is None
+
+
+class _ReadyController:
     async def ensure_ready(self):
         return None
-
-    def note_image_decode_failure(self):
-        self.events.append("image_decode")
-
-    def note_parse_success(self):
-        self.events.append("success")
 
 
 @pytest.mark.parametrize("status", ["ok", "pending"])
@@ -940,7 +996,7 @@ def test_image_decode_400_parks_paper_uncharged(tmp_path, monkeypatch, status):
     p.extract_attempts = MAX_EXTRACT_ATTEMPTS - 1     # one charge from terminal
     _stub_good_probe(monkeypatch)
     _install_fake_mineru_raising(monkeypatch, _IMAGE_DECODE_400)
-    monkeypatch.setattr(extract, "get_server_controller", _RecordingController)
+    monkeypatch.setattr(extract, "get_server_controller", _ReadyController)
 
     out = asyncio.run(extract.extract_md(p, lib, llm=object()))
     assert out is None
@@ -960,44 +1016,35 @@ def test_plain_400_still_charges_through_real_client(tmp_path, monkeypatch):
     _stub_good_probe(monkeypatch)
     _install_fake_mineru_raising(
         monkeypatch, "Unexpected status code: [400], response body: bad request")
-    monkeypatch.setattr(extract, "get_server_controller", _RecordingController)
+    monkeypatch.setattr(extract, "get_server_controller", _ReadyController)
 
     out = asyncio.run(extract.extract_md(p, lib, llm=object()))
     assert out is None
     assert p.extract_attempts == 1
 
 
-def test_image_decode_failure_is_reported_to_controller(tmp_path, monkeypatch):
-    from papervault.library.mineru_client import MineruImageDecodeError
-    lib, p = _pdf_paper(tmp_path)
-    ctl = _RecordingController()
-    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
+@pytest.mark.parametrize("status", ["ok", "pending"])
+def test_readiness_unavailable_defers_without_charging(tmp_path, monkeypatch, status):
+    from papervault.library.services.mineru_server import MineruServerUnavailable
+
+    lib, paper = _pdf_paper(tmp_path)
+    paper.download_status = status
+    paper.extract_attempts = 2
     _stub_good_probe(monkeypatch)
-    _stub_mineru(monkeypatch, raises=MineruImageDecodeError(_IMAGE_DECODE_400))
 
-    asyncio.run(extract.extract_md(p, lib, llm=object()))
-    assert ctl.events == ["image_decode"]
+    class Unavailable:
+        async def ensure_ready(self):
+            raise MineruServerUnavailable("gate unavailable")
 
+    async def unexpected_ocr(*args, **kwargs):
+        pytest.fail("unavailable readiness must defer before OCR")
 
-def test_other_transport_error_is_not_counted_as_image_decode(tmp_path, monkeypatch):
-    from papervault.library.mineru_client import MineruTransportError
-    lib, p = _pdf_paper(tmp_path)
-    ctl = _RecordingController()
-    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
-    _stub_good_probe(monkeypatch)
-    _stub_mineru(monkeypatch, raises=MineruTransportError("connection refused"))
-
-    asyncio.run(extract.extract_md(p, lib, llm=object()))
-    assert ctl.events == []
-
-
-def test_successful_parse_is_reported_to_controller(tmp_path, monkeypatch):
-    lib, p = _pdf_paper(tmp_path)
-    ctl = _RecordingController()
-    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
-    _stub_good_probe(monkeypatch)
-    _stub_mineru(monkeypatch, returns="REAL ASSEMBLED BODY of the paper. " * 30)
-    _stub_judges_pass(monkeypatch)
-
-    asyncio.run(extract.extract_md(p, lib, llm=object()))
-    assert ctl.events == ["success"]
+    monkeypatch.setattr(extract, "get_server_controller", Unavailable)
+    monkeypatch.setattr(extract, "extract_mineru", unexpected_ocr)
+    assert asyncio.run(extract.extract_md(paper, lib, llm=object())) is None
+    assert paper.download_status == status
+    assert paper.extract_attempts == 2
+    assert paper.extract_deferred_sig is not None
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    assert any(e.get("event") == "extract_md_transport_retry" for e in events)
+    assert not any(e.get("event") == "extract_md_engine_failed" for e in events)

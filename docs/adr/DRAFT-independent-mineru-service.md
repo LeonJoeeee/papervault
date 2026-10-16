@@ -24,5 +24,6 @@ Lifecycle environment settings, watchdog tasks, transition locks, start
 cooldowns and parse-triggered self-healing leave the caller. The independent
 service absorbs wake latency and owns recovery for every consumer. Operators
 provision it separately; the library cannot repair a down service. Maintenance
-co-tenancy guards retain their unit-presence checks against `mineru.service`.
+co-tenancy guards retain their unit-presence checks against `mineru.service`
+and the retained standalone template's `papervault-mineru.service`.
 The orchestrator verifies asleep-to-extraction behavior after deployment.

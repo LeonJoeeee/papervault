@@ -132,8 +132,9 @@ Remove obsolete `PAPER_LIBRARY_MINERU_ONDEMAND`, `_WATCHDOG`, `_UNIT`,
 `_IDLE_TIMEOUT`, `_IDLE_CHECK`, `_READY_TIMEOUT`, `_HEALTH_POLL`, and
 `_IMAGE_DECODE_RESTART_AFTER` settings (each suffix uses the
 `PAPER_LIBRARY_MINERU` prefix). There are no caller-side lifecycle settings.
-Maintenance-window co-tenancy guards still check `papervault.service` and
-`mineru.service`; they do not inspect backend sleep state.
+Maintenance-window co-tenancy guards still check `papervault.service`,
+`mineru.service`, and the retained standalone template's `papervault-mineru.service`;
+they do not inspect backend sleep state.
 
 After deployment, the orchestrator verifies an extraction round-trip with the
 backend asleep. The request must complete through the same `:30000` endpoint

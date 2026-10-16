@@ -609,6 +609,29 @@ def test_parse_without_mineru_singleton_still_passes_caps(monkeypatch):
     assert captured["max_concurrency"] == mc.client_limits()[0]
 
 
+def test_discovery_failure_retries_on_next_endpoint(monkeypatch):
+    order, captured, discovered = [], {}, []
+    _install_fake_mineru(monkeypatch, _recording_parse(order, captured))
+    request_error = sys.modules["mineru_vl_utils.vlm_client.base_client"].RequestError
+    predictor = _CapPredictor()
+
+    class Singleton:
+        def get_model(self, backend, model_path, server_url, **kwargs):
+            discovered.append(server_url)
+            if server_url == "http://a":
+                raise request_error("invalid model metadata from first endpoint")
+            return predictor
+
+    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
+    module.ModelSingleton = Singleton
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    eps = [mc.Endpoint("a", "http://a"), mc.Endpoint("b", "http://b")]
+    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
+    assert discovered == ["http://a", "http://b"]
+    assert captured["server_url"] == "http://b"
+    assert captured["predictor"] is predictor
+
+
 # ============ issue #133: return freed parse memory to the OS ============
 # A whole-doc parse renders + base64-encodes page windows in worker threads;
 # glibc keeps the freed memory in per-thread arenas (+5.5 GB retained after an

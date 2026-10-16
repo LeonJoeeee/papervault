@@ -1016,9 +1016,12 @@ def test_plain_400_still_charges_through_real_client(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("status", ["ok", "pending"])
-def test_client_discovery_unavailable_defers_without_charging(tmp_path, monkeypatch, status):
+@pytest.mark.parametrize("failure", ["connect", "read_timeout", "request_error"])
+def test_client_discovery_unavailable_defers_without_charging(tmp_path, monkeypatch, status, failure):
     import sys
     import types
+
+    import httpx
 
     from papervault.library import mineru_client as mc
     from papervault.library.services.mineru_server import MineruServerController
@@ -1035,6 +1038,10 @@ def test_client_discovery_unavailable_defers_without_charging(tmp_path, monkeypa
 
     class Singleton:
         def get_model(self, *args, **kwargs):
+            if failure == "read_timeout":
+                raise httpx.ReadTimeout("synthetic discovery refused")
+            if failure == "request_error":
+                raise base.RequestError("synthetic discovery refused")
             raise base.ServerError("Failed to connect to server: synthetic discovery refused")
 
     module = types.ModuleType("mineru.backend.vlm.vlm_analyze")

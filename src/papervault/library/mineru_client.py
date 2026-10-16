@@ -412,9 +412,8 @@ def _apply_client_limits(predictor, max_concurrency: int, max_connections: int) 
 async def _prepare_capped_predictor(server_url: str, client_kwargs: dict) -> object | None:
     """Build (or fetch) mineru's singleton predictor for ``server_url`` and cap it.
 
-    Errors from the construction itself (e.g. the model-name probe against a
-    down server) propagate: ``aio_do_parse`` would have raised the same error
-    from the same call, and the caller classifies it identically."""
+    Construction errors propagate to the caller's transport retry path: model
+    discovery has not parsed a document, so it cannot charge a PDF attempt."""
     mod = sys.modules.get("mineru.backend.vlm.vlm_analyze")
     singleton_cls = getattr(mod, "ModelSingleton", None) if mod is not None else None
     if singleton_cls is None:
@@ -664,6 +663,14 @@ async def _extract_mineru_impl(
             }
             try:
                 predictor = await _prepare_capped_predictor(ep.url, client_kwargs)
+            except Exception as exc:  # noqa: BLE001 - discovery is always transport
+                # A discovery timeout or invalid model metadata is a service
+                # failure before any PDF parse, never a slow/defective document.
+                last_transport = exc
+                await _async_sleep_backoff(i, wall_clock_deadline)
+                continue
+
+            try:
                 await aio_do_parse(
                     output_dir=str(outdir),
                     pdf_file_names=[stem],

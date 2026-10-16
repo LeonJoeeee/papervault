@@ -44,7 +44,6 @@ from papervault.llm_routing import route
 
 from .mineru_client import (
     MineruExtractionError,
-    MineruImageDecodeError,
     MineruTransportError,
     endpoints_from_env,
     extract_mineru,
@@ -679,38 +678,25 @@ async def extract_md(paper: Paper, library: Library, *,
     # > _EXTRACT_CONCURRENCY, a freed slot is immediately re-dispatched → GPU stays fed.
     await concurrency.acquire_extract_slot()
     try:
-        # On-demand server gate (no-op unless PAPER_LIBRARY_MINERU_ONDEMAND=1):
-        # start the MinerU server if it was stopped on idle and WAIT for it to be
-        # model-ready. INSIDE the try so a readiness timeout (MineruServerUnavailable,
-        # a MineruTransportError subclass) lands in the C1 transport arm below —
-        # NO attempt charged, reconcile retries. The wall-clock deadline above was
-        # set at the call boundary; the cold-start wait is transport, not metered
-        # against the per-doc budget.
+        # Probe the independent service before OCR. Keep this inside the C1
+        # try-block: unavailable readiness defers without charging an attempt.
         await get_server_controller().ensure_ready()
         mineru_md = await extract_mineru(
             pdf_bytes, endpoints,
             stem=paper.key,
             wall_clock_deadline=wall_clock_deadline,
         )
-        # The server decoded this doc's page images: reset the stale-server
-        # self-heal streak (issue #134).
-        get_server_controller().note_parse_success()
     except MineruTransportError as exc:
         # ── C1 CORE: transport → DO NOT charge, DO NOT terminalize. ──
         # status & attempts deliberately UNMUTATED → classify re-routes the
         # paper to EXTRACT on the next reconcile sweep. Non-mutation IS the
-        # mechanism (SDD §2.4). A bare 500 / a `systemctl restart` window /
-        # both endpoints down all land here and never condemn the paper.
+        # mechanism (SDD §2.4). A bare 500, service restart, or unreachable
+        # endpoints all land here and never condemn the paper.
         # Issue #43: stamp the paper deferred against its CURRENT PDF artifact so
         # reconcile stops re-enqueuing it every sweep while the backend stays
         # down. Still NO attempt charged, still non-terminal — the deferral
         # auto-lifts on artifact change or backend recovery (see extract_defer).
         mark_extract_deferred(paper, library)
-        if isinstance(exc, MineruImageDecodeError):
-            # Issue #134: the server could not decode the client's own PNGs (a
-            # stale server process). Count it; N in a row restart the unit once
-            # (on-demand ON) or log one ERROR naming the unit (OFF). Never waits.
-            get_server_controller().note_image_decode_failure()
         library.log({"event": "extract_md_transport_retry", "key": paper.key,
                      "error": repr(exc)[:200],
                      "attempts": paper.extract_attempts,

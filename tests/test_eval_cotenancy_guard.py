@@ -68,13 +68,12 @@ def test_positive_detection_survives_later_probe_error(monkeypatch):
         run_eval._require_exclusive_gpu()
 
 
-def test_mineru_unit_name_honors_operator_override(monkeypatch):
+def test_guard_targets_independent_mineru_unit(monkeypatch):
     monkeypatch.delenv("KS_EVAL_ALLOW_COTENANCY", raising=False)
-    monkeypatch.setenv("PAPER_LIBRARY_MINERU_UNIT", "custom-mineru.service")
     probed = []
     def fake(cmd, capture_output=True, text=True, timeout=10):
         probed.append(cmd[-1])
         return SimpleNamespace(stdout="inactive\n")
     monkeypatch.setattr(subprocess, "run", fake)
     run_eval._require_exclusive_gpu()
-    assert "custom-mineru.service" in probed
+    assert probed == ["papervault.service", "mineru.service"]

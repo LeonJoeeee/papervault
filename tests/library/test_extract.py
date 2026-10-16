@@ -916,18 +916,9 @@ def _install_fake_mineru_raising(monkeypatch, message):
     monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0)
 
 
-class _RecordingController:
-    def __init__(self):
-        self.events = []
-
+class _ReadyController:
     async def ensure_ready(self):
         return None
-
-    def note_image_decode_failure(self):
-        self.events.append("image_decode")
-
-    def note_parse_success(self):
-        self.events.append("success")
 
 
 @pytest.mark.parametrize("status", ["ok", "pending"])
@@ -940,7 +931,7 @@ def test_image_decode_400_parks_paper_uncharged(tmp_path, monkeypatch, status):
     p.extract_attempts = MAX_EXTRACT_ATTEMPTS - 1     # one charge from terminal
     _stub_good_probe(monkeypatch)
     _install_fake_mineru_raising(monkeypatch, _IMAGE_DECODE_400)
-    monkeypatch.setattr(extract, "get_server_controller", _RecordingController)
+    monkeypatch.setattr(extract, "get_server_controller", _ReadyController)
 
     out = asyncio.run(extract.extract_md(p, lib, llm=object()))
     assert out is None
@@ -960,44 +951,35 @@ def test_plain_400_still_charges_through_real_client(tmp_path, monkeypatch):
     _stub_good_probe(monkeypatch)
     _install_fake_mineru_raising(
         monkeypatch, "Unexpected status code: [400], response body: bad request")
-    monkeypatch.setattr(extract, "get_server_controller", _RecordingController)
+    monkeypatch.setattr(extract, "get_server_controller", _ReadyController)
 
     out = asyncio.run(extract.extract_md(p, lib, llm=object()))
     assert out is None
     assert p.extract_attempts == 1
 
 
-def test_image_decode_failure_is_reported_to_controller(tmp_path, monkeypatch):
-    from papervault.library.mineru_client import MineruImageDecodeError
-    lib, p = _pdf_paper(tmp_path)
-    ctl = _RecordingController()
-    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
+@pytest.mark.parametrize("status", ["ok", "pending"])
+def test_readiness_unavailable_defers_without_charging(tmp_path, monkeypatch, status):
+    from papervault.library.services.mineru_server import MineruServerUnavailable
+
+    lib, paper = _pdf_paper(tmp_path)
+    paper.download_status = status
+    paper.extract_attempts = 2
     _stub_good_probe(monkeypatch)
-    _stub_mineru(monkeypatch, raises=MineruImageDecodeError(_IMAGE_DECODE_400))
 
-    asyncio.run(extract.extract_md(p, lib, llm=object()))
-    assert ctl.events == ["image_decode"]
+    class Unavailable:
+        async def ensure_ready(self):
+            raise MineruServerUnavailable("gate unavailable")
 
+    async def unexpected_ocr(*args, **kwargs):
+        pytest.fail("unavailable readiness must defer before OCR")
 
-def test_other_transport_error_is_not_counted_as_image_decode(tmp_path, monkeypatch):
-    from papervault.library.mineru_client import MineruTransportError
-    lib, p = _pdf_paper(tmp_path)
-    ctl = _RecordingController()
-    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
-    _stub_good_probe(monkeypatch)
-    _stub_mineru(monkeypatch, raises=MineruTransportError("connection refused"))
-
-    asyncio.run(extract.extract_md(p, lib, llm=object()))
-    assert ctl.events == []
-
-
-def test_successful_parse_is_reported_to_controller(tmp_path, monkeypatch):
-    lib, p = _pdf_paper(tmp_path)
-    ctl = _RecordingController()
-    monkeypatch.setattr(extract, "get_server_controller", lambda: ctl)
-    _stub_good_probe(monkeypatch)
-    _stub_mineru(monkeypatch, returns="REAL ASSEMBLED BODY of the paper. " * 30)
-    _stub_judges_pass(monkeypatch)
-
-    asyncio.run(extract.extract_md(p, lib, llm=object()))
-    assert ctl.events == ["success"]
+    monkeypatch.setattr(extract, "get_server_controller", Unavailable)
+    monkeypatch.setattr(extract, "extract_mineru", unexpected_ocr)
+    assert asyncio.run(extract.extract_md(paper, lib, llm=object())) is None
+    assert paper.download_status == status
+    assert paper.extract_attempts == 2
+    assert paper.extract_deferred_sig is not None
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    assert any(e.get("event") == "extract_md_transport_retry" for e in events)
+    assert not any(e.get("event") == "extract_md_engine_failed" for e in events)

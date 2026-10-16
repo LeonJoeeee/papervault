@@ -77,8 +77,7 @@ class MineruImageDecodeError(MineruTransportError):
     running on a deleted venv: Pillow loads its format plugins lazily, the import
     failed, and every ``Image.open`` from then on raised. A ``MineruTransportError``
     subclass so ``extract_md``'s C1 transport arm parks the paper with NO attempt
-    charged; the distinct type lets the caller count consecutive occurrences and
-    trigger the server self-heal (``services.mineru_server``).
+    charged. Recovery belongs to the independent MinerU service.
     """
 
 
@@ -262,7 +261,7 @@ def _status_of(exc: Exception) -> Optional[int]:
 
 def _is_connect_fail(exc: Exception) -> bool:
     """A ``ServerError("Failed to connect to server ...")`` — the server unit is
-    down / starting (the ``systemctl restart`` window, the case that motivates
+    down / starting (a service restart window, the case that motivates
     C1). Also catches generic connect/refused wording."""
     msg = str(exc).lower()
     return ("failed to connect to server" in msg
@@ -774,7 +773,7 @@ async def _extract_mineru_impl(
                 if code == 500:
                     # BARE 500 = AMBIGUOUS → default TRANSPORT (§2.3). Do NOT
                     # charge, do NOT terminalize; budget + reconcile catch a
-                    # genuinely-500ing doc. A systemctl restart returns bare
+                    # genuinely-500ing doc. A service restart returns bare
                     # 500 while weights load — must never condemn a paper.
                     last_transport = exc
                     await _async_sleep_backoff(i, wall_clock_deadline)

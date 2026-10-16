@@ -17,8 +17,8 @@ owns its card 24/7 and batches the per-page sub-requests server-side via
 caps how many whole-PDF extractions are in flight. ``ocr-pool.conf`` is
 REDEFINED (SDD §4.3) to a binary **pause-dispatch** toggle: an EMPTY file pauses
 admission (workers idle, the queue holds), a non-empty / absent file runs.
-"Free the GPU" is now ``systemctl stop`` of the MinerU server unit, not a
-conf edit.
+MinerU's independent service owns GPU sleep/wake; the dispatch toggle only
+controls this queue's admission.
 
 Worker body runs (SDD §2.1):
   1. ``await extract_md`` — ONE whole-PDF MinerU call under a concurrency permit
@@ -53,16 +53,6 @@ from . import concurrency
 from .classify import EXTRACT, classify
 
 log = logging.getLogger("papervault.library.extract_queue")
-
-
-def _note_mineru_activity() -> None:
-    """Stamp on-demand MinerU activity (no-op unless on-demand ON). Cheap and
-    must never raise on the hot path."""
-    try:
-        from .mineru_server import get_server_controller
-        get_server_controller().note_activity()
-    except Exception:  # noqa: BLE001
-        pass
 
 
 class ExtractQueue:
@@ -234,10 +224,6 @@ class ExtractQueue:
         self._pending[key] = priority
         self._seq += 1
         self._queue.put_nowait((priority, self._seq, key))
-        # On-demand MinerU: queued work means "don't stop the server" (no-op
-        # unless on-demand ON). _enqueue is the single chokepoint for add() AND
-        # boot recovery, so one call covers both.
-        _note_mineru_activity()
 
     def qsize(self) -> int:
         return self._queue.qsize()
@@ -251,8 +237,7 @@ class ExtractQueue:
             # admission — the worker idles (does NOT pull from the queue, so the
             # backlog holds + the in-flight set drains) and re-checks each poll
             # interval. A non-empty / absent file runs. This replaces the old
-            # GPU-index list semantics (the persistent MinerU server owns its
-            # card; "free the GPU" = stop the server unit).
+            # GPU-index list semantics; MinerU's service owns GPU sleep/wake.
             try:
                 dispatch_on = concurrency.extract_dispatch_enabled()
             except Exception:
@@ -288,11 +273,6 @@ class ExtractQueue:
             if self._pending.pop(key, None) is None:
                 self._queue.task_done()
                 continue
-            # On-demand MinerU: refresh activity on the work CRITICAL PATH (not
-            # just at enqueue) so a paper that waited in the queue past the idle
-            # timeout doesn't let the monitor stop the server out from under the
-            # extract we're about to run (review fix #5).
-            _note_mineru_activity()
             # fd-watermark early-warning (#93): the extract worker is the OCR
             # critical path where sockets to the MinerU/gateway backends are
             # opened, so this is the most relevant host for the cheap open-fd

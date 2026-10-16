@@ -304,8 +304,6 @@ async def test_extraction_checks_persisted_merge_generation_in_every_claim_phase
     class Controller:
         async def ensure_ready(self):
             pass
-        def note_parse_success(self):
-            pass
     monkeypatch.setattr(extract, "get_server_controller", Controller)
     monkeypatch.setattr(extract, "extract_mineru", ocr)
     monkeypatch.setattr(extract, "review_extract", lambda *_args, **_kwargs: {"ok": True})

@@ -31,23 +31,15 @@ docker compose --env-file .env -f deploy/docker-compose.yml up -d
 uv venv && uv pip install -e ".[mineru,grey]"
 #   uv pip install -e .                 # minimal core (no OCR, OA-only downloads)
 
-# 5. Start the MinerU OCR server (ONLY if you installed the [mineru] extra).
-#    extract talks to a MinerU vLLM server over HTTP on :30000; the [mineru]
-#    client libs do NOT start it, and nothing else will — without it every
-#    extract fails and papers sit at text_status="pending" forever.
-#
-#    RECOMMENDED — run it as a systemd --user service (restarts on failure, and
-#    papervault's on-demand lifecycle can start/stop it by name):
-cp deploy/papervault-mineru.service ~/.config/systemd/user/
-#    Edit the copy if `mineru-vllm-server` isn't on your login PATH or to pick a GPU.
-systemctl --user daemon-reload
-systemctl --user enable --now papervault-mineru.service
-#
-#    ALTERNATIVE — run it in the foreground (no restart-on-failure):
-#    mineru-vllm-server --host 127.0.0.1 --port 30000 &
-#
-#    First run pulls the MinerU2.5 weights from ModelScope (MINERU_MODEL_SOURCE,
-#    default `modelscope`). Point papervault at another host/port via MINERU_URL.
+# 5. Provision MinerU independently before enabling extraction.
+#    The [mineru] extra supplies HTTP client libraries, not the vLLM server.
+#    On the shared host, mineru.service runs the always-on backend privately on
+#    :30001; mineru-gate.service exposes :30000 and owns sleep/wake/recovery.
+#    Those services are provisioned outside this repository. papervault does not
+#    start, stop or restart them. Do not install a second listener on :30000.
+#    The default MINERU_URL stays http://127.0.0.1:30000; set it for another host.
+curl -fsS http://127.0.0.1:30000/health
+curl -fsS http://127.0.0.1:30000/v1/models   # must list a model, including while asleep
 
 # 6. Preflight — verify GPU, databases, LLM config, domain pack
 papervault doctor
@@ -115,65 +107,48 @@ not override a call site's role level. There is no caller-side provider-model
 mapping. Bare `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` model fallbacks are retired;
 use the documented `PAPERVAULT_LLM_*` endpoint/key configuration.
 
-## RTX 3090 idle-release deployment runbook
+## MinerU service boundary
 
-This is an operator action after separate approval. Merging the code changes no
-running service: both switches default off. On the measured installation the OCR
-unit is the legacy `paper-library-mineru.service` with `TimeoutStartSec=5min`;
-`papervault-mineru.service` does not exist on that host. The repo template uses
-the latter name. A read-only check of `papervault.service`'s process environment
-confirmed it runs as a user unit with `XDG_RUNTIME_DIR=/run/user/1000` and
-`DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus`, and that socket exists.
-Its controller can therefore reach `systemctl --user`. Confirm these facts on
-the target host before editing the service checkout's `.env`.
+MinerU is a shared, independently managed service ([issue #235](https://github.com/LeonJoeeee/papervault/issues/235)).
+On the shared host, `mineru.service` is always on with a private backend at
+`:30001`. `mineru-gate.service` owns the consumer endpoint
+`http://127.0.0.1:30000`, wakes the backend for workload, sleeps it after 600
+seconds without workload, and owns bounded backend recovery. The legacy
+`paper-library-mineru.service` is disabled and masked. The retained
+`deploy/papervault-mineru.service` is a standalone direct-listener template;
+it is not the shared host's backend or gate configuration.
 
-1. As the Unix user running `papervault.service`, check the user bus and unit:
-   `systemctl --user show paper-library-mineru.service -p LoadState -p TimeoutStartUSec`.
-   Also run `systemd-run --user --wait --pipe /usr/bin/systemctl --user show
-   paper-library-mineru.service -p LoadState` to check bus access inside a user
-   service, where the controller will run.
-   The installed unit and repo template both have `TimeoutStartSec=300` seconds;
-   keep `PAPER_LIBRARY_MINERU_READY_TIMEOUT` at 300 seconds or more (330 below
-   leaves margin). Check that `curl -fsS
-   http://127.0.0.1:30000/health` succeeds and `/v1/models` returns a nonempty
-   `data` list when the OCR model is loaded. The controller requires both.
-2. Add these exact lines to the service checkout's `.env` (use the actual unit
-   name if it differs):
+papervault requires `/health` 200 and `/v1/models` listing a model. It probes
+once within a three-second total budget; no unit start, warmup polling,
+load-state inspection, or lifecycle cooldown occurs in the caller. A sleeping
+backend is **ready**: both endpoints still answer, and the gate forwards these
+probes without waking the backend or counting them as activity. The next OCR
+request wakes it inside the service boundary. Unavailable readiness raises a
+transport error, so library extraction defers without charging an attempt and
+operator PDF pickup leaves the PDF pending.
 
-   ```dotenv
-   PAPER_LIBRARY_MINERU_ONDEMAND=1
-   PAPER_LIBRARY_MINERU_UNIT=paper-library-mineru.service
-   PAPER_LIBRARY_MINERU_READY_TIMEOUT=330
-   PAPER_LIBRARY_MINERU_IDLE_TIMEOUT=600
-   KS_BGE_IDLE_UNLOAD=1
-   KS_BGE_IDLE_TIMEOUT=600
-   ```
+`MINERU_URL` and `PAPER_LIBRARY_MINERU_*` HTTP-client settings remain supported.
+Remove obsolete `PAPER_LIBRARY_MINERU_ONDEMAND`, `_WATCHDOG`, `_UNIT`,
+`_IDLE_TIMEOUT`, `_IDLE_CHECK`, `_READY_TIMEOUT`, `_HEALTH_POLL`, and
+`_IMAGE_DECODE_RESTART_AFTER` settings (each suffix uses the
+`PAPER_LIBRARY_MINERU` prefix). There are no caller-side lifecycle settings.
+Maintenance-window co-tenancy guards still check `papervault.service` and
+`mineru.service`; they do not inspect backend sleep state.
 
-3. Restart `papervault.service` to load the settings. **This drops connected MCP
-   clients**; reconnect them after the service is healthy. Do not disable the
-   MinerU unit merely to enable on-demand mode: the controller stops it after the
-   idle interval and starts it on the next OCR call. The library extract queue and
-   operator PDF pickup use the controller. A separate manual OCR process (including
-   `scripts/probe_mineru_socket_leak.py`) does not; keep on-demand off while running
-   such a process or use a separately managed OCR server.
-4. Record `nvidia-smi -i 1 --query-compute-apps=pid,used_gpu_memory --format=csv`
-   before and after the 600-second idle period (adjust `-i` to the physical RTX
-   3090 index). Confirm the MinerU process exits and the papervault process falls
-   toward zero GPU memory. Other processes on the card must be accounted for.
-5. Measure cold start at deployment: after MinerU has stopped on idle, queue a
-   PDF extraction and read the `mineru model-ready after ...s` line from
-   `journalctl --user -u papervault.service`. The duration includes the unit
-   start and both readiness probes. Inspect `journalctl --user -u
-   paper-library-mineru.service` if the start fails or exceeds 330 seconds.
-   After both BGE models unload, invoke a normal `query` or `search_papers` and
-   read the `bge embedder loaded in ...s` and `bge reranker loaded in ...s` log
-   entries. Record query latency as well as model-load durations; these timings
-   require the actual 3090 and are not measured by CI.
+After deployment, the orchestrator verifies an extraction round-trip with the
+backend asleep. The request must complete through the same `:30000` endpoint
+without caller-side intervention. Host measurements and service deployment
+remain outside the lane's unit-test evidence.
 
-Rollback: remove or set `PAPER_LIBRARY_MINERU_ONDEMAND=0` and
-`KS_BGE_IDLE_UNLOAD=0`, then restart `papervault.service` (clients disconnect
-again). Start the configured MinerU user unit so OCR remains resident. Verify
-`/health`, `/v1/models`, and a normal MCP call before closing the change.
+## BGE idle release
+
+The in-process BGE embedder and reranker have a separate opt-in idle release:
+`KS_BGE_IDLE_UNLOAD=1` and `KS_BGE_IDLE_TIMEOUT=600`. After both unload, a
+normal `query` or `search_papers` reloads the model it needs. Measure GPU memory
+and the `bge embedder loaded in ...s` / `bge reranker loaded in ...s` log entries
+on the target GPU. To roll back BGE idle release, set `KS_BGE_IDLE_UNLOAD=0`
+and restart papervault under the operator's deployment procedure; connected
+MCP clients must reconnect. These BGE settings do not control MinerU.
 
 ## Acquisition-v2 format deploys: drain barrier
 

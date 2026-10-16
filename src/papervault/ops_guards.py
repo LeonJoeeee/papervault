@@ -30,9 +30,8 @@ def active_service_units(
 ) -> list[str]:
     """papervault service units that are systemd-active (or *activating*), else [].
 
-    Probes ``papervault.service`` + the MinerU unit (operator override
-    ``PAPER_LIBRARY_MINERU_UNIT``; the hardcoded default would no-op the gate on a renamed
-    deploy) unless ``units`` names others; ``states`` are the ``is-active`` answers that
+    Probes ``papervault.service`` + the independent ``mineru.service`` unless
+    ``units`` names others; ``states`` are the ``is-active`` answers that
     count as running. ``FileNotFoundError`` (no systemd at all — CI / container) breaks the loop
     permissively (empty list → callers proceed). A transient probe failure on one unit is
     swallowed and the scan continues, but a positive already in hand is NEVER discarded
@@ -41,8 +40,7 @@ def active_service_units(
     use this mode because an unobserved co-writer cannot be admitted.
     """
     if units is None:
-        units = ("papervault.service",
-                 os.environ.get("PAPER_LIBRARY_MINERU_UNIT", "papervault-mineru.service"))
+        units = ("papervault.service", "mineru.service")
     running = tuple(states)
     active: list[str] = []
     for unit in units:

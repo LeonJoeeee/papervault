@@ -957,6 +957,10 @@ def test_stopped_backend_allows_workload_post_and_extraction(tmp_path, monkeypat
     async def parse(**kwargs):
         # Simulate only the external OCR adapter; extraction and client admission
         # still run their real readiness checks before reaching this workload.
+        # mineru-vl-utils 1.0.5 discovers the model via GET /v1/models at client
+        # construction, before any workload POST. This fake bypasses discovery:
+        # the gate must synthesize /v1/models while stopped. Live acceptance must
+        # include the real adapter; this test covers only caller admission.
         async with httpx.AsyncClient() as http:
             response = await http.post(f"{kwargs['server_url']}/v1/chat/completions", json={
                 "model": "MinerU2.5-Pro-2605-1.2B", "messages": [],

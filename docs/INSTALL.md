@@ -118,22 +118,23 @@ seconds without workload, and owns bounded backend recovery. The legacy
 `deploy/papervault-mineru.service` is a standalone direct-listener template;
 it is not the shared host's backend or gate configuration.
 
-papervault requires only gate `/health` 200. It probes once within a three-second
-total budget; no unit start, warmup polling, load-state inspection, or lifecycle
-cooldown occurs in the caller. A stopped backend is **idle and ready**: the gate
-answers health 200 with `{"status":"ok","backend":"stopped"}`. The caller does not
-inspect that body or require `/v1/models`, which cannot serve a model while the
-backend is stopped. The next OCR workload POST starts the backend inside the
-service boundary; the gate waits for it to become ready and forwards the request
-(measured cold start: about 20–25 seconds). Unavailable gate health raises a
-transport error, so library extraction defers without charging an attempt and
-operator PDF pickup leaves the PDF pending.
+papervault performs no caller-side pre-flight; `ensure_ready` is an immediate
+no-op. A stopped backend is **idle and ready**: the next OCR workload POST starts
+it inside the service boundary, and the gate waits for it to become ready before
+forwarding the request (measured cold start: about 20–25 seconds). The MinerU
+client's discovery/parse calls determine reachability. Their transport errors
+defer library extraction without charging an attempt and leave operator PDF
+pickup pending. Singleton construction and discovery run off the MCP event loop,
+so concurrent cold clients wait for its lock in threads; socket cleanup still
+runs on the client's own loop. No unit start, warmup polling, load-state
+inspection, or lifecycle cooldown occurs in the caller.
 
-`MINERU_URL` and `PAPER_LIBRARY_MINERU_*` HTTP-client settings remain supported.
+`MINERU_URL` and the active `PAPER_LIBRARY_MINERU_*` HTTP-client settings remain supported.
 Remove obsolete `PAPER_LIBRARY_MINERU_ONDEMAND`, `_WATCHDOG`, `_UNIT`,
-`_IDLE_TIMEOUT`, `_IDLE_CHECK`, `_READY_TIMEOUT`, `_HEALTH_POLL`, and
-`_IMAGE_DECODE_RESTART_AFTER` settings (each suffix uses the
-`PAPER_LIBRARY_MINERU` prefix). There are no caller-side lifecycle settings.
+`_IDLE_TIMEOUT`, `_IDLE_CHECK`, `_READY_TIMEOUT`, `_HEALTH_POLL`,
+`_IMAGE_DECODE_RESTART_AFTER`, `_PRECHECK`, and `_PRECHECK_TIMEOUT` settings
+(each suffix uses the `PAPER_LIBRARY_MINERU` prefix). There are no caller-side
+lifecycle settings.
 Maintenance-window co-tenancy guards still check `papervault.service`,
 `mineru.service`, and the retained standalone template's `papervault-mineru.service`;
 they do not inspect backend load state.

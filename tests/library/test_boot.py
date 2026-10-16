@@ -152,13 +152,13 @@ def test_shutdown_before_boot_completes_is_clean(tmp_path):
 
 
 def test_bind_not_gated_on_mineru_reachability(tmp_path):
-    """A down/hung MinerU (OCR at :30000 refused or the readiness probe blocking)
+    """A down/hung MinerU (OCR at :30000 refused or the readiness hook blocking)
     must NOT gate the port bind (issue #34): ``start_background`` returns promptly
-    and the detached boot COMPLETES even while the MinerU readiness probe blocks
+    and the detached boot COMPLETES even while the MinerU readiness hook blocks
     forever. Extraction stays degraded (the worker handles MinerU-down per-item,
     C1) but the bind/boot never wait on it.
 
-    The readiness probe is replaced with one that HANGS (never returns), so if the
+    The readiness hook is replaced with one that HANGS (never returns), so if the
     boot/bind path awaited MinerU readiness anywhere this test would time out. It
     does not: MinerU is touched only on the worker critical path, never on the
     bind path. Seed one EXTRACT-routed paper so the recovery scan has real work.
@@ -171,10 +171,10 @@ def test_bind_not_gated_on_mineru_reachability(tmp_path):
         mineru_server.reset_server_controller_for_test()
         ctrl = mineru_server.get_server_controller()
 
-        release = asyncio.Event()   # never set during the boot window → probe hangs
+        release = asyncio.Event()   # never set during the boot window → hook hangs
 
         async def hanging_ensure_ready() -> None:
-            await release.wait()     # simulate :30000 unreachable / vLLM still loading
+            await release.wait()     # simulate a blocking replacement readiness hook
 
         ctrl.ensure_ready = hanging_ensure_ready  # type: ignore[method-assign]
         try:
@@ -182,7 +182,7 @@ def test_bind_not_gated_on_mineru_reachability(tmp_path):
             eq = server._paper_extract_queue
 
             # The bind point (lifespan yield) is reached the instant this returns —
-            # it must NOT wait on the hung MinerU probe.
+            # it must NOT wait on the hung MinerU readiness hook.
             shutdown = await asyncio.wait_for(start_background(server, log), timeout=2.0)
 
             # The DETACHED boot completes (queues up, reconcile up) despite MinerU

@@ -90,96 +90,29 @@ def test_extract_mineru_no_endpoints_is_transport():
 
 
 def test_extract_mineru_import_failure_is_transport(monkeypatch):
-    """A DOWN/absent MinerU surfaces as a TRANSPORT error (deploy problem, not a
-    per-doc defect) — never an extraction charge. With the #76 reachability
-    pre-check ON (default), an unreachable ``127.0.0.1:30000`` is classified
-    transport BEFORE the lazy import even runs; in a mineru-less venv the absent
-    import would classify the same way if the pre-check were bypassed. Either
-    path proves the contract: no per-doc charge for a deploy/transport failure,
-    and ``import papervault.library.extract`` never requires mineru at import."""
-    eps = [mc.Endpoint("a", "http://127.0.0.1:30000")]
-    with pytest.raises(mc.MineruTransportError):
+    """An absent optional parser is a deploy/transport failure, without HTTP."""
+    monkeypatch.setitem(sys.modules, "mineru.cli.common", None)
+    eps = [mc.Endpoint("a", "http://unreachable.invalid:30000")]
+    with pytest.raises(mc.MineruTransportError, match="mineru_import_failed"):
         asyncio.run(mc.extract_mineru(b"%PDF-1.4 fake", eps, stem="x"))
 
 
-# ------------- issue #76: async reachability pre-check (loop-safety) ---------
-# aio_do_parse's client construction runs SYNCHRONOUS work on the S4 event loop
-# and stalls when MinerU is unreachable (py-spy caught MainThread there), which
-# starved the MCP handshake. The pre-check fast-fails a down server off-block.
+def test_extract_reaches_parser_without_http_preflight(monkeypatch):
+    import httpx
 
+    def unexpected_http(*args, **kwargs):
+        pytest.fail("client admission must not construct an HTTP client")
 
-def test_precheck_unreachable_short_circuits_before_parse(monkeypatch):
-    """Pre-check ON + an unreachable server ⇒ MineruTransportError raised BEFORE
-    aio_do_parse is ever entered (the loop-blocking construction never runs)."""
-    _install_fake_mineru(monkeypatch, None)
-
-    async def _boom(**_kw):
-        raise AssertionError("aio_do_parse must NOT be called when unreachable")
-    import sys
-    sys.modules["mineru.cli.common"].aio_do_parse = _boom
-
-    async def _down(*_a, **_k):
-        return False
-    monkeypatch.setattr(mc, "_any_endpoint_ready", _down)
-    monkeypatch.setattr(mc, "_PRECHECK_ENABLED", True, raising=False)
-
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    with pytest.raises(mc.MineruTransportError) as ei:
-        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
-    assert "precheck" in str(ei.value)
-
-
-def test_precheck_off_reaches_parse(monkeypatch):
-    """PAPER_LIBRARY_MINERU_PRECHECK=0 (flag off) skips the probe entirely and
-    goes straight to aio_do_parse — the pre-#76 behaviour (revert lever)."""
-    md_written = {}
-
-    async def _fake_parse(**kw):
+    async def parse(**kwargs):
         from pathlib import Path
-        out = Path(kw["output_dir"]) / kw["pdf_file_names"][0] / "vlm"
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"{kw['pdf_file_names'][0]}.md").write_text("# body")
-        md_written["ok"] = True
+        out = Path(kwargs["output_dir"]) / "x" / "vlm"
+        out.mkdir(parents=True)
+        (out / "x.md").write_text("# body")
 
-    _install_fake_mineru(monkeypatch, _fake_parse)
-
-    async def _must_not_probe(*_a, **_k):
-        raise AssertionError("pre-check must be skipped when flag off")
-    monkeypatch.setattr(mc, "_any_endpoint_ready", _must_not_probe)
-    monkeypatch.setattr(mc, "_PRECHECK_ENABLED", False, raising=False)
-
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    md = asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
-    assert md == "# body" and md_written.get("ok")
-
-
-def test_any_endpoint_ready_passes_if_one_up(monkeypatch):
-    """``_any_endpoint_ready`` is ANY, not ALL — one healthy endpoint in a
-    2-endpoint set is enough to proceed (preserves round-robin failover)."""
-    async def _health(url, _timeout):
-        return url.endswith(":30001")  # only the 2nd endpoint is up
-    monkeypatch.setattr(mc, "_endpoint_health_ok", _health)
-    eps = [mc.Endpoint("a", "http://a:30000"), mc.Endpoint("b", "http://b:30001")]
-    assert asyncio.run(mc._any_endpoint_ready(eps, 1.0)) is True
-
-    async def _all_down(_url, _timeout):
-        return False
-    monkeypatch.setattr(mc, "_endpoint_health_ok", _all_down)
-    assert asyncio.run(mc._any_endpoint_ready(eps, 1.0)) is False
-
-
-def test_endpoint_health_ok_down_is_false_fast():
-    """The real async probe against a closed localhost port returns False
-    quickly (connection-refused) without raising — the loop-safe fast path."""
-    import socket
-    import time
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    t0 = time.monotonic()
-    ok = asyncio.run(mc._endpoint_health_ok(f"http://127.0.0.1:{port}", 2.5))
-    assert ok is False
-    assert time.monotonic() - t0 < 2.5  # refused resolves well under the timeout
+    _install_fake_mineru(monkeypatch, parse)
+    monkeypatch.setattr(httpx, "AsyncClient", unexpected_http)
+    eps = [mc.Endpoint("a", "http://unreachable.invalid:30000")]
+    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
 
 
 def test_read_md_from_outdir_missing_is_extraction(tmp_path):
@@ -244,12 +177,6 @@ def _install_fake_mineru(monkeypatch, aio_do_parse):
         monkeypatch.setitem(sys.modules, name, mod)
     monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0, raising=False)  # no real sleeps
 
-    # Issue #76: force the async reachability pre-check to "reachable" so these
-    # tests exercise the retry-loop classification (the server is stubbed as
-    # up-and-answering; the pre-check is covered separately below).
-    async def _reachable(*_a, **_k):
-        return True
-    monkeypatch.setattr(mc, "_any_endpoint_ready", _reachable)
     return ServerError
 
 
@@ -655,6 +582,7 @@ def test_parse_passes_caps_to_mineru_client(monkeypatch):
     eps = [mc.Endpoint("a", "http://a:30000")]
     assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
     # Passed through aio_do_parse (mineru forwards max_concurrency) ...
+    assert captured["predictor"] is predictor
     assert captured["max_concurrency"] == 16
     assert captured["max_connections"] == 40
     # ... and the singleton predictor is built with the same kwargs for the same
@@ -679,6 +607,29 @@ def test_parse_without_mineru_singleton_still_passes_caps(monkeypatch):
     assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
     assert order == ["aio_do_parse"]
     assert captured["max_concurrency"] == mc.client_limits()[0]
+
+
+def test_discovery_failure_retries_on_next_endpoint(monkeypatch):
+    order, captured, discovered = [], {}, []
+    _install_fake_mineru(monkeypatch, _recording_parse(order, captured))
+    request_error = sys.modules["mineru_vl_utils.vlm_client.base_client"].RequestError
+    predictor = _CapPredictor()
+
+    class Singleton:
+        def get_model(self, backend, model_path, server_url, **kwargs):
+            discovered.append(server_url)
+            if server_url == "http://a":
+                raise request_error("invalid model metadata from first endpoint")
+            return predictor
+
+    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
+    module.ModelSingleton = Singleton
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    eps = [mc.Endpoint("a", "http://a"), mc.Endpoint("b", "http://b")]
+    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
+    assert discovered == ["http://a", "http://b"]
+    assert captured["server_url"] == "http://b"
+    assert captured["predictor"] is predictor
 
 
 # ============ issue #133: return freed parse memory to the OS ============
@@ -774,3 +725,115 @@ def test_trim_heap_resolves_real_glibc_symbol(monkeypatch):
     monkeypatch.setattr(mc, "_malloc_trim_fn", mc._UNLOADED)
     monkeypatch.setattr(mc, "_MALLOC_TRIM_ENABLED", True)
     assert mc.trim_heap() is True
+
+
+# Issue #237: a slow discovery must hold the singleton lock only off-loop.
+@pytest.mark.parametrize("operation", ["prepare", "cleanup"])
+async def test_slow_discovery_does_not_block_event_loop(monkeypatch, operation):
+    import threading
+
+    loop = asyncio.get_running_loop()
+    entered = threading.Event()
+    release = threading.Event()
+    closed = []
+
+    class AioClient:
+        async def aclose(self):
+            closed.append(asyncio.get_running_loop())
+
+    predictor = _CapPredictor()
+    predictor.client._aio_client_cache = {loop: AioClient()}
+
+    class Singleton:
+        _lock = threading.RLock()
+        _models = {"k": predictor}
+
+        def __new__(cls):
+            with cls._lock:
+                return super().__new__(cls)
+
+        def get_model(self, *args, **kwargs):
+            with self._lock:
+                entered.set()
+                if not release.wait(2):
+                    raise AssertionError("synthetic discovery was not released")
+                return predictor
+
+    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
+    module.ModelSingleton = Singleton
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    kwargs = {"max_concurrency": 16, "max_connections": 40}
+    first = asyncio.create_task(mc._prepare_capped_predictor("http://a", kwargs))
+    second = None
+    timer = None
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        heartbeat = loop.create_future()
+        started = loop.time()
+        handle = loop.call_later(0.01, lambda: heartbeat.set_result(
+            (loop.time() - started, release.is_set())))
+        # Independent timer prevents a regression from deadlocking the test.
+        timer = threading.Timer(0.4, release.set)
+        timer.start()
+        if operation == "prepare":
+            second = asyncio.create_task(mc._prepare_capped_predictor("http://b", kwargs))
+        else:
+            second = asyncio.create_task(mc._close_mineru_client_for_loop(loop))
+        lag, discovery_finished = await heartbeat
+        assert lag < 0.2, f"10ms heartbeat delayed by {lag:.3f}s"
+        assert not discovery_finished
+    finally:
+        release.set()
+        if timer is not None:
+            timer.cancel()
+            timer.join()
+        if second is not None:
+            await asyncio.gather(first, second)
+        else:
+            await first
+    handle.cancel()
+    if operation == "cleanup":
+        assert closed == [loop]
+        assert loop not in predictor.client._aio_client_cache
+
+
+async def test_cleanup_keeps_client_if_parse_starts_during_singleton_lookup(monkeypatch):
+    import threading
+
+    loop = asyncio.get_running_loop()
+    release = threading.Event()
+    aio = _StubAioClient()
+    cache = {loop: aio}
+
+    class Singleton:
+        _models = {"k": _StubPredictor(cache)}
+
+        def __new__(cls):
+            if not release.wait(2):
+                raise AssertionError("singleton lookup was not released")
+            return super().__new__(cls)
+
+    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
+    module.ModelSingleton = Singleton
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
+    mc._incref_current_loop()
+    start_parse = loop.call_later(0.01, mc._incref_current_loop)
+    timer = threading.Timer(0.4, release.set)
+    timer.start()
+    try:
+        await mc._decref_current_loop_and_maybe_close()
+        # Ensure the scheduled parse has started even on the old blocked path.
+        await asyncio.sleep(0.02)
+        assert mc._loop_parse_refcounts[loop] == 1
+        assert cache[loop] is aio
+        assert not aio.aclosed
+        await mc._decref_current_loop_and_maybe_close()
+        assert aio.aclosed
+        assert loop not in cache
+    finally:
+        release.set()
+        timer.cancel()
+        timer.join()
+        start_parse.cancel()
+        mc._loop_parse_refcounts.pop(loop, None)

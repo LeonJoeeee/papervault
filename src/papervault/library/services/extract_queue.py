@@ -11,8 +11,8 @@ receives work from two sources:
 
 2026-06-06 (MinerU migration, SDD §4.1): **worker count is a fixed explicit
 knob** ``_EXTRACT_CONCURRENCY`` (env ``PAPER_LIBRARY_EXTRACT_CONCURRENCY``,
-default 8), DECOUPLED from GPU count. The persistent MinerU2.5-Pro vLLM server
-owns its card 24/7 and batches the per-page sub-requests server-side via
+default 8), DECOUPLED from GPU count. The independent MinerU2.5-Pro vLLM service
+owns GPU sleep/wake and batches the per-page sub-requests server-side via
 ``--max-num-seqs``; an explicit ``asyncio.Semaphore`` (``concurrency.acquire_extract_slot``)
 caps how many whole-PDF extractions are in flight. ``ocr-pool.conf`` is
 REDEFINED (SDD §4.3) to a binary **pause-dispatch** toggle: an EMPTY file pauses

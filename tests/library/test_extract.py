@@ -869,8 +869,8 @@ def test_confirmed_gate_failopen_second_pass_does_not_overturn():
 #
 # The 09-20..09-25 incident: a stale MinerU server answered every page with HTTP
 # 400 "Failed to load image"; the client charged it as a per-doc defect and 5,828
-# healthy papers went terminal. It is now transport-class (no charge, status kept)
-# and each occurrence is reported to the server controller's self-heal counter.
+# healthy papers went terminal. It is now transport-class (no charge, status kept);
+# the independent MinerU service owns recovery.
 
 _IMAGE_DECODE_400 = (
     'Unexpected status code: [400], response body: {"error":{"message":'

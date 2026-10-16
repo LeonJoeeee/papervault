@@ -592,8 +592,8 @@ async def extract_md(paper: Paper, library: Library, *,
         NOT charge ``extract_attempts``, do NOT set ``extract_failed``.
         Non-mutation lets classify re-route the paper next reconcile sweep.
         This includes ``MineruImageDecodeError`` (the server answered 400
-        ``Failed to load image`` — issue #134), which is also reported to the
-        server controller's self-heal counter.
+        ``Failed to load image`` — issue #134); recovery belongs to the
+        independent MinerU service.
       - ``MineruExtractionError`` (per-doc defect) and a completeness-gate
         reject charge toward ``MAX_EXTRACT_ATTEMPTS``; terminal at budget
         ONLY (there is no instant-terminal-on-first-failure — the old

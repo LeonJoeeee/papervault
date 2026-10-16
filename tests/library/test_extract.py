@@ -915,26 +915,21 @@ def _install_fake_mineru_raising(monkeypatch, message):
 
     base = _install_fake_mineru(monkeypatch, aio_do_parse)
 
-    async def _reachable(*_a, **_k):
-        return True
-    monkeypatch.setattr(mc, "_any_endpoint_ready", _reachable)
     monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0)
 
 
-def test_stopped_backend_allows_workload_post_and_extraction(tmp_path, monkeypatch):
-    """Health 200 with no served model must admit the POST that starts OCR."""
+def test_extraction_sends_workload_without_health_preflight(tmp_path, monkeypatch):
+    """Caller admission needs no health response before the self-waking POST."""
     from pathlib import Path
 
     import httpx
 
-    from papervault.library import mineru_client as mc
     from papervault.library.services.mineru_server import MineruServerController
 
     lib, paper = _pdf_paper(tmp_path)
     _stub_good_probe(monkeypatch)
     _stub_judges_pass(monkeypatch)
     monkeypatch.setenv("MINERU_URL", "http://127.0.0.1:30000")
-    monkeypatch.setattr(mc, "_PRECHECK_ENABLED", True)
     controller = MineruServerController()
     monkeypatch.setattr(extract, "get_server_controller", lambda: controller)
     markdown = "Complete extracted paper body. " * 30
@@ -942,8 +937,6 @@ def test_stopped_backend_allows_workload_post_and_extraction(tmp_path, monkeypat
 
     def handler(request):
         requests.append((request.method, request.url.path))
-        if request.method == "GET" and request.url.path == "/health":
-            return httpx.Response(200, json={"status": "ok", "backend": "stopped"})
         if request.method == "POST" and request.url.path == "/v1/chat/completions":
             return httpx.Response(200, json={
                 "choices": [{"message": {"role": "assistant", "content": markdown}}],
@@ -955,8 +948,8 @@ def test_stopped_backend_allows_workload_post_and_extraction(tmp_path, monkeypat
         transport=httpx.MockTransport(handler), **kwargs))
 
     async def parse(**kwargs):
-        # Simulate only the external OCR adapter; extraction and client admission
-        # still run their real readiness checks before reaching this workload.
+        # Simulate only the external OCR adapter; controller and client admission
+        # run unmodified, without health pre-flights.
         # mineru-vl-utils 1.0.5 discovers the model via GET /v1/models at client
         # construction, before any workload POST. This fake bypasses discovery:
         # the gate must synthesize /v1/models while stopped. Live acceptance must
@@ -973,8 +966,7 @@ def test_stopped_backend_allows_workload_post_and_extraction(tmp_path, monkeypat
 
     _install_fake_mineru(monkeypatch, parse)
     assert asyncio.run(extract.extract_md(paper, lib, llm=object())) == markdown
-    assert requests == [("GET", "/health"), ("GET", "/health"),
-                        ("POST", "/v1/chat/completions")]
+    assert requests == [("POST", "/v1/chat/completions")]
     assert lib.has_extract(paper.key, "md")
     assert paper.download_status == "ok"
     assert paper.extract_attempts == 0
@@ -1024,27 +1016,38 @@ def test_plain_400_still_charges_through_real_client(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("status", ["ok", "pending"])
-def test_readiness_unavailable_defers_without_charging(tmp_path, monkeypatch, status):
-    from papervault.library.services.mineru_server import MineruServerUnavailable
+def test_client_discovery_unavailable_defers_without_charging(tmp_path, monkeypatch, status):
+    import sys
+    import types
+
+    from papervault.library import mineru_client as mc
+    from papervault.library.services.mineru_server import MineruServerController
 
     lib, paper = _pdf_paper(tmp_path)
     paper.download_status = status
     paper.extract_attempts = 2
     _stub_good_probe(monkeypatch)
 
-    class Unavailable:
-        async def ensure_ready(self):
-            raise MineruServerUnavailable("gate unavailable")
+    async def unexpected_parse(**kwargs):
+        pytest.fail("failed model discovery must defer before parsing")
 
-    async def unexpected_ocr(*args, **kwargs):
-        pytest.fail("unavailable readiness must defer before OCR")
+    base = _install_fake_mineru(monkeypatch, unexpected_parse)
 
-    monkeypatch.setattr(extract, "get_server_controller", Unavailable)
-    monkeypatch.setattr(extract, "extract_mineru", unexpected_ocr)
+    class Singleton:
+        def get_model(self, *args, **kwargs):
+            raise base.ServerError("Failed to connect to server: synthetic discovery refused")
+
+    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
+    module.ModelSingleton = Singleton
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(mc, "_INLINE_RETRIES", 0)
+    monkeypatch.setattr(extract, "get_server_controller", MineruServerController)
     assert asyncio.run(extract.extract_md(paper, lib, llm=object())) is None
     assert paper.download_status == status
     assert paper.extract_attempts == 2
     assert paper.extract_deferred_sig is not None
     events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
-    assert any(e.get("event") == "extract_md_transport_retry" for e in events)
+    assert any(e.get("event") == "extract_md_transport_retry"
+               and "synthetic discovery refused" in e["error"] for e in events)
     assert not any(e.get("event") == "extract_md_engine_failed" for e in events)

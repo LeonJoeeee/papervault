@@ -16,7 +16,7 @@ One Python package (`papervault`), one server process, subsystems as modules:
 - **eval/** — the bundled harness (recall@served, hallucination rate, trap gates) + method notes. Retrieval/pipeline quality changes are benchmark-arbitrated.
 - **plugin shell** — the minimal installable `plugin/` subdir (`plugin/.claude-plugin/plugin.json` + `plugin/.mcp.json` MCP wiring), routed to by the repo-root `.claude-plugin/marketplace.json`; only `plugin/` ships on install. No skills shipped in v1. Thin by rule; per-agent adapters never hold logic.
 
-Boundaries: the library→knowledge hand-off is the on-disk vault — single writer (library), one reader (knowledge scheduler) — with reader and writer versioned together inside the package. External processes: MinerU OCR service (HTTP through its gate; service-owned stop/start and recovery; library probes gate health only, with a stopped backend ready to accept workload), Neo4j + Postgres (docker-compose), the operator LLM endpoint (OpenAI-compatible).
+Boundaries: the library→knowledge hand-off is the on-disk vault — single writer (library), one reader (knowledge scheduler) — with reader and writer versioned together inside the package. External processes: MinerU OCR service (HTTP through its gate; service-owned stop/start and recovery; no library pre-flight, with workload waking a stopped backend and client discovery/parse errors determining reachability), Neo4j + Postgres (docker-compose), the operator LLM endpoint (OpenAI-compatible).
 
 ## Key quality goals
 1. **Measured, not claimed** — the eval harness is a product component; risky quality changes merge only with benchmark arbitration.

@@ -179,65 +179,6 @@ _BACKOFF_BASE = float(
 _BACKOFF_CAP = float(
     os.environ.get("PAPER_LIBRARY_MINERU_BACKOFF_CAP", "30.0"))
 
-# ── Reachability pre-check (issue #76 — MCP event-loop robustness) ──────────
-# ``aio_do_parse``'s VLM-http-client CONSTRUCTION (``vlm_analyze._get_model_async``
-# / ``__new__``) runs SYNCHRONOUS work on the S4 single event loop before any
-# awaitable I/O — py-spy repeatedly caught MainThread stuck there when the MinerU
-# server is unreachable (a fresh cold construction blocks ~1.3s; a hanging /
-# modelscope-cold-fetch endpoint blocks far longer — 10-40s observed). On a
-# restart with an extract backlog while MinerU is DOWN, that on-loop block plus
-# the ~30s outer async retry churn per paper starves the MCP
-# ``initialize``/``tools/list`` handshake (issue #76 / ai-research-lab#31 Cause B).
-# The same event-loop-starvation class PR #75 fixed for the KS query path.
-#
-# Fix (mirrors PR #75's flag-gated, behaviour-preserving shape): before the
-# blocking construction, run a FULLY-ASYNC ``/health`` probe with a SHORT timeout.
-# A down/hanging server resolves to unreachable in ≤``_PRECHECK_TIMEOUT`` seconds
-# WITHOUT ever blocking the loop, and we raise ``MineruTransportError`` —
-# ``extract_md``'s existing C1 transport arm then defers the paper with NO charge
-# (identical OUTCOME to the pre-#76 path, reached fast + off-block instead of via
-# the on-loop construction stall). A reachable server (``/health`` 200) proceeds
-# exactly as before, so an up MinerU is byte-unchanged. Health-up-but-model-not-
-# loaded transients still fall through to ``aio_do_parse``'s bare-500→transport
-# handling (unchanged). ``PAPER_LIBRARY_MINERU_PRECHECK=0`` restores the pre-#76
-# straight-to-``aio_do_parse`` behaviour (diagnostic/revert lever).
-_PRECHECK_ENABLED = os.environ.get(
-    "PAPER_LIBRARY_MINERU_PRECHECK", "1").strip().lower() in ("1", "true", "yes")
-_PRECHECK_TIMEOUT = float(
-    os.environ.get("PAPER_LIBRARY_MINERU_PRECHECK_TIMEOUT", "2.5"))
-
-
-async def _endpoint_health_ok(url: str, timeout: float) -> bool:
-    """True iff ``url`` answers ``GET /health`` 200 within ``timeout`` seconds.
-
-    Fully async (``httpx.AsyncClient``) so a DOWN (connection-refused) or HANGING
-    (black-holed connect / slow ``/health``) server resolves to ``False`` WITHOUT
-    blocking the event loop — the whole point of the #76 pre-check. Any error /
-    timeout ⇒ ``False`` (treat as unreachable, conservative: a false-negative only
-    costs a transport-defer + reconcile retry, never a wrong per-doc charge)."""
-    import httpx
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            r = await client.get(url.rstrip("/") + "/health")
-        return r.status_code == 200
-    except Exception:  # noqa: BLE001 — any failure ⇒ not reachable
-        return False
-
-
-async def _any_endpoint_ready(endpoints: list[Endpoint], timeout: float) -> bool:
-    """True iff ANY endpoint answers ``/health`` 200 (probed concurrently).
-
-    ``any`` — not ``all`` — preserves the round-robin failover contract: proceed
-    to ``aio_do_parse`` while at least ONE card is up, so a single dead endpoint
-    in a 2-endpoint set never blocks the healthy one. Steady state has ONE
-    endpoint, so this degenerates to a single probe."""
-    results = await asyncio.gather(
-        *(_endpoint_health_ok(ep.url, timeout) for ep in endpoints),
-        return_exceptions=True,
-    )
-    return any(r is True for r in results)
-
-
 # ------------------------- ServerError discriminator -----------------------
 
 
@@ -414,11 +355,20 @@ async def _close_mineru_client_for_loop(loop) -> None:
     ModelSingleton = getattr(mod, "ModelSingleton", None) if mod is not None else None
     if ModelSingleton is None:  # pragma: no cover - no real OCR in this process
         return
+
+    def snapshot_predictors():
+        # __new__ takes the same RLock as discovery; never acquire it on-loop.
+        return list(getattr(ModelSingleton(), "_models", {}).values())
+
     try:
-        predictors = list(getattr(ModelSingleton(), "_models", {}).values())
+        predictors = await asyncio.to_thread(snapshot_predictors)
     except Exception:  # noqa: BLE001 - never break the extract on cleanup
         return
     for predictor in predictors:
+        # A new parse can start while the snapshot or aclose is awaiting. Its
+        # eventual decref will close the client after that parse finishes.
+        if _loop_parse_refcounts.get(loop, 0) > 0:
+            return
         client = getattr(predictor, "client", None)
         cache = getattr(client, "_aio_client_cache", None)
         if not isinstance(cache, dict):
@@ -439,9 +389,11 @@ async def _close_mineru_client_for_loop(loop) -> None:
 # reuses it. mineru 3.4.4 reads ``max_concurrency`` from those kwargs but never
 # passes ``max_connections`` to the client, so the socket ceiling would be
 # silently lost. Before each parse we therefore obtain the SAME singleton
-# predictor (same key, same kwargs, off the loop exactly as mineru's own
-# ``_get_model_async`` does) and set both limits on it and its HTTP client. The
-# per-loop ``httpx.AsyncClient`` is built lazily from ``client.max_connections``
+# predictor (same key and kwargs) entirely off-loop and set both limits on it
+# and its HTTP client. Pass it into ``aio_do_parse`` so ``aio_doc_analyze`` skips
+# ``_get_model_async``, whose singleton lookup otherwise takes an RLock on-loop
+# even when the predictor is cached (#76, #237). The per-loop
+# ``httpx.AsyncClient`` is built lazily from ``client.max_connections``
 # during the parse, so it is created capped. Guarded like the #93 close hook: a
 # mineru without these internals (or a stubbed test) just skips this step.
 
@@ -457,7 +409,7 @@ def _apply_client_limits(predictor, max_concurrency: int, max_connections: int) 
         predictor.max_concurrency = max_concurrency
 
 
-async def _prepare_capped_predictor(server_url: str, client_kwargs: dict) -> None:
+async def _prepare_capped_predictor(server_url: str, client_kwargs: dict) -> object | None:
     """Build (or fetch) mineru's singleton predictor for ``server_url`` and cap it.
 
     Errors from the construction itself (e.g. the model-name probe against a
@@ -467,13 +419,20 @@ async def _prepare_capped_predictor(server_url: str, client_kwargs: dict) -> Non
     singleton_cls = getattr(mod, "ModelSingleton", None) if mod is not None else None
     if singleton_cls is None:
         return
-    get_model = getattr(singleton_cls(), "get_model", None)
-    if get_model is None:  # pragma: no cover - defensive, unknown mineru build
-        return
-    predictor = await asyncio.to_thread(
-        get_model, "http-client", None, server_url, **client_kwargs)
-    _apply_client_limits(predictor, client_kwargs["max_concurrency"],
-                         client_kwargs["max_connections"])
+
+    def get_predictor():
+        # Evaluating singleton_cls() before to_thread would block the MCP loop
+        # behind another worker's discovery, even with get_model offloaded.
+        get_model = getattr(singleton_cls(), "get_model", None)
+        if get_model is None:  # pragma: no cover - defensive, unknown mineru build
+            return None
+        return get_model("http-client", None, server_url, **client_kwargs)
+
+    predictor = await asyncio.to_thread(get_predictor)
+    if predictor is not None:
+        _apply_client_limits(predictor, client_kwargs["max_concurrency"],
+                             client_kwargs["max_connections"])
+    return predictor
 
 
 # --------------------- heap trim after each parse (#133) --------------------
@@ -650,21 +609,6 @@ async def _extract_mineru_impl(
     if not endpoints:
         raise MineruTransportError("no_endpoints_configured")
 
-    # Reachability pre-check (issue #76): fast-fail a DOWN/unreachable MinerU
-    # here — on the loop but FULLY ASYNC (never blocks it) — BEFORE the
-    # synchronous ``aio_do_parse`` client construction that py-spy caught
-    # starving the MCP handshake, and before the heavy lazy import + ~30s retry
-    # churn below. A down server ⇒ MineruTransportError ⇒ ``extract_md`` C1
-    # transport arm ⇒ deferred, NO charge (same outcome as pre-#76, reached in
-    # ≤_PRECHECK_TIMEOUT s async instead of via the on-loop stall). Off-flag
-    # (PAPER_LIBRARY_MINERU_PRECHECK=0) restores the straight-to-parse path.
-    if _PRECHECK_ENABLED and not await _any_endpoint_ready(
-            endpoints, _PRECHECK_TIMEOUT):
-        raise MineruTransportError(
-            "mineru_unreachable_precheck: no endpoint answered GET /health 200 "
-            f"within {_PRECHECK_TIMEOUT:.1f}s "
-            f"({', '.join(e.url for e in endpoints)})")
-
     # Lazy import: mineru is a heavy, optionally-absent dep (it is installed in
     # the server unit's venv and the daemon's import path per SDD §3.0, but
     # importing papervault.library.extract must never require it). An import failure
@@ -719,7 +663,7 @@ async def _extract_mineru_impl(
                 "max_connections": max_connections,
             }
             try:
-                await _prepare_capped_predictor(ep.url, client_kwargs)
+                predictor = await _prepare_capped_predictor(ep.url, client_kwargs)
                 await aio_do_parse(
                     output_dir=str(outdir),
                     pdf_file_names=[stem],
@@ -727,6 +671,7 @@ async def _extract_mineru_impl(
                     p_lang_list=["en"],          # REQUIRED positional; VLM ignores
                     backend="vlm-http-client",   # do_parse strips "vlm-" → "http-client"
                     server_url=ep.url,
+                    predictor=predictor,
                     formula_enable=True,
                     table_enable=True,
                     image_analysis=False,

@@ -1,6 +1,6 @@
 # Independent MinerU service ownership
 
-Status: Implements the owner ruling in [issue #235](https://github.com/LeonJoeeee/papervault/issues/235) (2026-10-16); number assigned at merge.
+Status: Implements the owner rulings in [issue #235](https://github.com/LeonJoeeee/papervault/issues/235) and [issue #237](https://github.com/LeonJoeeee/papervault/issues/237) (2026-10-16); number assigned at merge.
 
 ## Context
 
@@ -12,13 +12,18 @@ consumer `:30000`) that owns idle stop, workload-triggered start and bounded rec
 ## Decision
 
 Keep papervault's existing HTTP consumer endpoint and endpoint resolution.
-The library probes only gate `/health` once within a bounded HTTP budget;
-it never manages the server's lifecycle or inspects backend load state. Health
-200 admits workload even with a stopped backend and no model served yet:
-stopped is idle and ready through the gate. The subsequent workload POST starts
-the backend; requiring a model-list probe first would prevent that start.
-Gate health failure remains a transport error, preserving extraction's uncharged
-deferral and operator PDF pickup's pending state.
+The library performs no caller-side pre-flight; `ensure_ready` is a compatibility
+no-op. It never manages the server's lifecycle or inspects backend load state.
+A stopped backend is idle and ready through the gate: the workload POST starts
+the backend. The real client's discovery/parse calls determine reachability;
+their transport errors preserve extraction's uncharged deferral and operator
+PDF pickup's pending state.
+
+MinerU singleton construction, discovery and cleanup lookups run in thread
+offloads, so contention on the singleton's lock cannot block the MCP event loop
+(the hazard identified in #76). The prepared predictor passes into the parser,
+avoiding its otherwise synchronous singleton lookup. Socket cleanup stays on
+the client's own event loop. Extract-worker placement remains unchanged.
 
 ## Consequences
 

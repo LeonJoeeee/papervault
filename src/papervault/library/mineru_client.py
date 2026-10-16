@@ -1,11 +1,9 @@
-"""In-process async client for the persistent MinerU2.5-Pro vLLM server.
+"""In-process async client for the independent MinerU2.5-Pro OCR service.
 
-The daemon talks to a plain ``vllm serve`` of the MinerU2.5-Pro weights
-(path A, §3.1 of the L2 SDD) via mineru's own in-process VLM http-client
-(``aio_do_parse`` with ``backend="vlm-http-client"`` + ``server_url``). The
-model loads ONCE in the server; this module sends one whole-PDF parse per
-call and reads back the markdown that mineru writes to
-``<out_dir>/<stem>/vlm/<stem>.md``.
+The daemon talks through the service gate via mineru's own in-process VLM
+http-client (``aio_do_parse`` with ``backend="vlm-http-client"`` + ``server_url``).
+The service owns backend stop/start; this module sends one whole-PDF parse per
+call and reads back the markdown that mineru writes to ``<out_dir>/<stem>/vlm/<stem>.md``.
 
 **The transport-vs-extraction error split (C1, §2.2).** The single failure
 bucket of the old cascade is split into TWO typed exceptions so the caller
@@ -95,8 +93,10 @@ class MineruExtractionError(Exception):
 
 @dataclass(frozen=True)
 class Endpoint:
-    """One MinerU vLLM server URL (e.g. the 3090 at :30000 or the 5090 at
-    :30001). ``label`` is for logging only."""
+    """One MinerU consumer URL (default gate: ``http://127.0.0.1:30000``).
+
+    ``label`` is for logging only.
+    """
 
     label: str
     url: str

@@ -40,8 +40,8 @@ PRIORITY_LOW = 10
 
 # ---------- Extract dispatch pause-toggle via file (SDD §4.3) ----------
 #
-# 2026-06-06 (MinerU migration): the persistent MinerU2.5-Pro vLLM server owns
-# its GPU sleep/wake, so ``ocr-pool.conf`` controls only this caller's dispatch.
+# 2026-06-06 (MinerU migration): the independent MinerU2.5-Pro vLLM service owns
+# its GPU allocation, so ``ocr-pool.conf`` controls only this caller's dispatch.
 # It is a binary **pause-dispatch** toggle:
 #
 #   non-empty / absent → dispatch RUNS (the daemon admits new extractions)
@@ -74,7 +74,7 @@ def extract_dispatch_enabled() -> bool:
     Reads the redefined ``<vault>/ocr-pool.conf`` pause-dispatch toggle: an
     EMPTY file pauses dispatch (return False); a non-empty file or an absent
     file runs (return True). Content is no longer a GPU-index list — the
-    independent MinerU service owns GPU sleep/wake, regardless of this toggle.
+    independent MinerU service owns GPU allocation, regardless of this toggle.
     """
     import os
     pool_file = os.path.join(_vault_path(), "ocr-pool.conf")

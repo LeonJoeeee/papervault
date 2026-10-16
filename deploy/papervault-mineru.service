@@ -2,7 +2,7 @@
 #
 # Legacy standalone server template, managed by the operator independently of
 # papervault. The shared host deployment instead uses mineru.service behind
-# mineru-gate.service; that gate owns :30000 and backend sleep/wake/recovery.
+# mineru-gate.service; that gate owns :30000 and backend stop/start and recovery.
 # Do not install this direct-listener template alongside the gate on :30000.
 # papervault only probes readiness over HTTP and never manages this unit.
 #

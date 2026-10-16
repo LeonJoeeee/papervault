@@ -15,9 +15,6 @@ from papervault.library.services.mineru_server import (
 )
 
 
-_MODELS = {"object": "list", "data": [{"id": "MinerU2.5-Pro-2605-1.2B", "object": "model"}]}
-
-
 @pytest.fixture(autouse=True)
 def forbid_lifecycle_subprocesses(monkeypatch):
     async def unexpected(*args, **kwargs):
@@ -32,53 +29,45 @@ def _http(monkeypatch, handler):
         transport=httpx.MockTransport(handler), **kwargs))
 
 
-def test_sleeping_backend_is_ready_without_waking_or_inspecting_sleep(monkeypatch):
+def test_stopped_backend_is_ready_without_model_probe(monkeypatch):
     requests = []
 
     def handler(request):
         requests.append((request.method, str(request.url)))
-        # The gate returns these same observations while the backend is asleep.
-        return httpx.Response(200, json=_MODELS if request.url.path == "/v1/models" else {})
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok", "backend": "stopped"})
+        # Probes other than health fail while stopped and do not start the backend.
+        return httpx.Response(503)
 
     _http(monkeypatch, handler)
     asyncio.run(MineruServerController().ensure_ready())
-    assert requests == [("GET", "http://127.0.0.1:30000/health"),
-                        ("GET", "http://127.0.0.1:30000/v1/models")]
+    assert requests == [("GET", "http://127.0.0.1:30000/health")]
 
 
-@pytest.mark.parametrize("health_status,models_status,payload", [
-    (503, 200, _MODELS),
-    (200, 503, _MODELS),
-    (302, 200, _MODELS),
-    (200, 302, _MODELS),
-    (200, 200, {"data": []}),
-    (200, 200, {}),
-    (200, 200, None),
-    (200, 200, []),
-    (200, 200, {"data": "not a model list"}),
-    (200, 200, {"data": [{}]}),
-])
-async def test_unready_responses_raise_transport_error(
-    monkeypatch, health_status, models_status, payload,
-):
+@pytest.mark.parametrize("health_status", [503, 302])
+async def test_unready_responses_raise_transport_error(monkeypatch, health_status):
+    paths = []
+
     def handler(request):
-        if request.url.path == "/health":
-            return httpx.Response(health_status)
-        return httpx.Response(models_status, json=payload)
+        paths.append(request.url.path)
+        if request.url.path == "/healthy":
+            return httpx.Response(200)
+        return httpx.Response(health_status, headers={"Location": "/healthy"})
 
     _http(monkeypatch, handler)
     with pytest.raises(MineruServerUnavailable) as exc:
         await MineruServerController().ensure_ready()
     assert isinstance(exc.value, MineruTransportError)
+    assert paths == ["/health"]
 
 
-async def test_invalid_json_is_unavailable(monkeypatch):
+@pytest.mark.parametrize("body", ["not JSON", ""])
+async def test_health_200_does_not_require_json_body(monkeypatch, body):
     def handler(request):
-        return httpx.Response(200, text="not JSON" if request.url.path == "/v1/models" else "")
+        return httpx.Response(200, text=body)
 
     _http(monkeypatch, handler)
-    with pytest.raises(MineruServerUnavailable):
-        await MineruServerController().ensure_ready()
+    await MineruServerController().ensure_ready()
 
 
 @pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout])
@@ -91,14 +80,11 @@ async def test_http_failure_is_unavailable(monkeypatch, error_type):
         await MineruServerController().ensure_ready()
 
 
-@pytest.mark.parametrize("blocked_path", ["/health", "/v1/models"])
-async def test_entire_probe_has_a_bounded_budget(monkeypatch, blocked_path):
+async def test_entire_probe_has_a_bounded_budget(monkeypatch):
     monkeypatch.setattr(ms, "_HEALTH_HTTP_TIMEOUT", 0.01)
 
     async def handler(request):
-        if request.url.path == blocked_path:
-            await asyncio.Event().wait()
-        return httpx.Response(200)
+        await asyncio.Event().wait()
 
     _http(monkeypatch, handler)
     with pytest.raises(MineruServerUnavailable):
@@ -111,7 +97,7 @@ async def test_each_call_probes_once_and_recovers_without_cooldown(monkeypatch):
 
     def handler(request):
         paths.append(request.url.path)
-        return httpx.Response(200 if healthy else 503, json=_MODELS)
+        return httpx.Response(200 if healthy else 503)
 
     _http(monkeypatch, handler)
     controller = MineruServerController()
@@ -120,7 +106,7 @@ async def test_each_call_probes_once_and_recovers_without_cooldown(monkeypatch):
             await controller.ensure_ready()
     healthy = True
     await controller.ensure_ready()
-    assert paths == ["/health", "/health", "/health", "/v1/models"]
+    assert paths == ["/health", "/health", "/health"]
 
 
 @pytest.mark.parametrize("override,want", [
@@ -133,11 +119,11 @@ async def test_endpoint_resolution_keeps_first_env_endpoint(monkeypatch, overrid
 
     def handler(request):
         urls.append(str(request.url))
-        return httpx.Response(200, json=_MODELS)
+        return httpx.Response(200)
 
     _http(monkeypatch, handler)
     await MineruServerController(base_url=override).ensure_ready()
-    assert urls == [f"{want}/health", f"{want}/v1/models"]
+    assert urls == [f"{want}/health"]
 
 
 async def test_cancellation_propagates(monkeypatch):
@@ -158,7 +144,7 @@ async def test_cancellation_propagates(monkeypatch):
 @pytest.mark.parametrize("ready", [True, False])
 async def test_operator_session_probes_before_ocr(monkeypatch, ready):
     def handler(request):
-        return httpx.Response(200 if ready else 503, json=_MODELS)
+        return httpx.Response(200 if ready else 503, json={"backend": "stopped"})
 
     _http(monkeypatch, handler)
     entered = False

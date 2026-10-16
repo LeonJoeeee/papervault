@@ -878,22 +878,16 @@ _IMAGE_DECODE_400 = (
     '"type":"BadRequestError","param":null,"code":400}}')
 
 
-def _install_fake_mineru_raising(monkeypatch, message):
-    """Fake the lazily-imported mineru modules so the REAL ``extract_mineru``
-    runs its classification against an ``aio_do_parse`` that raises ServerError."""
+def _install_fake_mineru(monkeypatch, aio_do_parse):
+    """Replace the external parser imports, keeping the real client wrapper."""
     import sys
     import types
-
-    from papervault.library import mineru_client as mc
 
     class ServerError(RuntimeError):
         pass
 
     class RequestError(ValueError):
         pass
-
-    async def aio_do_parse(**_kw):
-        raise ServerError(message)
 
     common = types.ModuleType("mineru.cli.common")
     common.aio_do_parse = aio_do_parse
@@ -909,11 +903,78 @@ def _install_fake_mineru_raising(monkeypatch, message):
         ("mineru_vl_utils.vlm_client.base_client", base),
     ):
         monkeypatch.setitem(sys.modules, name, mod)
+    return base
+
+
+def _install_fake_mineru_raising(monkeypatch, message):
+    """Run real client classification against a parser that raises ServerError."""
+    from papervault.library import mineru_client as mc
+
+    async def aio_do_parse(**_kw):
+        raise base.ServerError(message)
+
+    base = _install_fake_mineru(monkeypatch, aio_do_parse)
 
     async def _reachable(*_a, **_k):
         return True
     monkeypatch.setattr(mc, "_any_endpoint_ready", _reachable)
     monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0)
+
+
+def test_stopped_backend_allows_workload_post_and_extraction(tmp_path, monkeypatch):
+    """Health 200 with no served model must admit the POST that starts OCR."""
+    from pathlib import Path
+
+    import httpx
+
+    from papervault.library import mineru_client as mc
+    from papervault.library.services.mineru_server import MineruServerController
+
+    lib, paper = _pdf_paper(tmp_path)
+    _stub_good_probe(monkeypatch)
+    _stub_judges_pass(monkeypatch)
+    monkeypatch.setenv("MINERU_URL", "http://127.0.0.1:30000")
+    monkeypatch.setattr(mc, "_PRECHECK_ENABLED", True)
+    controller = MineruServerController()
+    monkeypatch.setattr(extract, "get_server_controller", lambda: controller)
+    markdown = "Complete extracted paper body. " * 30
+    requests = []
+
+    def handler(request):
+        requests.append((request.method, request.url.path))
+        if request.method == "GET" and request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok", "backend": "stopped"})
+        if request.method == "POST" and request.url.path == "/v1/chat/completions":
+            return httpx.Response(200, json={
+                "choices": [{"message": {"role": "assistant", "content": markdown}}],
+            })
+        return httpx.Response(503)
+
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(
+        transport=httpx.MockTransport(handler), **kwargs))
+
+    async def parse(**kwargs):
+        # Simulate only the external OCR adapter; extraction and client admission
+        # still run their real readiness checks before reaching this workload.
+        async with httpx.AsyncClient() as http:
+            response = await http.post(f"{kwargs['server_url']}/v1/chat/completions", json={
+                "model": "MinerU2.5-Pro-2605-1.2B", "messages": [],
+            })
+        response.raise_for_status()
+        stem = kwargs["pdf_file_names"][0]
+        outdir = Path(kwargs["output_dir"]) / stem / "vlm"
+        outdir.mkdir(parents=True)
+        (outdir / f"{stem}.md").write_text(response.json()["choices"][0]["message"]["content"])
+
+    _install_fake_mineru(monkeypatch, parse)
+    assert asyncio.run(extract.extract_md(paper, lib, llm=object())) == markdown
+    assert requests == [("GET", "/health"), ("GET", "/health"),
+                        ("POST", "/v1/chat/completions")]
+    assert lib.has_extract(paper.key, "md")
+    assert paper.download_status == "ok"
+    assert paper.extract_attempts == 0
+    assert paper.extract_deferred_sig is None
 
 
 class _ReadyController:

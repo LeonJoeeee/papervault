@@ -33,13 +33,13 @@ uv venv && uv pip install -e ".[mineru,grey]"
 
 # 5. Provision MinerU independently before enabling extraction.
 #    The [mineru] extra supplies HTTP client libraries, not the vLLM server.
-#    On the shared host, mineru.service runs the always-on backend privately on
-#    :30001; mineru-gate.service exposes :30000 and owns sleep/wake/recovery.
+#    On the shared host, mineru.service runs the backend privately on :30001;
+#    mineru-gate.service exposes :30000 and owns backend stop/start and recovery.
 #    Those services are provisioned outside this repository. papervault does not
 #    start, stop or restart them. Do not install a second listener on :30000.
 #    The default MINERU_URL stays http://127.0.0.1:30000; set it for another host.
 curl -fsS http://127.0.0.1:30000/health
-curl -fsS http://127.0.0.1:30000/v1/models   # must list a model, including while asleep
+#    Health 200 is ready even with backend=stopped; a workload POST starts it.
 
 # 6. Preflight — verify GPU, databases, LLM config, domain pack
 papervault doctor
@@ -110,20 +110,22 @@ use the documented `PAPERVAULT_LLM_*` endpoint/key configuration.
 ## MinerU service boundary
 
 MinerU is a shared, independently managed service ([issue #235](https://github.com/LeonJoeeee/papervault/issues/235)).
-On the shared host, `mineru.service` is always on with a private backend at
-`:30001`. `mineru-gate.service` owns the consumer endpoint
-`http://127.0.0.1:30000`, wakes the backend for workload, sleeps it after 600
+On the shared host, `mineru.service` is boot-enabled with a private backend at
+`:30001`. The always-on `mineru-gate.service` owns the consumer endpoint
+`http://127.0.0.1:30000`, starts the backend for workload, stops it after 600
 seconds without workload, and owns bounded backend recovery. The legacy
-`paper-library-mineru.service` is disabled and masked. The retained
+`paper-library-mineru.service` is a transition alias of `mineru.service`. The retained
 `deploy/papervault-mineru.service` is a standalone direct-listener template;
 it is not the shared host's backend or gate configuration.
 
-papervault requires `/health` 200 and `/v1/models` listing a model. It probes
-once within a three-second total budget; no unit start, warmup polling,
-load-state inspection, or lifecycle cooldown occurs in the caller. A sleeping
-backend is **ready**: both endpoints still answer, and the gate forwards these
-probes without waking the backend or counting them as activity. The next OCR
-request wakes it inside the service boundary. Unavailable readiness raises a
+papervault requires only gate `/health` 200. It probes once within a three-second
+total budget; no unit start, warmup polling, load-state inspection, or lifecycle
+cooldown occurs in the caller. A stopped backend is **idle and ready**: the gate
+answers health 200 with `{"status":"ok","backend":"stopped"}`. The caller does not
+inspect that body or require `/v1/models`, which cannot serve a model while the
+backend is stopped. The next OCR workload POST starts the backend inside the
+service boundary; the gate waits for it to become ready and forwards the request
+(measured cold start: about 20–25 seconds). Unavailable gate health raises a
 transport error, so library extraction defers without charging an attempt and
 operator PDF pickup leaves the PDF pending.
 
@@ -134,10 +136,10 @@ Remove obsolete `PAPER_LIBRARY_MINERU_ONDEMAND`, `_WATCHDOG`, `_UNIT`,
 `PAPER_LIBRARY_MINERU` prefix). There are no caller-side lifecycle settings.
 Maintenance-window co-tenancy guards still check `papervault.service`,
 `mineru.service`, and the retained standalone template's `papervault-mineru.service`;
-they do not inspect backend sleep state.
+they do not inspect backend load state.
 
 After deployment, the orchestrator verifies an extraction round-trip with the
-backend asleep. The request must complete through the same `:30000` endpoint
+backend stopped. The request must complete through the same `:30000` endpoint
 without caller-side intervention. Host measurements and service deployment
 remain outside the lane's unit-test evidence.
 

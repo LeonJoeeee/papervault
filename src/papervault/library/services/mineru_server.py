@@ -1,10 +1,11 @@
 """Consumer-side readiness probes for the independent MinerU service.
 
 Consumers use the gate at ``http://127.0.0.1:30000`` (or the first endpoint
-resolved by ``MINERU_URL``). The service owns backend lifecycle, idle sleep,
-wake-up and self-healing. Readiness requires ``/health`` 200 AND ``/v1/models``
-listing a model. A sleeping backend satisfies both; these probes do not wake
-it or count as workload. The gate absorbs wake latency on the next OCR request.
+resolved by ``MINERU_URL``). The gate owns backend stop/start, idle release and
+self-healing. Readiness requires only gate ``/health`` 200. A stopped backend
+is idle and ready to accept workload through the gate, even with no model
+served yet. The gate starts the backend on the next workload POST and waits
+until it can serve the request; the health probe does not start the backend.
 
 ``ensure_ready`` performs one HTTP probe within a fixed three-second budget.
 Failure raises ``MineruServerUnavailable``, a ``MineruTransportError``, so
@@ -32,7 +33,7 @@ _HEALTH_HTTP_TIMEOUT = 3.0
 
 
 class MineruServerUnavailable(MineruTransportError):
-    """Readiness failed; extraction defers with no attempt charged."""
+    """Gate health failed; extraction defers with no attempt charged."""
 
 
 class MineruServerController:
@@ -51,7 +52,7 @@ class MineruServerController:
         yield
 
     async def ensure_ready(self) -> None:
-        """Probe once within the HTTP budget; unavailable is a transport error."""
+        """Probe gate health within the HTTP budget; stopped is idle and ready."""
         try:
             async with asyncio.timeout(_HEALTH_HTTP_TIMEOUT):
                 ready = await self._ready()
@@ -59,28 +60,17 @@ class MineruServerController:
             ready = False
         if not ready:
             raise MineruServerUnavailable(
-                f"mineru server not ready at {self._base}: "
-                "/health must return 200 and /v1/models must list a model")
+                f"mineru gate unavailable at {self._base}: /health must return 200")
 
     async def _ready(self) -> bool:
-        """A sleeping backend is ready when health and model-list probes pass."""
+        """Gate health 200 admits workload regardless of backend state."""
         import httpx
 
         try:
             async with httpx.AsyncClient(timeout=_HEALTH_HTTP_TIMEOUT) as client:
                 health = await client.get(f"{self._base}/health")
-                if health.status_code != 200:
-                    return False
-                models = await client.get(f"{self._base}/v1/models")
-                if models.status_code != 200:
-                    return False
-                payload = models.json()
-            data = payload.get("data") if isinstance(payload, dict) else None
-            return isinstance(data, list) and any(
-                isinstance(model, dict) and isinstance(model.get("id"), str) and model["id"]
-                for model in data
-            )
-        except Exception:  # noqa: BLE001 — failed HTTP/JSON observations mean unavailable
+            return health.status_code == 200
+        except Exception:  # noqa: BLE001 — failed HTTP observations mean unavailable
             return False
 
 

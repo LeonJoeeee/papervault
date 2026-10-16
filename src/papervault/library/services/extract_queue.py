@@ -12,12 +12,12 @@ receives work from two sources:
 2026-06-06 (MinerU migration, SDD §4.1): **worker count is a fixed explicit
 knob** ``_EXTRACT_CONCURRENCY`` (env ``PAPER_LIBRARY_EXTRACT_CONCURRENCY``,
 default 8), DECOUPLED from GPU count. The independent MinerU2.5-Pro vLLM service
-owns GPU sleep/wake and batches the per-page sub-requests server-side via
+owns GPU allocation and batches the per-page sub-requests server-side via
 ``--max-num-seqs``; an explicit ``asyncio.Semaphore`` (``concurrency.acquire_extract_slot``)
 caps how many whole-PDF extractions are in flight. ``ocr-pool.conf`` is
 REDEFINED (SDD §4.3) to a binary **pause-dispatch** toggle: an EMPTY file pauses
 admission (workers idle, the queue holds), a non-empty / absent file runs.
-MinerU's independent service owns GPU sleep/wake; the dispatch toggle only
+MinerU's independent service owns GPU allocation; the dispatch toggle only
 controls this queue's admission.
 
 Worker body runs (SDD §2.1):
@@ -237,7 +237,7 @@ class ExtractQueue:
             # admission — the worker idles (does NOT pull from the queue, so the
             # backlog holds + the in-flight set drains) and re-checks each poll
             # interval. A non-empty / absent file runs. This replaces the old
-            # GPU-index list semantics; MinerU's service owns GPU sleep/wake.
+            # GPU-index list semantics; MinerU's service owns GPU allocation.
             try:
                 dispatch_on = concurrency.extract_dispatch_enabled()
             except Exception:

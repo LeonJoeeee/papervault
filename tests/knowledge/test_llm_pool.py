@@ -877,5 +877,6 @@ async def test_request_preserves_level_without_caller_effort(tmp_path, monkeypat
         "ping", model=level, reasoning_effort="max",
         extra_body={"model": "provider-model", "thinking": True},
     ) == "Hello"
-    assert created == [{"model": level, "max_tokens": llm_mod._DEFAULT_MAX_TOKENS,
+    wire = f"{'papervault-' if gateway else ''}{level}"
+    assert created == [{"model": wire, "max_tokens": llm_mod._DEFAULT_MAX_TOKENS,
                         "stream": True, "stream_options": {"include_usage": True}}]

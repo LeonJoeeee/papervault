@@ -10,7 +10,7 @@ Usage:  set -a; . ./.env; set +a
 """
 import asyncio, json, os, sys
 
-from papervault.llm_routing import route
+from papervault.llm_routing import gateway_model, route
 
 GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
 VKEY = os.getenv("KS_VIRTUAL_KEY", "")
@@ -42,7 +42,7 @@ async def _judge(client, sem, e):
         for _ in range(3):
             try:
                 r = await client.chat.completions.create(
-                    model=route("eval_judge"), messages=[{"role": "system", "content": SYS}, {"role": "user", "content": user}],
+                    model=gateway_model(route("eval_judge")), messages=[{"role": "system", "content": SYS}, {"role": "user", "content": user}],
                     max_tokens=4000, temperature=0)
                 obj = _extract_json(r.choices[0].message.content or "")
                 if obj is not None and "faithful" in obj:

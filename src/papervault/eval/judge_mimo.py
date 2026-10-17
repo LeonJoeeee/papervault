@@ -37,7 +37,7 @@ from openai import AsyncOpenAI
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))  # repo root, for `papervault.eval`
 from papervault.eval import judge_aggregate as JA  # noqa: E402
-from papervault.llm_routing import route  # noqa: E402
+from papervault.llm_routing import gateway_model, route  # noqa: E402
 
 JUDGE = EVAL / "judge"
 GOLD = EVAL / os.getenv("JUDGE_GOLD", "gold_v2.jsonl")  # env-override for new gold frames (gold_v4 / gold_newq)
@@ -187,7 +187,7 @@ async def _judge_one(client, sem, tag, qid, gold_entry, force, counters):
         try:
             async with sem:
                 resp = await client.chat.completions.create(
-                    model=route("eval_judge"),
+                    model=gateway_model(route("eval_judge")),
                     messages=[{"role": "system", "content": _SYSTEM},
                               {"role": "user", "content": prompt}],
                     temperature=0.1,

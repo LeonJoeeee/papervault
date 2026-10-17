@@ -89,8 +89,9 @@ def test_library_request_preserves_each_level(tmp_path, monkeypatch, gateway, le
 
     monkeypatch.setattr(llm, "_create_completion", complete)
     assert llm.get_llm().call("judge") == "ok"
+    wire = f"openai/{'papervault-' if gateway else ''}{level}"
     assert requests == [{
-        "model": f"openai/{level}", "messages": [{"role": "user", "content": "judge"}],
+        "model": wire, "messages": [{"role": "user", "content": "judge"}],
         "base_url": "https://gateway.example/v1" if gateway else "https://direct.example/v1",
         "api_key": "test-key", "max_tokens": llm._DEFAULT_MAX_TOKENS,
     }]

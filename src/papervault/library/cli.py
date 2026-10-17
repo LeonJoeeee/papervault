@@ -36,31 +36,65 @@ def _json(obj) -> None:
 # ------------------------------- handlers ----------------------------------
 
 
+def cmd_policy_ruling(args) -> int:
+    """Record an explicit ruling; ordinary selectors never resolve UNKNOWN."""
+    from papervault import config
+    from .services.policy_ruling import apply_ruling, inspect_ruling
+    try:
+        keys = _read_key_file(args.keys)
+        root = Path(os.path.expanduser(os.environ.get("PAPERVAULT_VAULT")
+                    or os.environ.get("PAPER_LIBRARY_PATH") or str(config.VAULT_PATH)))
+        if args.apply:
+            from papervault.ops_guards import active_service_units
+            if active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES, strict=True):
+                raise ValueError("papervault.service is running and would overwrite this ruling; stop it first")
+        operation = apply_ruling if args.apply else inspect_ruling
+        result = operation(root, keys=keys, action=args.action, reason=args.reason)
+    except (OSError, ValueError, RuntimeError) as exc:
+        _err(str(exc))
+        return 2
+    _json(result)
+    if result["missing_count"] or result["mismatch_count"]:
+        _err(f"policy ruling refused: missing keys {result['missing_keys']}; mismatches {result['mismatches']}")
+        return 2
+    return 0
+
+
 def cmd_reopen_campaign(args) -> int:
     """Explicit capped maintenance pass; dry-run never constructs a writable store."""
     import asyncio
     from papervault import config
     from .reopen_v2 import inspect_campaign, run_campaign
     try:
+        keys = _read_key_file(args.keys) if args.keys is not None else None
         if not config.reopen_v2_enabled():
             raise ValueError("PAPERVAULT_REOPEN_V2 is disabled")
         root = Path(os.path.expanduser(os.environ.get("PAPERVAULT_VAULT")
                     or os.environ.get("PAPER_LIBRARY_PATH") or str(config.VAULT_PATH)))
         if args.dry_run:
-            result = inspect_campaign(root, cap=args.cap)
+            result = inspect_campaign(root, cap=args.cap, keys=keys)
         else:
             from filelock import FileLock
             from papervault.ops_guards import active_service_units
             if active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES, strict=True):
                 raise ValueError("papervault.service is running and would overwrite this campaign")
             # Validate read-only first so invalid caps/accounting cannot create a vault.
-            inspect_campaign(root, cap=args.cap)
+            inspect_campaign(root, cap=args.cap, keys=keys)
             with FileLock(str(root / ".reopen-campaign.lock"), timeout=0):
-                result = asyncio.run(run_campaign(Library(root), cap=args.cap))
+                result = asyncio.run(run_campaign(Library(root), cap=args.cap, keys=keys))
     except (OSError, ValueError, RuntimeError) as exc:
         _err(str(exc))
         return 2
-    _json(result) if args.json else print(f"selected {result['selected']}; completed {result['completed']}")
+    if args.json:
+        _json(result)
+    else:
+        print(f"selected {result['selected']}; completed {result['completed']}; "
+              f"missing {result['missing_count']}; rejected {result['rejected_count']}; "
+              f"deferred by cap {len(result['deferred_keys'])}")
+        for key in result["missing_keys"]:
+            print(f"  {key}: not_found")
+        for row in result["rejected"]:
+            print(f"  {row['key']}: {row['reason']}")
     return 0
 
 
@@ -1172,8 +1206,16 @@ def build_parser() -> argparse.ArgumentParser:
     pib.add_argument("--json", action="store_true", help="emit the recorded JSON accounting")
     pib.set_defaults(func=cmd_identity_backfill)
 
+    ppr = sp.add_parser("policy-ruling", help="record a scoped acquire ruling for the ADS metadata-only cohort")
+    ppr.add_argument("--keys", metavar="FILE", required=True, help="citation keys, one per line; # comments allowed")
+    ppr.add_argument("--action", choices=("acquire",), required=True)
+    ppr.add_argument("--reason", required=True, help="owner/orchestrator rationale for the ruling")
+    ppr.add_argument("--apply", action="store_true", help="persist the ruling and grants (default: read-only)")
+    ppr.set_defaults(func=cmd_policy_ruling)
+
     prc = sp.add_parser("reopen-campaign", help="run an explicit bounded re-open campaign (v2 opt-in)")
     prc.add_argument("--cap", type=int, required=True, help="maximum papers in this campaign (1..200)")
+    prc.add_argument("--keys", metavar="FILE", help="restrict to listed citation keys, preserving file order")
     prc.add_argument("--dry-run", action="store_true", help="select and validate without writes or requests")
     prc.add_argument("--json", action="store_true", help="emit campaign accounting as JSON")
     prc.set_defaults(func=cmd_reopen_campaign)

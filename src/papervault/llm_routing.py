@@ -9,6 +9,13 @@ from __future__ import annotations
 import os
 
 LEVELS = ("flash", "standard", "pro")
+_GATEWAY_PREFIX = "papervault-"
+
+
+def gateway_model(level: str) -> str:
+    """The gateway-facing model name for a level: the level is namespaced to this
+    project so the gateway never needs ambiguous global aliases (standard/pro)."""
+    return f"{_GATEWAY_PREFIX}{level}"
 _DEFAULT_LEVELS = {
     "build": "standard",
     "keyword": "flash",

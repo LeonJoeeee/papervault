@@ -28,7 +28,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from papervault import config
-from papervault.llm_routing import route
+from papervault.llm_routing import LEVELS, gateway_model, route
 from papervault.llm_usage import log_usage
 
 logger = logging.getLogger(__name__)
@@ -382,7 +382,11 @@ def _get_llm_via_gateway(mt: int, model: str | None):
     own retry on top of the proxy's failover (avoid double-retry)."""
     base = config.GATEWAY_URL
     key = config.GATEWAY_KEY
-    group = _litellm_model(model or route("judge"))
+    bare = (model or route("judge"))
+    bare = bare.split("/", 1)[-1]  # accept "openai/<level>" transport spelling too
+    if bare in LEVELS:
+        bare = gateway_model(bare)
+    group = _litellm_model(bare)
     cache_key = (mt, group, base)
     with _gw_lock:
         c = _gw_llms.get(cache_key)

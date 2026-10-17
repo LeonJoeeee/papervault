@@ -55,7 +55,7 @@ from typing import Any
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from papervault import config
-from papervault.llm_routing import route
+from papervault.llm_routing import LEVELS, gateway_model, route
 from papervault.llm_usage import log_usage
 
 logger = logging.getLogger(__name__)
@@ -577,6 +577,8 @@ class KeyPool:
         # Pass the requested level unchanged; the gateway resolves model and effort.
         openai_kwargs = {k: v for k, v in kwargs.items() if k in _OPENAI_STANDARD_KWARGS}
         model = _sdk_model(openai_kwargs.pop("model", None))
+        if model in LEVELS:  # namespaced wire name: papervault-<level>, no global aliases
+            model = gateway_model(model)
 
         # Gateway owns retry + timeout (config.yaml request_timeout/num_retries/retry_policy), so
         # send NO per-request retry/timeout to the proxy. synth.py / multiquery.py pass timeout=…

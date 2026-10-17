@@ -170,11 +170,11 @@ def test_gateway_on_returns_proxy_llm(monkeypatch):
     monkeypatch.setattr(L, "_gw_llms", {})
     got = L.get_llm()                       # default library role → standard
     assert isinstance(got, FakeLLM)         # L.LLM is monkeypatched to FakeLLM by _reset
-    assert got.kw == {"model": "openai/standard", "base_url": "http://proxy:4000/v1",
+    assert got.kw == {"model": "openai/papervault-standard", "base_url": "http://proxy:4000/v1",
                       "api_key": "sk-test", "max_tokens": L._DEFAULT_MAX_TOKENS, "num_retries": 0}
     # An explicit flash level preserves its output ceiling.
     cheap = L.get_llm(model="flash", max_tokens=4096)
-    assert cheap.kw["model"] == "openai/flash" and cheap.kw["max_tokens"] == 4096
+    assert cheap.kw["model"] == "openai/papervault-flash" and cheap.kw["max_tokens"] == 4096
     # cached: same (max_tokens, group) → same object
     assert L.get_llm() is got
 

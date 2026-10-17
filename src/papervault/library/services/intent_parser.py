@@ -28,8 +28,34 @@ logger = logging.getLogger(__name__)
 # Hard cap on search_terms. The prompt constrains LLM #0 to ~2-5 ORTHOGONAL
 # FACETS (term 0 = the verbatim anchor; A3 facet-orthogonality, no synonym
 # padding); we cap server-side as defensive truncation in case LLM ignores it.
-# The cap is a PREFIX, so it never displaces the term-0 anchor (A1).
+# The cap is a PREFIX, so it never displaces the term-0 anchor (A1), or its
+# first per-experiment replacement when the LLM merged named experiments.
 MAX_SEARCH_TERMS = 8
+
+
+# A conservative guard for known experiment names, not acronym-based NER:
+# methods/phenomena such as PINN, MHD and SEP must never be split as instruments.
+# Aliases share an identity; multiword names are matched as a whole.
+_EXPERIMENT_PATTERN = re.compile(
+    r"(?<!\w)(?:"
+    r"(?P<pamela>PAMELA)|"
+    r"(?P<ams02>Alpha Magnetic Spectrometer|AMS[-\s]?02)|"
+    r"(?P<auger>Pierre Auger(?: Observatory)?)|"
+    r"(?P<telescope_array>Telescope Array)"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
+_ENTITY_SEPARATOR = re.compile(r"[\s,/;&+]*(?:(?:and|or|versus|vs)\b\.?[\s,/;&+]*)*", re.I)
+_NEXT_MEASUREMENT_NOUN = {
+    "spectrum": "abundance",
+    "abundance": "fraction",
+    "fraction": "flux",
+    "flux": "measurement",
+    "measurement": "spectrum",
+}
+# Fold ASCII case only for the dictionary keys; retain Unicode word boundaries.
+_MEASUREMENT_NOUN = re.compile(r"\b(?ai:" + "|".join(_NEXT_MEASUREMENT_NOUN) + r")\b")
+_FORBIDDEN_SIBLING_NOUN = re.compile(r"\b(?:features?|excess(?:es)?|hints?)\b", re.I)
 
 
 class SearchPlan(TypedDict):
@@ -71,16 +97,42 @@ The downstream pipeline takes:
       solar maximum, multi-year forecast)
   Aim for ONE term per real facet present in the intent. Vary terminology ACROSS
   facets (expand acronyms, mix domain phrasing) — but the variation should change
-  the FACET, not just reword the same facet.
+  the FACET, not just reword the same facet. Instrument acronym/full-name pairs
+  are the explicit ENTITY RULE exception below.
+
+  ENTITY RULE — one named experiment/instrument per term; never merge entities into one term.
+  Give each experiment/instrument named in the intent its own system facet, paired with the
+  phenomenon and a canonical measurement noun — one of: fraction, spectrum,
+  flux, abundance, measurement. FORBID "feature", "features", "spectral feature",
+  "excess", "hint", and "debate" in entity terms: these describe the debate,
+  not the measurement reported by the original papers.
+  For an experiment/instrument named in the intent, when its common acronym
+  and full name differ, emit BOTH
+  name forms, each as its own term with the phenomenon and a canonical noun
+  (e.g. "AMS-02 positron fraction" AND
+  "Alpha Magnetic Spectrometer positron fraction"). Keep the name forms
+  separate; never merge an acronym and its full name into one term. These
+  required name forms are an exception to the no-synonym-rewording advice.
+  Distinct experiments are distinct facets even when measuring the same
+  phenomenon. For a multi-entity intent, term 0 can name the shared phenomenon;
+  it must not concatenate the entity names. Separate abundance/fraction from
+  energy-spectrum measurements when the intent asks for both observables.
+  Keep term 0 as the verbatim anchor. Within the eight-term budget INCLUDING
+  the anchor, first give each entity one canonical-noun term using its acronym,
+  then add full-name terms, then additional requested observables. If the
+  budget forces a choice, prefer one canonical-noun term per entity, acronym
+  first, then full names.
 
   OVER-SPLIT GUARD (do NOT manufacture fake facets): one atomic concept is ONE
   facet, never several synonym shards. "PINN", "physics-informed neural network",
   "physics-informed deep learning" are the SAME method facet — pick the best one,
   do not spend three terms on it. Prefer FEWER orthogonal terms over many
   near-duplicates: an intent with only 2 real facets should yield ~2 terms, not 6
-  padded ones. Never exceed 6 terms (hard ceiling 8); 2-5 is typical.
+  padded ones. Aim for 2-5 terms; use up to 8 when required instrument name forms
+  or requested observables need them. Never exceed 8 terms including the anchor.
 
-  Each term should be 2-6 words. Don't include single common words.
+  Each term should be 2-6 words, except when retaining a full instrument name
+  requires more. Don't include single common words.
 - filters: optional constraints derived from the intent. Two of them are
   SOFT HINTS — gentle ranking nudges, NEVER a hard cut:
     * citation_pref: an int when the intent wants well-cited / high-impact
@@ -124,7 +176,8 @@ Output ONLY JSON:
 
 ==== Few-shot examples ====
 (In each, term 0 is the verbatim ANCHOR; the rest are DISTINCT facets — never
-synonym rewordings of term 0. The reasoning names the facets.)
+synonym rewordings of term 0. Required instrument name forms follow the ENTITY
+RULE exception. The reasoning names the facets.)
 
 Intent: "a review of PINN"
 Output: {
@@ -146,7 +199,7 @@ Output: {
 
 Intent: "Voyager cosmic ray measurements in the outer heliosphere"
 Output: {
-  "search_terms": ["Voyager outer heliosphere cosmic ray", "cosmic ray modulation", "termination shock heliopause", "anomalous cosmic ray interstellar"],
+  "search_terms": ["Voyager heliospheric cosmic ray flux", "cosmic ray modulation", "termination shock heliopause", "anomalous cosmic ray interstellar"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
@@ -155,11 +208,20 @@ Output: {
 
 Intent: "latest progress on UHECR"
 Output: {
-  "search_terms": ["ultra-high-energy cosmic ray", "Pierre Auger Telescope Array", "UHECR composition spectrum", "extragalactic UHECR origin"],
+  "search_terms": ["ultra-high-energy cosmic ray", "Pierre Auger cosmic ray spectrum", "Telescope Array cosmic ray spectrum", "UHECR composition spectrum", "extragalactic UHECR origin"],
   "filters": {"year_min": 2023, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_recency",
   "reasoning": "Core=UHECR (anchor, acronym expanded). Facets: system (observatories), phenomenon (composition/spectrum), regime (origin). recency cue -> 2023+"
+}
+
+Intent: "Find original papers on cosmic ray positron measurements from PAMELA and AMS-02, covering positron abundance and energy spectra."
+Output: {
+  "search_terms": ["cosmic ray positron measurements", "PAMELA positron abundance", "AMS-02 positron fraction", "Payload for Antimatter Matter Exploration and Light-nuclei Astrophysics positron abundance", "Alpha Magnetic Spectrometer positron fraction", "PAMELA positron energy spectrum", "AMS-02 positron energy spectrum", "Alpha Magnetic Spectrometer positron energy spectrum"],
+  "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": "off"},
+  "limit_suggested": null,
+  "ranking_hint": "by_relevance",
+  "reasoning": "Core=cosmic ray positron measurements (verbatim shared-phenomenon anchor). Cover each experiment's acronym first with abundance/fraction, then its full name in a separate term, then energy spectrum. These canonical nouns target original measurements, not spectral features or debate. Eight terms including the anchor; never merge entities or name forms. Original papers -> primary work; no date cue -> no year window."
 }
 
 Intent: "AI applied to MHD simulation"
@@ -233,6 +295,49 @@ Output: {
 _SYSTEM_PROMPT = _SYSTEM_PROMPT.replace("__DOMAIN_LABEL__", get_domain().label)
 
 
+def _split_experiment_term(term: str) -> list[str]:
+    """Keep known experiments independently searchable with the shared topic.
+
+    Unknown names rely on the prompt rule. Zero/one recognized identity is
+    untouched, including multiple aliases referring to the same experiment.
+    """
+    matches = list(_EXPERIMENT_PATTERN.finditer(term))
+    entities: dict[str, str] = {}
+    spans: list[tuple[int, int]] = []
+    for match in matches:
+        entities.setdefault(match.lastgroup, match.group())
+        start, end = match.span()
+        # Remove wrappers around a name/alias, not parentheses in the topic.
+        if term[max(0, start - 1):start] == "(" and term[end:end + 1] == ")":
+            start, end = start - 1, end + 1
+        spans.append((start, end))
+    if len(entities) < 2:
+        return [term]
+
+    context = [term[:spans[0][0]]]
+    for left, right in zip(spans, spans[1:]):
+        gap = term[left[1]:right[0]]
+        # Drop only connectors BETWEEN entity names. A topical conjunction
+        # such as "electron and positron spectra" remains part of the query.
+        if not _ENTITY_SEPARATOR.fullmatch(gap):
+            context.append(gap)
+    context.append(term[spans[-1][1]:])
+    topic = " ".join(" ".join(context).split()).strip(" ,/;&+")
+    return [f"{entity} {topic}".strip() for entity in entities.values()]
+
+
+def _measurement_sibling_terms(term: str) -> list[str]:
+    """Keep the parent and add one adjacent measurement-noun variant if eligible."""
+    if not _EXPERIMENT_PATTERN.search(term) or _FORBIDDEN_SIBLING_NOUN.search(term):
+        return [term]
+    noun = _MEASUREMENT_NOUN.search(term)
+    if noun is None:
+        return [term]
+    replacement = _NEXT_MEASUREMENT_NOUN[noun.group().lower()]
+    sibling = term[:noun.start()] + replacement + term[noun.end():]
+    return [term, sibling]
+
+
 def parse_intent(query: str, llm=None) -> SearchPlan:
     """Parse a natural-language research intent into a structured search plan.
 
@@ -282,21 +387,23 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
     search_terms = parsed.get("search_terms") or [_query_anchor]
     if not isinstance(search_terms, list) or not search_terms:
         search_terms = [_query_anchor]
-    # Strip/filter-empty (NO cap yet) -> order-preserving DEDUP -> cap LAST.
+    # Strip/filter-empty -> split merged experiments -> noun siblings -> DEDUP -> cap LAST.
     # Dedup BEFORE the cap so a duplicate term never spends a fair-share slot
     # and so the cap never loses a genuine distinct sub-topic to an early dup.
     _stripped = [str(t).strip() for t in search_terms if str(t).strip()]  # NO cap yet
-    _seen: set = set()
-    _distinct = [t for t in _stripped if not (t in _seen or _seen.add(t))]  # order-preserving dedup
-    search_terms = _distinct[:MAX_SEARCH_TERMS]  # cap LAST — up to 8 DISTINCT terms
-    if not search_terms:
-        # No usable terms AND the query is itself empty-after-strip → there is
-        # nothing to search. Fail CLOSED as a parse error (the caller maps a
-        # ValueError to {status:error}) rather than fanning out / ingesting on
-        # an all-whitespace anchor term.
+    if not _stripped:
         if not _query_anchor:
             raise ValueError("intent_parser: empty query yields no search terms")
-        search_terms = [_query_anchor]
+        _stripped = [_query_anchor]
+    _expanded = [
+        variant
+        for term in _stripped
+        for part in _split_experiment_term(term)
+        for variant in _measurement_sibling_terms(part)
+    ]
+    _seen: set = set()
+    _distinct = [t for t in _expanded if not (t in _seen or _seen.add(t))]  # order-preserving dedup
+    search_terms = _distinct[:MAX_SEARCH_TERMS]  # cap LAST — up to 8 DISTINCT terms
 
     filters = parsed.get("filters") or {}
     if not isinstance(filters, dict):

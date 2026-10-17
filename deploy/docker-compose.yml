@@ -4,9 +4,14 @@
 name: papervault
 
 # papervault backing stores: Postgres (pgvector) + Neo4j.
+# Legacy ks-* names are retained from the former knowledge-system deployment so
+# Compose uses the existing stores instead of creating a duplicate stack.
+# PRODUCTION data lives in ks-pgdata (Postgres) and ks-neo4jdata (Neo4j).
+# Never run `docker volume rm ks-pgdata` or `docker volume rm ks-neo4jdata`.
+# These volumes are external: a missing production volume must fail, not be created empty.
 # The GPU services (embed/rerank in-process, MinerU OCR) run on the host, not here.
 #
-#   docker compose -f deploy/docker-compose.yml up -d
+#   docker compose -f deploy/docker-compose.yml --env-file .env up -d
 #
 # Credentials come from your .env — but with `-f deploy/...` you MUST pass it
 # explicitly (`docker compose --env-file .env -f deploy/docker-compose.yml up -d`),
@@ -17,13 +22,13 @@ name: papervault
 services:
   postgres:
     image: pgvector/pgvector:pg16
-    container_name: papervault-postgres
+    container_name: ks-postgres
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-papervault}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
       POSTGRES_DB: ${POSTGRES_DB:-papervault}
     volumes:
-      - papervault-pgdata:/var/lib/postgresql/data
+      - ks-pgdata:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
@@ -36,7 +41,7 @@ services:
 
   neo4j:
     image: neo4j:5-community
-    container_name: papervault-neo4j
+    container_name: ks-neo4j
     environment:
       # NEO4J_AUTH is neo4j/<password>; keep it in sync with NEO4J_PASSWORD in .env.
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-changeme}
@@ -46,7 +51,7 @@ services:
       NEO4J_server_memory_pagecache_size: 4G
       NEO4J_db_tx__log_rotation_retention__policy: "2 days"
     volumes:
-      - papervault-neo4jdata:/data
+      - ks-neo4jdata:/data
     ports:
       - "${NEO4J_HTTP_PORT:-7474}:7474"
       - "${NEO4J_BOLT_PORT:-7687}:7687"
@@ -58,7 +63,9 @@ services:
     restart: unless-stopped
 
 volumes:
-  papervault-pgdata:
-    name: papervault-pgdata
-  papervault-neo4jdata:
-    name: papervault-neo4jdata
+  ks-pgdata:
+    name: ks-pgdata
+    external: true
+  ks-neo4jdata:
+    name: ks-neo4jdata
+    external: true

@@ -18,6 +18,8 @@ One Python package (`papervault`), one server process, subsystems as modules:
 
 Boundaries: the library→knowledge hand-off is the on-disk vault — single writer (library), one reader (knowledge scheduler) — with reader and writer versioned together inside the package. External processes: MinerU OCR service (HTTP through its gate; service-owned stop/start and recovery; no library pre-flight, with workload waking a stopped backend and client discovery/parse errors determining reachability), Neo4j + Postgres (docker-compose), the operator LLM endpoint (OpenAI-compatible).
 
+Deployment #1 retains the legacy container names `ks-postgres` and `ks-neo4j`; production data lives in the existing Docker volumes `ks-pgdata` and `ks-neo4jdata`, declared external in `deploy/docker-compose.yml`. A future move off these names requires a maintenance window: stop PaperVault and both stores, copy each volume to its new name, update Compose, bring the stores up, and verify data and connectivity before resuming PaperVault. Preserve the original volumes for rollback: stop the replacement stores, restore the original Compose names and volumes, and bring the original stores up before resuming PaperVault.
+
 ## Key quality goals
 1. **Measured, not claimed** — the eval harness is a product component; risky quality changes merge only with benchmark arbitration.
 2. **Single-GPU budget** — resident models + OCR co-tenant fit a published 24 GB VRAM envelope under full co-load, zero OOM.

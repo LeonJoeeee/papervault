@@ -46,6 +46,16 @@ _EXPERIMENT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 _ENTITY_SEPARATOR = re.compile(r"[\s,/;&+]*(?:(?:and|or|versus|vs)\b\.?[\s,/;&+]*)*", re.I)
+_NEXT_MEASUREMENT_NOUN = {
+    "spectrum": "abundance",
+    "abundance": "fraction",
+    "fraction": "flux",
+    "flux": "measurement",
+    "measurement": "spectrum",
+}
+# Fold ASCII case only for the dictionary keys; retain Unicode word boundaries.
+_MEASUREMENT_NOUN = re.compile(r"\b(?ai:" + "|".join(_NEXT_MEASUREMENT_NOUN) + r")\b")
+_FORBIDDEN_SIBLING_NOUN = re.compile(r"\b(?:features?|excess(?:es)?|hints?)\b", re.I)
 
 
 class SearchPlan(TypedDict):
@@ -316,6 +326,18 @@ def _split_experiment_term(term: str) -> list[str]:
     return [f"{entity} {topic}".strip() for entity in entities.values()]
 
 
+def _measurement_sibling_terms(term: str) -> list[str]:
+    """Keep the parent and add one adjacent measurement-noun variant if eligible."""
+    if not _EXPERIMENT_PATTERN.search(term) or _FORBIDDEN_SIBLING_NOUN.search(term):
+        return [term]
+    noun = _MEASUREMENT_NOUN.search(term)
+    if noun is None:
+        return [term]
+    replacement = _NEXT_MEASUREMENT_NOUN[noun.group().lower()]
+    sibling = term[:noun.start()] + replacement + term[noun.end():]
+    return [term, sibling]
+
+
 def parse_intent(query: str, llm=None) -> SearchPlan:
     """Parse a natural-language research intent into a structured search plan.
 
@@ -365,7 +387,7 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
     search_terms = parsed.get("search_terms") or [_query_anchor]
     if not isinstance(search_terms, list) or not search_terms:
         search_terms = [_query_anchor]
-    # Strip/filter-empty -> split merged experiments -> DEDUP -> cap LAST.
+    # Strip/filter-empty -> split merged experiments -> noun siblings -> DEDUP -> cap LAST.
     # Dedup BEFORE the cap so a duplicate term never spends a fair-share slot
     # and so the cap never loses a genuine distinct sub-topic to an early dup.
     _stripped = [str(t).strip() for t in search_terms if str(t).strip()]  # NO cap yet
@@ -373,7 +395,12 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
         if not _query_anchor:
             raise ValueError("intent_parser: empty query yields no search terms")
         _stripped = [_query_anchor]
-    _expanded = [part for term in _stripped for part in _split_experiment_term(term)]
+    _expanded = [
+        variant
+        for term in _stripped
+        for part in _split_experiment_term(term)
+        for variant in _measurement_sibling_terms(part)
+    ]
     _seen: set = set()
     _distinct = [t for t in _expanded if not (t in _seen or _seen.add(t))]  # order-preserving dedup
     search_terms = _distinct[:MAX_SEARCH_TERMS]  # cap LAST — up to 8 DISTINCT terms

@@ -59,6 +59,24 @@ def test_parse_intent_leaves_single_entity_and_non_entity_terms_untouched(term):
     assert plan["search_terms"] == [term]
 
 
+@pytest.mark.parametrize("wording", [
+    "feature", "features", "spectral feature", "excess", "hint", "debate",
+])
+def test_parse_intent_leaves_measurement_wording_to_llm(wording):
+    plan = parse_intent("Find original positron measurement papers", FakeLLM([
+        "cosmic ray positron measurements",
+        f"PAMELA positron {wording}",
+        f"AMS-02 positron {wording}",
+        f"Alpha Magnetic Spectrometer positron {wording}",
+    ]))
+    assert plan["search_terms"] == [
+        "cosmic ray positron measurements",
+        f"PAMELA positron {wording}",
+        f"AMS-02 positron {wording}",
+        f"Alpha Magnetic Spectrometer positron {wording}",
+    ]
+
+
 def test_parse_intent_splits_before_deduplication_and_cap():
     plan = parse_intent("What did PAMELA and AMS-02 measure?", FakeLLM([
         "  cosmic ray positron  ",

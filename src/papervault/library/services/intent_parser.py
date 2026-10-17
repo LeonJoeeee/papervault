@@ -87,24 +87,42 @@ The downstream pipeline takes:
       solar maximum, multi-year forecast)
   Aim for ONE term per real facet present in the intent. Vary terminology ACROSS
   facets (expand acronyms, mix domain phrasing) — but the variation should change
-  the FACET, not just reword the same facet.
+  the FACET, not just reword the same facet. Instrument acronym/full-name pairs
+  are the explicit ENTITY RULE exception below.
 
   ENTITY RULE — one named experiment/instrument per term; never merge entities into one term.
-  Give each named experiment/instrument its own system facet, paired with the
-  phenomenon and a measurement noun (e.g. fraction, abundance, flux, spectrum).
+  Give each experiment/instrument named in the intent its own system facet, paired with the
+  phenomenon and a canonical measurement noun — one of: fraction, spectrum,
+  flux, abundance, measurement. FORBID "feature", "features", "spectral feature",
+  "excess", "hint", and "debate" in entity terms: these describe the debate,
+  not the measurement reported by the original papers.
+  For an experiment/instrument named in the intent, when its common acronym
+  and full name differ, emit BOTH
+  name forms, each as its own term with the phenomenon and a canonical noun
+  (e.g. "AMS-02 positron fraction" AND
+  "Alpha Magnetic Spectrometer positron fraction"). Keep the name forms
+  separate; never merge an acronym and its full name into one term. These
+  required name forms are an exception to the no-synonym-rewording advice.
   Distinct experiments are distinct facets even when measuring the same
   phenomenon. For a multi-entity intent, term 0 can name the shared phenomenon;
   it must not concatenate the entity names. Separate abundance/fraction from
   energy-spectrum measurements when the intent asks for both observables.
+  Keep term 0 as the verbatim anchor. Within the eight-term budget INCLUDING
+  the anchor, first give each entity one canonical-noun term using its acronym,
+  then add full-name terms, then additional requested observables. If the
+  budget forces a choice, prefer one canonical-noun term per entity, acronym
+  first, then full names.
 
   OVER-SPLIT GUARD (do NOT manufacture fake facets): one atomic concept is ONE
   facet, never several synonym shards. "PINN", "physics-informed neural network",
   "physics-informed deep learning" are the SAME method facet — pick the best one,
   do not spend three terms on it. Prefer FEWER orthogonal terms over many
   near-duplicates: an intent with only 2 real facets should yield ~2 terms, not 6
-  padded ones. Never exceed 6 terms (hard ceiling 8); 2-5 is typical.
+  padded ones. Aim for 2-5 terms; use up to 8 when required instrument name forms
+  or requested observables need them. Never exceed 8 terms including the anchor.
 
-  Each term should be 2-6 words. Don't include single common words.
+  Each term should be 2-6 words, except when retaining a full instrument name
+  requires more. Don't include single common words.
 - filters: optional constraints derived from the intent. Two of them are
   SOFT HINTS — gentle ranking nudges, NEVER a hard cut:
     * citation_pref: an int when the intent wants well-cited / high-impact
@@ -148,7 +166,8 @@ Output ONLY JSON:
 
 ==== Few-shot examples ====
 (In each, term 0 is the verbatim ANCHOR; the rest are DISTINCT facets — never
-synonym rewordings of term 0. The reasoning names the facets.)
+synonym rewordings of term 0. Required instrument name forms follow the ENTITY
+RULE exception. The reasoning names the facets.)
 
 Intent: "a review of PINN"
 Output: {
@@ -186,13 +205,13 @@ Output: {
   "reasoning": "Core=UHECR (anchor, acronym expanded). Facets: system (observatories), phenomenon (composition/spectrum), regime (origin). recency cue -> 2023+"
 }
 
-Intent: "What did PAMELA and AMS-02 measure about cosmic-ray positron abundance and energy spectra? Find the original measurement papers."
+Intent: "Find original papers on cosmic ray positron measurements from PAMELA and AMS-02, covering positron abundance and energy spectra."
 Output: {
-  "search_terms": ["cosmic ray positron measurements", "PAMELA positron abundance", "AMS-02 positron fraction", "PAMELA positron energy spectrum", "AMS-02 positron energy spectrum"],
+  "search_terms": ["cosmic ray positron measurements", "PAMELA positron abundance", "AMS-02 positron fraction", "Payload for Antimatter Matter Exploration and Light-nuclei Astrophysics positron abundance", "Alpha Magnetic Spectrometer positron fraction", "PAMELA positron energy spectrum", "AMS-02 positron energy spectrum", "Alpha Magnetic Spectrometer positron energy spectrum"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": "off"},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
-  "reasoning": "Core=cosmic ray positron measurements (shared-phenomenon anchor). Each experiment gets separate terms for abundance/fraction and energy spectrum, distinct observables requested by the intent. Never merge PAMELA with AMS-02 in one term: that excludes original single-experiment papers. Original measurements -> primary work; no date cue -> no year window."
+  "reasoning": "Core=cosmic ray positron measurements (verbatim shared-phenomenon anchor). Cover each experiment's acronym first with abundance/fraction, then its full name in a separate term, then energy spectrum. These canonical nouns target original measurements, not spectral features or debate. Eight terms including the anchor; never merge entities or name forms. Original papers -> primary work; no date cue -> no year window."
 }
 
 Intent: "AI applied to MHD simulation"

@@ -104,6 +104,7 @@ with `papervault.service` stopped, run an explicit bounded campaign:
 ```bash
 python -m papervault.library.cli reopen-campaign --cap 20 --dry-run --json
 python -m papervault.library.cli reopen-campaign --cap 20 --json
+python -m papervault.library.cli reopen-campaign --keys approved.keys --cap 50 --dry-run --json
 ```
 
 The selector takes exhausted retrieval with allowed policy, canonical resolved
@@ -114,6 +115,37 @@ enqueues the selected cohort through the existing download queue, waits for its
 results, and refuses a live service, unavailable service probe, or active campaign.
 An exclusive `.reopen-campaign.lock` prevents concurrent standalone writers.
 It does not recover unrelated pending work. There are no automatic campaigns.
+Optional `--keys FILE` restricts selection to citation keys in file order (one
+per line, with `#` comments and duplicates ignored). Every listed key is checked,
+including those after the cap: missing keys, records refused by `reopenable()`,
+exhausted budgets, and eligible keys deferred by the cap appear in the accounting.
+An empty key file selects nothing.
+
+For the owner-approved ADS recovery in [#245](https://github.com/LeonJoeeee/papervault/issues/245),
+resolve UNKNOWN policy with an explicit ruling before the scoped campaign:
+
+```bash
+python -m papervault.library.cli policy-ruling --keys approved.keys --action acquire --reason 'Owner approved ADS recovery #245'
+# In a maintenance window with papervault.service stopped:
+python -m papervault.library.cli policy-ruling --keys approved.keys --action acquire --reason 'Owner approved ADS recovery #245' --apply
+```
+
+The default is a read-only JSON report of matched keys and current policies;
+missing keys and cohort mismatches are counted and cause exit 2. Apply refuses
+the entire request if any key is invalid. The cohort requires source `ads`, no
+stored DOI/arXiv ID, an ADS abstract URL agreeing with `paper_id`, and exhausted
+`metadata_only` retrieval. Existing exclusions, quarantine, aliases, merge intents,
+and unsettled claims cannot be cleared by this ruling. UNKNOWN remains deny by
+default everywhere else.
+
+Apply appends one ruling (UTC timestamp, action, reason, keys, revision) to
+`correction-ledger.json` before durably saving grants. Each grant covers only
+`acquire`, has an empty reason set, is bound to its citation key, and meets the
+selected records' required revisions. Retrieval and download status stay intact;
+the campaign owns the subsequent re-open. Repeating a recorded key/action/revision
+does not add evidence rows, including recovery after an interrupted index save.
+Rulings and standalone campaigns share the writer lock and refuse a running
+service or unavailable service probe. The orchestrator owns live application.
 
 Standing authorization permits at most 200 reservations per campaign and three
 campaign starts in any rolling seven days (UTC wall clock), including interrupted

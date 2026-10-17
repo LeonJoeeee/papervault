@@ -47,6 +47,83 @@ def test_cli_dry_run_end_to_end_writes_nothing(vault):
     assert tree_bytes(lib.root) == before
 
 
+@pytest.mark.parametrize("cap,expected,deferred", [
+    (1, ["ZListed"], ["AListed"]), (2, ["ZListed", "AListed"], []),
+])
+def test_key_file_preserves_order_cap_and_reports_every_refusal(vault, monkeypatch, capsys, cap, expected, deferred):
+    from papervault import ops_guards
+    from papervault.library.cli import main
+    lib, unrelated = vault
+    for key in ("ZListed", "AListed", "Blocked"):
+        lib._papers[key] = Paper(key=key, doi=f"10.1234/{key}", download_status="metadata_only",
+            terminal_state=state_v2.TerminalState(retrieval=state_v2.Retrieval.EXHAUSTED,
+                policy=state_v2.Policy.UNKNOWN if key == "Blocked" else state_v2.Policy.CLEAR))
+    lib.save(force=True)
+    keys = lib.root.parent / "campaign.keys"
+    keys.write_text("# file order differs from alphabetical order\nZListed\nBlocked\nMissing\nAListed # second\nZListed\n")
+    monkeypatch.setenv("PAPERVAULT_VAULT", str(lib.root))
+    monkeypatch.setattr(ops_guards, "active_service_units", lambda *a, **kw: [])
+    attempted = []
+    def download(paper, stage, **providers):
+        attempted.append(paper.key)
+        paper.download_status = "metadata_only"
+        return False
+    monkeypatch.setattr(download_queue, "download_paper", download)
+    args = ["reopen-campaign", "--keys", str(keys), "--cap", str(cap), "--json"]
+    before = tree_bytes(lib.root)
+    assert main([*args, "--dry-run"]) == 0
+    preview = json.loads(capsys.readouterr().out)
+    assert preview["keys"] == expected and preview["selected"] == cap
+    assert preview["missing_keys"] == ["Missing"] and preview["missing_count"] == 1
+    assert preview["rejected"] == [{"key": "Blocked", "reason": "not_reopenable"}]
+    assert preview["rejected_count"] == 1 and preview["deferred_keys"] == deferred
+    assert tree_bytes(lib.root) == before
+    assert main(args) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["keys"] == expected and result["completed"] == cap
+    assert result["missing_keys"] == preview["missing_keys"]
+    assert result["rejected"] == preview["rejected"]
+    assert result["deferred_keys"] == deferred
+    assert sorted(attempted) == sorted(expected)
+    assert Library(lib.root).get(unrelated.key).reopen_claim is None
+
+
+def test_empty_key_file_never_falls_back_to_whole_library(vault, monkeypatch, capsys):
+    from papervault.library.cli import main
+    lib, _ = vault
+    monkeypatch.setenv("PAPERVAULT_VAULT", str(lib.root))
+    keys = lib.root.parent / "empty.keys"
+    keys.write_text("# select nobody\n")
+    before = tree_bytes(lib.root)
+    assert main(["reopen-campaign", "--keys", str(keys), "--cap", "1", "--dry-run", "--json"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["keys"] == [] and result["selected"] == 0
+    assert tree_bytes(lib.root) == before
+
+
+def test_empty_key_filename_refuses_instead_of_selecting_whole_library(vault, monkeypatch, capsys):
+    from papervault.library.cli import main
+    lib, _ = vault
+    monkeypatch.setenv("PAPERVAULT_VAULT", str(lib.root))
+    before = tree_bytes(lib.root)
+    assert main(["reopen-campaign", "--keys", "", "--cap", "1", "--dry-run", "--json"]) == 2
+    assert capsys.readouterr().err
+    assert tree_bytes(lib.root) == before
+
+
+def test_human_campaign_output_reports_missing_and_rejected_keys(vault, monkeypatch, capsys):
+    from papervault.library.cli import main
+    lib, paper = vault
+    paper.terminal_state = replace(paper.acquisition_state, policy=state_v2.Policy.UNKNOWN)
+    lib.save(force=True)
+    keys = lib.root.parent / "refused.keys"
+    keys.write_text(f"Missing\n{paper.key}\n")
+    monkeypatch.setenv("PAPERVAULT_VAULT", str(lib.root))
+    assert main(["reopen-campaign", "--keys", str(keys), "--cap", "1", "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "Missing" in output and paper.key in output and "not_reopenable" in output
+
+
 @pytest.mark.parametrize("override", [False, True], ids=["excluded", "scoped_override"])
 def test_cli_dry_run_and_apply_agree_on_off_domain_policy(vault, monkeypatch, capsys, override):
     from papervault import ops_guards

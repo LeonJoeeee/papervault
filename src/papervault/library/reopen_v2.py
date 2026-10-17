@@ -31,30 +31,40 @@ def _require_enabled():
         raise ValueError("PAPERVAULT_REOPEN_V2 is disabled")
 
 
-def _selection(root, cap, ledger):
+def _selection(root, cap, ledger, keys=None):
     # Both modes inspect the complete snapshot; domain exclusions and scoped
     # overrides are decided by reopenable(), rather than the library clean view.
     check_index_readable(root)
     papers = read_identity_records(Path(root))
-    eligible = []
-    for paper in papers:
+    by_key = {paper.key: paper for paper in papers}
+    order = list(dict.fromkeys(keys)) if keys is not None else sorted(by_key)
+    eligible, missing, rejected = [], [], []
+    for key in order:
+        paper = by_key.get(key)
+        if paper is None:
+            missing.append(key)
+            continue
         if not reopenable(paper):
+            rejected.append({"key": key, "reason": "not_reopenable"})
             continue
         if paper.merge_budget is not None:
             account = ledger.key_budget(paper.key)
             if account["spent"] >= account["budget"]:
+                rejected.append({"key": key, "reason": "budget_exhausted"})
                 continue
         eligible.append(paper)
-    selected = sorted(eligible, key=lambda paper: paper.key)[:cap]
-    return papers, selected
+    selected = eligible[:cap]
+    return papers, selected, {"requested": len(order), "missing_keys": missing,
+        "missing_count": len(missing), "rejected": rejected, "rejected_count": len(rejected),
+        "deferred_keys": [p.key for p in eligible[cap:]]}
 
 
-def inspect_campaign(root: Path, *, cap: int, clock=time.time) -> dict:
+def inspect_campaign(root: Path, *, cap: int, keys: list[str] | None = None, clock=time.time) -> dict:
     """Read-only selection and authorization validation; no constructor/lock writes."""
     _require_enabled()
     ledger = BudgetLedger(root, clock=clock)
     ledger.check_campaign(cap=cap)
-    papers, selected = _selection(root, cap, ledger)
+    papers, selected, accounting = _selection(root, cap, ledger, keys)
     if any(p.reopen_claim and p.reopen_claim.phase in {"queued", "dispatched"} for p in papers):
         raise LedgerError("unsettled campaign claims require recovery")
     for paper in selected:
@@ -62,7 +72,7 @@ def inspect_campaign(root: Path, *, cap: int, clock=time.time) -> dict:
         if generation != ledger.latest_generation(paper.key):
             raise LedgerError("index generation disagrees with the budget ledger")
     return {"dry_run": True, "cap": cap, "keys": [paper.key for paper in selected],
-            "selected": len(selected), "completed": 0}
+            "selected": len(selected), "completed": 0, **accounting}
 
 
 def _digest(path: Path) -> str | None:
@@ -300,7 +310,7 @@ async def process_attempt(queue, token, priority):
             stage.cleanup()
 
 
-async def run_campaign(library: Library, *, cap: int, queue=None, clock=time.time,
+async def run_campaign(library: Library, *, cap: int, keys: list[str] | None = None, queue=None, clock=time.time,
                        lease_seconds: float = 3600) -> dict:
     """Explicit campaigns only; boot/scheduler never selects re-open candidates."""
     from .services.download_queue import DownloadQueue
@@ -308,13 +318,13 @@ async def run_campaign(library: Library, *, cap: int, queue=None, clock=time.tim
     store = ClaimStore(library, clock=clock)
     async with store.lock:
         store.ledger.check_campaign(cap=cap)
-        papers, selected = _selection(library.root, cap, store.ledger)
+        papers, selected, accounting = _selection(library.root, cap, store.ledger, keys)
         if any(p.reopen_claim and p.reopen_claim.phase in {"queued", "dispatched"} for p in papers):
             raise LedgerError("unsettled campaign claims require recovery")
         if any(concurrency.is_in_flight(f"dl:{p.key}") for p in selected):
             raise LedgerError("duplicate in-flight identity; campaign halted")
         if not selected:
-            return {"dry_run": False, "cap": cap, "keys": [], "selected": 0, "completed": 0}
+            return {"dry_run": False, "cap": cap, "keys": [], "selected": 0, "completed": 0, **accounting}
         campaign = store.ledger.start_campaign(cap=cap, keys=[p.key for p in selected])
     owned = queue is None
     queue = queue or DownloadQueue(library)
@@ -342,4 +352,5 @@ async def run_campaign(library: Library, *, cap: int, queue=None, clock=time.tim
         if owned:
             await queue.stop()
     return {"dry_run": False, "campaign_id": campaign, "cap": cap, "keys": [p.key for p in selected],
-            "selected": len(selected), "completed": sum(store.current(t).reopen_claim.phase == "completed" for t in tokens)}
+            "selected": len(selected), "completed": sum(store.current(t).reopen_claim.phase == "completed" for t in tokens),
+            **accounting}

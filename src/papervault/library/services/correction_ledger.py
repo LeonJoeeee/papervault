@@ -49,7 +49,7 @@ class CorrectionLedger:
             raise ValueError(f"unreadable correction ledger at {self.path}") from exc
 
     @contextmanager
-    def transaction(self):
+    def transaction(self, *, durable: bool = False):
         # One lock across instances/processes; manifest assignment and emission
         # share the evidence write, so a restart cannot dispatch a batch twice.
         from ..store import _atomic_write
@@ -58,7 +58,7 @@ class CorrectionLedger:
             before = copy.deepcopy(state)
             yield state
             if state != before:
-                _atomic_write(self.path, json.dumps(state, ensure_ascii=False, indent=2))
+                _atomic_write(self.path, json.dumps(state, ensure_ascii=False, indent=2), durable=durable)
 
     def stage(self, *, key: str, fields: dict, existing: dict, incoming: dict,
               provenance: dict) -> str:

@@ -22,9 +22,14 @@ cp .env.example .env
 $EDITOR .env          # set PAPERVAULT_LLM_*, POSTGRES/NEO4J passwords,
                       # PAPERVAULT_CONTACT_EMAIL
 
-# 3. Backing stores (Postgres + Neo4j). --env-file is REQUIRED: with `-f
-#    deploy/...`, compose reads deploy/.env, NOT the repo-root .env — pass it
-#    explicitly so your POSTGRES/NEO4J passwords reach the containers.
+# 3. Backing stores (Postgres + Neo4j). The data volumes are declared external and
+#    hold your production data, so they must exist before the first start — a
+#    missing volume fails the start instead of silently creating an empty database.
+#    --env-file is REQUIRED: with `-f deploy/...`, compose reads deploy/.env, NOT
+#    the repo-root .env — pass it explicitly so your POSTGRES/NEO4J passwords reach
+#    the containers.
+docker volume create ks-pgdata
+docker volume create ks-neo4jdata
 docker compose --env-file .env -f deploy/docker-compose.yml up -d
 
 # 4. Install papervault (beta-standard: core + local OCR + grey download tiers)

@@ -37,6 +37,8 @@ See [`docs/INSTALL.md`](docs/INSTALL.md) for the full walkthrough. In brief:
 
 ```bash
 cp .env.example .env          # then fill in your LLM endpoint + key + data dir
+docker volume create ks-pgdata      # external volumes hold the database data (create once)
+docker volume create ks-neo4jdata
 docker compose --env-file .env -f deploy/docker-compose.yml up -d   # Neo4j + Postgres
 uv venv && uv pip install -e ".[mineru,grey]"       # beta standard: + local OCR + grey download tiers
 papervault doctor             # verify GPU, databases, LLM config

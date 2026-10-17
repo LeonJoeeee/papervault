@@ -1032,6 +1032,91 @@ def test_inspire_falls_back_to_doi_query(lib, monkeypatch):
 # NASA ADS strategy
 # ---------------------------------------------------------------------------
 
+@pytest.mark.parametrize("source, url, paper_id", [
+    ("ads", "https://ui.adsabs.harvard.edu/abs/2019amos.confE...8M/abstract", ""),
+    ("ads", "", "2019amos.confE...8M"),
+    ("ads:search", "https://ui.adsabs.harvard.edu/abs/2019amos.confE...8M", ""),
+    ("ads", "https://ui.adsabs.harvard.edu/abs/1996A%26A...316..538H/abstract", ""),
+])
+def test_ads_native_success_precedes_generic_tiers(
+        lib, paper, monkeypatch, file_url_identity, source, url, paper_id):
+    paper.source, paper.url, paper.paper_id = source, url, paper_id
+    paper.doi = paper.arxiv_id = ""
+    data, prompts = file_url_identity
+    calls = []
+    monkeypatch.setattr(download, "_try_ads", lambda _: calls.append("ads") or data)
+    monkeypatch.setattr(download, "_STRATEGIES", [
+        ("generic", lambda _: calls.append("generic") or data),
+    ])
+
+    assert download.download_paper(paper, lib) is True
+    assert calls == ["ads"]
+    assert lib.pdf_path(paper.key).read_bytes() == data
+    assert paper.download_status == "ok"
+    assert paper.download_source == "ads"
+    assert len(prompts) == 1
+    assert any(e["event"] == "downloaded" and e["source"] == "ads"
+               and e["verify"] == "llm_match: same work" for e in _logged_events(lib))
+
+
+@pytest.mark.parametrize("outcome", ["miss", "error", "mismatch"])
+def test_ads_native_miss_preserves_complete_generic_order(lib, paper, monkeypatch, outcome):
+    paper.source = "ads"
+    paper.url = "https://ui.adsabs.harvard.edu/abs/2019amos.confE...8M/abstract"
+    paper.doi = paper.arxiv_id = ""
+    calls = []
+
+    def ads_probe(_):
+        calls.append("ads")
+        if outcome == "error":
+            raise requests.Timeout("ADS fixture timeout")
+        return PDF_BYTES if outcome == "mismatch" else None
+
+    monkeypatch.setattr(download, "_try_ads", ads_probe)
+    monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (False, "test mismatch"))
+    monkeypatch.setattr(download, "_STRATEGIES", [
+        (name, lambda _, name=name: calls.append(name)) for name, _ in download._STRATEGIES
+    ])
+    monkeypatch.setattr(download, "_try_firecrawl_text_fallback", lambda *_: calls.append("firecrawl"))
+
+    assert download.download_paper(paper, lib) is False
+    assert calls == [
+        "ads", "url_override", "known_file_url", "arxiv", "iopscience_direct",
+        "crossref_tm", "citation_pdf_url", "wiley_tdm", "elsevier_tdm", "oa_aggregators",
+        "scihub", "annas_archive", "domain_aggregators", "hal_repository",
+        "curl_impersonate", "arxiv_by_title", "mdpi_scrapling", "researchgate", "web_search",
+        "firecrawl",
+    ]
+    assert not lib.has_pdf(paper.key)
+
+
+@pytest.mark.parametrize("fields", [
+    {"source": "manual"},
+    {"doi": "10.1/x"},
+    {"arxiv_id": "2401.0001"},
+    {"url": "https://ui.adsabs.harvard.edu/abs/invalid/abstract"},
+    {"url": "https://other.example/abs/2019amos.confE...8M/abstract"},
+    {"url": "", "paper_id": "invalid"},
+    {"paper_id": "2019mlhp.confR..59T"},
+])
+def test_non_native_ads_keeps_generic_order(lib, paper, monkeypatch, fields):
+    paper.source = "ads"
+    paper.url = "https://ui.adsabs.harvard.edu/abs/2019amos.confE...8M/abstract"
+    paper.doi = paper.arxiv_id = ""
+    for name, value in fields.items():
+        setattr(paper, name, value)
+    calls = []
+    monkeypatch.setattr(download, "_try_ads", lambda _: calls.append("ads"))
+    monkeypatch.setattr(download, "_STRATEGIES", [
+        ("first", lambda _: calls.append("first")),
+        ("second", lambda _: calls.append("second")),
+    ])
+    monkeypatch.setattr(download, "_try_firecrawl_text_fallback", lambda *_: calls.append("firecrawl"))
+
+    assert download.download_paper(paper, lib) is False
+    assert calls == ["first", "second", "firecrawl"]
+
+
 @responses.activate
 def test_ads_skipped_without_token(lib, paper, monkeypatch):
     """No ADS_API_TOKEN → ADS is a silent no-op (no API call)."""

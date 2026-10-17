@@ -1,7 +1,8 @@
 """Fetch PDFs into the library through the ordered ``_STRATEGIES`` cascade.
 
 Known arXiv records are checked for current-version withdrawal before fetching.
-Operator overrides come first, followed by stored file URLs and arXiv.
+ADS-native records without DOI/arXiv probe ADS first. The generic order starts
+with operator overrides, followed by stored file URLs and arXiv.
 Publisher, aggregator, and last-resort tiers follow; every hit passes the
 same PDF identity verifier before saving.
 
@@ -430,6 +431,7 @@ def _download_skip_reason(source: str, paper: Paper, *,
         if _canonical_arxiv_url_id(paper.url, allow_pdf=True):
             return "current_arxiv_version_required"
     credential = {
+        "ads": "ADS_API_TOKEN",
         "wiley_tdm": "WILEY_TDM_TOKEN",
         "elsevier_tdm": "ELSEVIER_TDM_API_KEY",
         "annas_archive": "ANNAS_ARCHIVE_API_KEY",
@@ -663,7 +665,14 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
             # a tier lands one, the now-GATED md co-exists with the PDF and
             # classify rule 2 rests it served as the gated md — invariant held.
 
-    for source, strategy in _STRATEGIES:
+    strategies = _STRATEGIES
+    if (paper.source.strip().lower().startswith("ads")
+            and not (paper.doi or paper.arxiv_id) and _ads_bibcode(paper)):
+        # #258: ADS-only papers crawled at ~0.7/min through irrelevant tiers;
+        # their native route succeeds in seconds. A miss keeps the full order.
+        strategies = [("ads", ads_member or _try_ads), *_STRATEGIES]
+
+    for source, strategy in strategies:
         with span("tier", source=source):
             try:
                 skip_reason = _download_skip_reason(source, paper, arxiv_record=arxiv_record)
@@ -691,14 +700,14 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
             if data:
                 with span("verification"):
                     ok, verify_reason = _verify_pdf_matches_metadata(data, paper)
-                if source == "domain_aggregators":
+                if source in {"ads", "domain_aggregators"}:
                     _record_ads_verification(paper, data, ok)
                     _log_ads_availability(paper, library)
                 if not ok:
                     library.log({"event": "download_pdf_mismatch", "key": paper.key,
                                  "source": source, "size": len(data),
                                  "reason": verify_reason})
-                    if source == "domain_aggregators" and _settle_ads_abstract(paper, library):
+                    if source in {"ads", "domain_aggregators"} and _settle_ads_abstract(paper, library):
                         return False
                     continue
                 with span("pdf_save"):
@@ -719,7 +728,7 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                              **publication_fields(measurement_identity, paper, verified=positively_verified,
                                                   library=library)})
                 return True
-            if source == "domain_aggregators":
+            if source in {"ads", "domain_aggregators"}:
                 _log_ads_availability(paper, library)
                 if _settle_ads_abstract(paper, library):
                     return False

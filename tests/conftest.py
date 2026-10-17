@@ -94,3 +94,17 @@ def pytest_collection_modifyitems(config, items):
 # tests must see the shipped defaults (off) unless a test sets its own value (issue #34).
 os.environ["PAPERVAULT_SAVE_MIN_INTERVAL_S"] = "0"
 os.environ["PAPERVAULT_BIB_MIN_INTERVAL_S"] = "0"
+
+
+@pytest.fixture(autouse=True)
+def _reset_search_breaker():
+    """The #115 per-backend circuit breaker keeps PROCESS-LIFETIME state keyed by
+    backend name. Without a reset it leaks across tests: three tests in a row
+    degrading ``semantic_scholar`` would open its circuit, and the NEXT test's
+    monkeypatched backend would silently never be called. Reset before AND after
+    each test in this shared tests/conftest.py so no module inherits the state."""
+    from papervault.library import search
+
+    search._breaker_reset()
+    yield
+    search._breaker_reset()

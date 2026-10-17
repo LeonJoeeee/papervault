@@ -19,18 +19,6 @@ from papervault.library import search
 from papervault.library.sources.exceptions import BackendDegraded
 
 
-@pytest.fixture(autouse=True)
-def _reset_search_breaker():
-    """The #115 per-backend circuit breaker keeps PROCESS-LIFETIME state keyed by
-    backend name. Without a reset it leaks across tests: three tests in a row
-    degrading ``semantic_scholar`` would open its circuit, and the NEXT test's
-    monkeypatched backend would silently never be called. Reset before AND after
-    so neither this module's tests nor another module's inherit the state."""
-    search._breaker_reset()
-    yield
-    search._breaker_reset()
-
-
 # ----------- _looks_like_review --------------------------------------------
 
 
@@ -633,6 +621,19 @@ def test_breaker_is_disabled_when_the_threshold_is_zero(monkeypatch):
     assert calls == ["t1", "t2", "t3", "t4"]
 
 
+def test_fanout_log_has_no_parenthetical_when_no_circuits_are_open(monkeypatch, caplog):
+    _stub_backends(monkeypatch)
+    caplog.set_level(logging.INFO, logger="papervault.library.search")
+
+    asyncio.run(search.search_external_async(["a", "b", "c"]))
+
+    fanout = [r.getMessage() for r in caplog.records
+              if "concurrent fetches" in r.getMessage()]
+    assert fanout == [
+        "search_external_async: 3 terms x 6 backends = 18 concurrent fetches",
+    ]
+
+
 def test_breaker_logs_one_open_and_one_close_line_not_one_per_skipped_term(
         monkeypatch, caplog):
     """(#115 Bounds) ONE INFO line when the circuit opens and ONE when it closes —
@@ -667,8 +668,10 @@ def test_breaker_logs_one_open_and_one_close_line_not_one_per_skipped_term(
     assert [r for r in caplog.records if "circuit OPEN" in r.getMessage()] == []
     fanout = [r.getMessage() for r in caplog.records
               if "concurrent fetches" in r.getMessage()]
-    assert len(fanout) == 1
-    assert "semantic_scholar" in fanout[0]
+    assert fanout == [
+        "search_external_async: 3 terms x 6 backends = 15 concurrent fetches "
+        "(circuit open, skipped: ['semantic_scholar'])",
+    ]
 
     # Cooldown elapses and three pairs succeed -> exactly one CLOSED line.
     caplog.clear()

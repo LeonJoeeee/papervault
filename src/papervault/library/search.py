@@ -715,10 +715,12 @@ async def search_external_async(
     # ONE line per fan-out naming the open circuits (#115) — this is how an
     # operator reading the journal tells "skipped, circuit open" from "tried and
     # failed"; the skipped pairs themselves log nothing.
+    open_backends = _breaker_open_backends()
+    skipped = len(queries) * len(open_backends)
+    circuit_note = f" (circuit open, skipped: {open_backends})" if open_backends else ""
     logger.info(
-        "search_external_async: %d terms x %d backends = %d concurrent fetches "
-        "(circuit open, skipped: %s)",
-        len(queries), len(CAPS), len(tasks), _breaker_open_backends() or "none",
+        "search_external_async: %d terms x %d backends = %d concurrent fetches%s",
+        len(queries), len(CAPS), len(tasks) - skipped, circuit_note,
     )
 
     # All (term, backend) pairs in parallel. One dead backend = one empty list.

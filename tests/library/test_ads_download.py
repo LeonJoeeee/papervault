@@ -130,7 +130,7 @@ def test_idless_ads_pdf_uses_normal_identity_save_and_bookkeeping(lib, paper, mo
     assert lib.pdf_path(paper.key).read_bytes() == data
     assert paper.pdf_path == f"pdfs/{paper.key}.pdf"
     assert paper.download_status == "ok"
-    assert paper.download_source == "domain_aggregators"
+    assert paper.download_source == "ads"
     assert paper.doi == paper.arxiv_id == ""
     assert len(prompts) == 1 and TITLE in prompts[0]
     params = parse_qs(urlsplit(responses.calls[0].request.url).query)
@@ -555,6 +555,7 @@ def test_anthology_listing_is_not_returned_as_full_paper(paper):
 
 @responses.activate
 def test_rejected_other_domain_member_still_settles_ads_abstract(lib, paper, monkeypatch):
+    paper.source = 'manual'  # Keep exercising the normal concurrent domain group.
     stub_metadata(doctype='abstract')
     responses.get(GATEWAY, body=abstract_pdf())
     responses.get(LEGACY, status=404)
@@ -610,7 +611,7 @@ def test_firecrawl_preflight_pdf_reuses_source_attempt_and_verifies(lib, paper, 
     assert len(gates) == 1 and verified == [data]
     assert lib.md_path(paper.key).read_bytes() == original
     assert lib.pdf_path(paper.key).read_bytes() == data
-    assert paper.download_source == 'domain_aggregators'
+    assert paper.download_source == 'ads'
 
 
 @responses.activate

@@ -28,8 +28,24 @@ logger = logging.getLogger(__name__)
 # Hard cap on search_terms. The prompt constrains LLM #0 to ~2-5 ORTHOGONAL
 # FACETS (term 0 = the verbatim anchor; A3 facet-orthogonality, no synonym
 # padding); we cap server-side as defensive truncation in case LLM ignores it.
-# The cap is a PREFIX, so it never displaces the term-0 anchor (A1).
+# The cap is a PREFIX, so it never displaces the term-0 anchor (A1), or its
+# first per-experiment replacement when the LLM merged named experiments.
 MAX_SEARCH_TERMS = 8
+
+
+# A conservative guard for known experiment names, not acronym-based NER:
+# methods/phenomena such as PINN, MHD and SEP must never be split as instruments.
+# Aliases share an identity; multiword names are matched as a whole.
+_EXPERIMENT_PATTERN = re.compile(
+    r"(?<!\w)(?:"
+    r"(?P<pamela>PAMELA)|"
+    r"(?P<ams02>Alpha Magnetic Spectrometer|AMS[-\s]?02)|"
+    r"(?P<auger>Pierre Auger(?: Observatory)?)|"
+    r"(?P<telescope_array>Telescope Array)"
+    r")(?!\w)",
+    re.IGNORECASE,
+)
+_ENTITY_SEPARATOR = re.compile(r"[\s,/;&+]*(?:(?:and|or|versus|vs)\b\.?[\s,/;&+]*)*", re.I)
 
 
 class SearchPlan(TypedDict):
@@ -72,6 +88,14 @@ The downstream pipeline takes:
   Aim for ONE term per real facet present in the intent. Vary terminology ACROSS
   facets (expand acronyms, mix domain phrasing) — but the variation should change
   the FACET, not just reword the same facet.
+
+  ENTITY RULE — one named experiment/instrument per term; never merge entities into one term.
+  Give each named experiment/instrument its own system facet, paired with the
+  phenomenon and a measurement noun (e.g. fraction, abundance, flux, spectrum).
+  Distinct experiments are distinct facets even when measuring the same
+  phenomenon. For a multi-entity intent, term 0 can name the shared phenomenon;
+  it must not concatenate the entity names. Separate abundance/fraction from
+  energy-spectrum measurements when the intent asks for both observables.
 
   OVER-SPLIT GUARD (do NOT manufacture fake facets): one atomic concept is ONE
   facet, never several synonym shards. "PINN", "physics-informed neural network",
@@ -146,7 +170,7 @@ Output: {
 
 Intent: "Voyager cosmic ray measurements in the outer heliosphere"
 Output: {
-  "search_terms": ["Voyager outer heliosphere cosmic ray", "cosmic ray modulation", "termination shock heliopause", "anomalous cosmic ray interstellar"],
+  "search_terms": ["Voyager heliospheric cosmic ray flux", "cosmic ray modulation", "termination shock heliopause", "anomalous cosmic ray interstellar"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
@@ -155,11 +179,20 @@ Output: {
 
 Intent: "latest progress on UHECR"
 Output: {
-  "search_terms": ["ultra-high-energy cosmic ray", "Pierre Auger Telescope Array", "UHECR composition spectrum", "extragalactic UHECR origin"],
+  "search_terms": ["ultra-high-energy cosmic ray", "Pierre Auger cosmic ray spectrum", "Telescope Array cosmic ray spectrum", "UHECR composition spectrum", "extragalactic UHECR origin"],
   "filters": {"year_min": 2023, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_recency",
   "reasoning": "Core=UHECR (anchor, acronym expanded). Facets: system (observatories), phenomenon (composition/spectrum), regime (origin). recency cue -> 2023+"
+}
+
+Intent: "What did PAMELA and AMS-02 measure about cosmic-ray positron abundance and energy spectra? Find the original measurement papers."
+Output: {
+  "search_terms": ["cosmic ray positron measurements", "PAMELA positron abundance", "AMS-02 positron fraction", "PAMELA positron energy spectrum", "AMS-02 positron energy spectrum"],
+  "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": "off"},
+  "limit_suggested": null,
+  "ranking_hint": "by_relevance",
+  "reasoning": "Core=cosmic ray positron measurements (shared-phenomenon anchor). Each experiment gets separate terms for abundance/fraction and energy spectrum, distinct observables requested by the intent. Never merge PAMELA with AMS-02 in one term: that excludes original single-experiment papers. Original measurements -> primary work; no date cue -> no year window."
 }
 
 Intent: "AI applied to MHD simulation"
@@ -233,6 +266,37 @@ Output: {
 _SYSTEM_PROMPT = _SYSTEM_PROMPT.replace("__DOMAIN_LABEL__", get_domain().label)
 
 
+def _split_experiment_term(term: str) -> list[str]:
+    """Keep known experiments independently searchable with the shared topic.
+
+    Unknown names rely on the prompt rule. Zero/one recognized identity is
+    untouched, including multiple aliases referring to the same experiment.
+    """
+    matches = list(_EXPERIMENT_PATTERN.finditer(term))
+    entities: dict[str, str] = {}
+    spans: list[tuple[int, int]] = []
+    for match in matches:
+        entities.setdefault(match.lastgroup, match.group())
+        start, end = match.span()
+        # Remove wrappers around a name/alias, not parentheses in the topic.
+        if term[max(0, start - 1):start] == "(" and term[end:end + 1] == ")":
+            start, end = start - 1, end + 1
+        spans.append((start, end))
+    if len(entities) < 2:
+        return [term]
+
+    context = [term[:spans[0][0]]]
+    for left, right in zip(spans, spans[1:]):
+        gap = term[left[1]:right[0]]
+        # Drop only connectors BETWEEN entity names. A topical conjunction
+        # such as "electron and positron spectra" remains part of the query.
+        if not _ENTITY_SEPARATOR.fullmatch(gap):
+            context.append(gap)
+    context.append(term[spans[-1][1]:])
+    topic = " ".join(" ".join(context).split()).strip(" ,/;&+")
+    return [f"{entity} {topic}".strip() for entity in entities.values()]
+
+
 def parse_intent(query: str, llm=None) -> SearchPlan:
     """Parse a natural-language research intent into a structured search plan.
 
@@ -282,21 +346,18 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
     search_terms = parsed.get("search_terms") or [_query_anchor]
     if not isinstance(search_terms, list) or not search_terms:
         search_terms = [_query_anchor]
-    # Strip/filter-empty (NO cap yet) -> order-preserving DEDUP -> cap LAST.
+    # Strip/filter-empty -> split merged experiments -> DEDUP -> cap LAST.
     # Dedup BEFORE the cap so a duplicate term never spends a fair-share slot
     # and so the cap never loses a genuine distinct sub-topic to an early dup.
     _stripped = [str(t).strip() for t in search_terms if str(t).strip()]  # NO cap yet
-    _seen: set = set()
-    _distinct = [t for t in _stripped if not (t in _seen or _seen.add(t))]  # order-preserving dedup
-    search_terms = _distinct[:MAX_SEARCH_TERMS]  # cap LAST — up to 8 DISTINCT terms
-    if not search_terms:
-        # No usable terms AND the query is itself empty-after-strip → there is
-        # nothing to search. Fail CLOSED as a parse error (the caller maps a
-        # ValueError to {status:error}) rather than fanning out / ingesting on
-        # an all-whitespace anchor term.
+    if not _stripped:
         if not _query_anchor:
             raise ValueError("intent_parser: empty query yields no search terms")
-        search_terms = [_query_anchor]
+        _stripped = [_query_anchor]
+    _expanded = [part for term in _stripped for part in _split_experiment_term(term)]
+    _seen: set = set()
+    _distinct = [t for t in _expanded if not (t in _seen or _seen.add(t))]  # order-preserving dedup
+    search_terms = _distinct[:MAX_SEARCH_TERMS]  # cap LAST — up to 8 DISTINCT terms
 
     filters = parsed.get("filters") or {}
     if not isinstance(filters, dict):

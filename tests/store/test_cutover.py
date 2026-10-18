@@ -77,3 +77,20 @@ def test_export_cli_obeys_durable_writer_fence_before_connecting(tmp_path):
     assert result.returncode == 2
     assert json.loads(result.stdout)["error"] == "WriterFenced"
     assert output.read_bytes() == b"frozen authority"
+
+
+@pytest.mark.parametrize("phase", ["preparing", "preflighted", "flipped_fenced", "rolled_back", "resumed"])
+def test_export_lease_requires_unfenced_phase_without_changing_library_authority(tmp_path, phase):
+    from papervault.store.fencing import WriterFenced, writer_lease
+
+    (tmp_path / ".catalog-handoff.json").write_text(json.dumps({
+        "phase": phase, "fence_id": "test", "writes_resumed": phase == "resumed",
+    }))
+    if phase not in {"rolled_back", "resumed"}:
+        with pytest.raises(WriterFenced):
+            writer_lease(tmp_path, None)
+        return
+    lease = writer_lease(tmp_path, None)
+    lease.close()
+    with pytest.raises(WriterFenced):
+        writer_lease(tmp_path, "postgres" if phase == "rolled_back" else "json")

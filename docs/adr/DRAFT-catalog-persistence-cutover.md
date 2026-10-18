@@ -84,8 +84,15 @@ subdirectories. It deliberately provides no live activation escape hatch.
 2. `--flip`: verify those revisions, retain a frozen canonical export, change the single
    authority env setting, perform and restore a real Library title probe while fenced,
    then export/compare again. Its final phase is `flipped_fenced`.
-3. `--rollback`: before writes resume, restore frozen JSON and JSON authority, release
-   the database fence, and verify JSON loads. Interrupted probe writes carry a durable
+3. `--rollback`: a failed preflight in `preparing` can be canceled before writes
+   resume. Release its database fence (if schema creation reached that point) and
+   durably record `rolled_back`, leaving JSON and env untouched. Partial imports
+   remain nonauthoritative history; cancellation requires neither a frozen export
+   nor count/parity equality. An interruption after DB fence release can be retried.
+   Correct the import inputs before another preflight; an explicit verified export
+   is allowed after recovery, while Library authority checks remain enforced.
+   After flip, restore frozen JSON and JSON authority, release the database fence,
+   and verify JSON loads. Interrupted probe writes carry a durable
    handoff token in audit, so they can be distinguished from unaccounted writes. An
    interrupted rollback can be resumed. Catalog probe/audit rows remain intact as
    nonauthoritative rehearsal history; a subsequent preflight imports JSON again.

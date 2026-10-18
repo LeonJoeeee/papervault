@@ -55,6 +55,22 @@ budget as achieved. If a command fails, read `.catalog-handoff.json` before reco
 its `writes_resumed` value is the rollback boundary. Preserve frozen JSON, audit, job
 markers and any uncertain `.reopen-staging` results. No scratch copy is a backup.
 
+If `--preflight --apply` fails with phase `preparing` and `writes_resumed=false`,
+cancel preparation with the same copy, env file, schema and staging database:
+
+```bash
+.venv/bin/python scripts/cutover_catalog.py --rehearsal --vault "$COPY" --env-file "$COPY/.env" --schema "$SCHEMA" --rollback
+```
+
+This releases the repository fence and records `rolled_back` without changing the
+vault JSON or env, even if import only partially committed or schema creation failed.
+It does not undo imported catalog rows. Do not delete the handoff file manually.
+Retry the same command if interrupted during recovery. Correct integrity errors or
+reconcile parity differences, then rerun `--preflight --apply`. An explicit
+`export_catalog.py --verify` is permitted after recovery; it replaces JSON from PG,
+so run it only when that is the intended reconciliation. Once `writes_resumed=true`,
+rollback is refused regardless of phase; preserve accepted writes and recover forward.
+
 ## Verification
 
 The PR contains final commands, exit codes, suite/lint/CI results, snapshot hashes,

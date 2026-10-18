@@ -16,7 +16,8 @@ def handoff_state(root: Path) -> dict:
     return json.loads(path.read_bytes()) if path.exists() else {}
 
 
-def writer_lease(root: Path, authority: str, *, handoff_token: str | None = None):
+def writer_lease(root: Path, authority: str | None, *, handoff_token: str | None = None):
+    """Fence all writers; authority-independent exports pass authority=None."""
     root.mkdir(parents=True, exist_ok=True)
     if handoff_token:
         state = handoff_state(root)
@@ -31,7 +32,8 @@ def writer_lease(root: Path, authority: str, *, handoff_token: str | None = None
             raise WriterFenced("catalog handoff currently holds the writer fence") from None
         state = handoff_state(root)
         if state and (state.get("phase") not in {"resumed", "rolled_back"}
-                      or authority != ("postgres" if state["phase"] == "resumed" else "json")):
+                      or (authority is not None
+                          and authority != ("postgres" if state["phase"] == "resumed" else "json"))):
             raise WriterFenced("catalog handoff fences writers or authority disagrees with durable phase")
         return lease
     except BaseException:

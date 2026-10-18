@@ -3,6 +3,7 @@
 
 The output path and PAPERVAULT_CATALOG_DSN are explicit. The database connection
 is read-only; no schema changes, imports or credential discovery occur.
+Export obeys handoff fencing and is permitted again after a preflight rollback.
 """
 import argparse
 import json
@@ -27,7 +28,7 @@ def main(argv=None):
         parser.error("PAPERVAULT_CATALOG_DSN is required")
     lease = None
     try:
-        lease = writer_lease(args.output.parent, "postgres")
+        lease = writer_lease(args.output.parent, None)
         with psycopg.connect(dsn, autocommit=True, connect_timeout=5,
                              options="-c default_transaction_read_only=on") as connection:
             report = export_catalog(PostgresCatalogRepository(connection, schema=args.schema,

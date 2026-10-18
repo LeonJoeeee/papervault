@@ -18,6 +18,7 @@ class MemoryCatalog:
         self.aliases = {}
         self.rulings = {}
         self.jobs = {}
+        self.unique_fields = set()
 
     def ensure_schema(self, *, audit):
         pass
@@ -60,6 +61,12 @@ class MemoryCatalog:
 
     def finalize_identity_indexes(self, *, audit):
         return {}
+
+    def identity_index_fields(self):
+        return self.unique_fields
+
+    def all_aliases(self):
+        return dict(self.aliases)
 
 
 def snapshot(tmp_path, papers):
@@ -172,3 +179,54 @@ def test_dry_run_command_does_not_require_dsn_or_write_the_snapshot(tmp_path):
                             capture_output=True, text=True, env=env)
     assert result.returncode == 2
     assert "PAPERVAULT_CATALOG_DSN" in result.stderr
+
+
+def test_existing_target_identity_collision_is_reported_before_record_writes(tmp_path):
+    from papervault.store.importer import import_catalog
+    from papervault.store.repository import Record
+
+    repo = MemoryCatalog()
+    repo.records["Z"] = Record.from_payload("Z", {"key": "Z", "doi": "10.1/same"})
+    repo.unique_fields = {"doi"}
+    adapter = snapshot(tmp_path, [{"key": "A"}, {"key": "B", "doi": "10.1/SAME"}])
+    report = import_catalog(adapter, repo)
+    assert report["identity_conflicts"] == [{"field": "doi", "value": "10.1/same", "keys": ["B", "Z"]}]
+    assert report["integrity_errors"]
+    assert report["changed"] == 0
+    assert list(repo.records) == ["Z"]
+    assert repo.audit == []
+
+
+def test_stale_target_alias_prevents_a_false_zero_difference_report(tmp_path):
+    from papervault.store.importer import import_catalog
+
+    repo = MemoryCatalog()
+    before = snapshot(tmp_path, [{"key": "A", "terminal_state": {"merge": "alias", "alias_key": "B"}},
+                                {"key": "B"}])
+    import_catalog(before, repo)
+    after = snapshot(tmp_path, [{"key": "A"}, {"key": "B"}])
+    report = import_catalog(after, repo)
+    assert report["per_key_match"] == {"A": False, "B": True}
+    assert report["difference_rate"] == 0.5
+    assert report["supporting_differences"]["aliases"] == [
+        {"key": "A", "json": None, "postgres": "B"},
+    ]
+
+
+def test_interrupted_import_reports_the_committed_progress(tmp_path):
+    from papervault.store.importer import import_catalog
+
+    adapter = snapshot(tmp_path, [{"key": "A"}, {"key": "B"}])
+    repo = MemoryCatalog()
+    upsert = repo.upsert
+
+    def interrupted(record, *, audit):
+        if record.key == "B":
+            raise RuntimeError("interrupted")
+        return upsert(record, audit=audit)
+
+    repo.upsert = interrupted
+    with pytest.raises(RuntimeError) as failure:
+        import_catalog(adapter, repo)
+    assert failure.value.catalog_report["changed"] == 1
+    assert failure.value.catalog_report["difference_rate"] is None

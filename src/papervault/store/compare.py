@@ -16,17 +16,22 @@ COMPARISON_FIELDS = (
 )
 
 
-def record_differences(left: Record | None, right: Record | None) -> dict:
+def record_differences(left: Record | None, right: Record | None, *,
+                       json_alias: str | None = None, postgres_alias: str | None = None) -> dict:
     if left is None or right is None:
-        return {"presence": {"json": left is not None, "postgres": right is not None}}
-    return {field: {"json": getattr(left, field), "postgres": getattr(right, field)}
-            for field in COMPARISON_FIELDS if getattr(left, field) != getattr(right, field)}
+        fields = {"presence": {"json": left is not None, "postgres": right is not None}}
+    else:
+        fields = {field: {"json": getattr(left, field), "postgres": getattr(right, field)}
+                  for field in COMPARISON_FIELDS if getattr(left, field) != getattr(right, field)}
+    if json_alias != postgres_alias:
+        fields["alias"] = {"json": json_alias, "postgres": postgres_alias}
+    return fields
 
 
-def _pool_workload(records: dict[str, Record], path: Path) -> tuple[set[str], list[dict]]:
+def _pool_workload(records, path: Path) -> tuple[set[str], list[dict]]:
     by_doi, by_title = defaultdict(set), defaultdict(set)
     normalize_title = lambda title: re.sub(r"[^a-z0-9]+", "", (title or "").lower())
-    for record in records.values():
+    for record in records:
         if record.doi:
             by_doi[record.doi].add(record.key)
         if title := normalize_title(record.title):
@@ -53,13 +58,18 @@ def compare_catalog(json_records, postgres_records, *, limit: int | None = None,
         raise ValueError("limit must be nonnegative")
     left = {r.key: r for r in json_records.all()}
     right = {r.key: r for r in postgres_records.all()}
-    canon_keys, unmatched = _pool_workload(left, Path(pool_path)) if pool_path else (set(), [])
+    left_aliases = getattr(json_records, "all_aliases", lambda: {})()
+    right_aliases = getattr(postgres_records, "all_aliases", lambda: {})()
+    canon_keys, unmatched = _pool_workload(
+        [*left.values(), *right.values()], Path(pool_path),
+    ) if pool_path else (set(), [])
     canon_keys.update(pool_keys)
-    workload = sorted(left.keys() | right.keys())
+    workload = sorted(left.keys() | right.keys() | left_aliases.keys() | right_aliases.keys())
     selected = set(workload if limit is None else workload[:limit]) | canon_keys
     differences = []
     for key in sorted(selected):
-        fields = record_differences(left.get(key), right.get(key))
+        fields = record_differences(left.get(key), right.get(key),
+                                   json_alias=left_aliases.get(key), postgres_alias=right_aliases.get(key))
         if fields:
             differences.append({"key": key, "fields": fields})
     return {

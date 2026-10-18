@@ -18,6 +18,10 @@ class Records:
     def get(self, key):
         return self.records.get(key)
 
+    def all_aliases(self):
+        return {r.key: r.payload["terminal_state"]["alias_key"] for r in self.records.values()
+                if r.merge == "alias"}
+
 
 def test_comparator_checks_columns_and_payload_and_missing_keys():
     from papervault.store.compare import compare_catalog
@@ -79,3 +83,30 @@ def test_comparator_command_requires_explicit_shadow_dsn(tmp_path):
     assert result.returncode == 2
     assert "PAPERVAULT_CATALOG_DSN" in result.stderr
     assert list(tmp_path.iterdir()) == [path]
+
+
+def test_limit_keeps_landmark_keys_that_exist_only_in_postgres(tmp_path):
+    from papervault.store.compare import compare_catalog
+    from papervault.store.repository import Record
+
+    a = Record.from_payload("A", {"key": "A"})
+    z = Record.from_payload("Z", {"key": "Z", "doi": "10.1/canon"})
+    pool = tmp_path / "pools.jsonl"
+    pool.write_text(json.dumps({"qid": "r2", "pool": [{"doi": "10.1/canon"}]}) + "\n")
+    report = compare_catalog(Records(a), Records(a, z), limit=1, pool_path=pool)
+    assert report["pool_keys"] == ["Z"]
+    assert report["compared"] == 2
+    assert report["different"] == 1
+    assert report["difference_rate"] == 0.5
+
+
+def test_comparator_reports_relational_alias_drift():
+    from papervault.store.compare import compare_catalog
+    from papervault.store.repository import Record
+
+    a, b = (Record.from_payload(key, {"key": key}) for key in "AB")
+    left, right = Records(a, b), Records(a, b)
+    right.all_aliases = lambda: {"A": "B"}
+    report = compare_catalog(left, right)
+    assert report["different"] == 1
+    assert report["differences"][0]["fields"]["alias"] == {"json": None, "postgres": "B"}

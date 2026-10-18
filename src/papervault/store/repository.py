@@ -83,17 +83,21 @@ class PendingJob:
     key: str
     state: str = "pending"
     attempts: int = 0
-    enqueued_at: str | None = None
-    started_at: str | None = None
-    finished_at: str | None = None
+    enqueued_at: str | datetime | None = None
+    started_at: str | datetime | None = None
+    finished_at: str | datetime | None = None
     detail: dict = field(default_factory=dict)
 
     def __post_init__(self):
-        if not self.id or not self.kind or not self.key or not self.state or self.attempts < 0:
+        if (any(not isinstance(value, str) or not value.strip()
+                for value in (self.id, self.kind, self.key, self.state))
+                or type(self.attempts) is not int or self.attempts < 0):
             raise ValueError("job requires id, kind, key, state and nonnegative attempts")
         for name in ("enqueued_at", "started_at", "finished_at"):
             value = getattr(self, name)
             if value is not None:
+                if not isinstance(value, (str, datetime)):
+                    raise ValueError("job timestamps must be ISO strings or datetimes")
                 value = datetime.fromisoformat(value) if isinstance(value, str) else value
                 if value.tzinfo is None:
                     raise ValueError("job timestamps must be timezone-aware")
@@ -121,6 +125,7 @@ class CatalogRepository(Protocol):
     def set_status(self, key: str, status: str, *, audit: AuditEvent) -> bool: ...
     def list_by_status(self, status: str) -> list[str]: ...
     def resolve_alias(self, key: str) -> str: ...
+    def all_aliases(self) -> dict[str, str]: ...
     def add_alias(self, alias: str, canonical: str, *, audit: AuditEvent) -> bool: ...
 
 
@@ -227,12 +232,22 @@ class PostgresCatalogRepository:
             record = self.get(key)
             if record is None:
                 raise KeyError(key)
+            if record.download_status == status:
+                return False
             paper = Paper.model_validate(record.payload)
+            # Capture legacy policy BEFORE changing retrieval. Otherwise a reset
+            # to pending would derive clear policy from the new routing status.
+            if paper.terminal_state is None:
+                paper.terminal_state = derive_legacy(paper, include_domain=True)
             paper.download_status = status
             payload = copy.deepcopy(record.payload)
             payload["download_status"] = status
-            if "terminal_state" in payload:
-                payload["terminal_state"] = paper.model_dump(mode="json")["terminal_state"]
+            state = paper.model_dump(mode="json")["terminal_state"]
+            if isinstance(payload.get("terminal_state"), dict):
+                # Only these axes changed; retain unknown nested payload fields.
+                payload["terminal_state"].update({name: state[name] for name in ("retrieval", "cause")})
+            else:
+                payload["terminal_state"] = state
             return self._upsert(Record.from_payload(key, payload), audit)
 
     def list_by_status(self, status: str) -> list[str]:
@@ -251,6 +266,18 @@ class PostgresCatalogRepository:
                 return key
             key = row["canonical_key"]
         raise ValueError("alias cycle")
+
+    def all_aliases(self) -> dict[str, str]:
+        return {row["alias_key"]: row["canonical_key"] for row in self.connection.execute(sql.SQL(
+            "SELECT alias_key, canonical_key FROM {} ORDER BY alias_key"
+        ).format(self._table("aliases")))}
+
+    def identity_index_fields(self) -> set[str]:
+        indexes = {row["indexname"] for row in self.connection.execute(
+            "SELECT indexname FROM pg_indexes WHERE schemaname = %s "
+            "AND indexdef LIKE 'CREATE UNIQUE INDEX %%'", (self.schema,),
+        )}
+        return {field for field in ("doi", "arxiv_id") if "records_" + field + "_unique" in indexes}
 
     def add_alias(self, alias: str, canonical: str, *, audit: AuditEvent) -> bool:
         with self._write(audit):

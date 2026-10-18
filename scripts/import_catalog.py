@@ -47,7 +47,7 @@ def main(argv=None):
                                         ledger_path=args.ledger, jobs_path=args.jobs)
     except (OSError, ValueError, TypeError, KeyError, psycopg.Error) as exc:
         # Database exceptions may contain credentials; report the class, never a DSN/message.
-        report = report or {}
+        report = getattr(exc, "catalog_report", None) or report or {}
         report.update(error=type(exc).__name__, dry_run=not args.apply)
         print(json.dumps(report, sort_keys=True, ensure_ascii=False, default=str))
         return 2

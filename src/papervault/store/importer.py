@@ -97,6 +97,7 @@ def import_catalog(adapter: LibraryAdapter, repository=None, *, ledger_path=None
         "changed": 0, "supporting_changed": {"aliases": 0, "rulings": 0, "jobs": 0},
         "supporting_counts": {"aliases": len(aliases), "rulings": len(rulings), "jobs": len(jobs)},
         "target_identity_indexes": None, "extra_keys": [],
+        "supporting_differences": {"aliases": []}, "phase": "dry_run",
     }
     if repository is None or errors:
         return report
@@ -106,38 +107,71 @@ def import_catalog(adapter: LibraryAdapter, repository=None, *, ledger_path=None
             "source": adapter.source, "supporting_source_sha256": support_hashes, **detail,
         })
 
-    repository.ensure_schema(audit=event("schema_migration"))
-    for record in records:
-        report["changed"] += repository.upsert(record, audit=event(
-            "snapshot_record", payload_sha256=record.payload_sha256,
-        ))
-    for alias, canonical in sorted(aliases.items()):
-        report["supporting_changed"]["aliases"] += repository.add_alias(
-            alias, canonical, audit=event("snapshot_alias", canonical=canonical),
+    try:
+        report["phase"] = "schema"
+        repository.ensure_schema(audit=event("schema_migration"))
+        report["phase"] = "identity_preflight"
+        existing = {r.key: r for r in repository.all()}
+        projected = existing | {r.key: r for r in records}
+        report["identity_conflicts"] = identity_conflicts(list(projected.values()))
+        constrained = repository.identity_index_fields()
+        blocked = [conflict for conflict in report["identity_conflicts"] if conflict["field"] in constrained]
+        if blocked:
+            report["integrity_errors"].extend(
+                {"error": "identity_conflict_with_unique_index", **conflict} for conflict in blocked
+            )
+            report["target_total"] = len(existing)
+            return report
+        report["phase"] = "records"
+        for record in records:
+            report["changed"] += repository.upsert(record, audit=event(
+                "snapshot_record", payload_sha256=record.payload_sha256,
+            ))
+        report["phase"] = "aliases"
+        for alias, canonical in sorted(aliases.items()):
+            report["supporting_changed"]["aliases"] += repository.add_alias(
+                alias, canonical, audit=event("snapshot_alias", canonical=canonical),
+            )
+        report["phase"] = "rulings"
+        for ruling in rulings:
+            report["supporting_changed"]["rulings"] += repository.import_ruling(
+                ruling, audit=event("snapshot_ruling", ruling=ruling),
+            )
+        report["phase"] = "jobs"
+        for job in jobs:
+            report["supporting_changed"]["jobs"] += repository.import_job(job, audit=event("snapshot_job"))
+        # Each committed record is its own restart checkpoint. A retry emits
+        # events only for remaining/changed effects, without a checkpoint file.
+        report["phase"] = "identity_indexes"
+        report["target_identity_indexes"] = repository.finalize_identity_indexes(
+            audit=event("identity_indexes"),
         )
-    for ruling in rulings:
-        report["supporting_changed"]["rulings"] += repository.import_ruling(
-            ruling, audit=event("snapshot_ruling", ruling=ruling),
-        )
-    for job in jobs:
-        report["supporting_changed"]["jobs"] += repository.import_job(job, audit=event("snapshot_job"))
-    # Each committed record is its own restart checkpoint. A retry emits events
-    # only for remaining/changed effects; no checkpoint file or live writer is used.
-    report["target_identity_indexes"] = repository.finalize_identity_indexes(
-        audit=event("identity_indexes"),
-    )
-    target = {r.key: r for r in repository.all()}
+        report["phase"] = "reconciliation"
+        target = {r.key: r for r in repository.all()}
+        target_aliases = repository.all_aliases()
+    except Exception as exc:
+        # Preserve committed progress for the CLI without hiding the failure
+        # from Python callers or including potentially sensitive DB messages.
+        exc.catalog_report = report
+        raise
     differences = []
     for record in records:
-        fields = record_differences(record, target.get(record.key))
+        fields = record_differences(record, target.get(record.key),
+                                   json_alias=aliases.get(record.key), postgres_alias=target_aliases.get(record.key))
         report["per_key_match"][record.key] = not fields
         if fields:
             differences.append({"key": record.key, "fields": fields})
-    report["extra_keys"] = sorted(target.keys() - hashes.keys())
+    report["supporting_differences"]["aliases"] = [
+        {"key": key, "json": aliases.get(key), "postgres": target_aliases.get(key)}
+        for key in sorted(aliases.keys() | target_aliases.keys())
+        if aliases.get(key) != target_aliases.get(key)
+    ]
+    report["extra_keys"] = sorted((target.keys() | target_aliases.keys()) - hashes.keys())
     report["differences"] = differences
     denominator = len(records) + len(report["extra_keys"])
     report["difference_rate"] = (
         (len(differences) + len(report["extra_keys"])) / denominator if denominator else 0.0
     )
     report["target_total"] = len(target)
+    report["phase"] = "reconciled"
     return report

@@ -106,3 +106,46 @@ def test_repository_rejects_non_catalog_namespaces(schema):
 
     with pytest.raises(ValueError):
         PostgresCatalogRepository(TransactionConnection(), schema=schema)
+
+
+@pytest.mark.parametrize("state", ["absent", None])
+def test_status_reset_preserves_legacy_unknown_policy(state, monkeypatch):
+    from papervault.store.repository import AuditEvent, PostgresCatalogRepository, Record
+
+    payload = {"key": "A", "download_status": "metadata_only", "legacy": "retained"}
+    if state is None:
+        payload["terminal_state"] = None
+    original = Record.from_payload("A", payload)
+    repo = PostgresCatalogRepository(TransactionConnection())
+    monkeypatch.setattr(repo, "get", lambda key: original)
+    written = []
+    monkeypatch.setattr(repo, "_upsert", lambda record, audit: written.append(record) or True)
+    assert repo.set_status("A", "pending", audit=AuditEvent("test", "reset"))
+    assert written[0].retrieval == "eligible"
+    assert written[0].policy == "unknown"
+    assert written[0].payload["terminal_state"]["policy"] == "unknown"
+    assert written[0].payload["legacy"] == "retained"
+
+
+def test_status_change_preserves_unknown_nested_state_fields(monkeypatch):
+    from papervault.store.repository import AuditEvent, PostgresCatalogRepository, Record
+
+    record = Record.from_payload("A", {"key": "A", "download_status": "metadata_only",
+        "terminal_state": {"policy": "unknown", "retrieval": "exhausted", "future": {"keep": 42}}})
+    repo = PostgresCatalogRepository(TransactionConnection())
+    monkeypatch.setattr(repo, "get", lambda key: record)
+    written = []
+    monkeypatch.setattr(repo, "_upsert", lambda record, audit: written.append(record) or True)
+    repo.set_status("A", "pending", audit=AuditEvent("test", "reset"))
+    assert written[0].payload["terminal_state"]["future"] == {"keep": 42}
+
+
+@pytest.mark.parametrize("invalid", [
+    {"id": 42}, {"kind": 42}, {"state": []}, {"key": 42}, {"attempts": 0.5},
+    {"attempts": True}, {"enqueued_at": 42}, {"started_at": []},
+])
+def test_job_snapshots_reject_values_that_cannot_round_trip(invalid):
+    from papervault.store.repository import PendingJob
+
+    with pytest.raises(ValueError):
+        PendingJob(**({"id": "job", "kind": "extract", "key": "A"} | invalid))

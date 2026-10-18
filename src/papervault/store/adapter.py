@@ -69,3 +69,8 @@ class LibraryAdapter:
     def all(self) -> Iterator[Record]:
         for paper in sorted(self._library.all_papers(include_quarantined=True), key=lambda p: p.key):
             yield self.get(paper.key)
+
+    def all_aliases(self) -> dict[str, str]:
+        return {paper.key: paper.terminal_state.alias_key
+                for paper in self._library.all_papers(include_quarantined=True)
+                if paper.terminal_state and paper.terminal_state.merge == "alias"}

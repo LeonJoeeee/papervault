@@ -93,7 +93,7 @@ def test_alias_cycle_rejected_and_history_append_only(repo):
     assert count(repo, "audit") == before
     for table in ("audit", "rulings"):
         with pytest.raises(psycopg.errors.RaiseException):
-            repo.connection.execute(sql.SQL("TRUNCATE {}.{}").format(
+            repo.connection.execute(sql.SQL("TRUNCATE {}.{} CASCADE").format(
                 sql.Identifier(repo.schema), sql.Identifier(table),
             ))
 

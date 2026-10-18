@@ -3,6 +3,8 @@
 > Shared baseline for all parallel work. Read before any task.
 > Changing anything here = public merge + human approval + an ADR.
 
+The owner-ratified [papervault constitution v2.1-rc2](specs/2026-10-18-papervault-constitution.md) and [refactor plan v0.3](specs/2026-10-18-papervault-refactor-plan.md) (2026-10-18) govern the redesign, with the constitution taking precedence. [ADR-0007](adr/0007-papervault-constitution.md) records their rationale, independent review trail, owner clarifications, authorization boundary, and deferred mechanisms. This overview describes the existing implementation; future changes and implementation slices must conform to the governing documents.
+
 ## Context
 papervault is a self-hosted literature + knowledge layer for coding agents. It runs as ONE MCP server process exposing three tools — `search_papers` (discover + auto-ingest literature), `get_paper` (metadata + full-text lookup), `query` (cited synthesis from a knowledge graph) — with an independently managed MinerU OCR service plus Neo4j and Postgres. Agents connect over MCP (Claude Code via the bundled plugin; any MCP client via documented config). All LLM calls route to one operator-supplied OpenAI-compatible endpoint. Hardware floor: one 24 GB-class NVIDIA GPU on Linux (PRD constraints).
 

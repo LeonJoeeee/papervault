@@ -2,10 +2,14 @@
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from papervault.library.store import Library
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
 def test_active_library_fences_cutover_and_exclusive_fence_blocks_new_library(tmp_path):
@@ -32,9 +36,9 @@ def test_durable_fenced_phase_survives_command_exit(tmp_path):
 
 
 def test_script_requires_explicit_copy_and_rejects_live_before_connecting(tmp_path):
-    result = subprocess.run([sys.executable, "scripts/cutover_catalog.py", "--flip",
+    result = subprocess.run([sys.executable, str(REPO_ROOT / "scripts/cutover_catalog.py"), "--flip",
         "--rehearsal", "--vault", "/data/paper-vault", "--env-file", str(tmp_path / ".env")],
-        capture_output=True, text=True, timeout=10)
+        cwd=tmp_path, capture_output=True, text=True, timeout=10)
     assert result.returncode == 2
     assert "live vault" in result.stdout + result.stderr
 
@@ -67,9 +71,9 @@ def test_export_cli_obeys_durable_writer_fence_before_connecting(tmp_path):
     }))
     output = tmp_path / "index.json"
     output.write_bytes(b"frozen authority")
-    result = subprocess.run([sys.executable, "scripts/export_catalog.py", "--output", str(output), "--verify"],
+    result = subprocess.run([sys.executable, str(REPO_ROOT / "scripts/export_catalog.py"), "--output", str(output), "--verify"],
         env={**os.environ, "PAPERVAULT_CATALOG_DSN": "host=127.0.0.1 port=1 dbname=missing"},
-        capture_output=True, text=True, timeout=10)
+        cwd=tmp_path, capture_output=True, text=True, timeout=10)
     assert result.returncode == 2
     assert json.loads(result.stdout)["error"] == "WriterFenced"
     assert output.read_bytes() == b"frozen authority"

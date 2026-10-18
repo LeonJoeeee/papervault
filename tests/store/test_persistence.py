@@ -14,6 +14,19 @@ from papervault.library.store import Library
 from papervault.store.repository import AuditEvent, Record, PendingJob
 
 
+@pytest.fixture(params=[
+    ("0", "0", "0"),
+    ("1", "0", "0"),
+    ("0", "1", "0"),
+    ("0", "0", "1"),
+    ("1", "1", "1"),
+], ids=["legacy", "terminal", "reopen", "merge", "all-v2"])
+def acquisition_flags(request, monkeypatch):
+    for name, value in zip(("TERMINAL", "REOPEN", "MERGE"), request.param):
+        monkeypatch.setenv(f"PAPERVAULT_{name}_V2", value)
+    return "1" in request.param
+
+
 def pg_library(repo, tmp_path, monkeypatch):
     from papervault.store.persistence import PostgresPersistence
 
@@ -53,19 +66,25 @@ def test_pg_load_save_delta_and_noop_leave_json_untouched(repo, tmp_path, monkey
     assert loaded.get("A").authors == ["nested edit"]
 
 
-def test_pg_preserves_unknown_payload_and_does_not_flush_load_defaults(repo, tmp_path, monkeypatch):
+def test_pg_preserves_unknown_payload_and_does_not_flush_load_defaults(repo, tmp_path, monkeypatch, acquisition_flags):
     repo.upsert(Record.from_payload("A", {"key": "A", "future": {"keep": 42}}),
                 expected_revision=0, audit=AuditEvent("test", "seed"))
     lib = pg_library(repo, tmp_path, monkeypatch)
     before = count(repo, "audit")
     lib.save(force=True)
     assert count(repo, "audit") == before
+    assert repo.get("A").revision == 1
+    assert repo.get("A").payload == {"key": "A", "future": {"keep": 42}}
     lib.get("A").title = "new title"
     lib.save(force=True)
     assert repo.get("A").payload == {"key": "A", "title": "new title", "future": {"keep": 42}}
+    assert repo.get("A").revision == 2
+    assert count(repo, "audit") == before + 1
+    lib.save(force=True)
+    assert count(repo, "audit") == before + 1
 
 
-def test_pg_reloads_and_merges_disjoint_metadata_once_but_reports_overlaps(repo, tmp_path, monkeypatch):
+def test_pg_reloads_and_merges_disjoint_metadata_once_but_reports_overlaps(repo, tmp_path, monkeypatch, acquisition_flags):
     from papervault.store.persistence import CatalogConflict
 
     repo.upsert(Record.from_payload("A", {"key": "A", "title": "before"}),
@@ -92,7 +111,7 @@ def test_pg_reloads_and_merges_disjoint_metadata_once_but_reports_overlaps(repo,
         two.save(force=True)
 
 
-def test_pg_purge_and_collision_refused_before_mutation_or_unlink(repo, tmp_path, monkeypatch):
+def test_pg_purge_and_collision_refused_before_mutation_or_unlink(repo, tmp_path, monkeypatch, acquisition_flags):
     from papervault.store.repository import DeletionRefused
 
     lib = pg_library(repo, tmp_path, monkeypatch)
@@ -101,16 +120,61 @@ def test_pg_purge_and_collision_refused_before_mutation_or_unlink(repo, tmp_path
         lib._reindex(lib._papers[key])
     lib.save(force=True)
     lib.pdf_path("B").write_bytes(b"retained")
+    before = {key: paper.model_dump(mode="json") for key, paper in lib._papers.items()}
+    audit_before = count(repo, "audit")
     with pytest.raises(DeletionRefused):
         lib.purge("B")
     with pytest.raises(DeletionRefused):
         lib.set_resolved_doi("B", "10.1/A")
-    assert lib.get("B") is not None
+    assert {key: paper.model_dump(mode="json") for key, paper in lib._papers.items()} == before
+    assert count(repo, "audit") == audit_before
+    assert not lib.manifest_path.exists()
     assert lib.pdf_path("B").read_bytes() == b"retained"
     lib._papers.pop("B")
     with pytest.raises(DeletionRefused):
         lib.save(force=True)
     assert repo.get("B") is not None
+
+
+def test_pg_status_write_persists_observed_state(repo, tmp_path, monkeypatch, acquisition_flags):
+    repo.upsert(Record.from_payload("A", {"key": "A", "future": {"keep": 42}}),
+                expected_revision=0, audit=AuditEvent("test", "seed"))
+    lib = pg_library(repo, tmp_path, monkeypatch)
+    lib.get("A").download_status = "failed"
+    lib.save(force=True)
+    payload = repo.get("A").payload
+    assert payload["download_status"] == "failed"
+    assert payload["future"] == {"keep": 42}
+    if acquisition_flags:
+        assert payload["terminal_state"]["retrieval"] == "exhausted"
+        assert payload["terminal_state"]["cause"] == "retrieval_exhausted"
+    else:
+        assert "terminal_state" not in payload
+
+
+@pytest.mark.parametrize("deadline", [0.0, 1e20], ids=["expired", "waiting"])
+def test_pg_resumed_doi_collision_refused_before_mutation(repo, tmp_path, monkeypatch, deadline):
+    from papervault.library.merge_v2 import MergeIntent
+    from papervault.store.repository import DeletionRefused
+
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    intent = MergeIntent(merge_id="persisted", canonical_key="A", absorbed_key="B",
+                         started_at=0.0, deadline=deadline)
+    for key in ("A", "B"):
+        paper = Paper(key=key, title=key, doi="10.1/A" if key == "A" else "",
+                      merge_intent=intent)
+        repo.upsert(Record.from_payload(key, paper.model_dump(mode="json")),
+                    expected_revision=0, audit=AuditEvent("test", "seed"))
+    lib = pg_library(repo, tmp_path, monkeypatch)
+    lib.pdf_path("B").write_bytes(b"retained")
+    before = {key: paper.model_dump(mode="json") for key, paper in lib._papers.items()}
+    audit_before = count(repo, "audit")
+    with pytest.raises(DeletionRefused):
+        lib.set_resolved_doi("B", "10.1/A")
+    assert {key: paper.model_dump(mode="json") for key, paper in lib._papers.items()} == before
+    assert count(repo, "audit") == audit_before
+    assert lib.pdf_path("B").read_bytes() == b"retained"
+    assert not (tmp_path / "reopen-budget.jsonl").exists()
 
 
 def test_pg_failed_batch_does_not_advance_snapshot(repo, tmp_path, monkeypatch):

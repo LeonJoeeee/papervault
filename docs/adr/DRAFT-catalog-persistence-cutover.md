@@ -26,6 +26,10 @@ The save batch (the debounce interval) is the commit unit, rather than each attr
 assignment. A crash loses the uncommitted in-memory batch, as in JSON mode, and cannot
 commit half of a catalog batch. Acknowledgment preserves changes made to the working
 object while the save ran; committed snapshots advance only after the outer commit.
+Metadata-only PG edits preserve absent legacy defaults and unknown payload fields,
+including with acquisition V2 flags enabled. Derived acquisition state stays a read
+projection until an ingress/status writer or an explicit state command records an
+observation; saving metadata alone does not materialize it.
 
 Every record upsert/status write requires `expected_revision`. New writes start at
 revision 1; existing P1 rows migrate with revision 0. A stale expectation raises
@@ -48,8 +52,9 @@ failed/unknown publication commit for forward recovery. Artifact bytes precede t
 catalog references; a failed catalog commit may leave unpublished bytes and must not
 be treated as successful publication. This does not implement P5 versioned derivatives.
 
-In PG mode, purge and legacy identity consolidation that would delete a record refuse
-before changing the working set or unlinking files. Missing keys in a save also refuse.
+In PG mode, purge and DOI-resolution collision merges refuse before changing the
+working set or unlinking files, including before dispatch to the V2 merge path.
+Missing keys in a save also refuse.
 Retention, tombstones and record deletion await P5.
 
 JSON load/save/rotation/BibTeX behavior stays in its existing path. PG save never writes

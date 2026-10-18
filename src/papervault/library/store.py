@@ -430,11 +430,9 @@ class Library:
 
     def _save_catalog(self) -> None:
         from papervault.store.persistence import CatalogConflict
-        enabled = terminal_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled()
-        for key, paper in self._papers.items():
-            if (enabled and paper.terminal_state is None
-                    and self._state_v2_fingerprints.get(key) != hash(paper.model_dump_json())):
-                paper.terminal_state = paper.unquiesced_state
+        # The PG delta preserves raw legacy payloads. Metadata edits must not
+        # materialize read-derived state; ingress/status writers record actual
+        # acquisition changes before this persistence boundary.
         try:
             self._catalog_backend.save(self._papers)
         except CatalogConflict as exc:
@@ -888,6 +886,9 @@ class Library:
             holder = self.find(doi=(doi or "").strip())
             if (merge_v2_enabled() and holder is not None
                     and holder.key in {intent.canonical_key, intent.absorbed_key}):
+                if self._catalog_backend is not None:
+                    from papervault.store.repository import DeletionRefused
+                    raise DeletionRefused("PG identity collision merge is refused in P2")
                 from .merge_v2 import MergeStore, write_locked
                 merged = write_locked(lambda: MergeStore(self)._merge_records(
                     intent.canonical_key, intent.absorbed_key))
@@ -907,6 +908,9 @@ class Library:
                 return ("merge_waiting", holder_key)
             holder_key = holder.key
         if holder_key is not None and holder_key != key:
+            if self._catalog_backend is not None:
+                from papervault.store.repository import DeletionRefused
+                raise DeletionRefused("PG identity collision merge is refused in P2")
             # A twin already owns this DOI. Merge the stub's blank-fill fields
             # into the holder (journal-DOI side wins identity), then purge the
             # stub. We DO NOT write the duplicate DOI onto the stub — that would
@@ -919,9 +923,6 @@ class Library:
                 from .merge_v2 import MergeStore, write_locked
                 merged = write_locked(lambda: MergeStore(self)._merge_records(holder_key, key))
                 return ("collision" if merged is not None else "merge_waiting", holder_key)
-            if self._catalog_backend is not None:
-                from papervault.store.repository import DeletionRefused
-                raise DeletionRefused("PG merge requiring record deletion is refused in P2")
             if holder is not None:
                 merged = self._merge(holder, p.model_dump())
                 self._papers[holder_key] = merged

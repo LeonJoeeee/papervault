@@ -56,7 +56,8 @@ its `writes_resumed` value is the rollback boundary. Preserve frozen JSON, audit
 markers and any uncertain `.reopen-staging` results. No scratch copy is a backup.
 
 If `--preflight --apply` fails with phase `preparing` and `writes_resumed=false`,
-cancel preparation with the same copy, env file, schema and staging database:
+or succeeds with phase `preflighted` and the operator decides not to flip, cancel
+preparation with the same copy, env file, schema and staging database:
 
 ```bash
 .venv/bin/python scripts/cutover_catalog.py --rehearsal --vault "$COPY" --env-file "$COPY/.env" --schema "$SCHEMA" --rollback
@@ -64,7 +65,10 @@ cancel preparation with the same copy, env file, schema and staging database:
 
 This releases the repository fence and records `rolled_back` without changing the
 vault JSON or env, even if import only partially committed or schema creation failed.
-It does not undo imported catalog rows. Do not delete the handoff file manually.
+For `preflighted`, cancellation first checks that JSON still matches the recorded
+SHA256. Changed JSON is refused with forward-recovery guidance and fences retained.
+No frozen snapshot is needed or restored. It does not undo imported catalog rows.
+Do not delete the handoff file manually.
 Retry the same command if interrupted during recovery. Correct integrity errors or
 reconcile parity differences, then rerun `--preflight --apply`. An explicit
 `export_catalog.py --verify` is permitted after recovery; it replaces JSON from PG,

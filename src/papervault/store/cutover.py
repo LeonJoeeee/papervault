@@ -156,10 +156,12 @@ class Cutover:
     def rollback(self):
         start = time.monotonic()
         with exclusive_fence(self.root):
-            state = self._fenced({"preparing", "flipped_fenced", "flipping", "rolling_back"})
-            if state["phase"] == "preparing":
-                # Preparation can fail before schema creation or after partial
-                # import. JSON authority is unchanged; no snapshot is restored.
+            state = self._fenced({"preparing", "preflighted", "flipped_fenced", "flipping", "rolling_back"})
+            if state["phase"] in {"preparing", "preflighted"}:
+                if state["phase"] == "preflighted" and _sha(self.index) != state["json_sha256"]:
+                    raise RuntimeError("JSON changed since preflight: forward recovery required")
+                # Abort before flip, including failed preparation before schema
+                # creation or after partial import. No snapshot is restored.
                 exists = self.repository.connection.execute("SELECT to_regclass(%s) AS name",
                     (self.repository.schema + ".writer_fence",)).fetchone()
                 if exists["name"]:

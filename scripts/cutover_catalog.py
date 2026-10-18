@@ -2,8 +2,9 @@
 """P2 pre-flip rehearsal tooling: a vault COPY and staging DB are mandatory.
 
 --preflight --apply fences and imports delta; --flip probes/exports while fenced;
---rollback cancels a failed preflight in preparing without changing JSON or env,
-or restores the frozen snapshot after flip. It is forbidden after writes resume.
+--rollback cancels preparing or preflighted without changing JSON or env (after
+successful preflight, JSON must match its recorded hash), or restores the frozen
+snapshot after flip. It is forbidden after writes resume.
 --resume closes that window durably BEFORE executing explicit orchestrator-supplied
 restart and health commands. Commands are argv (shlex), never shell scripts.
 Live authority activation is not enabled.

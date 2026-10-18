@@ -60,6 +60,55 @@ def test_changed_json_after_preflight_refuses_flip(repo, tmp_path, monkeypatch):
     assert "PAPERVAULT_CATALOG_AUTHORITY" not in cutover.env.read_text()
 
 
+def test_successful_preflight_can_abort_and_preflight_again(repo, tmp_path, monkeypatch):
+    from papervault.store.cutover import Cutover
+    from papervault.store.repository import PostgresCatalogRepository
+
+    cutover = setup_cutover(repo, tmp_path, monkeypatch)
+    assert cutover.preflight(apply=True)["go"]
+    state = cutover.state()
+    assert state["phase"] == "preflighted" and not state["writes_resumed"]
+    assert repo.connection.execute(sql.SQL("SELECT fence_id FROM {}").format(
+        repo._table("writer_fence"))).fetchone()["fence_id"] == state["fence_id"]
+    original = cutover.index.read_bytes(), cutover.index.stat().st_mtime_ns
+    original_env = cutover.env.read_bytes()
+
+    # Abort through a fresh command, without a frozen post-flip snapshot.
+    recovery = Cutover(tmp_path, cutover.env,
+                       PostgresCatalogRepository(repo.connection, schema=repo.schema))
+    assert recovery.rollback()["phase"] == "rolled_back"
+    assert recovery.state()["phase"] == "rolled_back"
+    assert not recovery.state()["writes_resumed"]
+    assert (cutover.index.read_bytes(), cutover.index.stat().st_mtime_ns) == original
+    assert cutover.env.read_bytes() == original_env
+    assert not cutover.frozen.exists()
+    assert repo.connection.execute(sql.SQL("SELECT fence_id FROM {}").format(
+        repo._table("writer_fence"))).fetchone()["fence_id"] is None
+    Library(tmp_path, authority="json").close()
+    report = recovery.preflight(apply=True)
+    assert report["go"] and report["difference_rate"] == 0
+    assert recovery.state()["fence_id"] != state["fence_id"]
+
+
+def test_preflighted_abort_refuses_changed_json_without_releasing_fences(repo, tmp_path, monkeypatch):
+    from papervault.store.fencing import WriterFenced
+
+    cutover = setup_cutover(repo, tmp_path, monkeypatch)
+    cutover.preflight(apply=True)
+    payload = json.loads(cutover.index.read_bytes())
+    payload["papers"]["A"]["title"] = "unaccounted external edit"
+    cutover.index.write_text(json.dumps(payload))
+    original = {path: path.read_bytes() for path in (cutover.index, cutover.env, cutover.state_path)}
+    with pytest.raises(RuntimeError, match="changed.*forward recovery required"):
+        cutover.rollback()
+    assert {path: path.read_bytes() for path in original} == original
+    assert not cutover.frozen.exists()
+    assert repo.connection.execute(sql.SQL("SELECT fence_id FROM {}").format(
+        repo._table("writer_fence"))).fetchone()["fence_id"] == cutover.state()["fence_id"]
+    with pytest.raises(WriterFenced):
+        Library(tmp_path, authority="json")
+
+
 def test_interrupted_first_probe_can_rollback_while_writers_still_fenced(repo, tmp_path, monkeypatch):
     from papervault.library.store import Library
 
@@ -150,16 +199,20 @@ def test_failed_preflight_rollback_preserves_json_and_unfences_export(repo, tmp_
     assert recovery.preflight(apply=True)["go"]
 
 
-def test_preflight_abort_retries_after_database_fence_was_cleared(repo, tmp_path, monkeypatch):
+@pytest.mark.parametrize("phase", ["preparing", "preflighted"])
+def test_preflight_abort_retries_after_database_fence_was_cleared(repo, tmp_path, monkeypatch, phase):
     from papervault.store.cutover import Cutover
 
     cutover = setup_cutover(repo, tmp_path, monkeypatch)
-    # Interrupt after durable preparing intent and DB fencing, before import.
-    import papervault.store.cutover as module
-    with monkeypatch.context() as patch:
-        patch.setattr(module, "import_catalog", lambda *a: (_ for _ in ()).throw(OSError("interrupted import")))
-        with pytest.raises(OSError):
-            cutover.preflight(apply=True)
+    if phase == "preparing":
+        # Interrupt after durable preparing intent and DB fencing, before import.
+        import papervault.store.cutover as module
+        with monkeypatch.context() as patch:
+            patch.setattr(module, "import_catalog", lambda *a: (_ for _ in ()).throw(OSError("interrupted import")))
+            with pytest.raises(OSError):
+                cutover.preflight(apply=True)
+    else:
+        cutover.preflight(apply=True)
     original = cutover.index.read_bytes()
     record = cutover._record
 
@@ -171,7 +224,7 @@ def test_preflight_abort_retries_after_database_fence_was_cleared(repo, tmp_path
     monkeypatch.setattr(cutover, "_record", interrupted)
     with pytest.raises(OSError, match="DB fence release"):
         cutover.rollback()
-    assert cutover.state()["phase"] == "preparing"
+    assert cutover.state()["phase"] == phase
     assert repo.connection.execute(sql.SQL("SELECT fence_id FROM {}").format(
         repo._table("writer_fence"))).fetchone()["fence_id"] is None
     assert Cutover(tmp_path, cutover.env, repo).rollback()["phase"] == "rolled_back"
@@ -192,10 +245,11 @@ def test_preflight_abort_before_schema_or_database_fence_exists(repo, tmp_path, 
     assert cutover.preflight(apply=True)["go"]
 
 
-def test_preparing_rollback_refuses_after_writes_resumed(repo, tmp_path, monkeypatch):
+@pytest.mark.parametrize("phase", ["preparing", "preflighted"])
+def test_preflip_rollback_refuses_after_writes_resumed(repo, tmp_path, monkeypatch, phase):
     cutover = setup_cutover(repo, tmp_path, monkeypatch)
     cutover.preflight(apply=True)
-    cutover._record(cutover.state(), phase="preparing", writes_resumed=True)
+    cutover._record(cutover.state(), phase=phase, writes_resumed=True)
     original = {path: path.read_bytes() for path in (cutover.index, cutover.env, cutover.state_path)}
     with pytest.raises(RuntimeError, match="forward recovery required"):
         cutover.rollback()

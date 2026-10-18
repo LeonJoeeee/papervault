@@ -1,0 +1,261 @@
+{
+ "generated_at": "2026-10-18T21:25:55+0800",
+ "records": 26684,
+ "download_status": {
+  "ok": 22417,
+  "metadata_only": 3941,
+  "extract_failed": 151,
+  "failed": 161,
+  "pending": 14
+ },
+ "sources": {
+  "semantic_scholar": 1679,
+  "arxiv": 3384,
+  "ss_references": 272,
+  "openalex": 1892,
+  "inspire": 3666,
+  "crossref": 61,
+  "core": 1692,
+  "europepmc": 23,
+  "ads": 14015
+ },
+ "v2_retrieval": {
+  "Retrieval.VERIFIED": 22329,
+  "Retrieval.EXHAUSTED": 4102,
+  "Retrieval.ACQUIRED": 239,
+  "Retrieval.IN_PROGRESS": 2,
+  "Retrieval.ELIGIBLE": 12
+ },
+ "v2_policy": {
+  "Policy.UNKNOWN": 25994,
+  "Policy.OVERRIDE": 549,
+  "Policy.CLEAR": 141
+ },
+ "v2_merge": {
+  "Merge.CANONICAL": 26674,
+  "Merge.ALIAS": 10
+ },
+ "v2_quarantine": {
+  "False": 26643,
+  "True": 41
+ },
+ "has_doi": 19951,
+ "has_arxiv": 10512,
+ "years": {
+  "2019": 917,
+  "2020": 1079,
+  "2022": 1356,
+  "2025": 2114,
+  "2023": 1628,
+  "2024": 1999,
+  "2012": 674,
+  "1994": 175,
+  "1991": 130,
+  "2017": 743,
+  "1958": 4,
+  "2018": 942,
+  "2021": 1254,
+  "1966": 16,
+  "1956": 5,
+  "2016": 811,
+  "2014": 645,
+  "2015": 737,
+  "1977": 80,
+  "1957": 3,
+  "1968": 26,
+  "1961": 6,
+  "1964": 9,
+  "1971": 28,
+  "2010": 602,
+  "2013": 793,
+  "1998": 176,
+  "1989": 124,
+  "1978": 75,
+  "2009": 538,
+  "1987": 118,
+  "2001": 313,
+  "1984": 95,
+  "2004": 350,
+  "2007": 407,
+  "1997": 131,
+  "1967": 21,
+  "1941": 1,
+  "2008": 542,
+  "2011": 542,
+  "1969": 16,
+  "1995": 190,
+  "1999": 189,
+  "1983": 127,
+  "2000": 207,
+  "2002": 264,
+  "1988": 114,
+  "1996": 122,
+  "1960": 5,
+  "2005": 402,
+  "1980": 87,
+  "1973": 34,
+  "2003": 332,
+  "1972": 26,
+  "1990": 141,
+  "1975": 82,
+  "1974": 42,
+  "2026": 1871,
+  "2006": 408,
+  "1981": 141,
+  "1982": 94,
+  "1976": 84,
+  "1993": 172,
+  "1992": 140,
+  "1965": 11,
+  "1985": 135,
+  "1986": 131,
+  "1970": 18,
+  "1979": 98,
+  "1959": 6,
+  "1955": 2,
+  "1963": 7,
+  "1954": 3,
+  "1962": 5,
+  "1029": 1,
+  "2027": 3,
+  "1950": 1,
+  "1953": 1,
+  "20188": 1,
+  "1933": 1
+ },
+ "duplicate_dois": {
+  "10.1016/j.asr.2007.07.024": 2,
+  "10.1103/physrevlett.111.081102": 2,
+  "10.1103/physrevlett.105.121101": 2,
+  "10.48550/arxiv.2502.09450": 2,
+  "10.1088/1475-7516/2010/12/020": 2,
+  "10.1103/physrevd.88.023001": 2,
+  "10.1016/j.physletb.2009.01.016": 2,
+  "10.1007/s11207-020-01663-7": 2,
+  "10.3847/1538-4357/ae67fc": 2,
+  "10.3847/1538-4357/aade4e": 2
+ },
+ "duplicate_arxivs": {
+  "1312.2002v1": 2,
+  "2207.14115v1": 2,
+  "2011.06620v1": 2,
+  "0708.2587v1": 2,
+  "1308.0133v2": 2,
+  "1007.0821v1": 2,
+  "2403.02536v1": 2,
+  "0809.0162v2": 2,
+  "2004.12510v1": 2,
+  "1612.09579": 2
+ },
+ "pdf_files": 22560,
+ "pdf_bytes": 76595455518,
+ "md_files": 22329,
+ "txt_files": 3666,
+ "md_bytes": 1564032680,
+ "txt_bytes": 291732310,
+ "postgres": {
+  "doc_status": {
+   "failed": 11,
+   "processed": 43151
+  },
+  "ks_ledger": {
+   "processing": 1,
+   "done": 38955,
+   "done_abstract": 4194,
+   "done_meta": 168
+  }
+ },
+ "r2_coverage": {
+  "pools": 12,
+  "entries_total": 111,
+  "matched": 92,
+  "readable": 92,
+  "indexed": 92,
+  "per_pool": [
+   {
+    "qid": "broad-cr-spectra",
+    "n": 8,
+    "matched": 8,
+    "readable": 8,
+    "indexed": 8
+   },
+   {
+    "qid": "broad-equation-discovery",
+    "n": 10,
+    "matched": 7,
+    "readable": 7,
+    "indexed": 7
+   },
+   {
+    "qid": "broad-galactic-cr-transport",
+    "n": 9,
+    "matched": 7,
+    "readable": 7,
+    "indexed": 7
+   },
+   {
+    "qid": "broad-heliosheath-acr",
+    "n": 10,
+    "matched": 9,
+    "readable": 9,
+    "indexed": 9
+   },
+   {
+    "qid": "broad-heliospheric-obs",
+    "n": 9,
+    "matched": 9,
+    "readable": 9,
+    "indexed": 9
+   },
+   {
+    "qid": "broad-imf-turbulence",
+    "n": 10,
+    "matched": 9,
+    "readable": 9,
+    "indexed": 9
+   },
+   {
+    "qid": "broad-pinn-solvers",
+    "n": 10,
+    "matched": 8,
+    "readable": 8,
+    "indexed": 8
+   },
+   {
+    "qid": "broad-positron-dm-excess",
+    "n": 10,
+    "matched": 8,
+    "readable": 8,
+    "indexed": 8
+   },
+   {
+    "qid": "broad-sde-solvers",
+    "n": 6,
+    "matched": 5,
+    "readable": 5,
+    "indexed": 5
+   },
+   {
+    "qid": "broad-sep-gle",
+    "n": 10,
+    "matched": 8,
+    "readable": 8,
+    "indexed": 8
+   },
+   {
+    "qid": "broad-solar-modulation",
+    "n": 9,
+    "matched": 9,
+    "readable": 9,
+    "indexed": 9
+   },
+   {
+    "qid": "broad-uhecr-air-showers",
+    "n": 10,
+    "matched": 5,
+    "readable": 5,
+    "indexed": 5
+   }
+  ]
+ }
+}

@@ -87,6 +87,116 @@ This business is frozen: no optimization budget; regression watch only.
 | co-active VRAM peak (4-way OCR + concurrent queries) | **18.8 / 24 GB** | 2026-07-16 stress test |
 | held-in-reserve levers | MinerU gmu 0.40→0.30; rerank batch 4→smaller | never needed |
 
+## F0 frozen baseline (2026-10-18)
+
+This is the P0 freeze required by the [ratified refactor plan](specs/2026-10-18-papervault-refactor-plan.md),
+before F1 changes behavior. The [corrected orchestrator artifacts on #263](https://github.com/LeonJoeeee/papervault/issues/263#issuecomment-6250459625)
+are preserved verbatim: [snapshot tool](../scripts/snapshot_catalog.py) and
+[frozen JSON](baselines/f0-snapshot-2026-10-18.json). The orchestrator measured the snapshot at
+**2026-10-18T21:25:55+0800** against lab deployment #1. These are sequential observations of a
+running system, not an atomic database/filesystem snapshot or a migration backup. Live counts
+drift; later runs must produce new evidence rather than overwrite this frozen measurement.
+
+The legacy source/configuration reference is commit
+[`f872ec097f488356f4547b3c8447712e3263db71`](https://github.com/LeonJoeeee/papervault/tree/f872ec097f488356f4547b3c8447712e3263db71)
+(package 0.7.37). The following instrument, workload, and judge-configuration identities freeze
+what is being compared; the historical July results were not remeasured in October.
+
+| ruler | instrument version | workload version | judge/configuration version |
+| --- | --- | --- | --- |
+| R1, historical must-find recall proxy | [`scripts/mustfind_recall.py`](../scripts/mustfind_recall.py), instrument v2; Git blob `fddb3fbb5727ca3955710955456d2e63b5964dff` | `intents_v1.jsonl`: first 12 broad intents; `gold_search_pools.jsonl`: 12 frozen pools, 111 entries | v2 matcher: normalized DOI first, then normalized title containment (shorter title ≥ 4 words) or token Jaccard ≥ 0.8; no LLM judge; sequential default `search_papers` calls, empty serve retried once then quarantined/excluded |
+| R2, current canon coverage | `scripts/snapshot_catalog.py`, F0 corrected artifact; SHA-256 `01b328e596f0ce5b445bd53e99977d6bc9e29fcb95e9d9523a86ac03b8b1da57` | Same frozen landmark pools as R1 | F0 deterministic matcher: stripped/lowercase DOI, then exact title after lowercasing/removing non-ASCII-alphanumerics; no LLM judge; coverage definitions below |
+| R3, historical precision/ranking | [`scripts/search_relevance_baseline.py`](../scripts/search_relevance_baseline.py) rubric/served-list collector; Git blob `79e592440eb4dc3ea47e02bc26ac6dd37d74ce0b` | First 12 broad intents from `intents_v1.jsonl`; July 18 served order `srb_v1_0718`, 180 papers | Frozen canonical config `opus-max-blind-2026-07-18`: Claude opus, reasoning effort MAX, 12 fresh contexts (one per intent), rubric-only blind panel; title+abstract, relevant ≥ 0.7. The script's MiMo judge is a dev smoke, not this canonical judge |
+
+Workload Git blobs at the reference commit:
+[`intents_v1.jsonl`](../src/papervault/eval/intents_v1.jsonl) =
+`6744ad5d4f64247986830202645d4b91c89ce867` (24 intents total, first 12 broad used here);
+[`gold_search_pools.jsonl`](../src/papervault/eval/gold_search_pools.jsonl) =
+`e204cf641bbe4b5bf889791b963b55d093817988`. The legacy search default budget was 15 unless
+the intent parser suggested a count (`PAPER_SEARCH_DEFAULT_LIMIT=15`); the R3 panel contains
+180 served papers (15 per intent on average). The drivers do not pin a caller-supplied result
+count. The exact opus model release was not recorded in the historical baseline; the configuration above
+preserves the recorded model family and effort, without inventing a release identifier.
+
+| frozen historical measurement | value | measurement/configuration |
+| --- | --- | --- |
+| R1 proxy: must-find recall | **0.2361 mean / 0.00 min** | 2026-07-19, instrument v2, `mfr_v2_0719`; audited served lists, lenient matcher, empty-serve retry/quarantine; single shot |
+| R3: P@served | **0.9111 mean / 0.7333 min** | 2026-07-18, `srb_v1_0718_claudejudge_max.json`, canonical opus MAX blind panel; 180 served papers over 12 intents |
+| R3: ranking | **P@5 0.9667 mean / 0.60 min; nDCG@15 0.9828 mean** | Same July 18 served order and canonical relevance scores |
+| R3: judge-side spread | **±0.03** | Same 180 papers: MiMo 0.9056, opus default effort 0.9444, opus MAX 0.9111; default/MAX agreement 170/180 |
+
+These preserve the legacy rulers. R1's historical pool recall is a proxy for the constitution's
+named-need recall; R1 and R3 came from different dates/served lists, so they are not a paired
+precision/recall run. The historical record does not establish a fixed resolved budget for every
+R1 intent, human-label calibration, or an abstention rate. A future constitution-aligned ruler
+must version those additions and the mandatory PAMELA/AMS-02 fixture separately; none is claimed
+as newly measured here. The earlier sections retain their historical run conditions and tags.
+
+For R2, **metadata** means a pool entry matches a parsed `Paper` record; **readable** means that
+record has an existing `extracts/md/<key>.md` or `extracts/txt/<key>.txt`; **indexed** means its
+key appears as a `.md`/`.txt` file-path basename in a LightRAG `doc_status` row marked `processed`.
+This legacy instrument checks file existence and processed-path membership, not text quality,
+content hashes, or revision-compatible publication. It counts pool entries, not deduplicated
+works, and its match rule differs from the historical R1 lenient title matcher.
+
+| frozen landmark pool | entries | metadata | readable | indexed |
+| --- | --- | --- | --- | --- |
+| broad-cr-spectra | 8 | 8 | 8 | 8 |
+| broad-equation-discovery | 10 | 7 | 7 | 7 |
+| broad-galactic-cr-transport | 9 | 7 | 7 | 7 |
+| broad-heliosheath-acr | 10 | 9 | 9 | 9 |
+| broad-heliospheric-obs | 9 | 9 | 9 | 9 |
+| broad-imf-turbulence | 10 | 9 | 9 | 9 |
+| broad-pinn-solvers | 10 | 8 | 8 | 8 |
+| broad-positron-dm-excess | 10 | 8 | 8 | 8 |
+| broad-sde-solvers | 6 | 5 | 5 | 5 |
+| broad-sep-gle | 10 | 8 | 8 | 8 |
+| broad-solar-modulation | 9 | 9 | 9 | 9 |
+| broad-uhecr-air-showers | 10 | 5 | 5 | 5 |
+| **Total (entry-weighted)** | **111** | **92 (82.88%)** | **92 (82.88%)** | **92 (82.88%)** |
+
+The **19 unmatched landmark entries are a canon-seeding follow-up, not a P0 failure**. They
+are unmatched by this frozen DOI/title rule; the count alone does not prove absence from the
+vault. P0 records the measurement, without seeding papers or changing serving behavior.
+
+The catalog observation contains **26,684** parsed records: 22,417 `ok`, 3,941 `metadata_only`,
+151 `extract_failed`, 161 `failed`, and 14 `pending`. It includes 26,674 canonical records and
+10 aliases, with 41 quarantined records; identifier counts are 19,951 with DOI and 10,512 with
+arXiv ID. The raw duplicate groups (10 DOI, 10 arXiv) include all parsed records, without alias
+resolution. The JSON also preserves every source/year/state count. Files: 22,560 PDFs
+(76,595,455,518 bytes), 22,329 Markdown extracts (1,564,032,680 bytes), and 3,666 text extracts
+(291,732,310 bytes). PostgreSQL reports 43,151 processed / 11 failed doc-status rows and ledger
+counts `done=38955`, `done_abstract=4194`, `done_meta=168`, `processing=1`; these are separate
+legacy observations, not interchangeable paper-coverage counts.
+
+Topology remains the repository-described deployment: one `papervault.service` MCP process,
+independent MinerU OCR service, and `ks-postgres` / `ks-neo4j` stores (see
+[architecture](architecture.md)). Timing references remain the dated measurements above:
+search 319 s mean (222–525 s), query 187 s with synthesis, search-to-full-text ≈ 10 min, and
+search-to-queryable ≈ 20–30 min. No new October latency or topology probe was performed.
+
+Snapshot usage (operator only, with the project's dependencies installed):
+
+```bash
+.venv/bin/python scripts/snapshot_catalog.py
+```
+
+The verbatim tool is specific to deployment #1: it reads `/data/paper-vault/index.json`,
+PDF/extract directory entries and sizes, and the pool file at
+`/home/leon/lab/papervault/src/papervault/eval/gold_search_pools.jsonl`. Its sole file write is
+the report at `/home/leon/.claude/jobs/ac15ab17/tmp/f0-snapshot-2026-10-18.json`; the output
+parent must already exist and be writable. It never constructs `Library`: records are parsed
+with `Paper` (invalid records are skipped). Both PostgreSQL connections use
+`default_transaction_read_only=on` and issue only `SELECT`s. Supply credentials through the
+existing operator environment, never committed files. The aggregate query accepts
+`PAPERVAULT_POSTGRES_DSN`, then `POSTGRES_DSN`, then `POSTGRES_*` components; the indexed-key
+query uses only components (`POSTGRES_USER=ks`, `POSTGRES_HOST=127.0.0.1`, `POSTGRES_PORT=5432`,
+`POSTGRES_DB=knowledge_system`, plus `POSTGRES_PASSWORD`). Ensure those components identify the
+same store even when a DSN is set. Aggregate-query errors are recorded; indexed-key query
+failures are silently ignored by this frozen script, so a successful process exit alone does
+not validate indexed coverage. The orchestrator reported a successful live run for the frozen
+artifact; reruns require these same input paths and database settings.
+
 ## Arbitration rules (how these numbers may change)
 
 1. **Quality is a hard constraint**: a retrieval-affecting change flips its default only

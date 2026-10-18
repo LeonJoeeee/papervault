@@ -1,4 +1,4 @@
-"""Non-authoritative PostgreSQL shadow catalog; live Library writes stay in JSON."""
+"""Guarded PostgreSQL catalog and optional Library persistence backend."""
 
 from .repository import AuditEvent, CatalogRepository, PendingJob, PostgresCatalogRepository, Record
 

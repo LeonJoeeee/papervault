@@ -29,7 +29,7 @@ class MemoryCatalog:
     def get(self, key):
         return self.records.get(key)
 
-    def upsert(self, record, *, audit):
+    def upsert(self, record, *, audit, expected_revision):
         if self.records.get(record.key) == record:
             return False
         self.records[record.key] = record
@@ -109,10 +109,10 @@ def test_import_resumes_after_a_committed_prefix(tmp_path):
     repo = MemoryCatalog()
     upsert = repo.upsert
 
-    def interrupted(record, *, audit):
+    def interrupted(record, *, audit, expected_revision):
         if record.key == "B":
             raise RuntimeError("interrupted")
-        return upsert(record, audit=audit)
+        return upsert(record, audit=audit, expected_revision=expected_revision)
 
     repo.upsert = interrupted
     with pytest.raises(RuntimeError, match="interrupted"):
@@ -220,13 +220,27 @@ def test_interrupted_import_reports_the_committed_progress(tmp_path):
     repo = MemoryCatalog()
     upsert = repo.upsert
 
-    def interrupted(record, *, audit):
+    def interrupted(record, *, audit, expected_revision):
         if record.key == "B":
             raise RuntimeError("interrupted")
-        return upsert(record, audit=audit)
+        return upsert(record, audit=audit, expected_revision=expected_revision)
 
     repo.upsert = interrupted
     with pytest.raises(RuntimeError) as failure:
         import_catalog(adapter, repo)
     assert failure.value.catalog_report["changed"] == 1
     assert failure.value.catalog_report["difference_rate"] is None
+
+
+def test_import_materializes_jobs_for_active_claims_before_handoff(tmp_path):
+    from papervault.store.importer import import_catalog
+
+    adapter = snapshot(tmp_path, [{"key": "A", "reopen_claim": {
+        "key": "A", "generation": 2, "lease_id": "current", "lease_expiry": 9999999999.,
+        "campaign_id": "c", "phase": "dispatched",
+    }}])
+    repo = MemoryCatalog()
+    report = import_catalog(adapter, repo)
+    assert report["supporting_counts"]["jobs"] == 1
+    assert repo.jobs["reopen:A"].attempts == 2
+    assert repo.jobs["reopen:A"].lease_id == "current"

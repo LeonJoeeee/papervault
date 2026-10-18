@@ -7,7 +7,7 @@ import hashlib
 import json
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from importlib.resources import files
 from typing import Iterator, Protocol
@@ -49,6 +49,7 @@ class Record:
     title: str
     payload: dict
     payload_version: int = 1
+    revision: int = 0
 
     @classmethod
     def from_payload(cls, key: str, payload: dict) -> Record:
@@ -87,12 +88,15 @@ class PendingJob:
     started_at: str | datetime | None = None
     finished_at: str | datetime | None = None
     detail: dict = field(default_factory=dict)
+    lease_id: str | None = None
 
     def __post_init__(self):
         if (any(not isinstance(value, str) or not value.strip()
                 for value in (self.id, self.kind, self.key, self.state))
                 or type(self.attempts) is not int or self.attempts < 0):
             raise ValueError("job requires id, kind, key, state and nonnegative attempts")
+        if self.lease_id is not None and (not isinstance(self.lease_id, str) or not self.lease_id.strip()):
+            raise ValueError("lease_id must be a nonempty string when supplied")
         for name in ("enqueued_at", "started_at", "finished_at"):
             value = getattr(self, name)
             if value is not None:
@@ -121,8 +125,8 @@ class AuditEvent:
 class CatalogRepository(Protocol):
     def get(self, key: str) -> Record | None: ...
     def all(self) -> Iterator[Record]: ...
-    def upsert(self, record: Record, *, audit: AuditEvent) -> bool: ...
-    def set_status(self, key: str, status: str, *, audit: AuditEvent) -> bool: ...
+    def upsert(self, record: Record, *, audit: AuditEvent, expected_revision: int) -> bool: ...
+    def set_status(self, key: str, status: str, *, audit: AuditEvent, expected_revision: int) -> bool: ...
     def list_by_status(self, status: str) -> list[str]: ...
     def resolve_alias(self, key: str) -> str: ...
     def all_aliases(self) -> dict[str, str]: ...
@@ -135,13 +139,26 @@ _RECORD_COLUMNS = (
 )
 
 
+class StaleWrite(RuntimeError):
+    def __init__(self, key: str, expected: int, actual: int | None):
+        self.key, self.expected, self.actual = key, expected, actual
+        super().__init__(f"catalog conflict for {key}: expected revision {expected}, actual {actual}")
+
+
+class StaleCompletion(RuntimeError):
+    """An attempt no longer owns the active catalog job; no completion committed."""
+
+
+class DeletionRefused(RuntimeError):
+    """P2 PG authority retains records until retention/tombstones are specified."""
+
+
 class PostgresCatalogRepository:
     """Synchronous, explicit-connection repository; caller owns connection lifetime.
 
     Supply an autocommit connection so each public write owns its commit. A
-    schema-local transaction lock serializes shadow writers, including alias
-    cycle checks and imports. This deliberately favors integrity over throughput
-    for P1; no live service imports or constructs this repository.
+    schema-local transaction lock serializes writers, including alias cycle
+    checks and imports. Revision predicates still reject stale observations.
     """
 
     def __init__(self, connection, *, schema: str = "catalog", read_only: bool = False):
@@ -153,6 +170,7 @@ class PostgresCatalogRepository:
         self.connection.row_factory = dict_row
         self.schema = schema
         self.read_only = read_only
+        self.fence_id = None
 
     def _table(self, name: str):
         return sql.Identifier(self.schema, name)
@@ -166,7 +184,22 @@ class PostgresCatalogRepository:
         with self.connection.transaction():
             self.connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
                                     ("papervault:" + self.schema,))
+            exists = self.connection.execute("SELECT to_regclass(%s) AS name",
+                                             (self.schema + ".writer_fence",)).fetchone()
+            if exists and exists["name"]:
+                row = self.connection.execute(sql.SQL("SELECT fence_id FROM {}").format(
+                    self._table("writer_fence"))).fetchone()
+                if row and row["fence_id"] and row["fence_id"] != self.fence_id:
+                    from .fencing import WriterFenced
+                    raise WriterFenced("catalog writers durably fenced for handoff")
             yield
+
+    def set_fence(self, fence_id: str | None, *, audit: AuditEvent):
+        with self._write(audit):
+            self.connection.execute(sql.SQL("UPDATE {} SET fence_id = %s").format(
+                self._table("writer_fence")), (fence_id,))
+            self._finish(None, audit)
+        self.fence_id = fence_id
 
     def _finish(self, key: str | None, audit: AuditEvent):
         self.connection.execute(sql.SQL(
@@ -187,51 +220,102 @@ class PostgresCatalogRepository:
             ).format(self._table("schema_version"))).fetchone()
             if row:
                 self._finish(None, audit)
+            row = self.connection.execute(sql.SQL(
+                "INSERT INTO {} (version, name) VALUES (2, 'P2 guarded catalog persistence') "
+                "ON CONFLICT (version) DO NOTHING RETURNING version"
+            ).format(self._table("schema_version"))).fetchone()
+            if row:
+                self._finish(None, audit)
 
     def get(self, key: str) -> Record | None:
         row = self.connection.execute(sql.SQL("SELECT {} FROM {} WHERE key = %s").format(
-            sql.SQL(", ").join(map(sql.Identifier, _RECORD_COLUMNS)), self._table("records"),
+            sql.SQL(", ").join(map(sql.Identifier, (*_RECORD_COLUMNS, "revision"))), self._table("records"),
         ), (key,)).fetchone()
         return Record(**row) if row else None
 
     def all(self) -> Iterator[Record]:
         rows = self.connection.execute(sql.SQL("SELECT {} FROM {} ORDER BY key").format(
-            sql.SQL(", ").join(map(sql.Identifier, _RECORD_COLUMNS)), self._table("records"),
+            sql.SQL(", ").join(map(sql.Identifier, (*_RECORD_COLUMNS, "revision"))), self._table("records"),
         ))
         return (Record(**row) for row in rows)
 
-    def _upsert(self, record: Record, audit: AuditEvent) -> bool:
-        if record != Record.from_payload(record.key, record.payload):
+    def _upsert(self, record: Record, audit: AuditEvent, expected_revision: int) -> bool:
+        if type(expected_revision) is not int or expected_revision < 0:
+            raise ValueError("expected_revision must be a nonnegative integer")
+        if replace(record, revision=0) != Record.from_payload(record.key, record.payload):
             raise ValueError("record columns do not match payload version 1")
+        current = self.get(record.key)
+        if ((current is None and expected_revision != 0)
+                or (current is not None and current.revision != expected_revision)):
+            raise StaleWrite(record.key, expected_revision, current.revision if current else None)
+        if current and replace(current, revision=0) == replace(record, revision=0):
+            return False
         columns = sql.SQL(", ").join(map(sql.Identifier, _RECORD_COLUMNS))
         updates = sql.SQL(", ").join(sql.SQL("{} = EXCLUDED.{}").format(
             sql.Identifier(c), sql.Identifier(c),
         ) for c in _RECORD_COLUMNS if c != "key")
-        old = sql.SQL(", ").join(sql.SQL("existing.{}").format(sql.Identifier(c))
-                                 for c in _RECORD_COLUMNS)
-        new = sql.SQL(", ").join(sql.SQL("EXCLUDED.{}").format(sql.Identifier(c))
-                                 for c in _RECORD_COLUMNS)
         values = [Jsonb(record.payload) if c == "payload" else getattr(record, c)
                   for c in _RECORD_COLUMNS]
         changed = self.connection.execute(sql.SQL(
-            "INSERT INTO {} AS existing ({}) VALUES ({}) ON CONFLICT (key) DO UPDATE "
-            "SET {}, updated_at = now() WHERE ({}) IS DISTINCT FROM ({}) RETURNING key"
+            "INSERT INTO {} AS existing ({}, revision) VALUES ({}, 1) ON CONFLICT (key) DO UPDATE "
+            "SET {}, revision = existing.revision + 1, updated_at = now() "
+            "WHERE existing.revision = %s RETURNING key"
         ).format(self._table("records"), columns,
-                 sql.SQL(", ").join(sql.Placeholder() for _ in values), updates, old, new),
-            values).fetchone()
+                 sql.SQL(", ").join(sql.Placeholder() for _ in values), updates),
+            [*values, expected_revision]).fetchone()
+        if not changed:
+            actual = self.get(record.key)
+            raise StaleWrite(record.key, expected_revision, actual.revision if actual else None)
         if changed:
             self._finish(record.key, audit)
         return bool(changed)
 
-    def upsert(self, record: Record, *, audit: AuditEvent) -> bool:
+    def upsert(self, record: Record, *, audit: AuditEvent, expected_revision: int) -> bool:
         with self._write(audit):
-            return self._upsert(record, audit)
+            previous = self.get(record.key)
+            changed = self._upsert(record, audit, expected_revision)
+            if record.merge == "alias" or (previous and previous.merge == "alias"):
+                before = self.all_aliases().get(record.key)
+                self._sync_aliases([record])
+                if not changed and before != self.all_aliases().get(record.key):
+                    self._finish(record.key, audit)
+            return changed
 
-    def set_status(self, key: str, status: str, *, audit: AuditEvent) -> bool:
+    def flush(self, records, *, expected_revisions: dict[str, int], audit: AuditEvent) -> dict[str, int]:
+        """One atomic delta batch, with one state_flush event per changed key."""
+        records = list(records)
+        revisions = {}
+        with self._write(audit):
+            for record in records:
+                event = replace(audit, detail={**audit.detail, "payload_sha256": record.payload_sha256},
+                                pending_jobs=tuple(j for j in audit.pending_jobs if j.key == record.key))
+                changed = self._upsert(record, event, expected_revisions[record.key])
+                revisions[record.key] = expected_revisions[record.key] + int(changed)
+            self._sync_aliases(records)
+        return revisions
+
+    def _sync_aliases(self, records):
+        # Remove changed projections first so a valid final graph is not
+        # rejected because the previous graph temporarily points the other way.
+        for record in records:
+            self.connection.execute(sql.SQL("DELETE FROM {} WHERE alias_key=%s").format(
+                self._table("aliases")), (record.key,))
+        for record in records:
+            if record.merge == "alias":
+                target = record.payload["terminal_state"]["alias_key"]
+                if not target or target == record.key or self.resolve_alias(target) == record.key:
+                    raise ValueError("invalid alias or alias cycle")
+                self.connection.execute(sql.SQL(
+                    "INSERT INTO {} (alias_key, canonical_key) VALUES (%s, %s)"
+                ).format(self._table("aliases")), (record.key, target))
+
+    def set_status(self, key: str, status: str, *, audit: AuditEvent, expected_revision: int) -> bool:
         with self._write(audit):
             record = self.get(key)
             if record is None:
                 raise KeyError(key)
+            if record.revision != expected_revision:
+                raise StaleWrite(key, expected_revision, record.revision)
             if record.download_status == status:
                 return False
             paper = Paper.model_validate(record.payload)
@@ -248,7 +332,32 @@ class PostgresCatalogRepository:
                 payload["terminal_state"].update({name: state[name] for name in ("retrieval", "cause")})
             else:
                 payload["terminal_state"] = state
-            return self._upsert(Record.from_payload(key, payload), audit)
+            return self._upsert(Record.from_payload(key, payload), audit, expected_revision)
+
+    def check_completion(self, job_id: str, *, attempt: int, lease_id: str):
+        row = self.connection.execute(sql.SQL("SELECT * FROM {} WHERE id = %s").format(
+            self._table("jobs")), (job_id,)).fetchone()
+        if (not row or row["attempts"] != attempt or row["lease_id"] != lease_id
+                or row["state"] not in {"queued", "dispatched"}):
+            raise StaleCompletion(f"stale completion for {job_id}")
+        return row
+
+    def complete_job(self, job_id: str, *, attempt: int, lease_id: str, outcome: str,
+                     expected_attempt: int, expected_lease: str, audit: AuditEvent) -> bool:
+        if outcome not in {"completed", "not_sent", "released", "failed"}:
+            raise ValueError("completion requires a terminal outcome")
+        with self._write(audit):
+            if attempt != expected_attempt or lease_id != expected_lease:
+                raise StaleCompletion(f"stale completion for {job_id}")
+            row = self.connection.execute(sql.SQL(
+                "UPDATE {} SET state = %s, finished_at = now() "
+                "WHERE id = %s AND attempts = %s AND lease_id = %s "
+                "AND state IN ('queued', 'dispatched') RETURNING key"
+            ).format(self._table("jobs")), (outcome, job_id, expected_attempt, expected_lease)).fetchone()
+            if not row:
+                raise StaleCompletion(f"stale completion for {job_id}")
+            self._finish(row["key"], audit)
+            return True
 
     def list_by_status(self, status: str) -> list[str]:
         return [r["key"] for r in self.connection.execute(sql.SQL(
@@ -302,14 +411,26 @@ class PostgresCatalogRepository:
             values["enqueued_at"] = old["enqueued_at"] if old else datetime.now(timezone.utc)
         if old == values:
             return False
+        if old and (job.attempts < old["attempts"] or (
+                job.attempts == old["attempts"] and (
+                    job.lease_id != old["lease_id"]
+                    or (old["state"] not in {"pending", "queued", "dispatched"}
+                        and job.state in {"queued", "dispatched"})))):
+            raise StaleCompletion(f"job snapshot regresses active/settled attempt for {job.id}")
         columns = list(values)
-        self.connection.execute(sql.SQL(
-            "INSERT INTO {} ({}) VALUES ({}) ON CONFLICT (id) DO UPDATE SET {}"
+        changed = self.connection.execute(sql.SQL(
+            "INSERT INTO {} AS existing ({}) VALUES ({}) ON CONFLICT (id) DO UPDATE SET {} "
+            "WHERE existing.attempts = %s AND existing.lease_id IS NOT DISTINCT FROM %s "
+            "AND existing.state = %s RETURNING id"
         ).format(self._table("jobs"), sql.SQL(", ").join(map(sql.Identifier, columns)),
                  sql.SQL(", ").join(sql.Placeholder() for _ in columns),
                  sql.SQL(", ").join(sql.SQL("{} = EXCLUDED.{}").format(
                      sql.Identifier(c), sql.Identifier(c)) for c in columns if c != "id")),
-            [Jsonb(value) if column == "detail" else value for column, value in values.items()])
+            [*[Jsonb(value) if column == "detail" else value for column, value in values.items()],
+             old["attempts"] if old else None, old["lease_id"] if old else None,
+             old["state"] if old else None]).fetchone()
+        if not changed:
+            raise StaleCompletion(f"job changed during snapshot write for {job.id}")
         return True
 
     def import_job(self, job: PendingJob, *, audit: AuditEvent) -> bool:

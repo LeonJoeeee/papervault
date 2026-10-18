@@ -46,6 +46,18 @@ def _supporting_inputs(adapter, records, ledger_path, jobs_path):
     if not isinstance(job_data, dict) or not isinstance(job_data.get("jobs"), list):
         raise ValueError("job snapshot must contain a jobs list")
     jobs = [PendingJob(**row) for row in job_data["jobs"]]
+    explicit = {job.id: job for job in jobs}
+    for record in records:
+        claim = record.payload.get("reopen_claim")
+        if claim and claim["phase"] in {"queued", "dispatched"}:
+            job = PendingJob("reopen:" + record.key, "reopen", record.key,
+                state=claim["phase"], attempts=claim["generation"], lease_id=claim["lease_id"],
+                detail={"campaign_id": claim["campaign_id"]})
+            if job.id not in explicit:
+                jobs.append(job)
+            elif any(getattr(explicit[job.id], field) != getattr(job, field)
+                     for field in ("kind", "key", "state", "attempts", "lease_id")):
+                raise ValueError("job snapshot disagrees with active record claim")
     keys = {record.key for record in records}
     aliases, errors = {}, []
     for record in records:
@@ -123,10 +135,14 @@ def import_catalog(adapter: LibraryAdapter, repository=None, *, ledger_path=None
             report["target_total"] = len(existing)
             return report
         report["phase"] = "records"
-        for record in records:
+        def alias_depth(key):
+            return 1 + alias_depth(aliases[key]) if key in aliases else 0
+
+        for record in sorted(records, key=lambda row: (alias_depth(row.key), row.key)):
+            previous = existing.get(record.key)
             report["changed"] += repository.upsert(record, audit=event(
                 "snapshot_record", payload_sha256=record.payload_sha256,
-            ))
+            ), expected_revision=previous.revision if previous else 0)
         report["phase"] = "aliases"
         for alias, canonical in sorted(aliases.items()):
             report["supporting_changed"]["aliases"] += repository.add_alias(

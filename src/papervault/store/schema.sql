@@ -1,4 +1,4 @@
--- P1 shadow only. No public/LightRAG objects are referenced or modified.
+-- Catalog only. No public/LightRAG objects are referenced or modified.
 -- Identity uniqueness is installed by the importer AFTER conflict classification.
 CREATE SCHEMA IF NOT EXISTS catalog;
 
@@ -7,6 +7,11 @@ CREATE TABLE IF NOT EXISTS catalog.schema_version (
     name TEXT NOT NULL,
     applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS catalog.writer_fence (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    fence_id TEXT
+);
+INSERT INTO catalog.writer_fence (singleton) VALUES (TRUE) ON CONFLICT DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS catalog.records (
     key TEXT PRIMARY KEY,
@@ -27,6 +32,7 @@ CREATE TABLE IF NOT EXISTS catalog.records (
         AND payload ? 'key' AND payload ->> 'key' = key)
 );
 CREATE INDEX IF NOT EXISTS records_status_idx ON catalog.records (download_status);
+ALTER TABLE catalog.records ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS catalog.aliases (
     alias_key TEXT PRIMARY KEY,
@@ -75,6 +81,7 @@ CREATE TABLE IF NOT EXISTS catalog.derivations (
     recipe JSONB NOT NULL,
     published_at TIMESTAMPTZ NOT NULL
 );
+ALTER TABLE catalog.jobs ADD COLUMN IF NOT EXISTS lease_id TEXT;
 
 CREATE OR REPLACE FUNCTION catalog.reject_history_change() RETURNS trigger
 LANGUAGE plpgsql AS $$

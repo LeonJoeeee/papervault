@@ -209,9 +209,18 @@ def _author_lastname_jaccard(authors_a: list[str], authors_b: list[str]) -> floa
 class Library:
     """A directory holding library.bib + index.json + pdfs/ + extracts/."""
 
-    def __init__(self, root: Optional[str | Path] = None):
+    def __init__(self, root: Optional[str | Path] = None, *, authority: str | None = None,
+                 _handoff_token: str | None = None):
         import threading
         import weakref
+        authority = authority or os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json")
+        if authority not in {"json", "postgres"}:
+            raise ValueError("PAPERVAULT_CATALOG_AUTHORITY must be json or postgres")
+        self._catalog_backend = None
+        if authority == "postgres":
+            from papervault.store.persistence import PostgresPersistence
+            self._catalog_backend = PostgresPersistence.from_environment()
+            self._catalog_backend.fence_id = _handoff_token
         self._merge_execution_lock = threading.RLock()
         self._merge_active: dict[str, int] = {}
         self._merge_queues = weakref.WeakSet()
@@ -225,6 +234,12 @@ class Library:
         # env read is not — a tilde path (the style .env.example ships) would otherwise
         # become a literal cwd-relative './~/...' dir, diverging from what doctor reports.
         self.root = Path(os.path.expanduser(str(root or env_root or config.VAULT_PATH)))
+        from filelock import FileLock
+        self._catalog_save_lock = FileLock(str(self.root / ".write.lock")) if self._catalog_backend else None
+        from papervault.store.fencing import writer_lease
+        lease = writer_lease(self.root, authority, handoff_token=_handoff_token)
+        self._writer_finalizer = weakref.finalize(self, lease.close) if lease else None
+        self._writer_closed = False
         self.bib_path = self.root / "library.bib"
         self.index_path = self.root / "index.json"
         # D14: the last known-good index, rotated in on every successful save.
@@ -260,9 +275,26 @@ class Library:
         self.correction_next_at = 0.0
         self._load()
 
+    def close(self) -> None:
+        """Release the writer fence when an embedded Library's lifetime ends."""
+        if self._writer_finalizer:
+            self._writer_finalizer()
+        self._writer_closed = True
+
+    def _check_writer(self):
+        if self._writer_closed:
+            from papervault.store.fencing import WriterFenced
+            raise WriterFenced("Library is closed; reopen under the current catalog authority")
+
     # ----- load / save -----
 
     def _load(self) -> None:
+        if self._catalog_backend is not None:
+            self._papers = self._catalog_backend.load()
+            for paper in self._papers.values():
+                self._state_v2_fingerprints[paper.key] = hash(paper.model_dump_json())
+                self._reindex(paper)
+            return
         if not self.index_path.exists():
             # No primary index. If a backup survived (e.g. the primary was
             # truncated to zero bytes by a crash mid-write and then the half
@@ -345,6 +377,10 @@ class Library:
             self._by_title[nt] = key
 
     def _save_index(self, *, durable: bool = False) -> None:
+        self._check_writer()
+        if self._catalog_backend is not None:
+            self._save_catalog()
+            return
         # Metadata/queue saves must not strip an unsupported format header,
         # even with v2 flags off. Refuse before rotating the last-good index.
         from .state_v2 import check_index_readable
@@ -391,6 +427,38 @@ class Library:
         data = {"version": 1, "papers": records}
         _atomic_write(self.index_path, json.dumps(data, ensure_ascii=False, indent=2), durable=durable)
         self._state_v2_fingerprints = fingerprints
+
+    def _save_catalog(self) -> None:
+        from papervault.store.persistence import CatalogConflict
+        # The PG delta preserves raw legacy payloads. Metadata edits must not
+        # materialize read-derived state; ingress/status writers record actual
+        # acquisition changes before this persistence boundary.
+        try:
+            self._catalog_backend.save(self._papers)
+        except CatalogConflict as exc:
+            self._index_dirty = True
+            self.log({"event": "catalog_conflict", "keys": list(exc.keys)})
+            raise
+        self._by_doi.clear()
+        self._by_arxiv.clear()
+        self._by_title.clear()
+        for paper in self._papers.values():
+            self._state_v2_fingerprints[paper.key] = hash(paper.model_dump_json())
+            self._reindex(paper)
+
+    def catalog_completion(self, token):
+        from contextlib import contextmanager, nullcontext
+        if not self._catalog_backend:
+            return nullcontext()
+
+        @contextmanager
+        def guarded():
+            # All paths take file lock -> PG lock in the same order. save()
+            # reenters this exact FileLock instance during staged publication.
+            with self._catalog_save_lock.acquire(timeout=30):
+                with self._catalog_backend.completion(token):
+                    yield
+        return guarded()
 
     def _primary_sane(self) -> bool:
         """Cheap structural check (no full parse) that the primary index looks like a
@@ -440,6 +508,7 @@ class Library:
         Campaign callers pass ``force=True, durable=True`` to bypass debounce and
         require a stable-storage acknowledgment for the index.
         """
+        self._check_writer()
         now = time.monotonic()
         if (not force and self._save_min_interval > 0
                 and (now - self._last_index_save) < self._save_min_interval):
@@ -448,10 +517,11 @@ class Library:
         from filelock import FileLock, Timeout
         lock_path = self.root / ".write.lock"
         try:
-            with FileLock(str(lock_path), timeout=lock_timeout):
+            write_lock = self._catalog_save_lock or FileLock(str(lock_path), timeout=lock_timeout)
+            with write_lock.acquire(timeout=lock_timeout):
                 self._save_index(durable=durable)
                 self._last_index_save = time.monotonic()
-                self._index_dirty = False
+                self._index_dirty = self._catalog_backend.dirty(self._papers) if self._catalog_backend else False
                 if force or (now - self._last_bib_save) >= self._bib_min_interval:
                     self._save_bib()
                     self._last_bib_save = time.monotonic()
@@ -708,6 +778,10 @@ class Library:
 
         Returns a dict describing what was removed.
         """
+        self._check_writer()
+        if self._catalog_backend is not None:
+            from papervault.store.repository import DeletionRefused
+            raise DeletionRefused("PG purge is refused in P2; retention/tombstones await P5")
         existing = self._papers.get(key)
         if existing is None:
             return {"key": key, "removed": False, "reason": "not in library"}
@@ -812,6 +886,9 @@ class Library:
             holder = self.find(doi=(doi or "").strip())
             if (merge_v2_enabled() and holder is not None
                     and holder.key in {intent.canonical_key, intent.absorbed_key}):
+                if self._catalog_backend is not None:
+                    from papervault.store.repository import DeletionRefused
+                    raise DeletionRefused("PG identity collision merge is refused in P2")
                 from .merge_v2 import MergeStore, write_locked
                 merged = write_locked(lambda: MergeStore(self)._merge_records(
                     intent.canonical_key, intent.absorbed_key))
@@ -831,6 +908,9 @@ class Library:
                 return ("merge_waiting", holder_key)
             holder_key = holder.key
         if holder_key is not None and holder_key != key:
+            if self._catalog_backend is not None:
+                from papervault.store.repository import DeletionRefused
+                raise DeletionRefused("PG identity collision merge is refused in P2")
             # A twin already owns this DOI. Merge the stub's blank-fill fields
             # into the holder (journal-DOI side wins identity), then purge the
             # stub. We DO NOT write the duplicate DOI onto the stub — that would

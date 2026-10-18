@@ -52,7 +52,7 @@ def test_record_event_and_pending_job_commit_together():
 
     conn = TransactionConnection()
     repo = PostgresCatalogRepository(conn)
-    repo.upsert(Record.from_payload("A", {"key": "A"}), audit=AuditEvent(
+    repo.upsert(Record.from_payload("A", {"key": "A"}), expected_revision=0, audit=AuditEvent(
         actor="test", event="registered", pending_jobs=(PendingJob("job-A", "extract", "A"),),
     ))
     assert len(conn.committed) == 3
@@ -70,20 +70,21 @@ def test_failed_audit_or_job_rolls_back_the_mutation(fail_table):
     conn = TransactionConnection(fail_table=fail_table)
     repo = PostgresCatalogRepository(conn)
     with pytest.raises(RuntimeError, match="injected database failure"):
-        repo.upsert(Record.from_payload("A", {"key": "A"}), audit=AuditEvent(
+        repo.upsert(Record.from_payload("A", {"key": "A"}), expected_revision=0, audit=AuditEvent(
             actor="test", event="registered", pending_jobs=(PendingJob("job-A", "extract", "A"),),
         ))
     assert conn.committed == []
     assert conn.staged == []
 
 
-def test_unchanged_record_does_not_emit_events_or_jobs():
+def test_unchanged_record_does_not_emit_events_or_jobs(monkeypatch):
     from papervault.store.repository import AuditEvent, PostgresCatalogRepository, Record
 
     conn = TransactionConnection(changed=False)
-    assert not PostgresCatalogRepository(conn).upsert(
-        Record.from_payload("A", {"key": "A"}), audit=AuditEvent("test", "import"),
-    )
+    repo = PostgresCatalogRepository(conn)
+    record = Record.from_payload("A", {"key": "A"})
+    monkeypatch.setattr(repo, "get", lambda key: record)
+    assert not repo.upsert(record, expected_revision=0, audit=AuditEvent("test", "import"))
     assert not any('"audit"' in query for query, _ in conn.committed)
 
 
@@ -96,7 +97,7 @@ def test_audit_is_required_and_read_only_repository_refuses_writes():
     with pytest.raises(TypeError):
         repo.upsert(record)
     with pytest.raises(PermissionError):
-        repo.upsert(record, audit=AuditEvent("test", "import"))
+        repo.upsert(record, expected_revision=0, audit=AuditEvent("test", "import"))
     assert conn.committed == []
 
 
@@ -119,8 +120,8 @@ def test_status_reset_preserves_legacy_unknown_policy(state, monkeypatch):
     repo = PostgresCatalogRepository(TransactionConnection())
     monkeypatch.setattr(repo, "get", lambda key: original)
     written = []
-    monkeypatch.setattr(repo, "_upsert", lambda record, audit: written.append(record) or True)
-    assert repo.set_status("A", "pending", audit=AuditEvent("test", "reset"))
+    monkeypatch.setattr(repo, "_upsert", lambda record, audit, expected_revision: written.append(record) or True)
+    assert repo.set_status("A", "pending", expected_revision=0, audit=AuditEvent("test", "reset"))
     assert written[0].retrieval == "eligible"
     assert written[0].policy == "unknown"
     assert written[0].payload["terminal_state"]["policy"] == "unknown"
@@ -135,8 +136,8 @@ def test_status_change_preserves_unknown_nested_state_fields(monkeypatch):
     repo = PostgresCatalogRepository(TransactionConnection())
     monkeypatch.setattr(repo, "get", lambda key: record)
     written = []
-    monkeypatch.setattr(repo, "_upsert", lambda record, audit: written.append(record) or True)
-    repo.set_status("A", "pending", audit=AuditEvent("test", "reset"))
+    monkeypatch.setattr(repo, "_upsert", lambda record, audit, expected_revision: written.append(record) or True)
+    repo.set_status("A", "pending", expected_revision=0, audit=AuditEvent("test", "reset"))
     assert written[0].payload["terminal_state"]["future"] == {"keep": 42}
 
 

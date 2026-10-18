@@ -20,6 +20,14 @@ One Python package (`papervault`), one server process, subsystems as modules:
 
 Boundaries: the library→knowledge hand-off is the on-disk vault — single writer (library), one reader (knowledge scheduler) — with reader and writer versioned together inside the package. External processes: MinerU OCR service (HTTP through its gate; service-owned stop/start and recovery; no library pre-flight, with workload waking a stopped backend and client discovery/parse errors determining reachability), Neo4j + Postgres (docker-compose), the operator LLM endpoint (OpenAI-compatible).
 
+P2 preparation adds an opt-in `PAPERVAULT_CATALOG_AUTHORITY=postgres` backend behind
+Library's existing working set. It reads catalog records and commits revision-guarded
+delta batches with audit/pending work; JSON becomes a separately generated export.
+Unset/`json` retains the existing behavior. PG deletion is refused in P2. The
+[catalog persistence ADR](adr/DRAFT-catalog-persistence-cutover.md) records commit
+semantics, completion guards and rehearsal fencing; the
+[readiness checklist](specs/2026-10-18-p2-readiness.md) keeps live activation owner-gated.
+
 Deployment #1 retains the legacy container names `ks-postgres` and `ks-neo4j`; production data lives in the existing Docker volumes `ks-pgdata` and `ks-neo4jdata`, declared external in `deploy/docker-compose.yml`. A future move off these names requires a maintenance window: stop PaperVault and both stores, copy each volume to its new name, update Compose, bring the stores up, and verify data and connectivity before resuming PaperVault. Preserve the original volumes for rollback: stop the replacement stores, restore the original Compose names and volumes, and bring the original stores up before resuming PaperVault.
 
 ## Key quality goals

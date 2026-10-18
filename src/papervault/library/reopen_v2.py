@@ -19,6 +19,8 @@ from .services import concurrency
 from .services.identity_backfill import read_identity_records
 from .state_v2 import Merge, Retrieval, check_index_readable, effective_policy, resolved_identity
 from .store import Library, _fsync_dir
+from papervault.store.repository import StaleCompletion
+from papervault.store.persistence import CatalogConflict
 from .telemetry_v2 import identity_snapshot, publication_fields, record_censored
 
 _IDENTITY_FIELDS = {"key", "doi", "arxiv_id", "paper_id", "inspire_record_id", "url", "title", "authors", "year"}
@@ -93,10 +95,11 @@ class StagedAttempt:
     def __init__(self, library: Library, token):
         check_index_readable(library.root)
         self.live, self.token = library, token
+        self.publication_uncertain = False
         self.before = library.get(token.key).model_copy(deep=True)
         self.root = library.root / ".reopen-staging" / token.lease_id
         self.root.mkdir(parents=True, exist_ok=False)
-        self.library = Library(self.root)
+        self.library = Library(self.root, authority="json")
         self.library._telemetry_live = library
         # The isolated artifacts do not own accounting. Merge generation
         # fencing must consult the same durable history as the live executor.
@@ -116,6 +119,7 @@ class StagedAttempt:
         return getattr(self.library, f"{kind}_path")(self.token.key)
 
     def cleanup(self) -> None:
+        self.library.close()
         shutil.rmtree(self.root)
 
     def _publication_refusal(self, store, paper, result):
@@ -161,40 +165,61 @@ class StagedAttempt:
                         store._quarantine(paper, "live artifact changed during execution")
                         return False
                     changed[kind] = digest
-            fills = {name: getattr(result, name) for name in ("doi", "arxiv_id")
-                     if not getattr(self.before, name) and getattr(result, name)}
-            measurement_identity = identity_snapshot(self.before, library=self.live) if stoprules_v2_enabled() else None
-            if fills:
-                # The publication fences above authorize only this existing
-                # dispatched result, including same-row verified blank fills.
-                applied = self.live._fill_verified_identifiers(paper, **fills,
-                    provenance={"operation": "reopen", "generation": self.token.generation})
-                if applied != fills:
-                    store._quarantine(paper, "identity fill refused at publication")
+            before_publication = paper.model_copy(deep=True)
+            try:
+                with self.live.catalog_completion(self.token):
+                    fills = {name: getattr(result, name) for name in ("doi", "arxiv_id")
+                             if not getattr(self.before, name) and getattr(result, name)}
+                    measurement_identity = identity_snapshot(self.before, library=self.live) if stoprules_v2_enabled() else None
+                    if fills:
+                        # The publication fences above authorize only this existing
+                        # dispatched result, including same-row verified blank fills.
+                        applied = self.live._fill_verified_identifiers(paper, **fills,
+                            provenance={"operation": "reopen", "generation": self.token.generation})
+                        if applied != fills:
+                            store._quarantine(paper, "identity fill refused at publication")
+                            return False
+                        if stoprules_v2_enabled():
+                            # Advance only after the fenced writer acknowledges every
+                            # authorized blank fill, preserving existing adoption.
+                            measurement_identity = identity_snapshot(self.before.model_copy(update=applied))
+                    self.publication_uncertain = True
+                    for kind, digest in changed.items():
+                        live_path = getattr(self.live, f"{kind}_path")(paper.key)
+                        if digest is None:
+                            live_path.unlink(missing_ok=True)
+                        else:
+                            temporary = live_path.with_suffix(live_path.suffix + ".reopen.tmp")
+                            with temporary.open("wb") as stream:
+                                stream.write(self.path(kind).read_bytes())
+                                stream.flush()
+                                os.fsync(stream.fileno())
+                            os.replace(temporary, live_path)
+                        _fsync_dir(live_path.parent, durable=True)
+                        setattr(paper, f"{kind}_path", str(live_path.relative_to(self.live.root)) if digest else None)
+                    for field in _RESULT_FIELDS:
+                        if getattr(result, field) != getattr(self.before, field) and getattr(paper, field) == getattr(self.before, field):
+                            setattr(paper, field, getattr(result, field))
+                    paper.download_status = result.download_status
+                    paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "completed"})
+                    store.save()
+            except BaseException as exc:
+                # A failed/unknown catalog commit cannot authorize a subsequent
+                # quarantine save of the uncommitted completed working object.
+                for name in type(paper).model_fields:
+                    setattr(paper, name, getattr(before_publication, name))
+                self.live._by_doi.clear()
+                self.live._by_arxiv.clear()
+                self.live._by_title.clear()
+                for retained in self.live._papers.values():
+                    self.live._reindex(retained)
+                self.live._index_dirty = True
+                if isinstance(exc, (StaleCompletion, CatalogConflict)):
+                    self.live.log({"event": "catalog_conflict", "key": self.token.key,
+                                   "reason": type(exc).__name__})
                     return False
-                if stoprules_v2_enabled():
-                    # Advance only after the fenced writer acknowledges every
-                    # authorized blank fill, preserving existing adoption.
-                    measurement_identity = identity_snapshot(self.before.model_copy(update=applied))
-            for kind, digest in changed.items():
-                live_path = getattr(self.live, f"{kind}_path")(paper.key)
-                if digest is None:
-                    live_path.unlink(missing_ok=True)
-                else:
-                    temporary = live_path.with_suffix(live_path.suffix + ".reopen.tmp")
-                    with temporary.open("wb") as stream:
-                        stream.write(self.path(kind).read_bytes())
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    os.replace(temporary, live_path)
-                _fsync_dir(live_path.parent, durable=True)
-                setattr(paper, f"{kind}_path", str(live_path.relative_to(self.live.root)) if digest else None)
-            for field in _RESULT_FIELDS:
-                if getattr(result, field) != getattr(self.before, field) and getattr(paper, field) == getattr(self.before, field):
-                    setattr(paper, field, getattr(result, field))
-            paper.download_status = result.download_status
-            paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "completed"})
-            store.save()
+                raise
+            self.publication_uncertain = False
             store.ledger.complete(self.token)
             self.live.log({"event": "reopen_complete", "key": paper.key,
                            "generation": self.token.generation, "lease_id": self.token.lease_id,
@@ -306,7 +331,7 @@ async def process_attempt(queue, token, priority):
         if expiry is not None:
             expiry.cancel()
             await asyncio.gather(expiry, return_exceptions=True)
-        if stage is not None and drained:
+        if stage is not None and drained and not stage.publication_uncertain:
             stage.cleanup()
 
 

@@ -414,6 +414,19 @@ must be censored. Request counts/status/rate headers and same-window host proces
 memory measurements remain necessary to validate upstream limits and resource costs.
 This instrumentation changes neither the four workers nor the four semaphore permits.
 
+## Catalog persistence preparation
+
+The default authority remains `index.json`. The optional
+`PAPERVAULT_CATALOG_AUTHORITY=postgres` backend requires an explicit
+`PAPERVAULT_CATALOG_DSN` and a migrated catalog. Library saves commit guarded delta
+batches with audit and pending work; stale conflicts surface as `catalog_conflict`.
+PG saves leave JSON untouched; run `scripts/export_catalog.py --output <path> --verify`
+for the canonical export. PG purge/deletion is refused during P2.
+
+The [readiness checklist and rehearsal runbook](docs/specs/2026-10-18-p2-readiness.md)
+cover the copy-only cutover/rollback tools and remaining owner gates. Live activation
+is not authorized by this release.
+
 ## Releases
 
 papervault is consumed **by pin** (ADR-0001): deployments track an annotated git tag

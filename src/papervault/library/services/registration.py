@@ -24,7 +24,7 @@ from papervault.library.models import Paper, normalize_title
 from papervault.library.sources.identity import normalized_source_identities, merge_source_identities
 from papervault.library.sources.inspire import merge_inspire_fields, retained_inspire_fields
 from papervault.library.state_v2 import Policy, Retrieval, TerminalState, admission, effective_policy
-from papervault.library.store import _normalize_arxiv, _normalize_doi, _validate_paper_metadata
+from papervault.library.store import _validate_paper_metadata
 from papervault.library.services.bm25_search import paper_to_dict
 from papervault.store.persistence import _overlay
 from papervault.store.repository import AuditEvent, PendingJob, Record, payload_hash
@@ -244,26 +244,27 @@ class RegistrationService:
         lib._check_writer()
         backend = lib._catalog_backend
         with lib._catalog_save_lock.acquire(timeout=30) if backend else nullcontext():
+            replace_json_snapshot = False
             while True:
                 try:
                     if backend:
                         return self._register_postgres(candidates, actor=actor, reason=reason)
-                    return self._register_json(candidates, actor=actor, reason=reason)
+                    return self._register_json(candidates, actor=actor, reason=reason,
+                                               replace_snapshot=replace_json_snapshot)
                 except _RegistrationIdentityChanged:
                     # A verified fill won during staging IO. PG rolls back the
                     # entire stale batch; JSON replaces its isolated snapshot.
                     # Re-stage against the winner, never publish a second key.
+                    replace_json_snapshot = True
                     continue
 
     def _check_publication(self, changed):
-        """Called under the live identity lock, checking every incoming axis."""
+        """Check only identities actually adopted by the staged records."""
         for key, outcome in changed.items():
-            for observation in outcome["observations"]:
-                for name in ("doi", "arxiv_id"):
-                    if value := observation.get(name):
-                        owner = self.library.find(**{name: value})
-                        if owner is not None and owner.key != key:
-                            raise _RegistrationIdentityChanged
+            for name, token in outcome["identifiers"].items():
+                owner = self.library._identifier_owner(name, token)
+                if owner is not None and owner.key != key:
+                    raise _RegistrationIdentityChanged
 
     @contextmanager
     def _reserve_publication(self, changed):
@@ -277,12 +278,10 @@ class RegistrationService:
             with lib._merge_execution_lock:
                 self._check_publication(changed)
                 for key, outcome in changed.items():
-                    for observation in outcome["observations"]:
-                        for name, normalize in (("doi", _normalize_doi), ("arxiv_id", _normalize_arxiv)):
-                            if value := normalize(observation.get(name) or ""):
-                                claim = (name, value, key, object())
-                                reservations.add(claim)
-                                lib._identity_reservations.add(claim)
+                    for name, token in outcome["identifiers"].items():
+                        claim = (name, token, key, object())
+                        reservations.add(claim)
+                        lib._identity_reservations.add(claim)
             yield
         finally:
             with lib._merge_execution_lock:
@@ -344,7 +343,8 @@ class RegistrationService:
             # Publish only after outer commit, preserving live objects and
             # any worker field edits made while IO was in progress.
             with lib._merge_execution_lock:
-                self._check_publication(changed)
+                # Adopted identities are fenced through this publication. No
+                # postcommit re-staging: the batch is already authoritative.
                 captured = {}
                 for record in accepted:
                     current = lib.get(record.key)
@@ -358,7 +358,7 @@ class RegistrationService:
                     lib._reindex(lib.get(record.key))
             return outcomes
 
-    def _register_json(self, candidates, *, actor, reason):
+    def _register_json(self, candidates, *, actor, reason, replace_snapshot=False):
         lib = self.library
         # JSON compatibility remains behind the same command, never serving.
         # Its legacy file format does not provide PG's transactional outbox.
@@ -366,7 +366,9 @@ class RegistrationService:
             view = _view(lib, lib._papers)
             captured = {key: p.model_dump(mode="json") for key, p in lib._papers.items()}
             outcomes, changed = self._stage(view, candidates)
-        if changed:
+        if changed or replace_snapshot:
+            # A discarded snapshot may already be on disk. Even an empty retry
+            # must replace it with the current live records and restrictions.
             # Write an isolated working set. No serving identity lock is held
             # across disk IO, and failed saves never publish staged objects.
             view.save(force=True)
@@ -475,6 +477,11 @@ class RegistrationService:
                 outcome["observations"] = []
                 changed[paper.key] = outcome
             changed[paper.key]["observations"].append(observed)
+        for key, outcome in changed.items():
+            paper = view.get(key)
+            outcome["identifiers"] = {
+                name: token for name in ("doi", "arxiv_id")
+                if (token := view._identifier_token(name, getattr(paper, name), paper.source))}
         return outcomes, changed
 
 

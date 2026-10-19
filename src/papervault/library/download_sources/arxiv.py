@@ -12,7 +12,7 @@ import requests
 from urllib3.exceptions import HTTPError
 
 from ..models import ArxivWithdrawal, Paper, canonicalize_author, normalize_title
-from ._shared import TIMEOUT, USER_AGENT, _is_pdf_bytes, log
+from ._shared import Library, TIMEOUT, USER_AGENT, _adopt_source_identifiers, _is_pdf_bytes, log
 
 
 _ID = re.compile(r"(?P<base>(?:[0-9]{4}\.[0-9]{4,5}|[a-z][a-z.-]*/[0-9]{7}))(?:v[1-9][0-9]*)?")
@@ -245,8 +245,7 @@ def _remember_withdrawal(paper: Paper, record: _ArxivRecord) -> None:
     )
 
 
-def _prepare_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
-    from ..telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
+def _prepare_arxiv(paper: Paper, *, library: Optional[Library] = None) -> Optional[_ArxivRecord]:
     identifier = _arxiv_input(paper)
     if not identifier:
         return None
@@ -254,12 +253,16 @@ def _prepare_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
     if record.status == "not_found":
         log.warning("arxiv[%s]: confirmed missing base — clearing arxiv_id=%r (keeping doi=%r)",
                     paper.key, paper.arxiv_id, paper.doi)
-        paper.arxiv_id = ""
+        if library is None:
+            paper.arxiv_id = ""
+        else:
+            with library._merge_execution_lock:
+                paper.arxiv_id = ""
+                library._reindex(paper)
     elif record.status == "found":
         if not paper.arxiv_id:
-            before = adoption_snapshot(paper)
-            paper.arxiv_id = identifier
-            acknowledge_identity_adoption(paper, before, {"arxiv_id": identifier})
+            if not _adopt_source_identifiers(paper, library, arxiv_id=identifier):
+                return None
         if record.withdrawn:
             _remember_withdrawal(paper, record)
     return record
@@ -282,10 +285,10 @@ def _try_arxiv_with_record(paper: Paper, record: Optional[_ArxivRecord]) -> Opti
     return None
 
 
-def _try_arxiv(paper: Paper) -> Optional[bytes]:
+def _try_arxiv(paper: Paper, *, library: Optional[Library] = None) -> Optional[bytes]:
     if _confirmed_arxiv_withdrawal(paper):
         return None
-    return _try_arxiv_with_record(paper, _prepare_arxiv(paper))
+    return _try_arxiv_with_record(paper, _prepare_arxiv(paper, library=library))
 
 
 def _arxiv_title_has_identity(paper: Paper, record: Optional[_ArxivRecord] = None) -> bool:
@@ -300,7 +303,8 @@ def _arxiv_title_has_identity(paper: Paper, record: Optional[_ArxivRecord] = Non
                 and _base_id(identifier) == _base_id(record.requested_id))
 
 
-def _try_arxiv_by_title(paper: Paper, *, record: Optional[_ArxivRecord] = None) -> Optional[bytes]:
+def _try_arxiv_by_title(paper: Paper, *, record: Optional[_ArxivRecord] = None,
+                        library: Optional[Library] = None) -> Optional[bytes]:
     """When the paper has no arxiv_id but has a title, search arxiv by
     title to discover an arxiv preprint version. Many papers in
     paywalled journals have arxiv preprints whose ID didn't get captured
@@ -372,13 +376,11 @@ def _try_arxiv_by_title(paper: Paper, *, record: Optional[_ArxivRecord] = None) 
         matched_author = any(len(name) >= 5 and name in names for name in
                              (normalize_title(canonicalize_author(a)) for a in record.authors))
         if normalize_title(record.title) == normalize_title(paper.title) and matched_author:
-            paper.arxiv_id = discovered_arxiv_id
-            paper.arxiv_withdrawal = candidate.arxiv_withdrawal
+            if _adopt_source_identifiers(paper, library, arxiv_id=discovered_arxiv_id):
+                paper.arxiv_withdrawal = candidate.arxiv_withdrawal
         return None
     data = _try_arxiv_with_record(candidate, record)
     if data:
-        from ..telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
-        before = adoption_snapshot(paper)
-        paper.arxiv_id = discovered_arxiv_id
-        acknowledge_identity_adoption(paper, before, {"arxiv_id": discovered_arxiv_id})
+        if not _adopt_source_identifiers(paper, library, arxiv_id=discovered_arxiv_id):
+            return None
     return data

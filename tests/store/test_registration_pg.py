@@ -271,3 +271,42 @@ async def test_registration_commit_reservation_is_read_safe_and_released_on_roll
         assert queued == [key]
     lib.save(force=True)
     assert len([r for r in repo.all() if r.doi == "10.1234/registration"]) == 1
+
+
+async def test_observation_only_fill_after_commit_does_not_retry_committed_batch(repo, tmp_path, monkeypatch):
+    lib = pg_library(repo, tmp_path, monkeypatch)
+    original, _ = lib.upsert(candidate(doi="", arxiv_id="2401.12345"))
+    worker, _ = lib.upsert(candidate(doi="", title="Independent proton detector observations"))
+    lib.save(force=True)
+    service = RegistrationService(lib, SimpleNamespace(add=lambda key: pytest.fail("duplicate acquisition")))
+    write, depth, commits = repo._write, 0, []
+
+    @contextmanager
+    def fill_after_commit(audit):
+        nonlocal depth
+        depth += 1
+        try:
+            with write(audit):
+                yield
+            if depth == 1 and audit.event == "registration":
+                commits.append(audit.detail["command_id"])
+                assert not any(c[0] == "doi" for c in lib._identity_reservations)
+                assert lib.fill_verified_identifiers(worker.key, doi="10.1234/registration") == {
+                    "doi": "10.1234/registration"}
+        finally:
+            depth -= 1
+
+    monkeypatch.setattr(repo, "_write", fill_after_commit)
+    outcomes = await service.register_candidates([candidate(arxiv_id="2401.12345")],
+                                                actor="test", reason="observation-commit-gap")
+    assert outcomes[0]["status"] == "duplicate"
+    assert outcomes[0]["key"] == original.key
+    assert commits == ["observation-commit-gap"]
+    events = rows(repo, "audit", "event='registration'")
+    assert len(events) == 1
+    assert events[0]["detail"]["observations"][0]["doi"] == "10.1234/registration"
+    assert repo.get(original.key).payload["doi"] == original.doi == ""
+    assert worker.doi == "10.1234/registration"
+    assert lib._catalog_backend.dirty(lib._papers)
+    lib.save(force=True)
+    assert repo.get(worker.key).payload["doi"] == "10.1234/registration"

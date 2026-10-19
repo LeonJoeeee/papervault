@@ -114,30 +114,32 @@ def test_find_uses_current_fields_after_in_place_worker_updates(tmp_path, field,
     ("doi", "10.1234/reserved", "https://doi.org/10.1234/RESERVED"),
     ("arxiv_id", "0708.2587v1", "arXiv:0708.2587v2"),
 ])
-def test_registration_preserves_verified_identifier_reservations(tmp_path, monkeypatch, field, claimed, incoming):
+def test_registration_serializes_with_verified_identifier_adoption(tmp_path, monkeypatch, field, claimed, incoming):
     lib = _make_lib(tmp_path)
     original, _ = lib.upsert({"title": "Original work awaiting a verified identifier",
                              "authors": ["Casolino"], "year": 2007})
     reserved, resume = threading.Event(), threading.Event()
-    merge = lib._merge
+    reindex = lib._reindex
 
-    def pause_after_reservation(paper, fields, **kwargs):
+    def pause_before_reindex(paper):
         if paper is original and not reserved.is_set():
             reserved.set()
             assert resume.wait(5)
-        return merge(paper, fields, **kwargs)
+        return reindex(paper)
 
-    monkeypatch.setattr(lib, "_merge", pause_after_reservation)
-    with ThreadPoolExecutor(max_workers=1) as pool:
+    monkeypatch.setattr(lib, "_reindex", pause_before_reindex)
+    with ThreadPoolExecutor(max_workers=2) as pool:
         worker = pool.submit(lib.fill_verified_identifiers, original.key, **{field: claimed})
         try:
             assert reserved.wait(5)
-            registered, is_new = lib.upsert({"title": "Different source title for the reserved work",
-                                            "authors": ["Casolino"], "year": 2007, field: incoming})
-            assert not is_new and registered is original
+            registration = pool.submit(lib.upsert, {
+                "title": "Different source title for the reserved work",
+                "authors": ["Casolino"], "year": 2007, field: incoming})
         finally:
             resume.set()
         worker.result(timeout=5)
+        registered, is_new = registration.result(timeout=5)
+        assert not is_new and registered is original
     assert lib.keys() == ["Casolino2007"]
     assert lib.find(**{field: claimed}) is original
 
@@ -149,11 +151,57 @@ def test_failed_verified_fill_does_not_leave_an_active_identifier_reservation(tm
     def fail(*_args, **_kwargs):
         raise OSError("injected verified fill failure")
 
-    monkeypatch.setattr(lib, "_merge", fail)
+    monkeypatch.setattr(lib.corrections, "stage_fields", fail)
     with pytest.raises(OSError, match="verified fill"):
         lib.fill_verified_identifiers(original.key, doi="10.1234/reserved")
     assert original.doi == ""
     assert lib.find(doi="10.1234/reserved") is None
+
+
+@pytest.mark.parametrize("field,value,equivalent", [
+    ("doi", "10.1234/reserved", "https://doi.org/10.1234/RESERVED"),
+    ("arxiv_id", "2401.12345v1", "arXiv:2401.12345v2"),
+    ("paper_id", "123", "123"),
+    ("inspire_record_id", "1412451", "1412451"),
+])
+def test_shared_identifier_adoption_checks_reservations_and_current_ownership(
+        tmp_path, field, value, equivalent):
+    lib = _make_lib(tmp_path)
+    paper, _ = lib.upsert({"title": "Original work awaiting identifiers", "source": "inspire"})
+    other, _ = lib.upsert({"title": "Independent detector measurements", "source": "inspire"})
+    assert lib.adopt_identifiers(paper.key, **{field: value}) == {field: "adopted"}
+    assert lib.adopt_identifiers(paper.key, **{field: equivalent}) == {field: "already-mine"}
+    assert lib.adopt_identifiers(other.key, **{field: equivalent}) == {field: "refused-held-by-other"}
+    assert getattr(other, field) == ""
+    if field in {"doi", "arxiv_id"}:
+        assert lib.find(**{field: equivalent}) is paper
+
+
+def test_shared_identifier_adoption_refuses_unpublished_reservation_and_reindexes(tmp_path):
+    lib = _make_lib(tmp_path)
+    paper, _ = lib.upsert({"title": "Work awaiting an identifier"})
+    claim = ("doi", "10.1234/reserved", "Unpublished", object())
+    lib._identity_reservations.add(claim)
+    assert lib.adopt_identifiers(paper.key, doi="10.1234/reserved") == {"doi": "refused-reserved"}
+    assert paper.doi == ""
+    lib._identity_reservations.remove(claim)
+    assert lib.adopt_identifiers(paper.key, doi="10.1234/reserved") == {"doi": "adopted"}
+    assert lib._by_doi["10.1234/reserved"] == paper.key
+
+
+def test_adoption_evidence_failure_cannot_leave_partial_unindexed_fields(tmp_path, monkeypatch):
+    lib = _make_lib(tmp_path)
+    paper, _ = lib.upsert({"title": "Work awaiting verified identifiers"})
+    lib.upsert({"title": "Independent arxiv work", "arxiv_id": "2401.12345"})
+
+    def fail(*args, **kwargs):
+        raise OSError("correction evidence unavailable")
+
+    monkeypatch.setattr(lib.corrections, "stage_identity", fail)
+    with pytest.raises(OSError, match="correction evidence"):
+        lib.adopt_identifiers(paper.key, doi="10.1234/new", arxiv_id="2401.12345")
+    assert paper.doi == ""
+    assert lib.find(doi="10.1234/new") is None
 
 
 def test_key_collision_gets_suffix(tmp_path):

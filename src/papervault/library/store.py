@@ -1005,8 +1005,8 @@ class Library:
                                   arxiv_id: str = "", provenance: dict | None = None) -> dict[str, str]:
         """Fill verified blanks on this row; never redirect a merge to a twin.
 
-        Atomic dictionary claims arbitrate concurrent download workers before
-        the existing in-place merge. Unlike upsert/set_resolved_doi this never
+        Locked adoption arbitrates concurrent download workers. Unlike
+        upsert/set_resolved_doi this never
         selects or purges another row. The normal caller still batches save().
         A merge-intent or absorbed alias refuses all fills.
         """
@@ -1018,57 +1018,102 @@ class Library:
             return {}
         return self._fill_verified_identifiers(paper, doi=doi, arxiv_id=arxiv_id, provenance=provenance)
 
-    def _fill_verified_identifiers(self, paper: Paper, *, doi: str = "",
-                                   arxiv_id: str = "", provenance: dict | None = None) -> dict[str, str]:
-        """Same-row writer shared with fenced staged publication under its lock."""
+    @staticmethod
+    def _identifier_token(name: str, value: str, source: str = "") -> str:
+        if name == "doi":
+            return _normalize_doi(value)
+        if name == "arxiv_id":
+            return _normalize_arxiv(value)
+        if name == "inspire_record_id":
+            from .sources.inspire import inspire_record_id
+            return inspire_record_id(value)
+        if name == "paper_id":
+            # Source IDs belong to a namespace, not a global numeric-ID space.
+            from .sources.identity import PRIMARY_NAMESPACES
+            sources = re.split(r"[\s,;+|]+", source.strip().lower())
+            namespace = next((PRIMARY_NAMESPACES[s] for s in sources if s in PRIMARY_NAMESPACES), source)
+            return f"{namespace}:{value.strip()}" if value.strip() and namespace else ""
+        raise ValueError(f"unsupported identifier: {name}")
+
+    def _identifier_owner(self, name: str, token: str) -> Optional[Paper]:
+        """Current adopted fields own identities; stale caches cannot grant one."""
+        for paper in self._papers.values():
+            if self._identifier_token(name, getattr(paper, name), paper.source) == token:
+                from .merge_v2 import resolve_alias
+                return (resolve_alias(self, paper.key) or paper) if merge_v2_enabled() or paper.merge_budget else paper
+        return None
+
+    def adopt_identifiers(self, key: str, *, provenance: dict | None = None, completion=None,
+                          **identifiers: str) -> dict[str, str]:
+        """Arbitrate verified blank fills and reindex under the library write lock.
+
+        Never overwrite an adopted identity, merge another row, or claim a
+        registration reservation. The caller still owns its normal save boundary.
+        Each supplied axis returns an adoption or an explicit refusal reason.
+        """
+        from .claims_v2 import same_attempt
+        from .merge_v2 import blocked
+        from .state_v2 import Merge
         from .telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
-        before = adoption_snapshot(paper)
-        key = paper.key
-        self.corrections.stage_fields(paper, {"doi": doi, "arxiv_id": arxiv_id},
-                                      operation="verified_identifiers", provenance=provenance)
-        incoming = {}
-        reservations = set()
-        try:
-            with self._merge_execution_lock:
-                for name, value, index, normalized in (
-                    ("doi", doi, self._by_doi, _normalize_doi(doi)),
-                    ("arxiv_id", arxiv_id, self._by_arxiv, _normalize_arxiv(arxiv_id)),
-                ):
-                    if value and not getattr(paper, name):
-                        # Registration may reserve a key not yet published in
-                        # _papers. Reads can discard its absent index entry;
-                        # the active claim still fences adoption through commit.
-                        owner = next((claim[2] for claim in self._identity_reservations
-                                      if claim[:2] == (name, normalized) and claim[2] != key), None)
-                        owner = owner or index.setdefault(normalized, key)
-                        if owner == key:
-                            incoming[name] = value
-                            claim = (name, normalized, key, object())
-                            reservations.add(claim)
-                            self._identity_reservations.add(claim)
-                        else:
-                            self.corrections.stage_identity(paper, {name: value}, self.get(owner),
-                                provenance={"operation": "verified_identifiers", **(provenance or {})})
-            self._merge(paper, incoming, provenance={"operation": "verified_identifiers", **(provenance or {})})
-            applied = {}
-            with self._merge_execution_lock:
-                for name, value in incoming.items():
-                    current = getattr(paper, name)
-                    if current == value:
-                        applied[name] = value
-                        continue
-                    # Another writer filled this blank first. Remove our unused claim,
-                    # retaining the index when only the arXiv version/case differs.
-                    index = self._by_doi if name == "doi" else self._by_arxiv
-                    normalize = _normalize_doi if name == "doi" else _normalize_arxiv
-                    normalized = normalize(value)
-                    if normalize(current) != normalized and index.get(normalized) == key:
-                        index.pop(normalized, None)
+
+        # Validate before any side effect, including correction evidence.
+        for name, value in identifiers.items():
+            self._identifier_token(name, value)
+        with self._merge_execution_lock:
+            paper = self.get(key)
+            current = paper.reopen_claim if paper is not None else None
+            # An already-fenced dispatched completion may settle during merge
+            # drain. Its caller still validates lease, policy and budget; no
+            # ordinary fill or absorbed alias inherits that authorization.
+            completing = (completion is not None and current is not None
+                          and current.key == key and current.phase == "dispatched"
+                          and same_attempt(current, completion)
+                          and paper.acquisition_state.merge == Merge.CANONICAL
+                          and not paper.acquisition_state.alias_key)
+            if paper is None or (blocked(paper) and not completing):
+                return {name: "refused-missing" if paper is None else "refused-blocked"
+                        for name in identifiers}
+            self._check_writer()
+            self.corrections.stage_fields(paper, identifiers, operation="verified_identifiers",
+                                          provenance=provenance)
+            before = adoption_snapshot(paper)
+            outcomes, applied = {}, {}
+            for name, value in identifiers.items():
+                token = self._identifier_token(name, value, paper.source)
+                current = self._identifier_token(name, getattr(paper, name), paper.source)
+                reserved = any(claim[:2] == (name, token) and claim[2] != key
+                               for claim in self._identity_reservations)
+                owner = self._identifier_owner(name, token) if token else None
+                if not token:
+                    outcome = "refused-empty"
+                elif reserved:
+                    outcome = "refused-reserved"
+                elif owner is not None and owner.key != key:
+                    outcome = "refused-held-by-other"
+                    self.corrections.stage_identity(paper, {name: value}, owner,
+                        provenance={"operation": "verified_identifiers", **(provenance or {})})
+                elif current == token:
+                    outcome = "already-mine"
+                elif getattr(paper, name):
+                    outcome = "refused-existing"
+                else:
+                    applied[name] = value
+                    outcome = "adopted"
+                outcomes[name] = outcome
+            # Finish fallible correction recording before changing any field.
+            for name, value in applied.items():
+                setattr(paper, name, value)
+            self._reindex(paper)
             acknowledge_identity_adoption(paper, before, applied)
-            return applied
-        finally:
-            with self._merge_execution_lock:
-                self._identity_reservations.difference_update(reservations)
+            return outcomes
+
+    def _fill_verified_identifiers(self, paper: Paper, *, doi: str = "",
+                                   arxiv_id: str = "", provenance: dict | None = None,
+                                   completion=None) -> dict[str, str]:
+        """Compatibility result for existing verified-PDF and reopen callers."""
+        incoming = {name: value for name, value in (("doi", doi), ("arxiv_id", arxiv_id)) if value}
+        outcomes = self.adopt_identifiers(paper.key, provenance=provenance, completion=completion, **incoming)
+        return {name: incoming[name] for name, result in outcomes.items() if result == "adopted"}
 
     def export_bibtex(self, keys: Optional[list[str]] = None) -> tuple[str, list[str]]:
         """Render BibTeX for a subset (or the whole library if keys is None).

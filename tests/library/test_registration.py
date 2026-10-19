@@ -297,6 +297,143 @@ async def test_external_projection_has_stable_source_identity_before_registratio
     assert lib.keys() == []
 
 
+@pytest.mark.parametrize("field,value", [("doi", "10.1234/registration"),
+                                         ("arxiv_id", "2401.12345v1")])
+def test_real_download_adoption_is_refused_during_registration_commit(
+        tmp_path, monkeypatch, field, value):
+    from papervault.library.download_sources import arxiv, openalex
+    from papervault.library.services.registration import RegistrationService, _view
+
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(candidate(doi="", title="Independent proton detector observations",
+                                   url="https://arxiv.org/abs/2401.12345v1"))
+    lib.save(force=True)
+    service = RegistrationService(lib, SimpleNamespace(add=lambda key: None))
+    monkeypatch.setattr(arxiv, "_lookup_arxiv_record", lambda identifier: arxiv._ArxivRecord(
+        requested_id=identifier, status="found", latest_id=identifier))
+    discovery = admitted(doi="")
+    discovery[field] = value
+    view = _view(lib, lib._papers)
+    _, changed = service._stage(view, [discovery])
+    # Exercise the reservation and publication sequence used around PG commit,
+    # with disposable JSON persistence and real source adoption functions.
+    with service._reserve_publication(changed):
+        assert any(c[0] == field and c[2] != paper.key for c in lib._identity_reservations)
+        if field == "arxiv_id":
+            assert arxiv._prepare_arxiv(paper, library=lib) is None
+        else:
+            data = openalex._OpenAlexPDF(b"%PDF-test", value, "")
+            openalex._apply_openalex_identifiers(data, paper, lib, "llm_match:yes")
+        assert getattr(paper, field) == ""
+        service._check_publication(changed)
+        new_key = next(iter(changed))
+        lib._papers[new_key] = view.get(new_key)
+        lib._reindex(view.get(new_key))
+    lib.save(force=True)
+    assert lib.get(paper.key) is paper
+    assert getattr(paper, field) == ""
+    assert lib.find(**{field: value}).key == new_key
+    assert [p.key for p in Library(tmp_path)._papers.values() if getattr(p, field)] == [new_key]
+
+
+async def test_json_retry_persists_replacement_when_winner_policy_rejects_registration(tmp_path, monkeypatch):
+    from papervault.library.services.registration import RegistrationService
+    from papervault.library.state_v2 import Policy, Retrieval, TerminalState
+
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(candidate(doi="", title="Independent proton detector observations"))
+    lib.save(force=True)
+    save = Library._save_index
+    raced = False
+
+    def save_then_worker_adopts(self, **kwargs):
+        nonlocal raced
+        result = save(self, **kwargs)
+        if self is not lib and not raced:
+            raced = True
+            assert lib.fill_verified_identifiers(paper.key, doi="10.1234/registration") == {
+                "doi": "10.1234/registration"}
+            paper.terminal_state = TerminalState(policy=Policy.EXCLUDED, retrieval=Retrieval.ELIGIBLE)
+        return result
+
+    monkeypatch.setattr(Library, "_save_index", save_then_worker_adopts)
+    outcomes = await RegistrationService(lib, SimpleNamespace(add=lambda key: None)).register_candidates(
+        [admitted()], actor="test", reason="policy-rejected-retry")
+    assert outcomes[0]["reason"] == "registration_policy"
+    persisted = Library(tmp_path)
+    assert persisted.keys() == [paper.key]
+    assert persisted.get(paper.key).doi == "10.1234/registration"
+    assert persisted.get(paper.key).terminal_state.policy == Policy.EXCLUDED
+
+
+def test_observation_only_identifiers_do_not_reserve_or_invalidate_publication(tmp_path):
+    from papervault.library.services.registration import RegistrationService, _view
+
+    lib = Library(tmp_path)
+    original, _ = lib.upsert(candidate(doi="", arxiv_id="2401.12345"))
+    worker, _ = lib.upsert(candidate(doi="", title="Independent proton detector observations"))
+    service = RegistrationService(lib, SimpleNamespace(add=lambda key: None))
+    view = _view(lib, lib._papers)
+    _, changed = service._stage(view, [admitted(arxiv_id="2401.12345")])
+    assert view.get(original.key).doi == ""
+    with service._reserve_publication(changed):
+        assert lib.fill_verified_identifiers(worker.key, doi="10.1234/registration") == {
+            "doi": "10.1234/registration"}
+        service._check_publication(changed)
+    assert lib.get(original.key).doi == ""
+
+
+@pytest.mark.parametrize("route", ["title_pdf", "title_withdrawn", "override"])
+def test_other_arxiv_adoption_sites_refuse_active_registration_claim(tmp_path, monkeypatch, route):
+    from papervault.library import download
+    from papervault.library.download_sources import arxiv
+    from papervault.library.services.registration import RegistrationService, _view
+
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(candidate(doi="10.1234/worker", url="",
+                                   title="Independent proton detector observations"))
+    service = RegistrationService(lib, SimpleNamespace(add=lambda key: None))
+    view = _view(lib, lib._papers)
+    _, changed = service._stage(view, [admitted(doi="", arxiv_id="2401.12345v2")])
+    record = arxiv._ArxivRecord(requested_id="2401.12345v1", status="found",
+                                latest_id="2401.12345v1", withdrawn=route == "title_withdrawn",
+                                title=paper.title, authors=paper.authors)
+    monkeypatch.setattr(arxiv, "_lookup_arxiv_record", lambda _: record)
+    monkeypatch.setattr(arxiv, "_try_arxiv_with_record", lambda *_: b"%PDF-test")
+    monkeypatch.setattr("papervault.library.sources.arxiv.search_arxiv", lambda *a, **k: [
+        {"title": paper.title, "arxiv_id": "2401.12345v1"}])
+    monkeypatch.setattr("papervault.library.services.concurrency._vault_path", lambda: str(tmp_path))
+    (tmp_path / "url_overrides.json").write_text(json.dumps({paper.doi: "https://arxiv.org/pdf/2401.12345v1"}))
+    with service._reserve_publication(changed):
+        if route == "override":
+            assert download._prepare_cascade_arxiv(paper, lib) is None
+        else:
+            assert arxiv._try_arxiv_by_title(paper, library=lib) is None
+        assert paper.arxiv_id == ""
+        assert paper.arxiv_withdrawal is None
+        service._check_publication(changed)
+
+
+@pytest.mark.parametrize("conflict", ["held", "reserved"])
+def test_inspire_title_adoption_respects_shared_ownership(tmp_path, monkeypatch, conflict):
+    from papervault.library.download_sources import inspire
+
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(candidate(doi="", source="inspire"))
+    other, _ = lib.upsert(candidate(doi="", source="inspire", title="Independent detector observations"))
+    if conflict == "held":
+        assert lib.adopt_identifiers(other.key, inspire_record_id="1412451") == {
+            "inspire_record_id": "adopted"}
+    else:
+        lib._identity_reservations.add(("inspire_record_id", "1412451", "Unpublished", object()))
+    observation = {**paper.model_dump(), "inspire_record_id": "1412451",
+                   "inspire_document_urls": ["https://inspirehep.net/files/test.pdf"]}
+    monkeypatch.setattr(inspire, "lookup_inspire_record", lambda *a, **k: observation)
+    assert inspire._try_inspire(paper, library=lib) is None
+    assert paper.inspire_record_id == ""
+    assert paper.inspire_document_urls == []
+
+
 async def test_registration_failure_returns_candidate_outcome(tmp_path, monkeypatch):
     from papervault.library.services.registration import RegistrationService
 

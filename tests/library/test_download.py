@@ -2457,22 +2457,10 @@ def test_openalex_writeback_cannot_redirect_to_racing_identifier_owner(lib, open
                            "authors": ["Holder"], "year": 2020})
     doi, arxiv = "10.1088/race", "2102.11582v3"
 
-    class RacingIndex(dict):
-        def claim(self, key):
-            if key == doi and key not in self:
-                self[key] = holder.key
-                holder.doi = doi
-
-        def get(self, key, default=None):
-            value = super().get(key, default)
-            self.claim(key)  # Another worker claims the ID after a stale lookup.
-            return value
-
-        def setdefault(self, key, default=None):
-            self.claim(key)
-            return super().setdefault(key, default)
-
-    lib._by_doi = RacingIndex(lib._by_doi)
+    # A legitimate worker already owns the DOI, with a deliberately stale
+    # cache. Current adopted fields must still arbitrate the second fill.
+    holder.doi = doi
+    lib._by_doi.pop(doi, None)
     data = openalex._OpenAlexPDF(PDF_BYTES, doi, arxiv)
     openalex._apply_openalex_identifiers(data, p, lib, "llm_match: same work")
     assert holder.doi == doi
@@ -2484,13 +2472,13 @@ def test_openalex_writeback_cannot_redirect_to_racing_identifier_owner(lib, open
 def test_openalex_recovery_removes_unused_claims_on_same_row_update(
         lib, openalex_paper, monkeypatch):
     p = openalex_paper
-    merge = lib._merge
+    adopt = lib.adopt_identifiers
 
-    def intervening_update(paper, incoming, **kwargs):
+    def intervening_update(key, **incoming):
         lib.set_resolved_doi(p.key, "10.1088/other")
-        return merge(paper, incoming, **kwargs)
+        return adopt(key, **incoming)
 
-    monkeypatch.setattr(lib, "_merge", intervening_update)
+    monkeypatch.setattr(lib, "adopt_identifiers", intervening_update)
     changed = lib.fill_verified_identifiers(p.key, doi="10.1088/recovered")
     assert changed == {}
     assert p.doi == "10.1088/other"
@@ -2501,14 +2489,13 @@ def test_openalex_recovery_removes_unused_claims_on_same_row_update(
 def test_openalex_recovery_preserves_intervening_arxiv_version_index(
         lib, openalex_paper, monkeypatch):
     p = openalex_paper
-    merge = lib._merge
+    adopt = lib.adopt_identifiers
 
-    def intervening_update(paper, incoming, **kwargs):
-        merge(paper, {"arxiv_id": "2102.11582v1"})
-        lib._reindex(paper)
-        return merge(paper, incoming, **kwargs)
+    def intervening_update(key, **incoming):
+        assert adopt(key, arxiv_id="2102.11582v1") == {"arxiv_id": "adopted"}
+        return adopt(key, **incoming)
 
-    monkeypatch.setattr(lib, "_merge", intervening_update)
+    monkeypatch.setattr(lib, "adopt_identifiers", intervening_update)
     assert lib.fill_verified_identifiers(p.key, arxiv_id="2102.11582v3") == {}
     assert p.arxiv_id == "2102.11582v1"
     assert lib.find(arxiv_id="2102.11582") is p

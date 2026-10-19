@@ -8,7 +8,7 @@ Two judges over one shared machinery (batched + parallel + retry + ABSOLUTE scor
   ``publication_types`` is authoritative when present, but it's frequently empty (CORE
   never sets it; some Crossref/OpenAlex records don't) — so the LLM's ``is_paper`` fills
   the gap rather than letting empty metadata fail-open (datasets in) or fail-closed (CORE out).
-- ``judge_return``  (LLM3 / return gate): for each candidate (library + just-ingested),
+- ``judge_return``  (LLM3 / return gate): for each candidate (library + eligible external),
   an ABSOLUTE 0-1 relevance score vs the user's query intent. Caller thresholds +
   sorts + truncates to the requested count.
 

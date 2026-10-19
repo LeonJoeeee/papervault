@@ -22,11 +22,14 @@ materialize facade — the real read-only path is exercised directly.
 
 from __future__ import annotations
 
+import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from papervault.library import Library
+from papervault.library.state_v2 import Policy, Retrieval, TerminalState
 
 
 # ---------------- fixtures --------------------------------------------------
@@ -71,6 +74,8 @@ def server(populated_lib, monkeypatch):
     override them is hermetic by construction. Tests that exercise the
     new-fetch path override the mock per-test.
     """
+    monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda: SimpleNamespace())
+
     # Mock external multi-backend search to return no candidates by default.
     def fake_search_all(*args, **kwargs):
         return []
@@ -103,6 +108,22 @@ async def _call(server, name, args):
     result = await server.call_tool(name, args)
     text = "\n".join(c.text for c in result)
     return json.loads(text)
+
+
+async def _call_with_registration(server, name, args):
+    """Legacy lifecycle assertions explicitly wait for the separate command.
+
+    P3 supersedes the former assumption that returning from search means catalog
+    registration has committed. Read-independence tests call the handler directly.
+    """
+    queue = server._paper_registration_queue
+    await queue.start()
+    try:
+        result = await _call(server, name, args)
+        await asyncio.wait_for(queue._queue.join(), 2)
+        return result
+    finally:
+        await queue.stop()
 
 
 async def _get_one(server, identifier):
@@ -812,7 +833,7 @@ async def test_search_malformed_intent_returns_error(server, monkeypatch):
         raise ValueError("no JSON object in LLM response")
     monkeypatch.setattr("papervault.library.mcp.server.parse_intent", boom)
 
-    out = await _call(server, "search_papers", {"query": "anything at all"})
+    out = await _call_with_registration(server, "search_papers", {"query": "anything at all"})
     assert out["status"] == "error"
     assert out["results"] == []
     assert "message" in out
@@ -843,7 +864,7 @@ async def test_search_empty_query_fails_closed_no_ingest(
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("ingest gate ran on empty query")))
 
     keys_before = set(populated_lib.keys())
-    out = await _call(server, "search_papers", {"query": query})
+    out = await _call_with_registration(server, "search_papers", {"query": query})
     assert out["status"] == "error"
     assert out["results"] == []
     assert "message" in out
@@ -1030,7 +1051,7 @@ async def test_search_ingest_gate_and_minimal_records(server, populated_lib, mon
     _wire_search(monkeypatch, ingest=fake_ingest, ret=fake_return)
     server._paper_download_queue.add = lambda key, **kw: None  # no-op enqueue
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn inversion"})
     assert out["status"] == "ok"
 
     titles = [p.title for p in populated_lib.all_papers()]
@@ -1044,7 +1065,7 @@ async def test_search_ingest_gate_and_minimal_records(server, populated_lib, mon
 
     # NO-LEAK: output records are minimal; no internal pipeline tag leaks.
     for r in out["results"]:
-        assert set(r) <= MIN_FIELDS, f"non-minimal field leaked: {set(r) - MIN_FIELDS}"
+        assert set(r) <= MIN_FIELDS | {"source_identities"}, f"non-minimal field leaked: {set(r) - MIN_FIELDS}"
         assert not (_INTERNAL_TAGS & set(r)), f"internal tag leaked: {_INTERNAL_TAGS & set(r)}"
     assert "stats" not in out and "query" not in out  # lean envelope
 
@@ -1081,7 +1102,7 @@ async def test_service_degraded_omitted_when_boot_healthy(server, monkeypatch):
     assert gp["status"] == "ok"
     assert "service_degraded" not in gp
 
-    sp = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    sp = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn inversion"})
     assert sp["status"] == "ok"
     assert "service_degraded" not in sp
 
@@ -1106,7 +1127,7 @@ async def test_service_degraded_surfaced_on_both_tools_when_boot_failed(server, 
     assert gp["status"] == "ok"
     assert gp["service_degraded"] == reason
 
-    sp = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    sp = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn inversion"})
     assert sp["status"] == "ok"
     assert sp["service_degraded"] == reason
     # LIBRARY-PLANE degradation is a separate channel from SEARCH-BACKEND health.
@@ -1139,7 +1160,7 @@ async def test_search_ingest_stamps_judged_tier_on_new_record(
     _wire_search(monkeypatch, ingest=fake_ingest, ret=fake_return)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn inversion"})
     assert out["status"] == "ok"
 
     by_title = {p.title: p for p in populated_lib.all_papers(include_quarantined=True)}
@@ -1194,7 +1215,7 @@ async def test_search_ingest_does_not_overwrite_audit_set_tier(
     monkeypatch.setattr("papervault.library.mcp.server.judge_return", fake_return)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "solar wind modulation"})
+    out = await _call_with_registration(server, "search_papers", {"query": "solar wind modulation"})
     assert out["status"] == "ok"
     p = populated_lib.get("Potgieter2013")
     assert p.domain_tier == "1C"      # audit tier preserved, NOT overwritten by 2A
@@ -1235,7 +1256,7 @@ async def test_search_ingest_plugs_reject_egu_abstract_and_contentless_stub(
     monkeypatch.setattr("papervault.library.mcp.server.judge_return", fake_return)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "sep transport"})
+    out = await _call_with_registration(server, "search_papers", {"query": "sep transport"})
     assert out["status"] == "ok"
     titles = [p.title for p in populated_lib.all_papers()]
     assert any("Real PINN inversion" in t for t in titles)   # PLUG-clear → ingested
@@ -1261,7 +1282,7 @@ async def test_search_fair_share_no_term_starved(server, populated_lib, monkeypa
     _wire_search(monkeypatch, ingest=fake_ingest, ret=fake_return)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn inversion"})
     assert out["status"] == "ok"
     # The niche paper is seen by the ingest gate (fair-share, not starved)...
     niche = "GCR solar cycle long-horizon forecasting with neural processes"
@@ -1321,7 +1342,7 @@ async def test_search_rrf_consensus_floats_up_niche_still_surfaces(
     monkeypatch.setattr("papervault.library.mcp.server.judge_return", fake_return)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray pinn + gcr forecasting"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn + gcr forecasting"})
     assert out["status"] == "ok"
 
     cons_title = "Cross-cutting cosmic ray PINN GCR consensus paper"
@@ -1351,7 +1372,7 @@ async def test_search_judge_drop_is_not_fail_open(server, populated_lib, monkeyp
     _wire_search(monkeypatch, ingest=empty_ingest, ret=empty_return)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn inversion"})
     assert out["status"] == "ok"
     assert out["results"] == []  # return judge dropped → nothing returned
     after = {p.key for p in populated_lib.all_papers()}
@@ -1386,7 +1407,7 @@ async def test_search_clean_empty_returns_reframe_hint(server, populated_lib, mo
     monkeypatch.setattr("papervault.library.mcp.server.get_llm", lambda: object())
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "abstract methodology-only intent"})
+    out = await _call_with_registration(server, "search_papers", {"query": "abstract methodology-only intent"})
     assert out["status"] == "ok"
     assert out["results"] == []
     # Clean run: no batch was dropped, so the empty is a genuine no-match (not a retry case).
@@ -1443,7 +1464,7 @@ async def test_search_sort_secondary_by_recency(server, populated_lib, monkeypat
     _wire_two_equal_score(monkeypatch, ranking_hint="by_recency", fan_out=fan_out)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray transport"})
     years = [r["year"] for r in out["results"] if r["year"] in (2018, 2024)]
     assert years == [2024, 2018]   # newer first (year DESC secondary)
 
@@ -1455,7 +1476,7 @@ async def test_search_sort_secondary_by_importance(server, populated_lib, monkey
     _wire_two_equal_score(monkeypatch, ranking_hint="by_importance", fan_out=fan_out)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray transport"})
     cites = [r["citation_count"] for r in out["results"] if r["citation_count"] in (5, 99)]
     assert cites == [99, 5]   # higher citation_count first
 
@@ -1505,7 +1526,7 @@ async def test_search_authority_prior_skipped_when_ranking_hint_by_recency(
     _wire_two_equal_score(monkeypatch, ranking_hint="by_recency", fan_out=fan_out)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray transport"})
     years = [r["year"] for r in out["results"] if r["year"] in (2010, 2024)]
     assert years == [2024, 2010]   # recency wins; prior did NOT reorder to authority
 
@@ -1523,7 +1544,7 @@ async def test_search_authority_prior_skipped_when_ranking_hint_by_importance(
     _wire_two_equal_score(monkeypatch, ranking_hint="by_importance", fan_out=fan_out)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray transport"})
     cites = [r["citation_count"] for r in out["results"] if r["citation_count"] in (300, 400)]
     assert cites == [400, 300]   # raw-citation order wins; prior did NOT reorder
 
@@ -1541,7 +1562,7 @@ async def test_search_authority_prior_reorders_on_default_hint(
     _wire_two_equal_score(monkeypatch, ranking_hint="by_relevance", fan_out=fan_out)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray transport"})
     years = [r["year"] for r in out["results"] if r["year"] in (2010, 2024)]
     assert years == [2010, 2024]   # high-authority 2010 paper lifted above the 2024 one
 
@@ -1561,15 +1582,13 @@ async def test_search_judge_batches_dropped_zero_when_healthy(server, populated_
     _wire_search(monkeypatch, ingest=fake_ingest, ret=fake_return)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn inversion"})
     assert out["intent_parsed"]["judge_batches_dropped"] == {"ingest": 0, "return": 0}
 
 
 @pytest.mark.asyncio
-async def test_search_ingest_upsert_passes_no_llm(server, populated_lib, monkeypatch):
-    """The dead borderline-merge LLM path is gone: search ingest calls
-    library.upsert WITHOUT an ``llm`` (so no blocking sync llm.call ever runs on
-    the event loop under lib_write_lock during ingest)."""
+async def test_search_serving_and_registration_do_not_call_legacy_upsert(server, populated_lib, monkeypatch):
+    """P3 replaces inline legacy upsert with the explicit registration command."""
     seen_kwargs: list[dict] = []
     real_upsert = populated_lib.upsert
 
@@ -1589,11 +1608,9 @@ async def test_search_ingest_upsert_passes_no_llm(server, populated_lib, monkeyp
     _wire_search(monkeypatch, ingest=fake_ingest, ret=fake_return)
     server._paper_download_queue.add = lambda key, **kw: None
 
-    out = await _call(server, "search_papers", {"query": "cosmic ray pinn inversion"})
+    out = await _call_with_registration(server, "search_papers", {"query": "cosmic ray pinn inversion"})
     assert out["status"] == "ok"
-    assert seen_kwargs, "ingest path should have upserted at least one candidate"
-    # No call site passed an llm — the borderline-LLM branch is fully dead.
-    assert all("llm" not in kw for kw in seen_kwargs)
+    assert seen_kwargs == []
 
 
 # ============== resources ==================================================
@@ -1834,6 +1851,8 @@ async def test_search_fold_retains_only_verified_inspire_pairs(
     if origin == "library":
         existing, _ = populated_lib.upsert(dict(target))
         existing.download_status = "metadata_only"
+        # Acquisition exhaustion and metadata registration permission are separate.
+        existing.terminal_state = TerminalState(retrieval=Retrieval.EXHAUSTED, policy=Policy.CLEAR)
         populated_lib.save(force=True)
     queued = []
     server._paper_download_queue.add = lambda key, **_: queued.append(key)
@@ -1857,7 +1876,7 @@ async def test_search_fold_retains_only_verified_inspire_pairs(
     monkeypatch.setattr("papervault.library.mcp.server.search_external_async", external)
     monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", ingest)
     monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
-    result = await _call(server, "search_papers", {"query": "silicon tracker alignment"})
+    result = await _call_with_registration(server, "search_papers", {"query": "silicon tracker alignment"})
     assert result["status"] == "ok"
     paper = populated_lib.find(title=target["title"])
     if origin == "external" and conflict not in {None, "recid"}:
@@ -1924,7 +1943,7 @@ async def test_inspire_fold_rechecks_original_source_evidence(
     monkeypatch.setattr("papervault.library.mcp.server.search_external_async", external)
     monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", ingest)
     monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
-    result = await _call(server, "search_papers", {"query": "silicon tracker alignment"})
+    result = await _call_with_registration(server, "search_papers", {"query": "silicon tracker alignment"})
     assert result["status"] == "ok"
     assert paper.year == 2014
     assert paper.inspire_record_id == ""
@@ -1950,6 +1969,8 @@ async def test_search_fold_keeps_all_source_identity_observations(
     if origin == "library":
         existing, _ = populated_lib.upsert(dict(target))
         existing.download_status = "metadata_only"
+        # Acquisition exhaustion and metadata registration permission are separate.
+        existing.terminal_state = TerminalState(retrieval=Retrieval.EXHAUSTED, policy=Policy.CLEAR)
         populated_lib.save(force=True)
     queued = []
     server._paper_download_queue.add = lambda key, **_: queued.append(key)
@@ -1974,7 +1995,7 @@ async def test_search_fold_keeps_all_source_identity_observations(
     monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", ingest)
     monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
     monkeypatch.setattr("requests.get", lambda *_, **__: pytest.fail("admission made a GET"))
-    result = await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    result = await _call_with_registration(server, "search_papers", {"query": "cosmic ray transport"})
     assert result["status"] == "ok"
     paper = populated_lib.find(doi="10.1234/capture")
     assert paper is not None
@@ -1993,7 +2014,10 @@ async def test_search_fold_keeps_all_source_identity_observations(
     else:
         assert queued == [paper.key]
     for item in result["results"]:
-        assert "source_identities" not in item  # Existing minimal MCP contract.
+        if origin == "library":
+            assert "source_identities" not in item
+        elif item["doi"] == "10.1234/capture":
+            assert item["source_identities"] == observations
 
 
 async def test_search_rejected_candidate_does_not_store_source_identity(
@@ -2019,5 +2043,5 @@ async def test_search_rejected_candidate_does_not_store_source_identity(
     monkeypatch.setattr("papervault.library.mcp.server.search_external_async", external)
     monkeypatch.setattr("papervault.library.mcp.server.judge_ingest", ingest)
     monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
-    await _call(server, "search_papers", {"query": "cosmic ray transport"})
+    await _call_with_registration(server, "search_papers", {"query": "cosmic ray transport"})
     assert populated_lib.find(doi="10.1234/rejected") is None

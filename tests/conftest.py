@@ -35,32 +35,10 @@ _INTEGRATION_MODULES = {
 # unset, PAPERVAULT_LLM_KEYS/LLM_KEYS_FILE pointing at an absent file, a fresh empty
 # PAPERVAULT_DATA so the default llm_keys.json is absent). Kept ONLY the ones that failed.
 #
-# The search_papers tool calls get_llm() as an upfront credential preflight
-# (library/mcp/server.py) AFTER its empty-query Stage-0 guard but BEFORE the mocked
-# collaborators run — so any test that drives it with a NON-empty query raises "No LLM
-# credentials" and needs a key. The empty-query / docstring cases short-circuit before the
-# preflight and are hermetic, so they were UN-marked (moved back into the CI set). The
-# firecrawl re-entry quality-gate tests LOOKED hermetic in a local "no-creds" run, but that
-# was ambient-credential leakage (real keys reachable on the dev box -> the gate silently ran a
-# REAL judge LLM). On CI (guaranteed no creds) all 7 fail — CI is the ground truth for this
-# classification, so they are marked integration by exact name.
+# Search tests now mock the get_llm preflight in their server fixture, so they
+# exercise P3 as hermetic unit tests. Firecrawl re-entry tests still drive a real
+# judge LLM and remain integration tests.
 _INTEGRATION_NAMES = {
-    # test_mcp_server.py — search_papers get_llm() preflight (non-empty query).
-    "test_search_malformed_intent_returns_error",
-    "test_search_ingest_gate_and_minimal_records",
-    "test_search_ingest_plugs_reject_egu_abstract_and_contentless_stub",
-    "test_search_fair_share_no_term_starved",
-    "test_search_rrf_consensus_floats_up_niche_still_surfaces",
-    "test_search_judge_drop_is_not_fail_open",
-    "test_search_sort_secondary_by_recency",
-    "test_search_sort_secondary_by_importance",
-    "test_search_authority_prior_skipped_when_ranking_hint_by_recency",
-    "test_search_authority_prior_skipped_when_ranking_hint_by_importance",
-    "test_search_authority_prior_reorders_on_default_hint",
-    "test_search_judge_batches_dropped_zero_when_healthy",
-    "test_search_ingest_upsert_passes_no_llm",
-    "test_search_ingest_stamps_judged_tier_on_new_record",
-    "test_search_ingest_does_not_overwrite_audit_set_tier",
     # test_firecrawl_quality_gate.py — the re-entry gate drives a live judge LLM.
     "test_firecrawl_reentry_historical_md_passes_gate_stays_ok",
     "test_firecrawl_reentry_historical_stub_fails_gate_is_deleted_terminal",

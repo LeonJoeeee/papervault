@@ -3,9 +3,9 @@ plane's stage queues + safety-net tasks, shared by the standalone paper-library
 entrypoint and the unified papervault MCP server.
 
 Given an already-built server (from :func:`build_server`, which stashes the
-Library + both queues on the instance), this:
-  1. runs the one-time download_status migration (idempotent),
-  2. starts the extract then download queues (downstream-first),
+Library + queues on the instance), this:
+  1. starts independent bounded registration immediately,
+  2. defers migration and extract/download recovery (downstream-first),
   3. launches reconcile and monthly corrections,
 and returns an async ``shutdown()`` that tears them down in reverse.
 
@@ -60,6 +60,10 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
     library = server._paper_library                 # type: ignore[attr-defined]
     download_queue = server._paper_download_queue   # type: ignore[attr-defined]
     extract_queue = server._paper_extract_queue     # type: ignore[attr-defined]
+    registration_queue = server._paper_registration_queue  # type: ignore[attr-defined]
+    # Metadata registration has its own bounded worker and does not wait for
+    # acquisition/OCR recovery or availability.
+    await registration_queue.start()
 
     # Handles filled in by the background boot; shutdown reads whatever exists.
     reconcile_task: asyncio.Task | None = None
@@ -169,6 +173,7 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
         # that is more robust than the old coarse ``queues_started`` flag, which
         # went stale if the boot raised BETWEEN the two start() calls (extract
         # started, download not) and then skipped stopping the started one.
+        await registration_queue.stop()
         await download_queue.stop()
         await extract_queue.stop()
         # Graceful-shutdown flush: debounced state must reach disk before exit —

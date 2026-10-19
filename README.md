@@ -195,7 +195,11 @@ claims. Lease-expiry or execution-uncertainty quarantine continues to drop resul
 The default wait is 60 seconds (`MergeStore.quiesce(..., wait_seconds=...)`).
 An expired or uncertain wait stays quarantined and blocked after restart;
 expiry never permits a merge or refunds uncertain consumption. The operator
-or orchestrator must decide recovery explicitly.
+or orchestrator can explicitly call `await MergeStore.restart(expired_intent,
+wait_seconds=60)` to persist a fresh paired wait without releasing either fence.
+The returned intent must still pass the normal drain checks before `merge_records`;
+ordinary retries do not restart expired waits. Uncertain execution/commit intents
+remain blocked and require separate operator recovery.
 
 The canonical record retains the union of restrictions, intersection of grants,
 and source observations. The absorbed record remains an alias; `resolve_alias`

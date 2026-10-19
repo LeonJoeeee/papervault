@@ -15,7 +15,7 @@ import copy
 import hashlib
 import json
 import logging
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -24,7 +24,7 @@ from papervault.library.models import Paper, normalize_title
 from papervault.library.sources.identity import normalized_source_identities, merge_source_identities
 from papervault.library.sources.inspire import merge_inspire_fields, retained_inspire_fields
 from papervault.library.state_v2 import Policy, Retrieval, TerminalState, admission, effective_policy
-from papervault.library.store import _validate_paper_metadata
+from papervault.library.store import _normalize_arxiv, _normalize_doi, _validate_paper_metadata
 from papervault.library.services.bm25_search import paper_to_dict
 from papervault.store.persistence import _overlay
 from papervault.store.repository import AuditEvent, PendingJob, Record, payload_hash
@@ -194,6 +194,10 @@ class _RegistrationCancelled(asyncio.CancelledError):
         self.outcomes = outcomes
 
 
+class _RegistrationIdentityChanged(Exception):
+    """Discard a staged snapshot when a live worker has claimed its identity."""
+
+
 class RegistrationService:
     def __init__(self, library, download_queue, *, max_candidates=MAX_CANDIDATES,
                  max_downloads=MAX_CANDIDATES):
@@ -240,98 +244,154 @@ class RegistrationService:
         lib._check_writer()
         backend = lib._catalog_backend
         with lib._catalog_save_lock.acquire(timeout=30) if backend else nullcontext():
-            if backend:
-                with backend.repository() as repo:
-                    event = AuditEvent(actor, "registration", {"command_id": reason})
-                    with repo._write(event):
-                        records = {r.key: r for r in repo.all()}
-                        papers = {key: Paper.model_validate(r.payload) for key, r in records.items()}
-                        view = _view(lib, papers)
-                        outcomes, changed = self._stage(view, candidates)
-                        accepted, revisions = [], {}
-                        recorded_observations = None
-                        for key, outcome in changed.items():
-                            paper = view.get(key)
-                            before = records.get(key)
-                            normalized = Paper.model_validate(before.payload).model_dump(mode="json") if before else None
-                            payload = (_overlay(before.payload, normalized, paper.model_dump(mode="json"))
-                                       if before else paper.model_dump(mode="json"))
-                            record = Record.from_payload(key, payload)
-                            revision = before.revision if before else 0
-                            jobs = backend._jobs([record], {key: revision})
-                            if outcome["download"] == "admitted":
-                                jobs += (PendingJob("registration-download:" + key, "download", key,
-                                                    detail={"command_id": reason}),)
-                            audit = AuditEvent(actor, "registration", {
-                                "command_id": reason, "reason": reason,
-                                "outcome": outcome["status"], "download": outcome["download"],
-                                "source_identities": payload.get("source_identities", []),
-                                "observations": outcome["observations"],
-                                "observations_sha256": payload_hash(outcome["observations"]),
-                                "payload_sha256": record.payload_sha256,
-                            }, pending_jobs=jobs)
-                            did_change = repo.upsert(record, audit=audit, expected_revision=revision)
-                            if not did_change:
-                                # A no-op duplicate still has new evidence. A replay
-                                # of the same command/observations cannot append twice.
-                                if recorded_observations is None:
-                                    recorded_observations = {
-                                        (row["key"], row["observation"]) for row in repo.connection.execute(sql.SQL(
-                                            "SELECT key, detail->>'observations_sha256' AS observation FROM {} "
-                                            "WHERE actor=%s AND event='registration' AND detail->>'command_id'=%s"
-                                        ).format(repo._table("audit")), (actor, reason))}
-                                observation = (key, audit.detail["observations_sha256"])
-                                if observation not in recorded_observations:
-                                    repo._finish(key, replace(audit, pending_jobs=()))
-                                    recorded_observations.add(observation)
-                            revisions[key] = revision + int(did_change)
-                            accepted.append(record)
-                    # Publish only after outer commit, preserving live objects and
-                    # any worker field edits made while IO was in progress.
-                    with lib._merge_execution_lock:
-                        captured = {}
-                        for record in accepted:
-                            current = lib.get(record.key)
-                            if current is None:
-                                current = Paper.model_validate(record.payload)
-                                lib._papers[record.key] = current
-                            captured[record.key] = (backend.normalized.get(record.key)
-                                                     or current.model_dump(mode="json"))
-                        backend._accept(accepted, revisions, lib._papers, captured)
-                        for record in accepted:
-                            lib._reindex(lib.get(record.key))
-                    return outcomes
-            # JSON compatibility remains behind the same command, never serving.
-            # Its legacy file format does not provide PG's transactional outbox.
-            with lib._merge_execution_lock:
-                view = _view(lib, lib._papers)
-                captured = {key: p.model_dump(mode="json") for key, p in lib._papers.items()}
-            outcomes, changed = self._stage(view, candidates)
-            if changed:
-                # Write an isolated working set. No serving identity lock is held
-                # across disk IO, and failed saves never publish staged objects.
-                view.save(force=True)
-            with lib._merge_execution_lock:
-                for key in changed:
-                    current, staged = lib.get(key), view.get(key)
-                    if current is None:
-                        lib._papers[key] = staged
-                    else:
-                        now = current.model_dump(mode="json")
-                        saved = staged.model_dump(mode="json")
-                        for name in Paper.model_fields:
-                            if (saved.get(name) != captured[key].get(name)
-                                    and now.get(name) == captured[key].get(name)):
-                                setattr(current, name, copy.deepcopy(getattr(staged, name)))
-                    lib._reindex(lib.get(key))
-            for key, outcome in changed.items():
+            while True:
                 try:
-                    lib.log({"event": "registration", "actor": actor, "reason": reason,
-                             "key": key, "outcome": outcome["status"], "download": outcome["download"],
-                             "observations": outcome["observations"]})
-                except Exception:
-                    logger.warning("registration log unavailable for %s", key)
+                    if backend:
+                        return self._register_postgres(candidates, actor=actor, reason=reason)
+                    return self._register_json(candidates, actor=actor, reason=reason)
+                except _RegistrationIdentityChanged:
+                    # A verified fill won during staging IO. PG rolls back the
+                    # entire stale batch; JSON replaces its isolated snapshot.
+                    # Re-stage against the winner, never publish a second key.
+                    continue
+
+    def _check_publication(self, changed):
+        """Called under the live identity lock, checking every incoming axis."""
+        for key, outcome in changed.items():
+            for observation in outcome["observations"]:
+                for name in ("doi", "arxiv_id"):
+                    if value := observation.get(name):
+                        owner = self.library.find(**{name: value})
+                        if owner is not None and owner.key != key:
+                            raise _RegistrationIdentityChanged
+
+    @contextmanager
+    def _reserve_publication(self, changed):
+        """Fence verified fills through PG commit without blocking search reads.
+
+        New keys are not visible in the live working set before commit. Their
+        claims therefore live in the reservation set, independently of indexes.
+        """
+        lib, reservations = self.library, set()
+        try:
+            with lib._merge_execution_lock:
+                self._check_publication(changed)
+                for key, outcome in changed.items():
+                    for observation in outcome["observations"]:
+                        for name, normalize in (("doi", _normalize_doi), ("arxiv_id", _normalize_arxiv)):
+                            if value := normalize(observation.get(name) or ""):
+                                claim = (name, value, key, object())
+                                reservations.add(claim)
+                                lib._identity_reservations.add(claim)
+            yield
+        finally:
+            with lib._merge_execution_lock:
+                lib._identity_reservations.difference_update(reservations)
+
+    def _register_postgres(self, candidates, *, actor, reason):
+        lib = self.library
+        backend = lib._catalog_backend
+        with backend.repository() as repo, ExitStack() as publication:
+            event = AuditEvent(actor, "registration", {"command_id": reason})
+            with repo._write(event):
+                records = {r.key: r for r in repo.all()}
+                papers = {key: Paper.model_validate(r.payload) for key, r in records.items()}
+                view = _view(lib, papers)
+                with lib._merge_execution_lock:
+                    outcomes, changed = self._stage(view, candidates)
+                accepted, revisions = [], {}
+                recorded_observations = None
+                for key, outcome in changed.items():
+                    paper = view.get(key)
+                    before = records.get(key)
+                    normalized = Paper.model_validate(before.payload).model_dump(mode="json") if before else None
+                    payload = (_overlay(before.payload, normalized, paper.model_dump(mode="json"))
+                               if before else paper.model_dump(mode="json"))
+                    record = Record.from_payload(key, payload)
+                    revision = before.revision if before else 0
+                    jobs = backend._jobs([record], {key: revision})
+                    if outcome["download"] == "admitted":
+                        jobs += (PendingJob("registration-download:" + key, "download", key,
+                                            detail={"command_id": reason}),)
+                    audit = AuditEvent(actor, "registration", {
+                        "command_id": reason, "reason": reason,
+                        "outcome": outcome["status"], "download": outcome["download"],
+                        "source_identities": payload.get("source_identities", []),
+                        "observations": outcome["observations"],
+                        "observations_sha256": payload_hash(outcome["observations"]),
+                        "payload_sha256": record.payload_sha256,
+                    }, pending_jobs=jobs)
+                    did_change = repo.upsert(record, audit=audit, expected_revision=revision)
+                    if not did_change:
+                        # A no-op duplicate still has new evidence. A replay
+                        # of the same command/observations cannot append twice.
+                        if recorded_observations is None:
+                            recorded_observations = {
+                                (row["key"], row["observation"]) for row in repo.connection.execute(sql.SQL(
+                                    "SELECT key, detail->>'observations_sha256' AS observation FROM {} "
+                                    "WHERE actor=%s AND event='registration' AND detail->>'command_id'=%s"
+                                ).format(repo._table("audit")), (actor, reason))}
+                        observation = (key, audit.detail["observations_sha256"])
+                        if observation not in recorded_observations:
+                            repo._finish(key, replace(audit, pending_jobs=()))
+                            recorded_observations.add(observation)
+                    revisions[key] = revision + int(did_change)
+                    accepted.append(record)
+                # A collision rolls back records, audit and jobs together.
+                # Keep reservations through commit and live publication, while
+                # releasing the identity lock before commit IO begins.
+                publication.enter_context(self._reserve_publication(changed))
+            # Publish only after outer commit, preserving live objects and
+            # any worker field edits made while IO was in progress.
+            with lib._merge_execution_lock:
+                self._check_publication(changed)
+                captured = {}
+                for record in accepted:
+                    current = lib.get(record.key)
+                    if current is None:
+                        current = Paper.model_validate(record.payload)
+                        lib._papers[record.key] = current
+                    captured[record.key] = (backend.normalized.get(record.key)
+                                             or current.model_dump(mode="json"))
+                backend._accept(accepted, revisions, lib._papers, captured)
+                for record in accepted:
+                    lib._reindex(lib.get(record.key))
             return outcomes
+
+    def _register_json(self, candidates, *, actor, reason):
+        lib = self.library
+        # JSON compatibility remains behind the same command, never serving.
+        # Its legacy file format does not provide PG's transactional outbox.
+        with lib._merge_execution_lock:
+            view = _view(lib, lib._papers)
+            captured = {key: p.model_dump(mode="json") for key, p in lib._papers.items()}
+            outcomes, changed = self._stage(view, candidates)
+        if changed:
+            # Write an isolated working set. No serving identity lock is held
+            # across disk IO, and failed saves never publish staged objects.
+            view.save(force=True)
+        with lib._merge_execution_lock:
+            self._check_publication(changed)
+            for key in changed:
+                current, staged = lib.get(key), view.get(key)
+                if current is None:
+                    lib._papers[key] = staged
+                else:
+                    now = current.model_dump(mode="json")
+                    saved = staged.model_dump(mode="json")
+                    for name in Paper.model_fields:
+                        if (saved.get(name) != captured[key].get(name)
+                                and now.get(name) == captured[key].get(name)):
+                            setattr(current, name, copy.deepcopy(getattr(staged, name)))
+                lib._reindex(lib.get(key))
+        for key, outcome in changed.items():
+            try:
+                lib.log({"event": "registration", "actor": actor, "reason": reason,
+                         "key": key, "outcome": outcome["status"], "download": outcome["download"],
+                         "observations": outcome["observations"]})
+            except Exception:
+                logger.warning("registration log unavailable for %s", key)
+        return outcomes
 
     def _stage(self, view, candidates):
         outcomes, changed, downloads = [], {}, 0

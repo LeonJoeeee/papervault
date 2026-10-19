@@ -1035,13 +1035,19 @@ class Library:
                     ("arxiv_id", arxiv_id, self._by_arxiv, _normalize_arxiv(arxiv_id)),
                 ):
                     if value and not getattr(paper, name):
-                        if index.setdefault(normalized, key) == key:
+                        # Registration may reserve a key not yet published in
+                        # _papers. Reads can discard its absent index entry;
+                        # the active claim still fences adoption through commit.
+                        owner = next((claim[2] for claim in self._identity_reservations
+                                      if claim[:2] == (name, normalized) and claim[2] != key), None)
+                        owner = owner or index.setdefault(normalized, key)
+                        if owner == key:
                             incoming[name] = value
                             claim = (name, normalized, key, object())
                             reservations.add(claim)
                             self._identity_reservations.add(claim)
                         else:
-                            self.corrections.stage_identity(paper, {name: value}, self.get(index[normalized]),
+                            self.corrections.stage_identity(paper, {name: value}, self.get(owner),
                                 provenance={"operation": "verified_identifiers", **(provenance or {})})
             self._merge(paper, incoming, provenance={"operation": "verified_identifiers", **(provenance or {})})
             applied = {}

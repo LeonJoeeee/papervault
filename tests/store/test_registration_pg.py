@@ -1,5 +1,8 @@
 """Opt-in PG proofs for the separately admitted registration command."""
 
+import asyncio
+import threading
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -160,3 +163,111 @@ async def test_noop_duplicate_retains_bibliographic_alternative_once_per_command
     await service.register_candidates([alternate], actor="test", reason="alternate")
     assert len(rows(repo, "audit", "event='registration'")) == 2
     assert repo.get(key) == before
+
+
+@pytest.mark.parametrize("field,verified,incoming", [
+    ("doi", "10.1234/registration", "10.1234/registration"),
+    ("arxiv_id", "2401.12345v1", "2401.12345v1"),
+])
+async def test_registration_rolls_back_staged_twin_when_verified_fill_wins(
+        repo, tmp_path, monkeypatch, field, verified, incoming):
+    lib = pg_library(repo, tmp_path, monkeypatch)
+    paper, _ = lib.upsert(candidate(doi="", title="Independent proton detector observations"))
+    lib.save(force=True)
+    entered, release = threading.Event(), threading.Event()
+    upsert = repo.upsert
+
+    def paused_upsert(record, **kwargs):
+        result = upsert(record, **kwargs)
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return result
+
+    monkeypatch.setattr(repo, "upsert", paused_upsert)
+    queued = []
+    discovery = candidate(doi="")
+    discovery[field] = incoming
+    command = asyncio.create_task(RegistrationService(lib, SimpleNamespace(add=queued.append)).register_candidates(
+        [discovery], actor="test", reason="pg-save-boundary-race"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert await asyncio.to_thread(lib.fill_verified_identifiers, paper.key, **{field: verified}) == {
+            field: verified}
+    finally:
+        release.set()
+        outcomes = await command
+
+    assert outcomes[0]["status"] == "duplicate"
+    assert outcomes[0]["key"] == paper.key
+    assert lib.keys() == [paper.key]
+    assert lib.get(paper.key) is paper
+    assert [(r.key, r.payload[field]) for r in repo.all()] == [(paper.key, verified)]
+    events = rows(repo, "audit", "event='registration'")
+    assert [(e["key"], e["detail"]["outcome"]) for e in events] == [(paper.key, "duplicate")]
+    assert events[0]["detail"]["observations"][0][field] == incoming
+    assert rows(repo, "jobs", "kind='download'") == []
+    assert queued == []
+    assert not lib._identity_reservations
+
+
+@pytest.mark.parametrize("abort", [False, True])
+async def test_registration_commit_reservation_is_read_safe_and_released_on_rollback(
+        repo, tmp_path, monkeypatch, abort):
+    lib = pg_library(repo, tmp_path, monkeypatch)
+    paper, _ = lib.upsert(candidate(doi="", title="Independent proton detector observations"))
+    lib.save(force=True)
+    entered, release = threading.Event(), threading.Event()
+    write, depth = repo._write, 0
+
+    @contextmanager
+    def paused_commit(audit):
+        nonlocal depth
+        depth += 1
+        try:
+            with write(audit):
+                yield
+                if depth == 1 and audit.event == "registration":
+                    entered.set()
+                    assert release.wait(5)
+                    if abort:
+                        raise OSError("injected registration commit failure")
+        finally:
+            depth -= 1
+
+    monkeypatch.setattr(repo, "_write", paused_commit)
+    queued = []
+    command = asyncio.create_task(RegistrationService(lib, SimpleNamespace(add=queued.append)).register_candidates(
+        [candidate()], actor="test", reason="pg-commit-gap"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert await asyncio.wait_for(asyncio.to_thread(lib.find, doi="10.1234/registration"), 1) is None
+        filled = await asyncio.wait_for(asyncio.to_thread(
+            lib.fill_verified_identifiers, paper.key, doi="10.1234/registration"), 1)
+        assert filled == {}
+        assert paper.doi == ""
+        assert lib.keys() == [paper.key]
+    finally:
+        release.set()
+        outcomes = await command
+
+    assert not lib._identity_reservations
+    if abort:
+        assert outcomes[0]["status"] == "failed"
+        assert [r.key for r in repo.all()] == [paper.key]
+        assert rows(repo, "audit", "event='registration'") == []
+        assert rows(repo, "jobs", "kind='download'") == []
+        assert queued == []
+        assert lib.fill_verified_identifiers(paper.key, doi="10.1234/registration") == {
+            "doi": "10.1234/registration"}
+    else:
+        assert outcomes[0]["status"] == "registered"
+        key = outcomes[0]["key"]
+        assert key != paper.key
+        assert lib.find(doi="10.1234/registration").key == key
+        assert [r.key for r in repo.all() if r.doi == "10.1234/registration"] == [key]
+        assert len(rows(repo, "audit", "event='registration'")) == 1
+        assert [j["key"] for j in rows(repo, "jobs", "kind='download'")] == [key]
+        assert queued == [key]
+    lib.save(force=True)
+    assert len([r for r in repo.all() if r.doi == "10.1234/registration"]) == 1

@@ -196,6 +196,93 @@ async def test_registration_reuses_worker_filled_identity_and_retains_restrictio
     assert queued == []
 
 
+@pytest.mark.parametrize("field,verified,incoming", [
+    ("doi", "10.1234/registration", "https://doi.org/10.1234/REGISTRATION"),
+    ("arxiv_id", "2401.12345v1", "arXiv:2401.12345v2"),
+])
+async def test_registration_reconciles_verified_fill_during_save(
+        tmp_path, monkeypatch, field, verified, incoming):
+    import threading
+    from papervault.library.services.registration import RegistrationService
+
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(candidate(doi="", title="Independent proton detector observations"))
+    lib.save(force=True)
+    entered, release = threading.Event(), threading.Event()
+    save = Library._save_index
+
+    def paused_save(self, **kwargs):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(5)
+        return save(self, **kwargs)
+
+    monkeypatch.setattr(Library, "_save_index", paused_save)
+    queued = []
+    service = RegistrationService(lib, SimpleNamespace(add=queued.append))
+    discovery = admitted(doi="")
+    discovery[field] = incoming
+    registration = asyncio.create_task(service.register_candidates(
+        [discovery], actor="test", reason="save-boundary-race"))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        filled = await asyncio.wait_for(asyncio.to_thread(
+            lib.fill_verified_identifiers, paper.key, **{field: verified}), 2)
+        assert filled == {field: verified}
+    finally:
+        release.set()
+        outcomes = await registration
+
+    assert outcomes[0]["status"] == "duplicate"
+    assert outcomes[0]["key"] == paper.key
+    assert lib.keys() == [paper.key]
+    assert lib.get(paper.key) is paper
+    assert getattr(paper, field) == verified
+    assert queued == []
+    persisted = Library(tmp_path)
+    assert persisted.keys() == [paper.key]
+    assert getattr(persisted.get(paper.key), field) == verified
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    audit = [e for e in events if e.get("event") == "registration"]
+    assert [(e["key"], e["outcome"]) for e in audit] == [(paper.key, "duplicate")]
+    assert audit[0]["observations"][0][field] == incoming
+
+
+@pytest.mark.parametrize("field,verified,incoming", [
+    ("doi", "10.1234/registration", "https://doi.org/10.1234/REGISTRATION"),
+    ("arxiv_id", "2401.12345v1", "arXiv:2401.12345v2"),
+])
+@pytest.mark.parametrize("abort", [False, True])
+def test_unpublished_registration_reservation_fences_verified_fills(
+        tmp_path, field, verified, incoming, abort):
+    from papervault.library.services.registration import RegistrationService, _view
+
+    lib = Library(tmp_path)
+    paper, _ = lib.upsert(candidate(doi="", title="Independent proton detector observations"))
+    service = RegistrationService(lib, SimpleNamespace(add=lambda key: None))
+    discovery = admitted(doi="")
+    discovery[field] = incoming
+    _, changed = service._stage(_view(lib, lib._papers), [discovery])
+
+    class CommitFailed(Exception):
+        pass
+
+    try:
+        with service._reserve_publication(changed):
+            # A read during commit must neither expose an uncommitted record
+            # nor erase its protection from worker identity adoption.
+            assert lib.find(**{field: incoming}) is None
+            assert lib.fill_verified_identifiers(paper.key, **{field: verified}) == {}
+            assert getattr(paper, field) == ""
+            if abort:
+                raise CommitFailed
+    except CommitFailed:
+        pass
+
+    assert lib.keys() == [paper.key]
+    assert lib.fill_verified_identifiers(paper.key, **{field: verified}) == {field: verified}
+
+
 async def test_external_projection_has_stable_source_identity_before_registration(tmp_path, monkeypatch):
     lib = Library(tmp_path)
     server = build_server(library=lib)

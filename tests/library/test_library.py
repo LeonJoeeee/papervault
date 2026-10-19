@@ -1,6 +1,8 @@
 """Unit tests for the library module (no network)."""
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -93,7 +95,9 @@ def test_registration_matches_doi_forms_without_changing_stored_identity(tmp_pat
 
 @pytest.mark.parametrize("field,old,new", [
     ("doi", "10.1234/old", "10.1234/new"),
+    ("doi", "10.1234/old", ""),
     ("arxiv_id", "0708.2587v1", "0809.0162v2"),
+    ("arxiv_id", "0708.2587v1", ""),
     ("title", "Old source title before metadata correction", "Corrected source title for the registered work"),
 ])
 def test_find_uses_current_fields_after_in_place_worker_updates(tmp_path, field, old, new):
@@ -102,7 +106,54 @@ def test_find_uses_current_fields_after_in_place_worker_updates(tmp_path, field,
     original, _ = lib.upsert(payload)
     setattr(original, field, new)
     assert lib.find(**{field: old}) is None
-    assert lib.find(**{field: new}) is original
+    if new:
+        assert lib.find(**{field: new}) is original
+
+
+@pytest.mark.parametrize("field,claimed,incoming", [
+    ("doi", "10.1234/reserved", "https://doi.org/10.1234/RESERVED"),
+    ("arxiv_id", "0708.2587v1", "arXiv:0708.2587v2"),
+])
+def test_registration_preserves_verified_identifier_reservations(tmp_path, monkeypatch, field, claimed, incoming):
+    lib = _make_lib(tmp_path)
+    original, _ = lib.upsert({"title": "Original work awaiting a verified identifier",
+                             "authors": ["Casolino"], "year": 2007})
+    reserved, resume = threading.Event(), threading.Event()
+    merge = lib._merge
+
+    def pause_after_reservation(paper, fields, **kwargs):
+        if paper is original and not reserved.is_set():
+            reserved.set()
+            assert resume.wait(5)
+        return merge(paper, fields, **kwargs)
+
+    monkeypatch.setattr(lib, "_merge", pause_after_reservation)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        worker = pool.submit(lib.fill_verified_identifiers, original.key, **{field: claimed})
+        try:
+            assert reserved.wait(5)
+            registered, is_new = lib.upsert({"title": "Different source title for the reserved work",
+                                            "authors": ["Casolino"], "year": 2007, field: incoming})
+            assert not is_new and registered is original
+        finally:
+            resume.set()
+        worker.result(timeout=5)
+    assert lib.keys() == ["Casolino2007"]
+    assert lib.find(**{field: claimed}) is original
+
+
+def test_failed_verified_fill_does_not_leave_an_active_identifier_reservation(tmp_path, monkeypatch):
+    lib = _make_lib(tmp_path)
+    original, _ = lib.upsert({"title": "Work whose verified identifier fill will fail"})
+
+    def fail(*_args, **_kwargs):
+        raise OSError("injected verified fill failure")
+
+    monkeypatch.setattr(lib, "_merge", fail)
+    with pytest.raises(OSError, match="verified fill"):
+        lib.fill_verified_identifiers(original.key, doi="10.1234/reserved")
+    assert original.doi == ""
+    assert lib.find(doi="10.1234/reserved") is None
 
 
 def test_key_collision_gets_suffix(tmp_path):

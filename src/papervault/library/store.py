@@ -265,6 +265,7 @@ class Library:
         self._by_doi: dict[str, str] = {}
         self._by_arxiv: dict[str, str] = {}
         self._by_title: dict[str, str] = {}
+        self._identity_reservations: set[tuple[str, str, str, object]] = set()
         # Save-cost controls (issue #34 root cause: per-item full-index writes starved
         # the event loop during boot sweeps). Debounce is safe because the boot
         # reconcile re-registers anything a crash loses between flushes.
@@ -537,11 +538,15 @@ class Library:
 
     def find(self, *, doi: str = "", arxiv_id: str = "",
              title: str = "") -> Optional[Paper]:
-        """Look up current record identities, treating the indexes as caches.
+        """Look up current identities, retaining active verified-fill claims.
 
         Download workers can fill/clear identifiers on the shared Paper in
         place. A stale cache must not authorize allocating another citation key.
         """
+        with self._merge_execution_lock:
+            return self._find_current(doi=doi, arxiv_id=arxiv_id, title=title)
+
+    def _find_current(self, *, doi: str, arxiv_id: str, title: str) -> Optional[Paper]:
         for field, value, index, normalize in (
             ("doi", doi, self._by_doi, _normalize_doi),
             ("arxiv_id", arxiv_id, self._by_arxiv, _normalize_arxiv),
@@ -551,7 +556,11 @@ class Library:
             if not normalized:
                 continue
             paper = self._papers.get(index.get(normalized, ""))
-            if paper is None or normalize(getattr(paper, field)) != normalized:
+            # Verified fills reserve the index before publishing the field.
+            # Distinguish those live claims from identifiers cleared by a worker.
+            reserved = paper is not None and not getattr(paper, field) and any(
+                claim[:3] == (field, normalized, paper.key) for claim in self._identity_reservations)
+            if paper is None or (not reserved and normalize(getattr(paper, field)) != normalized):
                 paper = next((p for p in self._papers.values()
                               if normalize(getattr(p, field)) == normalized), None)
                 if paper is None:
@@ -1018,32 +1027,42 @@ class Library:
         self.corrections.stage_fields(paper, {"doi": doi, "arxiv_id": arxiv_id},
                                       operation="verified_identifiers", provenance=provenance)
         incoming = {}
-        for name, value, index, normalized in (
-            ("doi", doi, self._by_doi, _normalize_doi(doi)),
-            ("arxiv_id", arxiv_id, self._by_arxiv, _normalize_arxiv(arxiv_id)),
-        ):
-            if value and not getattr(paper, name):
-                if index.setdefault(normalized, key) == key:
-                    incoming[name] = value
-                else:
-                    self.corrections.stage_identity(paper, {name: value}, self.get(index[normalized]),
-                        provenance={"operation": "verified_identifiers", **(provenance or {})})
-        self._merge(paper, incoming, provenance={"operation": "verified_identifiers", **(provenance or {})})
-        applied = {}
-        for name, value in incoming.items():
-            current = getattr(paper, name)
-            if current == value:
-                applied[name] = value
-                continue
-            # Another writer filled this blank first. Remove our unused claim,
-            # retaining the index when only the arXiv version/case differs.
-            index = self._by_doi if name == "doi" else self._by_arxiv
-            normalize = _normalize_doi if name == "doi" else _normalize_arxiv
-            normalized = normalize(value)
-            if normalize(current) != normalized and index.get(normalized) == key:
-                index.pop(normalized, None)
-        acknowledge_identity_adoption(paper, before, applied)
-        return applied
+        reservations = set()
+        try:
+            with self._merge_execution_lock:
+                for name, value, index, normalized in (
+                    ("doi", doi, self._by_doi, _normalize_doi(doi)),
+                    ("arxiv_id", arxiv_id, self._by_arxiv, _normalize_arxiv(arxiv_id)),
+                ):
+                    if value and not getattr(paper, name):
+                        if index.setdefault(normalized, key) == key:
+                            incoming[name] = value
+                            claim = (name, normalized, key, object())
+                            reservations.add(claim)
+                            self._identity_reservations.add(claim)
+                        else:
+                            self.corrections.stage_identity(paper, {name: value}, self.get(index[normalized]),
+                                provenance={"operation": "verified_identifiers", **(provenance or {})})
+            self._merge(paper, incoming, provenance={"operation": "verified_identifiers", **(provenance or {})})
+            applied = {}
+            with self._merge_execution_lock:
+                for name, value in incoming.items():
+                    current = getattr(paper, name)
+                    if current == value:
+                        applied[name] = value
+                        continue
+                    # Another writer filled this blank first. Remove our unused claim,
+                    # retaining the index when only the arXiv version/case differs.
+                    index = self._by_doi if name == "doi" else self._by_arxiv
+                    normalize = _normalize_doi if name == "doi" else _normalize_arxiv
+                    normalized = normalize(value)
+                    if normalize(current) != normalized and index.get(normalized) == key:
+                        index.pop(normalized, None)
+            acknowledge_identity_adoption(paper, before, applied)
+            return applied
+        finally:
+            with self._merge_execution_lock:
+                self._identity_reservations.difference_update(reservations)
 
     def export_bibtex(self, keys: Optional[list[str]] = None) -> tuple[str, list[str]]:
         """Render BibTeX for a subset (or the whole library if keys is None).

@@ -66,6 +66,35 @@ def _text_pdf(text: str) -> bytes:
     return output.getvalue()
 
 
+@pytest.mark.parametrize("incoming_arxiv", ["0708.2587", "0708.2587v1", "arXiv:0708.2587v2"])
+def test_registration_after_arxiv_title_discovery_does_not_create_pending_twin(
+        lib, monkeypatch, incoming_arxiv):
+    from papervault.library.download_sources import arxiv
+
+    # Frozen Casolino ID/key, synthetic titles: exercise the real discovery
+    # mutation before any reload can rebuild the Library's identity cache.
+    original, _ = lib.upsert({"title": "Registration identity fixture for the PAMELA mission",
+                             "authors": ["Casolino"], "year": 2007,
+                             "doi": "10.1016/j.asr.2007.07.024"})
+    monkeypatch.setattr("papervault.library.sources.arxiv.search_arxiv", lambda *_args, **_kwargs: [
+        {"title": original.title, "arxiv_id": "0708.2587v1"}])
+    monkeypatch.setattr(arxiv, "_lookup_arxiv_record", lambda identifier: arxiv._ArxivRecord(
+        requested_id=identifier, status="found", latest_id="0708.2587v1"))
+    monkeypatch.setattr(arxiv, "_try_arxiv_with_record", lambda *_: _text_pdf(original.title))
+    monkeypatch.setattr(download, "_STRATEGIES", [("arxiv_by_title", download._try_arxiv_by_title)])
+    monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (True, "llm_match: fixture"))
+    assert download.download_paper(original, lib)
+    assert original.arxiv_id == "0708.2587v1" and original.download_status == "ok"
+
+    registered, is_new = lib.upsert({"title": "PAMELA mission registration identity fixture",
+                                    "authors": ["Casolino"], "year": 2007,
+                                    "arxiv_id": incoming_arxiv})
+    assert not is_new and registered is original
+    assert lib.keys() == ["Casolino2007"]
+    assert registered.download_status == "ok"
+    assert lib.has_pdf("Casolino2007")
+
+
 @pytest.fixture
 def file_url_identity(monkeypatch, paper):
     """Replace only the external LLM; parse and verify PDF text normally."""

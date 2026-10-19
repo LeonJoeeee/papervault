@@ -72,6 +72,39 @@ def test_find_by_arxiv_canonical_prefix_form_resolves(tmp_path):
     assert prefixed_v is not None and prefixed_v.key == p.key
 
 
+@pytest.mark.parametrize("stored,incoming", [
+    ("10.1016/J.ASR.2007.07.024", " https://doi.org/10.1016/j.asr.2007.07.024 "),
+    ("http://dx.doi.org/10.1016/j.asr.2007.07.024", "10.1016/J.ASR.2007.07.024"),
+    ("doi:10.1016/j.asr.2007.07.024", "HTTPS://DOI.ORG/10.1016/j.asr.2007.07.024"),
+])
+def test_registration_matches_doi_forms_without_changing_stored_identity(tmp_path, stored, incoming):
+    lib = _make_lib(tmp_path)
+    original, _ = lib.upsert({"title": "Original journal metadata for registration fixture",
+                             "authors": ["Casolino"], "year": 2007, "doi": stored,
+                             "download_status": "ok"})
+    result, is_new = lib.upsert({"title": "Different source title for the same registered work",
+                                 "authors": ["Casolino"], "year": 2007, "doi": incoming})
+    assert not is_new and result is original
+    assert lib.keys() == ["Casolino2007"]
+    assert original.doi == stored and original.download_status == "ok"
+    lib.save()
+    assert Library(lib.root).find(doi=incoming).key == "Casolino2007"
+
+
+@pytest.mark.parametrize("field,old,new", [
+    ("doi", "10.1234/old", "10.1234/new"),
+    ("arxiv_id", "0708.2587v1", "0809.0162v2"),
+    ("title", "Old source title before metadata correction", "Corrected source title for the registered work"),
+])
+def test_find_uses_current_fields_after_in_place_worker_updates(tmp_path, field, old, new):
+    lib = _make_lib(tmp_path)
+    payload = {"title": "Identifier update registration fixture", field: old}
+    original, _ = lib.upsert(payload)
+    setattr(original, field, new)
+    assert lib.find(**{field: old}) is None
+    assert lib.find(**{field: new}) is original
+
+
 def test_key_collision_gets_suffix(tmp_path):
     lib = _make_lib(tmp_path)
     p1, _ = lib.upsert({"title": "Test paper A for key collision",

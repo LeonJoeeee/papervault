@@ -277,6 +277,33 @@ class MergeStore:
         async with self.lock:
             return self._quiesce(canonical_key, absorbed_key, wait_seconds=wait_seconds)
 
+    async def restart(self, intent: MergeIntent, *, wait_seconds=60):
+        """Explicitly replace an expired wait, keeping both admission fences.
+
+        This does not establish drain or release claims, quarantine or budgets.
+        Uncertain execution/commit still requires separate operator recovery.
+        """
+        async with self.lock:
+            self._require_writer()
+            if not math.isfinite(wait_seconds) or wait_seconds <= 0:
+                raise ValueError("merge wait must be positive and finite")
+            with self.library._merge_execution_lock:
+                papers = self._pair(intent)
+                if (papers is None or intent.status != "expired"
+                        or any(paper.merge_intent != intent or paper.unquiesced_state.quarantine
+                               or self._can_quiesce(paper.key) is None for paper in papers)):
+                    return None
+                now = float(self.clock())
+                fresh = intent.model_copy(update={"merge_id": uuid.uuid4().hex, "status": "waiting",
+                                                  "started_at": now, "deadline": now + wait_seconds})
+                for paper in papers:
+                    paper.merge_intent = fresh
+                self.library.save(force=True, durable=True)
+                self.library.log({"event": "merge_intent_restarted", "previous_merge_id": intent.merge_id,
+                                  "merge_id": fresh.merge_id, "canonical_key": fresh.canonical_key,
+                                  "absorbed_key": fresh.absorbed_key})
+                return fresh
+
     def _drain_ready(self, intent):
         self._require_writer()
         papers = self._pair(intent)

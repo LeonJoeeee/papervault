@@ -157,6 +157,11 @@ def _fsync_dir(directory: Path, *, durable: bool = False) -> None:
         os.close(fd)
 
 
+def _normalize_doi(doi: str) -> str:
+    from .fetch import normalize_doi
+    return normalize_doi(doi).strip().lower()
+
+
 def _normalize_arxiv(arxiv_id: str) -> str:
     """Canonicalize an arxiv id for indexing / lookup.
 
@@ -369,7 +374,7 @@ class Library:
     def _reindex(self, p: Paper) -> None:
         key = (p.acquisition_state.alias_key or p.key) if merge_v2_enabled() or p.merge_budget else p.key
         if p.doi:
-            self._by_doi[p.doi.lower()] = key
+            self._by_doi[_normalize_doi(p.doi)] = key
         if p.arxiv_id:
             self._by_arxiv[_normalize_arxiv(p.arxiv_id)] = key
         nt = normalize_title(p.title)
@@ -532,22 +537,29 @@ class Library:
 
     def find(self, *, doi: str = "", arxiv_id: str = "",
              title: str = "") -> Optional[Paper]:
-        """Look a paper up by any identifier. Case-insensitive."""
-        if doi:
-            k = self._by_doi.get(doi.lower())
-            if k:
-                from .merge_v2 import resolve_alias
-                return resolve_alias(self, k) if merge_v2_enabled() or self._papers[k].merge_budget else self._papers[k]
-        if arxiv_id:
-            k = self._by_arxiv.get(_normalize_arxiv(arxiv_id))
-            if k:
-                from .merge_v2 import resolve_alias
-                return resolve_alias(self, k) if merge_v2_enabled() or self._papers[k].merge_budget else self._papers[k]
-        if title:
-            k = self._by_title.get(normalize_title(title))
-            if k:
-                from .merge_v2 import resolve_alias
-                return resolve_alias(self, k) if merge_v2_enabled() or self._papers[k].merge_budget else self._papers[k]
+        """Look up current record identities, treating the indexes as caches.
+
+        Download workers can fill/clear identifiers on the shared Paper in
+        place. A stale cache must not authorize allocating another citation key.
+        """
+        for field, value, index, normalize in (
+            ("doi", doi, self._by_doi, _normalize_doi),
+            ("arxiv_id", arxiv_id, self._by_arxiv, _normalize_arxiv),
+            ("title", title, self._by_title, normalize_title),
+        ):
+            normalized = normalize(value)
+            if not normalized:
+                continue
+            paper = self._papers.get(index.get(normalized, ""))
+            if paper is None or normalize(getattr(paper, field)) != normalized:
+                paper = next((p for p in self._papers.values()
+                              if normalize(getattr(p, field)) == normalized), None)
+                if paper is None:
+                    index.pop(normalized, None)
+                    continue
+                index[normalized] = paper.key
+            from .merge_v2 import resolve_alias
+            return resolve_alias(self, paper.key) if merge_v2_enabled() or paper.merge_budget else paper
         return None
 
     def get(self, key: str) -> Optional[Paper]:
@@ -717,10 +729,10 @@ class Library:
             return write_locked(lambda: MergeStore(self)._merge_records(
                 intent.canonical_key, intent.absorbed_key, metadata=incoming)) or existing
         twin = None
-        for value, index, normalize in ((incoming.get("doi"), self._by_doi, str.lower),
-                                        (incoming.get("arxiv_id"), self._by_arxiv, _normalize_arxiv)):
+        for name in ("doi", "arxiv_id"):
+            value = incoming.get(name)
             if value:
-                other = resolve_alias(self, index.get(normalize(value), ""))
+                other = self.find(**{name: value})
                 if other and other.key != existing.key and not other.acquisition_state.alias_key:
                     twin = other
                     break
@@ -745,7 +757,7 @@ class Library:
             if twin is not None and (merger._can_quiesce(twin.key) is None or twin.merge_intent is not None):
                 return existing
             if twin is None and all(not incoming.get(name) or normalize(incoming[name]) == normalize(getattr(existing, name))
-                                    for name, normalize in (("doi", str.lower), ("arxiv_id", _normalize_arxiv))):
+                                    for name, normalize in (("doi", _normalize_doi), ("arxiv_id", _normalize_arxiv))):
                 self._merge(existing, incoming)
                 self._reindex(existing)
                 return existing
@@ -789,7 +801,7 @@ class Library:
         # Drop from indexes
         self._papers.pop(key, None)
         if existing.doi:
-            self._by_doi.pop(existing.doi.lower(), None)
+            self._by_doi.pop(_normalize_doi(existing.doi), None)
         if existing.arxiv_id:
             self._by_arxiv.pop(_normalize_arxiv(existing.arxiv_id), None)
         nt = normalize_title(existing.title)
@@ -900,7 +912,7 @@ class Library:
         if not doi:
             return ("no_paper", "empty doi")
 
-        holder_key = self._by_doi.get(doi.lower())
+        holder_key = self._by_doi.get(_normalize_doi(doi))
         if holder_key is not None and (merge_v2_enabled() or self._papers[holder_key].merge_budget):
             from .merge_v2 import resolve_alias
             holder = resolve_alias(self, holder_key)
@@ -962,7 +974,7 @@ class Library:
             return "has_identifier"
         if not (recovery.doi or recovery.arxiv_id):
             return "empty_identity"
-        for value, index, normalize in ((recovery.doi, self._by_doi, str.lower),
+        for value, index, normalize in ((recovery.doi, self._by_doi, _normalize_doi),
                                         (recovery.arxiv_id, self._by_arxiv, _normalize_arxiv)):
             if value and index.get(normalize(value), key) != key:
                 holder = self.get(index[normalize(value)])
@@ -1007,7 +1019,7 @@ class Library:
                                       operation="verified_identifiers", provenance=provenance)
         incoming = {}
         for name, value, index, normalized in (
-            ("doi", doi, self._by_doi, doi.lower()),
+            ("doi", doi, self._by_doi, _normalize_doi(doi)),
             ("arxiv_id", arxiv_id, self._by_arxiv, _normalize_arxiv(arxiv_id)),
         ):
             if value and not getattr(paper, name):
@@ -1026,7 +1038,7 @@ class Library:
             # Another writer filled this blank first. Remove our unused claim,
             # retaining the index when only the arXiv version/case differs.
             index = self._by_doi if name == "doi" else self._by_arxiv
-            normalize = str.lower if name == "doi" else _normalize_arxiv
+            normalize = _normalize_doi if name == "doi" else _normalize_arxiv
             normalized = normalize(value)
             if normalize(current) != normalized and index.get(normalized) == key:
                 index.pop(normalized, None)

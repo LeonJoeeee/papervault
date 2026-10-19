@@ -140,6 +140,91 @@ async def test_expiry_remains_blocked_after_later_drain_and_restart(pair):
     assert not any(r["event"] == "merge" for r in ledger._read())
 
 
+async def test_expired_intent_can_be_explicitly_restarted_after_reload(pair):
+    from papervault.library.merge_v2 import MergeStore
+    from papervault.library.services import concurrency
+    lib, left, right, ledger, now = pair
+    merge = coordinator(pair)
+    intent = await merge.quiesce(left.key, right.key, wait_seconds=10)
+    lib._merge_active[right.key] = 1
+    async with concurrency.lib_write_lock:
+        assert merge._merge_records(left.key, right.key, metadata={
+            "arxiv_id": right.arxiv_id, "domain_status": "off_domain"}) is None
+    now[0] += 10
+    assert not await merge.drain_ready(intent)
+    lib._merge_active.clear()
+    restarted = Library(lib.root)
+    replay = MergeStore(restarted, ledger=ledger, clock=lambda: now[0])
+    expired = restarted.get(left.key).merge_intent
+    fresh = await replay.restart(expired, wait_seconds=30)
+    assert fresh.status == "waiting" and fresh.merge_id != expired.merge_id
+    assert fresh.started_at == now[0] and fresh.deadline == now[0] + 30
+    assert fresh.metadata == expired.metadata
+    for key in (left.key, right.key):
+        row = Library(lib.root).get(key)
+        assert row.merge_intent == fresh and row.acquisition_state.quarantine
+    assert not await replay.drain_ready(expired)
+    assert await replay.restart(expired) is None
+    merged = await replay.merge_records(left.key, right.key)
+    assert merged.key == left.key and merged.arxiv_id == right.arxiv_id
+    assert merged.acquisition_state.policy == Policy.EXCLUDED
+    assert not merged.acquisition_state.quarantine
+    assert restarted.get(right.key).acquisition_state.alias_key == left.key
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    event = next(row for row in events if row["event"] == "merge_intent_restarted")
+    assert event["previous_merge_id"] == expired.merge_id and event["merge_id"] == fresh.merge_id
+    assert len([row for row in ledger._read() if row["event"] == "merge"]) == 1
+
+
+async def test_restarted_expired_intent_still_requires_claim_drain_without_refunding(pair):
+    lib, left, right, ledger, now = pair
+    store, (queued, dispatched) = await claims(pair)
+    assert await store.pre_dispatch(dispatched)
+    merge = coordinator(pair)
+    intent = await merge.quiesce(left.key, right.key, wait_seconds=10)
+    now[0] += 10
+    assert not await merge.drain_ready(intent)
+    before = ledger.path.read_bytes()
+    fresh = await merge.restart(left.merge_intent)
+    assert fresh.status == "waiting"
+    assert await merge.merge_records(left.key, right.key) is None
+    assert ledger.path.read_bytes() == before and ledger.spent(dispatched.campaign_id) == 2
+    assert all(lib.get(key).acquisition_state.quarantine for key in (left.key, right.key))
+    assert not await store.claim(left.key, expected_state=left.acquisition_state,
+                                  expected_generation=1, campaign_id=queued.campaign_id)
+
+
+@pytest.mark.parametrize("status", ["waiting", "uncertain", "mismatched"])
+async def test_restart_refuses_nonexpired_or_mismatched_intents(pair, status):
+    lib, left, right, _, now = pair
+    merge = coordinator(pair)
+    intent = await merge.quiesce(left.key, right.key, wait_seconds=10)
+    if status != "waiting":
+        now[0] += 10
+        assert not await merge.drain_ready(intent)
+        if status == "uncertain":
+            left.merge_intent = right.merge_intent = left.merge_intent.model_copy(update={"status": "uncertain"})
+        else:
+            right.merge_intent = right.merge_intent.model_copy(update={"status": "uncertain"})
+        lib.save(force=True, durable=True)
+    before = lib.index_path.read_bytes()
+    assert await merge.restart(left.merge_intent) is None
+    assert lib.index_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("wait_seconds", [0, -1, float("inf"), float("nan")])
+async def test_restart_rejects_invalid_wait_without_mutation(pair, wait_seconds):
+    lib, left, right, _, now = pair
+    merge = coordinator(pair)
+    intent = await merge.quiesce(left.key, right.key, wait_seconds=10)
+    now[0] += 10
+    assert not await merge.drain_ready(intent)
+    before = lib.index_path.read_bytes()
+    with pytest.raises(ValueError, match="positive and finite"):
+        await merge.restart(left.merge_intent, wait_seconds=wait_seconds)
+    assert lib.index_path.read_bytes() == before
+
+
 async def test_lease_expiry_during_quiescence_drops_staged_result(pair):
     from papervault.library.reopen_v2 import StagedAttempt
     lib, left, right, ledger, now = pair
@@ -575,6 +660,7 @@ async def test_uncertain_post_ledger_save_cannot_repeat(pair, monkeypatch):
     assert ledger.latest_generation(left.key) == 1
     assert not await merge.drain_ready(left.merge_intent)
     assert await merge.merge_records(left.key, right.key) is None
+    assert await merge.restart(left.merge_intent) is None
 
 
 async def test_merge_flag_alone_enforces_domain_restrictions_and_admission(pair, monkeypatch):
@@ -674,6 +760,19 @@ async def test_stored_twin_upsert_retains_new_restrictions_and_observations(pair
     assert set(left.acquisition_state.policy_reasons) == {"non_paper", "off_domain"}
     assert not effective_policy(left.acquisition_state, key=left.key)
     assert {o.source for o in left.source_identities} == {"core", "ads", "openalex"}
+
+
+async def test_promotion_looks_up_current_twin_identifiers_before_allocating_a_key(pair):
+    from papervault.library.services import concurrency
+    lib, left, right, _, _ = pair
+    right.arxiv_id = "2102.12345v2"
+    before = lib.keys()
+    async with concurrency.lib_write_lock:
+        result, is_new = lib.upsert({"doi": left.doi, "arxiv_id": "arXiv:2102.12345v3"})
+    assert not is_new and result is left
+    assert lib.keys() == before
+    assert right.acquisition_state.alias_key == left.key
+    assert lib.find(arxiv_id="2102.12345") is left
 
 
 def test_quarantined_promotion_cannot_create_schedulable_twin(tmp_path, monkeypatch):

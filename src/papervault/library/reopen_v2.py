@@ -174,7 +174,7 @@ class StagedAttempt:
                     if fills:
                         # The publication fences above authorize only this existing
                         # dispatched result, including same-row verified blank fills.
-                        applied = self.live._fill_verified_identifiers(paper, **fills,
+                        applied = self.live._fill_verified_identifiers(paper, **fills, completion=self.token,
                             provenance={"operation": "reopen", "generation": self.token.generation})
                         if applied != fills:
                             store._quarantine(paper, "identity fill refused at publication")

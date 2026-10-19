@@ -330,12 +330,12 @@ def test_acknowledged_secondary_fill_never_masks_competing_canonical_doi_change(
     from papervault.library.download_sources.openalex import _OpenAlexPDF
     lib, paper = vault
     paper.reopen_claim = None
-    merge = lib._merge
-    def competing_writer(current, incoming, **kwargs):
-        result = merge(current, incoming, **kwargs)
-        current.doi = "10.1234/different"
+    adopt = lib.adopt_identifiers
+    def competing_writer(key, **incoming):
+        result = adopt(key, **incoming)
+        paper.doi = "10.1234/different"
         return result
-    monkeypatch.setattr(lib, "_merge", competing_writer)
+    monkeypatch.setattr(lib, "adopt_identifiers", competing_writer)
     data = _OpenAlexPDF(b"%PDF-fixture", "", "2601.00001")
     monkeypatch.setattr(download, "_STRATEGIES", [("openalex", lambda _: data)])
     monkeypatch.setattr(download, "_verify_pdf_matches_metadata", lambda *_: (True, "llm_match: fixture"))

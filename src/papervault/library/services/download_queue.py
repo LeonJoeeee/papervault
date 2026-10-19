@@ -3,8 +3,8 @@
 Independent of :class:`ExtractQueue`. Started by the daemon lifespan;
 receives work from two sources:
 
-  1. **External trigger** — MCP ``search_papers`` upserts metadata-only
-     candidates and calls ``download_queue.add(key)``. Foreground
+  1. **External trigger** — the separately admitted registration command commits
+     metadata and pending acquisition work, then calls ``download_queue.add(key)``. Foreground
      ``get_paper`` enqueues at ``PRIORITY_URGENT`` via the same ``add(key)``
      (fire-and-forget; the record carries ``text_status=pending`` until the
      background workers finish).

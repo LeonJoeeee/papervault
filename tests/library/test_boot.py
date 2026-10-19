@@ -236,3 +236,21 @@ def test_recovery_scan_probes_pdf_off_the_event_loop(tmp_path, monkeypatch):
         await eq.stop()
 
     asyncio.run(scenario())
+
+
+def test_registration_starts_independently_of_stalled_acquisition_boot(tmp_path):
+    async def scenario():
+        server = build_server(library_path=str(tmp_path))
+        gate = asyncio.Event()
+        async def stalled_extract_start():
+            await gate.wait()
+        server._paper_extract_queue.start = stalled_extract_start
+        shutdown = await start_background(server, log)
+        try:
+            assert server._paper_registration_queue._started
+            assert not server._paper_download_queue._started
+        finally:
+            await shutdown()
+        assert not server._paper_registration_queue._started
+        assert server._paper_registration_queue._workers == []
+    asyncio.run(scenario())

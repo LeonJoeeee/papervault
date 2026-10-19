@@ -13,6 +13,7 @@ NASA ADS requires ADS_API_TOKEN; silently skipped otherwise.
 from __future__ import annotations
 
 import concurrent.futures
+from functools import partial
 from contextvars import copy_context
 import json
 import logging
@@ -36,10 +37,10 @@ from urllib.parse import (
 import requests as requests
 
 from papervault.config import terminal_v2_enabled, stoprules_v2_enabled
-from .telemetry_v2 import (acknowledge_identity_adoption, adoption_snapshot,
-                           begin_identity_measurement, publication_fields, track_execution)
+from .telemetry_v2 import begin_identity_measurement, publication_fields, track_execution
 from papervault.llm_routing import route
 
+from .download_sources._shared import _adopt_source_identifiers
 from .models import (
     DOWNLOAD_STATUS_FAILED,
     DOWNLOAD_STATUS_METADATA_ONLY,
@@ -357,6 +358,7 @@ def _try_oa_aggregators(paper: Paper) -> Optional[bytes]:
 
 def _try_domain_aggregators(
     paper: Paper, *, ads_member: Optional[Callable[[Paper], Optional[bytes]]] = None,
+    library: Optional[Library] = None,
 ) -> Optional[bytes]:
     """Concurrent first-hit over four domain-specific paper indexes.
 
@@ -365,7 +367,7 @@ def _try_domain_aggregators(
     paper at most one will have content; running them serially wastes
     ~6-8s on the misses."""
     return _try_concurrent_first_hit(paper, [
-        ("inspire", _try_inspire),
+        ("inspire", partial(_try_inspire, library=library) if library is not None else _try_inspire),
         ("ads", _try_ads if ads_member is None else ads_member),
         ("europepmc", _try_europepmc),
         ("zenodo", _try_zenodo),
@@ -529,8 +531,8 @@ def _settle_arxiv_withdrawal(paper: Paper, library: Library, *,
     return True
 
 
-def _prepare_cascade_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
-    record = _prepare_arxiv(paper)
+def _prepare_cascade_arxiv(paper: Paper, library: Library) -> Optional[_ArxivRecord]:
+    record = _prepare_arxiv(paper, library=library)
     if record is not None or paper.arxiv_id:
         return record
     # An operator can supply an arXiv file URL for a DOI-only record. Route it
@@ -550,10 +552,9 @@ def _prepare_cascade_arxiv(paper: Paper) -> Optional[_ArxivRecord]:
     candidate.arxiv_id = identifier
     record = _prepare_arxiv(candidate)
     if record is not None and record.status == "found":
-        before = adoption_snapshot(paper)
-        paper.arxiv_id = candidate.arxiv_id
+        if not _adopt_source_identifiers(paper, library, arxiv_id=candidate.arxiv_id):
+            return None
         paper.arxiv_withdrawal = candidate.arxiv_withdrawal
-        acknowledge_identity_adoption(paper, before, {"arxiv_id": candidate.arxiv_id})
     return record
 
 
@@ -604,7 +605,7 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
     # position, but confirm withdrawal before an earlier tier or text re-gate
     # can supply/remove an older copy. This is per-call state, not a global cache.
     with span("preflight", source="arxiv"):
-        arxiv_record = (_prepare_cascade_arxiv(paper) if any(strategy is _try_arxiv for _, strategy in _STRATEGIES)
+        arxiv_record = (_prepare_cascade_arxiv(paper, library) if any(strategy is _try_arxiv for _, strategy in _STRATEGIES)
                         else None)
     if _settle_arxiv_withdrawal(paper, library, attempted=arxiv_record is not None):
         return False
@@ -686,9 +687,11 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                             skip_reason = None
                         data = _try_arxiv_with_record(paper, arxiv_record)
                     elif strategy is _try_arxiv_by_title:
-                        data = _try_arxiv_by_title(paper, record=arxiv_record)
-                    elif ads_member is not None and strategy is _try_domain_aggregators:
-                        data = _try_domain_aggregators(paper, ads_member=ads_member)
+                        data = _try_arxiv_by_title(paper, record=arxiv_record, library=library)
+                    elif strategy is _try_domain_aggregators:
+                        data = _try_domain_aggregators(paper, ads_member=ads_member, library=library)
+                    elif strategy is _try_inspire:
+                        data = _try_inspire(paper, library=library)
                     else:
                         data = strategy(paper)
             except Exception as exc:

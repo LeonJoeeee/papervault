@@ -36,7 +36,7 @@ def paper(lib, monkeypatch):
         ("domain_aggregators", download._try_domain_aggregators),
     ])
     for name in ("_try_inspire", "_try_europepmc", "_try_zenodo"):
-        monkeypatch.setattr(download, name, lambda _: None)
+        monkeypatch.setattr(download, name, lambda _, **kwargs: None)
     monkeypatch.setattr(download, "_try_firecrawl_text_fallback", lambda *_: False)
     return p
 
@@ -559,8 +559,11 @@ def test_rejected_other_domain_member_still_settles_ads_abstract(lib, paper, mon
     stub_metadata(doctype='abstract')
     responses.get(GATEWAY, body=abstract_pdf())
     responses.get(LEGACY, status=404)
-    monkeypatch.setattr(download, '_try_inspire', lambda _: _text_pdf('A different paper'))
-    monkeypatch.setattr(download, '_verify_pdf_matches_metadata', lambda *_: (False, 'llm_mismatch: other work'))
+    other_pdf = _text_pdf('A different paper')
+    verified = []
+    monkeypatch.setattr(download, '_try_inspire', lambda _, **kwargs: other_pdf)
+    monkeypatch.setattr(download, '_verify_pdf_matches_metadata',
+                        lambda data, _: (verified.append(data) or False, 'llm_mismatch: other work'))
     later = []
     monkeypatch.setattr(download, '_STRATEGIES', download._STRATEGIES + [
         ('later', lambda _: later.append('later')),
@@ -569,6 +572,7 @@ def test_rejected_other_domain_member_still_settles_ads_abstract(lib, paper, mon
     assert download.download_paper(paper, lib) is False
     assert paper.ads_availability.availability == 'confirmed_abstract_only'
     assert paper.download_status == 'metadata_only'
+    assert verified == [other_pdf]
     assert not later
 
 

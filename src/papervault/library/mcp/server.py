@@ -10,8 +10,8 @@ no business logic lives here, only protocol shaping. Each tool:
 
   - accepts any identifier form (citation key / DOI / arxiv id / fuzzy text)
   - is READ-ONLY for INGEST: a not-in-library DOI/arxiv is NEVER fetched +
-    ingested — it returns ``not_found``. The library's single ingest entrance
-    is ``search_papers`` (stop-gap, SDD I1). ``get_paper`` is not strictly
+    ingested — it returns ``not_found``. Search submits separate registration
+    commands after constructing its response. ``get_paper`` is not strictly
     side-effect-free, though: for an IN-library paper whose full text isn't
     ready (and is NOT terminal) it fires a fire-and-forget URGENT
     download/extract enqueue so a ``pending`` record progresses (SDD §5
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import copy
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from papervault.library import Library
 from papervault.library import fetch as fetcher
 from papervault.library.llm import get_llm
-from papervault.library.sources.inspire import merge_inspire_fields, retained_inspire_fields
+from papervault.library.sources.inspire import merge_inspire_fields
 from papervault.library.sources.identity import merge_source_identities
 from papervault.library.models import (
     DOWNLOAD_STATUS_EXTRACT_FAILED,
@@ -59,6 +60,11 @@ from papervault.library.services.bm25_search import (
     round_robin, _node_key)
 from papervault.library.services.download_queue import DownloadQueue
 from papervault.library.services.extract_queue import ExtractQueue
+from papervault.library.services.registration import (
+    RegistrationQueue, RegistrationService, ServingTrace,
+    metadata_is_paper as _metadata_is_paper, normalized_source_identities,  # noqa: F401 - compatibility import
+    preview_candidates, registration_rejection,
+)
 
 
 # ----------------------------- helpers --------------------------------------
@@ -414,40 +420,6 @@ def YEAR_DROP(paper: dict, year_min, year_max) -> bool:
         return False
     return (year_min is not None and y < year_min) or (year_max is not None and y > year_max)
 
-# is_paper backstop (block 2): source ``publication_types`` is authoritative WHEN it carries a
-# recognized marker; it's frequently empty (CORE never sets it; some Crossref/OpenAlex don't),
-# so an empty/unrecognized value defers to the LLM's ``is_paper`` rather than guessing.
-_PAPER_TYPES = {
-    "journalarticle", "journal-article", "article", "review", "conference",
-    "conferencepaper", "proceedings-article", "preprint", "posted-content",
-    "letter", "lettersandcomments", "casereport", "clinicaltrial",
-    "metaanalysis", "study", "dissertation", "thesis",
-    "book-chapter", "booksection",
-}
-_NON_PAPER_TYPES = {
-    "dataset", "software", "book", "monograph", "erratum", "retraction",
-    "editorial", "news", "peer-review", "peerreview", "grant", "component",
-    "paratext", "supplementary-materials", "supplementary-material",
-}
-
-
-def _metadata_is_paper(publication_types) -> Optional[bool]:
-    """Decide "is this a research paper" from source metadata ALONE.
-
-    Returns ``True`` / ``False`` only when the metadata is conclusive; ``None`` when it
-    can't decide (empty, or only unrecognized markers) — the caller then falls back to
-    the LLM's ``is_paper``. A non-paper marker (dataset/book/…) wins over a paper marker.
-    """
-    types = [str(t).strip().lower() for t in (publication_types or []) if str(t).strip()]
-    if not types:
-        return None
-    if any(t in _NON_PAPER_TYPES for t in types):
-        return False
-    if any(t in _PAPER_TYPES for t in types):
-        return True
-    return None
-
-
 async def _maybe_progress(ctx: Optional[Context], progress: float,
                           total: float, message: str) -> None:
     """ctx.report_progress is a no-op outside an MCP request, but it can
@@ -783,11 +755,11 @@ def build_server(library_path: Optional[str] = None,
                  # are cleaned up.
                  enable_insight: bool = True,  # noqa: ARG001 (back-compat)
                  insight_queue=None) -> FastMCP:  # noqa: ARG001 (back-compat)
-    """Construct a FastMCP server bound to a Library + 2 stage queues.
+    """Construct a FastMCP server bound to a Library + registration/download/extract queues.
 
     For tests, pass any of ``library=`` / ``download_queue=`` /
     ``extract_queue=`` to inject pre-built dependencies. For production,
-    only ``library_path`` is needed; both queues are constructed
+    only ``library_path`` is needed; the queues are constructed
     (chained via ``on_success`` callbacks) but not started — call
     ``await eq.start()`` then ``await dq.start()`` from the process
     entry point (``__main__.py``) before serving traffic. (Start
@@ -822,6 +794,7 @@ def build_server(library_path: Optional[str] = None,
             on_success=extract_queue.add,
         )
 
+    registration_queue = RegistrationQueue(RegistrationService(library, download_queue))
     resolver_svc = ResolverService(library)
 
     # When composed into the unified papervault server, tools register onto the passed-in
@@ -851,9 +824,10 @@ Tools (full params + good/bad examples are in each tool's own schema):
     ingest; a terminal paper is never re-enqueued.)
 
 Reading full text: both tools give you, per paper, EXACTLY ONE of ``text_path`` (an absolute
-file path — Read it for the verbatim full text, references intact) or ``text_status``. The
-``text_status`` is one of four values: ``"pending"`` (still working — in the library, text still
-downloading / OCR'ing; ≠ not-found, re-call later to pick it up) or three TERMINAL values that
+file path — Read it for the verbatim full text, references intact) or ``text_status``.
+External search results carry stable source identities and provenance before registration.
+``text_status`` is one of four values: ``"pending"`` (awaiting registration, download or OCR)
+or three TERMINAL values that
 will NOT progress — ``"extract_failed"`` (a PDF is on disk but extraction gave up),
 ``"download_failed"`` (no source found and no abstract — a true zero), ``"metadata_only"`` (no
 full text, but citable DOI/title/authors/year/abstract). ``abstract`` rides in the record either
@@ -866,6 +840,7 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
     mcp._paper_library = library  # type: ignore[attr-defined]
     mcp._paper_download_queue = download_queue  # type: ignore[attr-defined]
     mcp._paper_extract_queue = extract_queue  # type: ignore[attr-defined]
+    mcp._paper_registration_queue = registration_queue  # type: ignore[attr-defined]
 
     # ---------------- get_paper ----------------
 
@@ -1017,14 +992,15 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
           1. LLM1 parses your intent → search terms + filters + result count
           2. Multi-source external search (arxiv + ads + S2 + openalex
              + inspire + core, in parallel) merged with the in-library snapshot
-          3. LLM2 (ingest gate) judges NEW external candidates for domain +
-             paper-ness; in-domain real papers are upserted into the library
-             (PDFs queue for background download + extract). Off-domain /
-             non-paper records are dropped here — this is what keeps the
-             library clean.
-          4. LLM3 (return gate) scores every in-library + just-ingested
-             candidate for relevance to YOUR intent (absolute 0-1); below
-             threshold is dropped, the rest sorted and truncated to your count.
+          3. LLM2 judges NEW external candidates for domain + paper-ness.
+             Off-domain/non-paper records are dropped; eligible candidates
+             remain external until an independent registration command commits.
+          4. LLM3 scores library + eligible external candidates for relevance
+             to YOUR intent (absolute 0-1); below threshold is dropped, the
+             rest sorted and truncated to your count.
+          5. After building the response, submit eligible discoveries for
+             separately admitted registration, independently of the served list.
+             Search never waits for registration or download/OCR success.
 
         Returns:
           ``results``: papers ordered by relevance (the order IS the ranking).
@@ -1032,12 +1008,14 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
             doi, arxiv_id, citation_count — plus EXACTLY ONE text reference:
             ``text_path`` (an absolute file path you Read for the full verbatim
             text) when the extract is ready, else ``text_status`` — one of
-            ``"pending"`` (still working: in the library, full text still
-            downloading/OCR'ing — check back later; ``pending`` ≠ not found) OR
+            ``"pending"`` (full text unavailable; external results may still
+            await registration, download or OCR) OR
             one of three TERMINAL values that won't progress: ``"extract_failed"``
             (PDF on disk, extraction gave up), ``"download_failed"`` (no source
             found and no abstract), ``"metadata_only"`` (no full text but citable
-            metadata). The ``abstract`` is always present — use it both to decide
+            metadata). External records use a stable source identity in ``key``
+            and include ``source_identities`` provenance before a catalog ID exists.
+            The ``abstract`` is always present — use it both to decide
             which to read deep and to cite a ``metadata_only`` hit.
           ``intent_parsed``: how the system interpreted you AND observability
             signals about the run. Read it to verify alignment (refine ``query``
@@ -1061,7 +1039,8 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         The LLM infers filters (year window, review-only, min citations, result
         count, etc.) from your intent — just say them in words ("the last 2-3
         years", "5 papers", "reviews only"). After picking from ``results``, read the paper via its
-        ``text_path``, or call ``get_paper(<key>)`` to re-pull its record.
+        ``text_path``. Once registration commits, ``get_paper`` can resolve its
+        DOI/arXiv identity or internal citation key; admission may still be pending.
 
         Latency: minutes, not seconds — plan other work around the call. When the
         service is saturated the call returns a normal result
@@ -1087,8 +1066,9 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
             }
 
         # ONE shared LLM handle for the whole pipeline (parse_intent, judge_ingest,
-        # judge_return, AND library.upsert) — §1. The llm_sem PERMIT is re-acquired
+        # judge_return) — §1. The llm_sem PERMIT is re-acquired
         # per LLM-call site and never held across a network wait.
+        trace = ServingTrace(library)
         search_llm = get_llm()
 
         # ──── Stage 1: parse intent (LLM A) ────────────────────────────
@@ -1172,8 +1152,6 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         seen: dict[str, dict] = {}                                  # cross-arm fold key → node
         lib_by_key: dict[str, dict] = {}                            # Paper.key → library node
         folded_vouch: dict[str, int] = collections.defaultdict(int)  # lib Paper.key → vouch count
-        inspire_fills: dict[str, dict] = {}  # all original donor evidence, rechecked under lock
-        identity_fills: dict[str, list] = {}  # source observations for existing library twins
         buckets: dict[int, list] = collections.defaultdict(list)    # term_idx → ext node list
         # FULL-iteration invariant: register EVERY library node's identity first
         # (library-FIRST so a library twin wins identity over any external copy).
@@ -1202,8 +1180,6 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
             if node.get("source_identities"):
                 hit["source_identities"] = [o.model_dump() for o in merge_source_identities(
                     hit.get("source_identities"), node["source_identities"])]
-                if hit.get("_source_origin") == "library":
-                    identity_fills[hit["key"]] = hit["source_identities"]
             fills = merge_inspire_fields(hit, node)
             if fills:
                 hit.update(fills)
@@ -1215,8 +1191,6 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                 # External twin folds into a LIBRARY node → vouch (guarded to
                 # library-origin: hit["key"] is the stable Paper.key, real).
                 folded_vouch[hit["key"]] += 1
-                if fills:
-                    inspire_fills[hit["key"]] = dict(hit)
                 continue
             # ext↔ext fold: union this occurrence's vote onto the registered
             # external representative ``hit`` (no Paper.key, no vouch). A
@@ -1291,108 +1265,37 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                            k))[:ALSO_INCLUDE_CAP]
         lib_pool = lib_pool + [lib_by_key[k] for k in also_include]
 
-        # ──── Stage 3: LLM2 judge_ingest(ext) → gate → upsert ──────────
-        # Double-filter (stop-gap): the INGEST gate decides what enters the library
-        # (domain tier ∈ 1A-2C AND is_paper); a separate RETURN gate (Stage 4) decides
-        # what comes back to the agent. Library cands skip the ingest judge entirely.
+        # Stage 3 preserves the existing domain/paper gate, without catalog writes.
+        # Registration eligibility is independent of the later relevance/limit cuts.
         await _maybe_progress(ctx, 3, 5, "judging new papers for ingest")
         ingest_judgments, ingest_dropped = await judge_ingest(ext_pool, llm=search_llm)
+        eligible = []
+        for idx, node in enumerate(ext_pool):
+            cand = copy.deepcopy(node)
+            cand["_registration"] = ingest_judgments.get(idx)
+            known = library.find(doi=cand.get("doi") or "", arxiv_id=cand.get("arxiv_id") or "",
+                                 title=cand.get("title") or "") or library._find_preprint_journal_dup(cand)
+            rejection = registration_rejection(cand, known_identity=known is not None)
+            if rejection:
+                trace.record("registration", candidate=cand, decision="skipped", reason=rejection)
+                continue
+            eligible.append(cand)
 
-        ingested_dicts: list[dict] = []
-        ingested_keys: set[str] = set()   # same-key collapse → keeps ingested_dicts key-unique
-        async with concurrency.lib_write_lock:
-            for key, observations in identity_fills.items():
-                existing = library.get(key)
-                if existing is not None:
-                    existing.source_identities = merge_source_identities(
-                        existing.source_identities, observations)
-            for key, incoming in inspire_fills.items():
-                existing = library.get(key)
-                if existing is not None:
-                    # Recheck against the current Paper, preserving worker-owned
-                    # status/assets and any source pair another actor filled.
-                    fills = merge_inspire_fields(existing.model_dump(), incoming)
-                    for field, value in fills.items():
-                        setattr(existing, field, value)
-            for idx, cand in enumerate(ext_pool):
-                j = ingest_judgments.get(idx)
-                if j is None:
-                    continue  # judge dropped this batch (all retries failed) → NOT ingested (stop-gap)
-                if not j["ingest_ok"]:
-                    continue  # off-domain (Tier 3 / unjudged tier)
-                # PLUG A (junk-ingress fix, 2026-06-03): EGU/Copernicus abstract-only
-                # conference submissions are NOT papers (no full text exists). DOI-pattern
-                # is the ONLY reliable key — venue strings are dirty (OpenAlex mislabels
-                # real PoS/ICRC proceedings papers as "EGU … Conference Abstracts"). The
-                # \d after egu scopes to egusphere-egu<NN>-* abstracts, NOT egusphere-<year>-*
-                # preprints. Placed BEFORE the metadata wave-in so it also catches the
-                # ['article']-tagged abstracts that _metadata_is_paper would otherwise pass.
-                _doi_lc = (cand.get("doi") or "").lower()
-                if _doi_lc.startswith("10.5194/egusphere-egu") and _doi_lc[21:22].isdigit():
-                    continue  # EGU conference abstract (abstract-only, not a paper)
-                # is_paper: trust source metadata when conclusive, else the LLM backstop.
-                meta = _metadata_is_paper(cand.get("publication_types"))
-                is_paper = meta if meta is not None else j["llm_is_paper"]
-                if not is_paper:
-                    continue  # non-paper record (dataset / book / errata / …)
-                # PLUG B (junk-ingress fix, 2026-06-03): content floor — a candidate with
-                # no DOI, arxiv_id, INSPIRE recid, or abstract has nothing to fetch and nothing to
-                # index (a pure citation-graph ghost stub). Presence-only floor: every real
-                # keep clears it (paywalled→DOI, preprint→arxiv, INSPIRE→recid,
-                # searchable stub→abstract); rejects ONLY the content-less pathology.
-                if not ((cand.get("doi") or "").strip()
-                        or (cand.get("arxiv_id") or "").strip()
-                        or retained_inspire_fields(cand)["inspire_record_id"]
-                        or (cand.get("abstract") or "").strip()):
-                    continue  # no identifier / abstract → nothing fetchable or indexable
-                # dict(cand) shallow-copy isolates upsert's TOP-LEVEL mutation
-                # (it writes key/added_at + a None-coercion pass IN PLACE) from
-                # the live ext_pool node still shared with the round-robin
-                # emitted-set + return_pool. (authors list stays aliased — safe
-                # only because no upsert path mutates it in place.)
-                #
-                # NO llm= is passed: upsert is purely heuristic. The old
-                # borderline preprint↔journal LLM consult was a synchronous
-                # llm.call on the event-loop thread held under lib_write_lock
-                # (freezing the whole loop); dropping it removed that freeze AND
-                # a confirmed dead path. Borderline (sub-0.85 title sim) twins
-                # now conservatively DON'T merge — false-positive merges are
-                # data loss; a residual duplicate is the safer outcome.
-                paper, was_new = library.upsert(dict(cand))
-                if paper is None:
-                    continue  # phantom quality-gate reject (logged); do NOT touch ingested_keys
-                # Persist the gate's judged domain tier onto the record (#57) so the
-                # ingest decision is auditable after the fact ("what did the gate think
-                # of this paper when it let it in"). j["tier"] is a keep tier here
-                # (ingest_ok already gated it to INGEST_TIERS). Stamp ONLY on a fresh
-                # ingest or a still-None record — never clobber a tier the audit path
-                # (set_domain_status) assigned; domain_status is left untouched. In-place
-                # mutation on the stored Paper; the batched library.save() below persists it.
-                if was_new or paper.domain_tier is None:
-                    paper.domain_tier = j["tier"]
-                # Same-key collapse — GATE THE WHOLE TAIL (not just the append):
-                # a second candidate resolving to an already-ingested key must
-                # not re-enqueue a download.
-                if paper.key in ingested_keys:
-                    continue
-                if was_new and not library.has_pdf(paper.key):
-                    download_queue.add(paper.key)
-                ingested_dicts.append(paper_to_dict(paper))  # canonical (key + "library" origin)
-                ingested_keys.add(paper.key)                 # FINAL tail statement (lockstep)
-            library.save()
+        # Folded library observations are also registered separately. Their known
+        # catalog identities bypass re-judging, as they did before P3; current
+        # policy and identity are checked again by the registration command.
+        registration_candidates = eligible + [
+            dict(lib_by_key[key], _registration_known_key=key)
+            for key in folded_vouch
+        ]
+        external_dicts, response_projections = preview_candidates(library, eligible)
+        trace.record("retrieval", external=len(external_raw), local=len(library_dicts),
+                     external_pool=len(ext_pool), local_pool=len(lib_pool))
+        trace.record("gate", eligible=len(eligible), skipped=len(ext_pool) - len(eligible))
 
-        # ──── Stage 4: LLM3 judge_return(lib + ingested) → threshold ───
-        # Everything here is already vetted (in-library, or just passed the ingest gate);
-        # the return judge scores relevance to THIS query intent (absolute 0-1).
         await _maybe_progress(ctx, 4, 5, "scoring relevance")
-        # DEDUP BY KEY before L3, keeping the RICHER ingested copy: a library
-        # paper P can sit in lib_pool (BM25>0) AND be re-surfaced + ingest-judged
-        # on a non-shared identity axis → upsert MERGES into P's key → P also in
-        # ingested_dicts under the SAME key, but with a fresher post-merge
-        # abstract. Drop the stale lib_pool copy so L3 scores each key ONCE on
-        # its richest record (defensive .get → a None/missing key is a no-op).
-        _ingested_keys = {d.get("key") for d in ingested_dicts if d.get("key")}
-        return_pool = [c for c in lib_pool if c.get("key") not in _ingested_keys] + ingested_dicts
+        external_keys = set(response_projections)
+        return_pool = [c for c in lib_pool if c.get("key") not in external_keys] + external_dicts
         # search_terms = the parser's distinct sub-topics, fed to the return judge as the
         # "intended sub-topics" it scores each paper's BEST-matching sub-part against (§7).
         # inferred carries the SOFT prefs (citation/review) + year window — nudges, not cuts.
@@ -1404,9 +1307,12 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         for idx, cand in enumerate(return_pool):
             j = return_judgments.get(idx)
             if j is None:
-                continue  # judge dropped this batch → not returned (fewer results, no contamination)
-            if j["score"] < RETURN_THRESHOLD:
+                trace.record("return_gate", candidate=cand, decision="dropped")
                 continue
+            if j["score"] < RETURN_THRESHOLD:
+                trace.record("return_gate", candidate=cand, decision="below_threshold")
+                continue
+            trace.record("return_gate", candidate=cand, decision="accepted")
             scored.append((j["score"], cand))
         # Sort: PRIMARY = relevance score DESC always. The ranking_hint adds a
         # SECONDARY tiebreak among equal-score papers (V6 §7):
@@ -1446,21 +1352,32 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
             scored = _authority_reorder(scored)
 
         # ──── Stage 5: build minimal records, top-N (N = limit) ────────
-        # Pure ``_paper_dict`` projection, ordered by relevance (the ORDER is the rank
+        # Minimal local/external projections, ordered by relevance (the ORDER is the rank
         # signal — internal scores/tiers are not leaked into the agent's context).
         await _maybe_progress(ctx, 5, 5, "building response")
         results = []
+        for position, (_score, cand) in enumerate(scored):
+            trace.record("ranking", candidate=cand,
+                         decision="returned" if position < effective_limit else "limit")
         for _score, cand in scored[:effective_limit]:
             key = cand.get("key")
             paper_obj = library.get(key) if key else None
-            if paper_obj is None:
-                continue  # defensive: return_pool is all in-library by construction
-            results.append(_paper_dict(paper_obj, library))
+            if paper_obj is not None:
+                results.append(_paper_dict(response_projections.get(key, paper_obj), library))
+            else:
+                # Source identity is stable before registration allocates a catalog
+                # key. Only external results add provenance; local projection stays.
+                rec = {field: cand.get(field) or default for field, default in (
+                    ("title", ""), ("authors", []), ("year", None), ("venue", ""),
+                    ("abstract", ""), ("doi", ""), ("arxiv_id", ""), ("citation_count", 0))}
+                rec.update(key=cand["key"], text_status="pending",
+                           source_identities=normalized_source_identities(cand, cand.get("source") or ""))
+                results.append(rec)
 
         logger.info(
-            "search_papers: ext=%d lib=%d → ext_pool=%d lib_pool=%d → ingested=%d returned=%d",
+            "search_papers: ext=%d lib=%d → ext_pool=%d lib_pool=%d → eligible=%d returned=%d",
             len(external_raw), len(library_dicts), len(ext_pool), len(lib_pool),
-            len(ingested_dicts), len(results),
+            len(eligible), len(results),
         )
         # §8 source-health: configured-but-fully-degraded vs unconfigured
         # (disjoint by construction). Derived from the §3 ``degraded_map``
@@ -1478,7 +1395,7 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         reframe_fields: dict = {}
         if not results and ingest_dropped == 0 and return_dropped == 0:
             reframe_fields["reframe_hint"] = _reframe_hint()
-        return {
+        response = {
             "status": "ok",
             "results": results,
             **reframe_fields,
@@ -1508,6 +1425,15 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                 "reasoning": plan.get("reasoning", ""),
             },
         }
+        trace.record("serving", returned=len(results), eligible=len(registration_candidates))
+        try:
+            mcp._paper_registration_queue.submit(
+                registration_candidates, actor="search", reason=trace.trace_id, trace=trace)
+        except Exception:
+            logger.exception("registration submission failed (%s)", trace.trace_id)
+            for cand in registration_candidates[:120]:
+                trace.record("registration", candidate=cand, decision="failed", reason="submission_failed")
+        return response
 
     # ---------------- Distillation-tracking endpoints (curator queue) -------
     #

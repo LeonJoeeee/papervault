@@ -43,6 +43,30 @@ BROWSER_HEADERS = {
 TIMEOUT = 30
 
 
+def _adopt_source_identifiers(paper: Paper, library: Optional[Library], **identifiers: str) -> bool:
+    """Live fills use Library arbitration; standalone candidates remain detached."""
+    if library is None:
+        # Private source functions also operate on detached speculative cards.
+        # Production live callers always supply their owning Library.
+        from ..telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
+        before = adoption_snapshot(paper)
+        applied = {name: value for name, value in identifiers.items() if not getattr(paper, name)}
+        for name, value in applied.items():
+            setattr(paper, name, value)
+        acknowledge_identity_adoption(paper, before, applied)
+        return all(getattr(paper, name) == value for name, value in identifiers.items())
+    if library.get(paper.key) is not paper:
+        log.warning("identifier adoption refused for detached key %s", paper.key)
+        return False
+    outcomes = library.adopt_identifiers(paper.key, **identifiers,
+                                         provenance={"operation": "download_source"})
+    refused = {name: outcome for name, outcome in outcomes.items()
+               if outcome not in {"adopted", "already-mine"}}
+    if refused:
+        log.warning("identifier adoption refused for %s: %s", paper.key, refused)
+    return not refused
+
+
 def _is_pdf_bytes(data: bytes) -> bool:
     return data[:5] == b"%PDF-"
 

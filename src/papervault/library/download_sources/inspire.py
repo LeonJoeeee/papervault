@@ -6,7 +6,6 @@ from typing import Optional
 import requests
 
 from ..models import Paper
-from ..telemetry_v2 import acknowledge_identity_adoption, adoption_snapshot
 from ..sources.inspire import (
     API_URL,
     _document_urls,
@@ -17,7 +16,7 @@ from ..sources.inspire import (
     merge_inspire_fields,
     retained_inspire_fields,
 )
-from ._shared import TIMEOUT, USER_AGENT, _is_pdf_bytes
+from ._shared import Library, TIMEOUT, USER_AGENT, _adopt_source_identifiers, _is_pdf_bytes
 
 
 def inspire_applicable(paper: Paper) -> bool:
@@ -26,7 +25,7 @@ def inspire_applicable(paper: Paper) -> bool:
                 or (not paper.inspire_record_id and inspire_title_eligible(paper.model_dump())))
 
 
-def _try_inspire(paper: Paper) -> Optional[bytes]:
+def _try_inspire(paper: Paper, *, library: Optional[Library] = None) -> Optional[bytes]:
     """Use retained source documents/recid, existing identifiers, or a bounded title lookup.
 
     Bytes still face the common cascade identity verifier before any save.
@@ -48,10 +47,10 @@ def _try_inspire(paper: Paper) -> Optional[bytes]:
                 or not inspire_identity_matches(paper.model_dump(), candidate)):
             return None
         fields = merge_inspire_fields(paper.model_dump(), candidate)
-        before = adoption_snapshot(paper)
-        for key, value in fields.items():
-            setattr(paper, key, value)
-        acknowledge_identity_adoption(paper, before, fields)
+        if not _adopt_source_identifiers(paper, library,
+                                         inspire_record_id=fields["inspire_record_id"]):
+            return None
+        paper.inspire_document_urls = fields["inspire_document_urls"]
         urls = candidate["inspire_document_urls"]
     elif not recid and (paper.arxiv_id or paper.doi):
         # Preserve the existing identifier query. Older API fixtures/cached
@@ -76,10 +75,10 @@ def _try_inspire(paper: Paper) -> Optional[bytes]:
         fields = merge_inspire_fields(paper.model_dump(), candidate)
         if not fields:
             return None
-        before = adoption_snapshot(paper)
-        for key, value in fields.items():
-            setattr(paper, key, value)
-        acknowledge_identity_adoption(paper, before, fields)
+        if not _adopt_source_identifiers(paper, library,
+                                         inspire_record_id=fields["inspire_record_id"]):
+            return None
+        paper.inspire_document_urls = fields["inspire_document_urls"]
         urls = candidate["inspire_document_urls"]
     for url in urls:
         try:

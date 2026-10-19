@@ -109,6 +109,29 @@ async def test_queued_and_dispatched_claims_block_until_drained(pair, result_kin
     assert ledger.spent(dispatched.campaign_id) == 1
 
 
+async def test_completion_adoption_preserves_reservation_and_attempt_fences(pair):
+    lib, left, right, _, _ = pair
+    store, (_, dispatched) = await claims(pair)
+    assert await store.pre_dispatch(dispatched)
+    await coordinator(pair).quiesce(left.key, right.key)
+    assert lib.adopt_identifiers(right.key, doi="10.1234/completion") == {"doi": "refused-blocked"}
+    stale = dispatched.model_copy(update={"lease_id": "another-attempt"})
+    assert lib.adopt_identifiers(right.key, doi="10.1234/completion", completion=stale) == {
+        "doi": "refused-blocked"}
+    claim = ("doi", "10.1234/completion", "Unpublished", object())
+    lib._identity_reservations.add(claim)
+    try:
+        assert lib.adopt_identifiers(right.key, doi="10.1234/completion", completion=dispatched) == {
+            "doi": "refused-reserved"}
+    finally:
+        lib._identity_reservations.remove(claim)
+    assert right.doi == ""
+    right.terminal_state = replace(right.unquiesced_state, merge=Merge.ALIAS, alias_key=left.key)
+    assert lib.adopt_identifiers(right.key, doi="10.1234/completion", completion=dispatched) == {
+        "doi": "refused-blocked"}
+    assert right.doi == ""
+
+
 async def test_expiry_remains_blocked_after_later_drain_and_restart(pair):
     from papervault.library.reopen_v2 import StagedAttempt
     lib, left, right, ledger, now = pair

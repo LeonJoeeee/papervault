@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import logging
+import threading
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -50,6 +51,7 @@ _NON_PAPER_TYPES = {
     "peer-review", "peerreview", "grant", "component", "paratext", "supplementary-materials",
     "supplementary-material",
 }
+_IDENTIFIERS = {"doi", "arxiv_id", "paper_id", "inspire_record_id"}
 
 
 def metadata_is_paper(publication_types) -> bool | None:
@@ -124,6 +126,7 @@ def _view(library, papers):
     view = copy.copy(library)
     view._papers = {key: paper.model_copy(deep=True) for key, paper in papers.items()}
     view._by_doi, view._by_arxiv, view._by_title = {}, {}, {}
+    view._merge_execution_lock = threading.RLock()
     view._identity_reservations = set()
     for paper in view._papers.values():
         view._reindex(paper)
@@ -134,18 +137,22 @@ def _find(library, candidate):
     return library.find(**{name: candidate.get(name) or "" for name in ("doi", "arxiv_id", "title")})
 
 
-def _fill(paper: Paper, incoming: dict):
+def _fill(paper: Paper, incoming: dict, *, identities=True):
     """Fill bibliographic blanks on an isolated object, preserving authoritative state.
 
     Conflicting observations remain in the registration audit; registration cannot
     perform a correction, promotion/merge campaign, or copy source-supplied policy.
     """
-    for field, value in merge_inspire_fields(paper.model_dump(), incoming).items():
-        setattr(paper, field, value)
+    inspire = merge_inspire_fields(paper.model_dump(), incoming)
+    if not identities and inspire.get("inspire_record_id") != paper.inspire_record_id:
+        inspire = {}
+    for field, value in inspire.items():
+        if identities or field not in _IDENTIFIERS:
+            setattr(paper, field, value)
     paper.source_identities = merge_source_identities(paper.source_identities,
                                                       incoming.get("source_identities"))
     for name in _METADATA - {"source_identities", "inspire_record_id", "inspire_document_urls",
-                             "_inspire_metadata"}:
+                             "_inspire_metadata"} - (set() if identities else _IDENTIFIERS):
         value = incoming.get(name)
         if value in (None, "", [], 0):
             continue
@@ -296,14 +303,45 @@ class RegistrationService:
                 records = {r.key: r for r in repo.all()}
                 papers = {key: Paper.model_validate(r.payload) for key, r in records.items()}
                 view = _view(lib, papers)
+
+                # Resolve routing keys, then reload their authoritative rows at
+                # acceptance before applying any candidate metadata. PG's write
+                # transaction serializes other catalog writers. Do IO outside
+                # the identity lock so even a stalled reload cannot block reads.
+                refreshed = set()
+                for candidate in candidates:
+                    existing = _find(view, candidate) or view._find_preprint_journal_dup(candidate)
+                    live = _find(lib, candidate) or lib._find_preprint_journal_dup(candidate)
+                    existing = existing or (view.get(live.key) if live else None)
+                    if existing is None or existing.key in refreshed:
+                        continue
+                    row = repo.get(existing.key)
+                    if row is None:
+                        raise _RegistrationIdentityChanged
+                    records[row.key] = row
+                    paper = Paper.model_validate(row.payload)
+                    view._papers[row.key] = paper
+                    view._reindex(paper)
+                    refreshed.add(row.key)
+
                 with lib._merge_execution_lock:
-                    outcomes, changed = self._stage(view, candidates)
+                    captured = {key: p.model_dump(mode="json") for key, p in lib._papers.items()}
+                outcomes, changed = self._stage(view, candidates)
                 accepted, revisions = [], {}
                 recorded_observations = None
                 for key, outcome in changed.items():
                     paper = view.get(key)
                     before = records.get(key)
                     normalized = Paper.model_validate(before.payload).model_dump(mode="json") if before else None
+                    previous = backend.normalized.get(key)
+                    if normalized is not None and previous is not None and key in captured:
+                        # Retain unsaved worker metadata when authority has not
+                        # changed that field since our last load/save. A remote
+                        # change uses the fresh capture instead. Identities are
+                        # always refreshed explicitly at publication below.
+                        for name in Paper.model_fields.keys() - _IDENTIFIERS:
+                            if normalized.get(name) == previous.get(name):
+                                captured[key][name] = copy.deepcopy(previous.get(name))
                     payload = (_overlay(before.payload, normalized, paper.model_dump(mode="json"))
                                if before else paper.model_dump(mode="json"))
                     record = Record.from_payload(key, payload)
@@ -317,6 +355,7 @@ class RegistrationService:
                         "outcome": outcome["status"], "download": outcome["download"],
                         "source_identities": payload.get("source_identities", []),
                         "observations": outcome["observations"],
+                        "identity_conflicts": outcome.get("identity_conflicts", []),
                         "observations_sha256": payload_hash(outcome["observations"]),
                         "payload_sha256": record.payload_sha256,
                     }, pending_jobs=jobs)
@@ -340,22 +379,47 @@ class RegistrationService:
                 # Keep reservations through commit and live publication, while
                 # releasing the identity lock before commit IO begins.
                 publication.enter_context(self._reserve_publication(changed))
-            # Publish only after outer commit, preserving live objects and
-            # any worker field edits made while IO was in progress.
+            # Refresh identities from the committed row. Metadata acknowledgment
+            # preserves worker edits made since capture, but it must never bless
+            # an unsaved identifier by advancing its authoritative baseline.
+            publication_conflicts = []
             with lib._merge_execution_lock:
                 # Adopted identities are fenced through this publication. No
                 # postcommit re-staging: the batch is already authoritative.
-                captured = {}
                 for record in accepted:
                     current = lib.get(record.key)
                     if current is None:
                         current = Paper.model_validate(record.payload)
                         lib._papers[record.key] = current
-                    captured[record.key] = (backend.normalized.get(record.key)
-                                             or current.model_dump(mode="json"))
+                        captured[record.key] = current.model_dump(mode="json")
+                    saved = Paper.model_validate(record.payload)
+                    conflicts = self._local_identity_conflicts(view, saved, current)
+                    if conflicts:
+                        for outcome in outcomes:
+                            if outcome["key"] == record.key:
+                                outcome["reason"] = "identity_conflict"
+                                known = outcome.setdefault("identity_conflicts", [])
+                                known.extend(c for c in conflicts if c not in known)
+                        # Includes identifier edits made during commit, after
+                        # transactional audit was assembled; keep their evidence.
+                        publication_conflicts.append((record.key, conflicts))
+                    if (view._identifier_token("inspire_record_id", current.inspire_record_id)
+                            != view._identifier_token("inspire_record_id", saved.inspire_record_id)):
+                        current.inspire_document_urls = copy.deepcopy(saved.inspire_document_urls)
+                    if (view._identifier_token("paper_id", saved.paper_id, current.source)
+                            != view._identifier_token("paper_id", saved.paper_id, saved.source)):
+                        current.source = saved.source
+                    for name in _IDENTIFIERS:
+                        setattr(current, name, copy.deepcopy(getattr(saved, name)))
                 backend._accept(accepted, revisions, lib._papers, captured)
                 for record in accepted:
                     lib._reindex(lib.get(record.key))
+            for key, conflicts in publication_conflicts:
+                try:
+                    lib.log({"event": "registration_identity_conflict", "key": key,
+                             "command_id": reason, "identity_conflicts": conflicts})
+                except Exception:
+                    logger.warning("registration conflict log unavailable for %s", key)
             return outcomes
 
     def _register_json(self, candidates, *, actor, reason, replace_snapshot=False):
@@ -365,7 +429,7 @@ class RegistrationService:
         with lib._merge_execution_lock:
             view = _view(lib, lib._papers)
             captured = {key: p.model_dump(mode="json") for key, p in lib._papers.items()}
-            outcomes, changed = self._stage(view, candidates)
+        outcomes, changed = self._stage(view, candidates)
         if changed or replace_snapshot:
             # A discarded snapshot may already be on disk. Even an empty retry
             # must replace it with the current live records and restrictions.
@@ -395,7 +459,63 @@ class RegistrationService:
                 logger.warning("registration log unavailable for %s", key)
         return outcomes
 
+    @staticmethod
+    def _local_identity_conflicts(view, paper, live):
+        if live is None:
+            return []
+        return [{"field": name, "authority": getattr(paper, name),
+                 "observed": getattr(live, name), "origin": "local"}
+                for name in sorted(_IDENTIFIERS) if getattr(live, name)
+                and view._identifier_token(name, getattr(live, name), live.source)
+                != view._identifier_token(name, getattr(paper, name), paper.source)]
+
+    def _adopt(self, view, paper, incoming, live, live_view, *, existing):
+        """Apply staged identities only through the common adoption arbiter.
+
+        Its working set is authoritative; live owners/reservations are additional
+        conservative claims, never a replacement for the authoritative row.
+        """
+        claims = set(live_view._identity_reservations)
+        for current in live_view._papers.values():
+            for name in _IDENTIFIERS:
+                if token := view._identifier_token(name, getattr(current, name), current.source):
+                    claims.add((name, token, current.key, None))
+        view._identity_reservations = claims
+        identifiers, conflicts = {}, []
+        if not paper.source:
+            paper.source = incoming.get("source") or ""
+        for name in sorted(_IDENTIFIERS):
+            value = (retained_inspire_fields(incoming)[name]
+                     if name == "inspire_record_id" else incoming.get(name))
+            if not value:
+                continue
+            token = view._identifier_token(name, value, incoming.get("source") or paper.source)
+            if name == "paper_id" and token != view._identifier_token(name, value, paper.source):
+                continue  # another source's scalar ID remains an observation
+            if existing and name in {"doi", "arxiv_id"} and not getattr(paper, name):
+                if live is None or view._identifier_token(name, getattr(live, name)) != token:
+                    continue  # observations alone cannot promote a cross-identifier
+            if name == "inspire_record_id" and existing and not paper.inspire_record_id and not merge_inspire_fields(
+                    paper.model_dump(), incoming):
+                continue
+            identifiers[name] = value
+        decisions = view.adopt_identifiers(paper.key, provenance={"operation": "registration"},
+                                            **identifiers) if identifiers else {}
+        for name, decision in decisions.items():
+            if decision not in {"adopted", "already-mine"}:
+                conflicts.append({"field": name, "authority": getattr(paper, name),
+                                  "observed": identifiers[name], "origin": "candidate",
+                                  "decision": decision})
+        return conflicts + self._local_identity_conflicts(view, paper, live)
+
     def _stage(self, view, candidates):
+        # Admission/adoption uses an isolated live snapshot. In particular the
+        # shared adoption API may record correction evidence on disk; it must
+        # never perform that IO under the lock search uses for identity reads.
+        # Final reservation checks arbitrate intervening live worker adoptions.
+        with self.library._merge_execution_lock:
+            live_view = _view(self.library, self.library._papers)
+            live_view._identity_reservations = set(self.library._identity_reservations)
         outcomes, changed, downloads = [], {}, 0
         for index, candidate in enumerate(candidates):
             outcome = {"identity": candidate_identity(candidate), "status": "rejected",
@@ -404,7 +524,7 @@ class RegistrationService:
             existing = _find(view, candidate) or view._find_preprint_journal_dup(candidate)
             # Current fields + verified-fill reservations (#267), including
             # metadata that workers have not yet saved to the catalog.
-            live = _find(self.library, candidate) or self.library._find_preprint_journal_dup(candidate)
+            live = _find(live_view, candidate) or live_view._find_preprint_journal_dup(candidate)
             rejection = registration_rejection(candidate, known_identity=bool(existing or live))
             if rejection or index >= self.max_candidates:
                 outcome["reason"] = rejection or "registration_budget"
@@ -426,11 +546,20 @@ class RegistrationService:
                 outcome.update(status="duplicate", key=existing.key, reason="registration_policy")
                 continue
             # Detect conflicting exact axes instead of silently merging records.
-            matches = {p.key for lookup in (view, self.library)
+            matches = {p.key for lookup in (view, live_view)
                        for name in ("doi", "arxiv_id") if candidate.get(name)
                        if (p := lookup.find(**{name: candidate[name]})) is not None}
             if len(matches) > 1:
                 outcome["reason"] = "identity_conflict"
+                continue
+            if existing and any(
+                    token and (owner := live_view._identifier_owner(name, token)) is not None
+                    and owner.key != existing.key
+                    for name in _IDENTIFIERS
+                    for token in [view._identifier_token(name, getattr(existing, name), existing.source)]):
+                # An authoritative owner and a different unsaved local owner
+                # cannot be reconciled by retrying the same snapshot forever.
+                outcome.update(key=existing.key, reason="identity_conflict")
                 continue
             incoming = {k: copy.deepcopy(v) for k, v in candidate.items() if k in _METADATA}
             incoming["source_identities"] = normalized_source_identities(
@@ -439,33 +568,31 @@ class RegistrationService:
             observed["judgment"] = copy.deepcopy(candidate.get("_registration"))
             if existing:
                 paper = existing
-                # Source observations are evidence, not identifier promotion
-                # authority. A worker's already-adopted scalar may be persisted;
-                # other cross-identifier fills remain for the identity pipeline.
-                for name in ("doi", "arxiv_id"):
-                    if not getattr(paper, name) and (live is None or getattr(live, name) != incoming.get(name)):
-                        incoming.pop(name, None)
-                _fill(paper, incoming)
             else:
                 authors = incoming.get("authors") or []
                 # Reserve names present in either the authoritative snapshot or
                 # the live working set, including another uncommitted ingress.
-                reserved = set(view._papers) | set(self.library._papers)
+                reserved = set(view._papers) | set(live_view._papers)
                 key_view = copy.copy(view)
                 key_view._papers = dict.fromkeys(reserved)
                 key = key_view.allocate_key(authors[0] if authors else "", incoming.get("year"))
-                data = {k: v for k, v in incoming.items() if k in Paper.model_fields and v is not None}
-                data.update(retained_inspire_fields(incoming))
+                data = {k: v for k, v in incoming.items() if k in Paper.model_fields
+                        and k not in _IDENTIFIERS | {"inspire_document_urls"} and v is not None}
                 paper = Paper(key=key, **data, download_status="pending",
                               terminal_state=TerminalState(retrieval=Retrieval.ELIGIBLE, policy=Policy.CLEAR),
                               added_at=datetime.now(timezone.utc).isoformat())
                 view._papers[key] = paper
+            conflicts = self._adopt(view, paper, incoming, live, live_view, existing=bool(existing))
+            _fill(paper, incoming, identities=False)
+            if conflicts:
+                observed["identity_conflicts"] = conflicts
+                outcome["identity_conflicts"] = conflicts
             tier = (candidate.get("_registration") or {}).get("tier")
             if paper.domain_tier is None and tier in INGEST_TIERS:
                 paper.domain_tier = tier
             view._reindex(paper)
             outcome.update(status="duplicate" if existing else "registered", key=paper.key,
-                           reason="identity_exists" if existing else "admitted")
+                           reason="identity_conflict" if conflicts else "identity_exists" if existing else "admitted")
             if not existing and admission(paper.acquisition_state, identity_resolved=True,
                                            key=paper.key):
                 if downloads < self.max_downloads:
@@ -477,10 +604,12 @@ class RegistrationService:
                 outcome["observations"] = []
                 changed[paper.key] = outcome
             changed[paper.key]["observations"].append(observed)
+            if changed[paper.key] is not outcome and conflicts:
+                changed[paper.key].setdefault("identity_conflicts", []).extend(conflicts)
         for key, outcome in changed.items():
             paper = view.get(key)
             outcome["identifiers"] = {
-                name: token for name in ("doi", "arxiv_id")
+                name: token for name in _IDENTIFIERS
                 if (token := view._identifier_token(name, getattr(paper, name), paper.source))}
         return outcomes, changed
 
@@ -546,7 +675,8 @@ class RegistrationQueue:
     def _record_outcomes(trace, candidates, outcomes):
         for candidate, outcome in zip(candidates, outcomes):
             trace.record("registration", candidate=candidate, decision=outcome["status"],
-                         reason=outcome["reason"], key=outcome["key"], download=outcome["download"])
+                         reason=outcome["reason"], key=outcome["key"], download=outcome["download"],
+                         identity_conflicts=len(outcome.get("identity_conflicts", [])))
         trace.record("registration_summary", **{
             status: sum(o["status"] == status for o in outcomes)
             for status in ("registered", "duplicate", "rejected", "failed")})

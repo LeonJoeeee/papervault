@@ -91,6 +91,36 @@ async def test_registration_resolves_fresh_pg_identity_from_another_writer(repo,
     assert len(stale.keys()) == 1
 
 
+@pytest.mark.parametrize("field,local,winner", [
+    ("doi", "10.1234/E", "10.1234/D"),
+    ("arxiv_id", "2401.00001v1", "2401.00002v1"),
+    ("paper_id", "E", "D"),
+])
+async def test_registration_cannot_bless_stale_local_identity_over_another_writer(
+        repo, tmp_path, monkeypatch, field, local, winner):
+    one = pg_library(repo, tmp_path / "one", monkeypatch)
+    paper, _ = one.upsert(candidate(doi="", paper_id=""))
+    one.save(force=True)
+    two = pg_library(repo, tmp_path / "two", monkeypatch)
+    assert one.adopt_identifiers(paper.key, **{field: local}) == {field: "adopted"}
+    assert two.adopt_identifiers(paper.key, **{field: winner}) == {field: "adopted"}
+    two.save(force=True)
+    authoritative = repo.get(paper.key)
+    incoming = candidate(doi="", paper_id="")
+    incoming[field] = winner
+    outcomes = await RegistrationService(one, SimpleNamespace(add=lambda key: None)).register_candidates(
+        [incoming], actor="test", reason="two-writer-conflict")
+    assert outcomes[0]["reason"] == "identity_conflict"
+    assert one.get(paper.key) is paper
+    assert getattr(paper, field) == winner
+    assert one._catalog_backend.persisted[paper.key].revision == repo.get(paper.key).revision
+    assert repo.get(paper.key).revision >= authoritative.revision
+    events = rows(repo, "audit", "event='registration'")
+    assert events[-1]["detail"]["identity_conflicts"]
+    one.save(force=True)
+    assert repo.get(paper.key).payload[field] == winner
+
+
 async def test_registration_reuses_unsaved_worker_identifier_without_creating_twin(
         repo, tmp_path, monkeypatch):
     lib = pg_library(repo, tmp_path, monkeypatch)

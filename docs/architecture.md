@@ -11,22 +11,29 @@ papervault is a self-hosted literature + knowledge layer for coding agents. It r
 ## Structure
 One Python package (`papervault`), one server process, subsystems as modules:
 
-- **library/** — literature acquisition. Intent-parsed multi-source search (arXiv, ADS, Semantic Scholar, OpenAlex, INSPIRE, CORE), LLM ingest gate (domain-pack rubric), tiered download cascade (shadow-library and anti-bot tiers flag-gated, default off — ADR-0004), extract queue driving the OCR server, vault persistence (`index.json` + per-paper extracts on disk). Owns all writes to the vault.
+- **library/** — literature acquisition. Intent-parsed multi-source search (arXiv, ADS, Semantic Scholar, OpenAlex, INSPIRE, CORE), LLM ingest gate (domain-pack rubric), tiered download cascade (shadow-library and anti-bot tiers flag-gated, default off — ADR-0004), extract queue driving the OCR server, catalog persistence (Postgres authority + canonical `index.json` export) and per-paper extracts on disk. Owns all writes to the vault.
 - **knowledge/** — knowledge distillation + serving. Scheduler rounds (reconcile → diff → distill) reading the vault; LightRAG graph store (Neo4j graph, Postgres KV/vector/doc-status); in-process GPU embed + rerank (BGE-M3, bge-reranker); query pipeline (decompose → retrieve + rerank → cited synthesis); ingest ledger.
 - **mcp/** — the single endpoint, three tools, progress heartbeat (long queries survive client idle timeouts).
 - **domain pack** (config, not code) — search-gate rubric, entity ontology, extraction few-shots, instruction fragments. Space physics is the factory default and worked sample (ADR-0003).
 - **eval/** — the bundled harness (recall@served, hallucination rate, trap gates) + method notes. Retrieval/pipeline quality changes are benchmark-arbitrated.
 - **plugin shell** — the minimal installable `plugin/` subdir (`plugin/.claude-plugin/plugin.json` + `plugin/.mcp.json` MCP wiring), routed to by the repo-root `.claude-plugin/marketplace.json`; only `plugin/` ships on install. No skills shipped in v1. Thin by rule; per-agent adapters never hold logic.
 
-Boundaries: the library→knowledge hand-off is the on-disk vault — single writer (library), one reader (knowledge scheduler) — with reader and writer versioned together inside the package. External processes: MinerU OCR service (HTTP through its gate; service-owned stop/start and recovery; no library pre-flight, with workload waking a stopped backend and client discovery/parse errors determining reachability), Neo4j + Postgres (docker-compose), the operator LLM endpoint (OpenAI-compatible).
+Boundaries: the library→knowledge hand-off remains the on-disk vault (`index.json` export + paper artifacts) — single writer (library), one reader (knowledge scheduler) — with reader and writer versioned together inside the package. External processes: MinerU OCR service (HTTP through its gate; service-owned stop/start and recovery; no library pre-flight, with workload waking a stopped backend and client discovery/parse errors determining reachability), Neo4j + Postgres (docker-compose), the operator LLM endpoint (OpenAI-compatible).
 
-P2 preparation adds an opt-in `PAPERVAULT_CATALOG_AUTHORITY=postgres` backend behind
-Library's existing working set. It reads catalog records and commits revision-guarded
-delta batches with audit/pending work; JSON becomes a separately generated export.
-Unset/`json` retains the existing behavior. PG deletion is refused in P2. The
+Since the [owner-approved live cutover on 2026-10-19](https://github.com/LeonJoeeee/papervault/issues/268#issuecomment-6257668738),
+deployment #1 uses PostgreSQL database **`papervault_catalog` as catalog authority**
+with `PAPERVAULT_CATALOG_AUTHORITY=postgres`. Library's existing working set reads
+catalog records and commits revision-guarded delta batches with audit/pending work.
+`index.json` is the **canonical export**, generated separately with verification by
+the user unit `papervault-export.timer` **hourly at :17** (`OnCalendar=*:17`, host CST).
+It is not a second authority and is not rewritten by ordinary PG saves. Configuration
+still defaults to JSON when the authority setting is unset; the live deployment
+explicitly selects Postgres. PG deletion is refused in P2. The
 [catalog persistence ADR](adr/DRAFT-catalog-persistence-cutover.md) records commit
 semantics, completion guards and rehearsal fencing; the
-[readiness checklist](specs/2026-10-18-p2-readiness.md) keeps live activation owner-gated.
+[execution record and historical rehearsal runbook](specs/2026-10-18-p2-readiness.md)
+record the live sequence, operational timers and closed rollback boundary: recovery
+after the writes-resumed marker is forward-only.
 
 Deployment #1 retains the legacy container names `ks-postgres` and `ks-neo4j`; production data lives in the existing Docker volumes `ks-pgdata` and `ks-neo4jdata`, declared external in `deploy/docker-compose.yml`. A future move off these names requires a maintenance window: stop PaperVault and both stores, copy each volume to its new name, update Compose, bring the stores up, and verify data and connectivity before resuming PaperVault. Preserve the original volumes for rollback: stop the replacement stores, restore the original Compose names and volumes, and bring the original stores up before resuming PaperVault.
 

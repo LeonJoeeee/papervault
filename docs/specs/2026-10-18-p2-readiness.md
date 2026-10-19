@@ -1,25 +1,77 @@
-# P2 readiness — preparation only
+# P2 readiness — executed live cutover
 
-Live authority flip: **NO GO / not authorized**. This checklist implements
-[#268](https://github.com/LeonJoeeee/papervault/issues/268) §6 and its accepted amendment;
-[the persistence/cutover ADR](../adr/DRAFT-catalog-persistence-cutover.md) defines mechanics.
+Live authority flip: **EXECUTED**, with owner approval, by the orchestrator on
+**2026-10-19 09:18–09:23 CST (UTC+08:00)**. The
+[live cutover decision and execution record](https://github.com/LeonJoeeee/papervault/issues/268#issuecomment-6257668738)
+supersedes the preparation-only status. PostgreSQL database `papervault_catalog` is now
+the authoritative catalog; `/data/paper-vault/index.json` is its canonical export.
+[The persistence/cutover ADR](../adr/DRAFT-catalog-persistence-cutover.md) defines the
+mechanics accepted on [#268](https://github.com/LeonJoeeee/papervault/issues/268).
 
-| Owner checklist item | Current evidence / remaining action |
+## Executed sequence
+
+The orchestrator executed the live sequence manually. The rehearsal CLI deliberately
+refuses the live vault; the copy-only commands below were not used to activate it.
+The overall window and the import/export durations below are wall-clock timings.
+
+| Step | Recorded result |
 | --- | --- |
-| Live shadow is in sync | A read-only copy of the current live JSON/ledger was imported into an isolated `papervault_catalog_stage`: 26,696 records, comparator difference rate 0, no import integrity errors. This establishes copy/stage parity. The production shadow DSN was not supplied or discovered; the orchestrator must repeat the live read-only comparison. |
-| Copy cutover and rollback | Fenced title probe, verified canonical export and frozen rollback exercised on the metadata copy. Final command timings and restart-fixture evidence are recorded in the PR. No production service or config was changed. |
-| Concurrency | Opt-in PostgreSQL tests run two OS processes with independent connections/working sets: unrelated rows survive, one overlapping write reports a conflict, one completion wins and its stale peer is rejected, audit remains append-only, bounded joins detect deadlocks. Orchestrator must rerun with its explicit test DSN. |
-| Window and recovery | Target: stop/drain writers → final delta import/comparison → frozen export/flip/fenced probe → mark writes resumed → restart/health/export verification, within 60 minutes. Metadata-only timings do not establish a full deployment downtime guarantee. Frozen rollback ends before the restart command; afterward recover forward. |
-| Identity conflicts | The copy still reports 20 normalized identity conflict groups. Owner adjudication of aliases and the two suspected mislabels is pending; this change preserves every record and performs no adjudication. |
+| Backup | Retained `index.json`, correction ledger, reopen-budget ledger and `.env` in `/home/leon/backups/papervault-cutover-20261019` (109 MB). |
+| Stop writers | Stopped `papervault.service`; 8 idle loopback sessions were left to reconnect automatically. |
+| Fresh catalog database | Recreated `papervault_catalog` before the final import. |
+| Import | `import_catalog --apply`: **36 s**, **26,696 records**, difference rate **0.0**, integrity errors **0**; 21 identity conflicts reported and preserved without merging. |
+| Compare | **26,696 compared / 0 different / difference rate 0.0**. |
+| Authority flip | Set `.env` to `PAPERVAULT_CATALOG_AUTHORITY=postgres` with an explicit `PAPERVAULT_CATALOG_DSN`; retained `.env.bak-20261019-cutover`. Credentials remain in protected configuration. |
+| Export | PostgreSQL → `/data/paper-vault/index.json`: **8 s**, verification difference rate **0.0**. |
+| Writes-resumed marker | Durably recorded `/data/paper-vault/.catalog-cutover.json` with `phase: flipped_live` and `writes_resumed: true`, before starting the service. |
+| Start and health | `papervault.service` active; MCP initialization and `get_paper("Adriani2009")` succeeded. |
+| First PostgreSQL writes | `catalog.audit` advanced **26,701 → 26,714**: **+13 audit rows** from recovered-queue state flushes. The JSON index SHA remained unchanged. |
 
-The restart rehearsal uses a disposable HTTP health fixture backed by the real Library
-load/save path and the staging catalog. It performs an authoritative save after the
-writes-resumed marker and verifies post-start export parity. It does **not** start the
-complete MCP/knowledge/queue topology or copy the 72 GB source corpus. A full isolated
-MCP deployment rehearsal, including retained artifacts and its dependencies, remains an
-orchestrator prerequisite. Do not point its knowledge plane at production stores.
+The frozen-snapshot rollback window **closed at the writes-resumed marker**, before
+service start. Recovery is now **forward-only**: preserve accepted PostgreSQL writes,
+audit and pending work. A restart or health failure cannot reopen that window; do not
+restore an older JSON snapshot over accepted catalog mutations.
 
-## Fenced rehearsal runbook
+## Post-cutover operations
+
+The orchestrator installed the following user units after the flip. Times use the
+deployment host's CST (UTC+08:00) timezone.
+
+| Unit | Schedule | Operation |
+| --- | --- | --- |
+| `papervault-export.timer` | Hourly at **:17**, `OnCalendar=*:17` | Export PostgreSQL to the canonical `index.json` with `--verify`. The operational test refreshed the file and used 7 s CPU; this is separate from the 8 s wall-clock cutover export above. |
+| `papervault-db-backup.timer` | Nightly at **03:23** | `pg_dump -Fc papervault_catalog` to `/home/leon/backups/papervault-db/`, with **14-day retention**. The first dump was 28 MB. |
+
+The JSON index is an hourly projection, not a second authority; ordinary PostgreSQL
+saves do not rewrite it. Deferred items remain: adjudication of the 21 identity
+conflicts, the twin-creation defect tracked in
+[#267](https://github.com/LeonJoeeee/papervault/issues/267), and off-host backup
+replication under the F1 backup ADR. The local dump schedule does not close that
+off-host recovery item.
+
+## Historical rehearsal evidence
+
+Preparation first imported a read-only JSON/ledger copy into isolated
+`papervault_catalog_stage`: 26,696 records, comparator difference rate 0 and no import
+integrity errors. The bounded restart fixture exercised the real Library load/save
+path, writes-resumed marker and post-start export parity, rather than the full MCP
+topology. Opt-in PostgreSQL tests covered independent-process writers, overlapping
+write conflicts, stale completion rejection and append-only audit.
+
+The orchestrator subsequently recorded the
+[full-scale rehearsal](https://github.com/LeonJoeeee/papervault/issues/268#issuecomment-6252595278):
+26,696 records, read-only symlinks to retained paper artifacts, a staging MCP service
+serving `get_paper("Adriani2009")`, and zero-difference import/flip comparisons.
+Wall-clock timings were 29 s for import, 25 s for preflight/apply, 30 s for flip and
+3.5 s for rollback. Identity conflicts had risen to 21 and were reported without
+merging. The live sequence above records the subsequent production comparison and
+activation separately.
+
+## Historical fenced rehearsal runbook
+
+Retained as guidance for isolated copies. These commands do not authorize another live
+flip. The rehearsal phase file is `.catalog-handoff.json`; the manual live cutover used
+the `.catalog-cutover.json` marker recorded above.
 
 Provision a vault **copy**, retain its JSON, correction ledger and reopen-budget ledger,
 and provision a staging database named `papervault_catalog_stage`. For a full service
@@ -77,7 +129,10 @@ rollback is refused regardless of phase; preserve accepted writes and recover fo
 
 ## Verification
 
-The PR contains final commands, exit codes, suite/lint/CI results, snapshot hashes,
-counts, comparator output and timings. PG tests skip only without
+The [preparation PR](https://github.com/LeonJoeeee/papervault/pull/269) contains rehearsal
+commands, snapshot hashes, counts, comparator output and timings; the linked
+orchestrator records above supply full-scale rehearsal and live execution evidence.
+The documentation update PR records final commands, exit codes, version alignment and
+suite/lint/CI results. PG tests skip only without
 `PAPERVAULT_CATALOG_TEST_DSN`; an explicitly configured but unavailable DSN fails.
 The exact merge-result CI and independent acceptance verdict remain orchestrator-owned.

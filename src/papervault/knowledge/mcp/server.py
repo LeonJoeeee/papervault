@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from contextlib import asynccontextmanager
@@ -170,12 +171,18 @@ async def _start_once() -> bool:
 
 
 async def _retry_start() -> None:
+    """Own one startup attempt at a time, retrying failures without blocking serving."""
     global _startup_task
     try:
         while _auto_ingest_enabled():
-            await _wait_selfcheck_retry(_selfcheck_retry_delay())
-            if await _start_once():
-                return
+            try:
+                if await _start_once():
+                    return
+            except Exception:
+                log.exception("KS background startup failed; HTTP serving continues; retry scheduled")
+            delay = _selfcheck_retry_delay()
+            log.warning("KS startup not ready; retrying in %ss", delay)
+            await _wait_selfcheck_retry(delay)
     finally:
         _startup_task = None
 
@@ -183,22 +190,36 @@ async def _retry_start() -> None:
 async def start_background() -> None:
     """Start the S4 auto-ingest scheduler ONCE, in the server's event loop. Idempotent — safe to call
     from BOTH the server-startup app lifespan (boot, __main__) and the per-session FastMCP lifespan
-    (no-op after boot). Default-OFF; opt in with KS_AUTO_INGEST_ENABLED=true."""
+    (no-op after boot). Default-OFF; opt in with KS_AUTO_INGEST_ENABLED=true.
+
+    Wait at most KS_STARTUP_AWAIT_SEC (default 3s; 0 skips waiting). A slow graph/model
+    initialization continues in the background, with failed attempts retried automatically.
+    """
     global _startup_task
     if _bg_task is not None or _startup_task is not None:
         return
     if not _auto_ingest_enabled():
         log.info("auto-ingest DISABLED (set KS_AUTO_INGEST_ENABLED=true to opt in)")
         return
-    # Publish before awaiting: concurrent session lifespans cannot start a second probe.
-    _startup_task = asyncio.create_task(_start_once(), name="ks-embedding-startup")
     try:
-        ready = await _startup_task
-    except BaseException:
-        _startup_task = None
-        raise
-    _startup_task = None if ready else asyncio.create_task(
-        _retry_start(), name="ks-embedding-retry")
+        timeout = float(os.getenv("KS_STARTUP_AWAIT_SEC", "3"))
+        if not math.isfinite(timeout) or timeout < 0:
+            raise ValueError("startup wait must be finite and nonnegative")
+    except ValueError:
+        log.warning("Invalid KS_STARTUP_AWAIT_SEC; using the default 3s startup wait")
+        timeout = 3.0
+    # Publish before awaiting: concurrent sessions cannot start another initialization.
+    # This task owns both the initial attempt and retries; timeout must not cancel an
+    # in-progress graph initialization or launch a competing attempt against the singleton.
+    _startup_task = asyncio.create_task(_retry_start(), name="ks-embedding-retry")
+    try:
+        await asyncio.wait_for(asyncio.shield(_startup_task), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.warning(
+            "KS startup still pending after %ss (KS_STARTUP_AWAIT_SEC); "
+            "HTTP serving continues while initialization/retries run in the background",
+            timeout,
+        )
 
 
 async def stop_background() -> None:

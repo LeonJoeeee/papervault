@@ -1,18 +1,29 @@
 """Root test config: environment isolation + the `integration` marker.
 
-Unit tests (the CI set) must not touch live infrastructure. This machine may export
-prod env (PAPER_LIBRARY_PATH etc.) pointing at a real vault; strip the vault vars so
-unit tests get clean defaults / their own tmp fixtures. Tests needing GPU / Postgres /
+Unit tests (the CI set) must not touch live infrastructure. Disable dotenv loading
+and strip inherited vault/catalog settings before application imports. Catalog tests
+use JSON unless they explicitly opt into the guarded test DSN. Tests needing GPU / Postgres /
 Neo4j / network / a live LLM are marked `integration` and excluded from CI via
 `pytest -m "not integration"`; run the full suite on reference hardware.
 """
 import os
 import sys
+from importlib.metadata import version
 from pathlib import Path
 
+from packaging.version import Version
 import pytest
 
 # --- environment isolation (before any papervault.config import resolves paths) ---
+# Older dotenv ignores the subprocess-safe disable flag. Refuse that environment
+# before collecting tests; the prescribed uv sync installs the locked 1.2.2 release.
+if Version(version("python-dotenv")) < Version("1.2"):
+    raise pytest.UsageError("Test isolation requires python-dotenv>=1.2; run uv sync --extra dev")
+
+# Also inherited by subprocesses: config and third-party imports must not load .env.
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+os.environ["PAPERVAULT_CATALOG_AUTHORITY"] = "json"
+os.environ.pop("PAPERVAULT_CATALOG_DSN", None)
 for _v in ("PAPER_LIBRARY_PATH", "PAPERVAULT_VAULT", "PAPERVAULT_DATA"):
     os.environ.pop(_v, None)
 
@@ -68,14 +79,22 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.integration)
 
 
-# The lab .env (loaded by papervault.config at import) may opt into save debouncing;
-# tests must see the shipped defaults (off) unless a test sets its own value (issue #34).
+# An inherited environment may opt into save debouncing; tests must see the shipped
+# defaults (off) unless a test sets its own value (issue #34).
 os.environ["PAPERVAULT_SAVE_MIN_INTERVAL_S"] = "0"
 os.environ["PAPERVAULT_BIB_MIN_INTERVAL_S"] = "0"
 
 
 @pytest.fixture(autouse=True)
-def _reset_search_breaker():
+def _isolate_catalog_environment(monkeypatch):
+    """Reset each test too, before its fixtures can construct a Library."""
+    monkeypatch.setenv("PYTHON_DOTENV_DISABLED", "1")
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "json")
+    monkeypatch.delenv("PAPERVAULT_CATALOG_DSN", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_search_breaker(_isolate_catalog_environment):
     """The #115 per-backend circuit breaker keeps PROCESS-LIFETIME state keyed by
     backend name. Without a reset it leaks across tests: three tests in a row
     degrading ``semantic_scholar`` would open its circuit, and the NEXT test's

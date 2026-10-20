@@ -13,6 +13,60 @@ import pytest
 
 TEST_DSN = "postgresql://tester@127.0.0.1:1/papervault_catalog_test"
 LIVE_DSN = "postgresql://tester@127.0.0.1:1/papervault_catalog"
+HOSTILE_ENV = {
+    "PAPERVAULT_CATALOG_AUTHORITY": "postgres",
+    "PAPERVAULT_CATALOG_DSN": LIVE_DSN,
+    "PAPERVAULT_TERMINAL_V2": "1",
+    "PAPERVAULT_IDENTITY_V2": "1",
+    "PAPERVAULT_REOPEN_V2": "1",
+    "PAPERVAULT_POLITE_V2": "1",
+    "PAPERVAULT_MERGE_V2": "1",
+    "PAPERVAULT_STOPRULES_V2": "1",
+    "PAPERVAULT_LLM_GATEWAY": "1",
+    "PAPERVAULT_LLM_GATEWAY_URL": "http://production.invalid/v1",
+    "PAPERVAULT_LLM_GATEWAY_KEY": "production-key",
+    "PAPERVAULT_LLM_API_KEY": "production-key",
+    "PAPERVAULT_LLM_BASE_URL": "http://production.invalid/v1",
+    "PAPERVAULT_DATA": "/production/data",
+    "PAPERVAULT_VAULT": "/production/vault",
+    "PAPERVAULT_FUTURE_FLAG": "1",
+    "KS_AUTO_INGEST_ENABLED": "true",
+    "KS_ALLOW_PROD_WORKSPACE": "1",
+    "KS_CHUNK_TOKEN_SIZE": "99",
+    "KS_FUTURE_SETTING": "1",
+    "NEO4J_WORKSPACE": "l0",
+    "NEO4J_URI": "bolt://production.invalid:7687",
+    "POSTGRES_WORKSPACE": "l0",
+    "POSTGRES_DB": "production",
+    "POSTGRES_DATABASE": "production",
+    "POSTGRES_HOST": "production.invalid",
+    "PGSERVICE": "production",
+    "PGDATABASE": "papervault_catalog",
+    "MINERU_URL": "http://production.invalid:30000",
+    "OPENALEX_API_KEY": "production-key",
+    "OPENALEX_MAILTO": "production@example.invalid",
+    "OPENAI_API_KEY": "production-key",
+    "ANTHROPIC_API_KEY": "production-key",
+    "MIMO_API_KEY_1": "tp-production-key",
+    "ADS_API_TOKEN": "production-key",
+    "CORE_API_KEY": "production-key",
+    "FIRECRAWL_API_KEY": "production-key",
+    "FIRECRAWL_API_URL": "http://production.invalid",
+    "UNPAYWALL_EMAIL": "production@example.invalid",
+    "WILEY_TDM_TOKEN": "production-key",
+    "ELSEVIER_TDM_API_KEY": "production-key",
+    "ANNAS_ARCHIVE_API_KEY": "production-key",
+    "ZOTERO_API_KEY": "production-key",
+    "PAPER_LIBRARY_PATH": "/production/vault",
+    "PAPER_LIBRARY_EXTRACT_CONCURRENCY": "99",
+    "PAPER_PIPELINE_USE_SCIHUB": "1",
+    "PAPER_SEARCH_DEFAULT_LIMIT": "99",
+    "LLM_KEYS_FILE": "/production/llm_keys.json",
+    "LIGHTRAG_WORKING_DIR": "/production/knowledge",
+    "BGE_M3_DEVICE": "cuda:99",
+    "ENTITY_EXTRACTION_USE_JSON": "1",
+    "RERANK_TIMEOUT": "9999",
+}
 
 
 @pytest.mark.parametrize("test_dsn,explicit_env,dotenv_version", [
@@ -39,17 +93,53 @@ def test_hostile_environment_cannot_escape_test_isolation(
     (tmp_path / "test_probe.py").write_text(textwrap.dedent('''
         import json
         import os
+        from pathlib import Path
         import pytest
         from papervault import config
+        from papervault.knowledge.config import CONFIG
+        from papervault.library import extract, mineru_client
         from papervault.library.store import Library
 
+        def assert_test_defaults():
+            assert os.environ["PAPERVAULT_CATALOG_AUTHORITY"] == "json"
+            assert "PAPERVAULT_CATALOG_DSN" not in os.environ
+            assert os.environ.get("PAPERVAULT_CATALOG_TEST_DSN") == os.environ.get("EXPECTED_TEST_DSN")
+            assert not any((config.terminal_v2_enabled(), config.identity_v2_enabled(),
+                            config.reopen_v2_enabled(), config.polite_v2_enabled(),
+                            config.merge_v2_enabled(), config.stoprules_v2_enabled()))
+            assert not config.USE_GATEWAY
+            assert config.LLM_API_KEY == config.LLM_BASE_URL == config.GATEWAY_KEY == ""
+            assert config.DATA_DIR.is_dir()
+            assert config.DATA_DIR != Path.home() / ".local/share/papervault"
+            assert config.VAULT_PATH == config.DATA_DIR / "vault"
+            assert config.LLM_KEYS_FILE == config.DATA_DIR / "llm_keys.json"
+            assert not config.LLM_KEYS_FILE.exists()
+            assert CONFIG.postgres.host == "localhost"
+            assert CONFIG.postgres.db == "papervault"
+            assert CONFIG.lightrag.chunk_token_size == 2400
+            assert CONFIG.lightrag.working_dir == str(config.DATA_DIR / "knowledge_store")
+            assert CONFIG.mimo.endpoints == ()
+            assert CONFIG.anthropic.api_key == ""
+            assert CONFIG.bge_m3.device == "cuda:0"
+            assert mineru_client.endpoints_from_env()[0].url == "http://127.0.0.1:30000"
+            assert extract._EXTRACT_CONCURRENCY == 8
+            for name in ("PAPERVAULT_FUTURE_FLAG", "KS_FUTURE_SETTING", "KS_AUTO_INGEST_ENABLED",
+                         "KS_ALLOW_PROD_WORKSPACE", "NEO4J_WORKSPACE", "POSTGRES_WORKSPACE",
+                         "PGSERVICE", "PGDATABASE", "OPENALEX_API_KEY", "OPENALEX_MAILTO",
+                         "OPENAI_API_KEY", "ADS_API_TOKEN", "CORE_API_KEY", "FIRECRAWL_API_KEY",
+                         "FIRECRAWL_API_URL", "WILEY_TDM_TOKEN", "ELSEVIER_TDM_API_KEY",
+                         "ANNAS_ARCHIVE_API_KEY", "ZOTERO_API_KEY", "UNPAYWALL_EMAIL",
+                         "PAPER_PIPELINE_USE_SCIHUB", "PAPER_SEARCH_DEFAULT_LIMIT",
+                         "ENTITY_EXTRACTION_USE_JSON", "RERANK_TIMEOUT"):
+                assert name not in os.environ, name
+
         # Collection must already be safe, before any autouse fixture runs.
-        assert os.environ["PAPERVAULT_CATALOG_AUTHORITY"] == "json"
-        assert "PAPERVAULT_CATALOG_DSN" not in os.environ
+        assert_test_defaults()
         assert "DOTENV_ISOLATION_SENTINEL" not in os.environ
 
         @pytest.fixture
         def library(tmp_path):
+            assert_test_defaults()
             lib = Library(tmp_path)
             yield lib
             lib.close()
@@ -62,18 +152,29 @@ def test_hostile_environment_cannot_escape_test_isolation(
         def test_unscoped_environment_change():
             os.environ["PAPERVAULT_CATALOG_AUTHORITY"] = "postgres"
             os.environ["PAPERVAULT_CATALOG_DSN"] = "host=127.0.0.1 port=1 dbname=papervault_catalog"
+            os.environ["PAPERVAULT_MERGE_V2"] = "1"
+            os.environ["KS_AUTO_INGEST_ENABLED"] = "true"
+            os.environ["MINERU_URL"] = "http://production.invalid:30000"
+            os.environ["CORE_API_KEY"] = "production-key"
 
         def test_next_fixture_still_uses_json(library):
             test_write_uses_json(library)
+
+        def test_flags_require_explicit_opt_in(monkeypatch):
+            monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+            assert config.merge_v2_enabled()
+
+        def test_explicit_opt_in_does_not_leak():
+            assert_test_defaults()
     '''))
     env = dict(os.environ)
     for key in ("PAPERVAULT_CATALOG_TEST_DSN", "PAPERVAULT_ENV", "PYTHON_DOTENV_DISABLED",
-                "DOTENV_ISOLATION_SENTINEL"):
+                "DOTENV_ISOLATION_SENTINEL", "EXPECTED_TEST_DSN"):
         env.pop(key, None)
-    env.update(PAPERVAULT_CATALOG_AUTHORITY="postgres", PAPERVAULT_CATALOG_DSN=LIVE_DSN,
-               PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    env.update(HOSTILE_ENV, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
     if test_dsn:
         env["PAPERVAULT_CATALOG_TEST_DSN"] = test_dsn
+        env["EXPECTED_TEST_DSN"] = test_dsn
     if explicit_env:
         env["PAPERVAULT_ENV"] = str(env_file)
     runner = textwrap.dedent('''
@@ -98,7 +199,7 @@ def test_hostile_environment_cannot_escape_test_isolation(
         assert "python-dotenv>=1.2" in result.stdout + result.stderr
     else:
         assert result.returncode == 0, result.stdout + result.stderr
-        assert "3 passed" in result.stdout
+        assert "5 passed" in result.stdout
 
 
 @pytest.mark.parametrize("dsn", [

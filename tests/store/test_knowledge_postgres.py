@@ -347,13 +347,21 @@ def prepare_metadata(k, tmp_path):
     prepare(k)
     store = ImmutableInputStore(tmp_path)
     artifact = store.capture(b'{"title":"one"}', role="metadata")
-    manifest, input_revision = make_input_manifest("paper:A", {"title": "one"}, [artifact], tier="metadata")
+    manifest, input_revision = make_input_manifest("paper:A", {"title": "one"}, [artifact], tier="metadata",
+                                                   parent_evidence_revision=artifact["artifact_id"])
     k.command("register_input", "metadata-input", {"unit_id": "paper:A", "consumed_input_revision": input_revision,
                                                 "manifest": manifest})
     recipe = k.command("register_recipe", "metadata-recipe", {"recipe": {"schema_version": 1,
         "output_contract": {"metadata": {"required": ["metadata", "tombstones"], "not_applicable": ["graph", "vectors"]}}}})["recipe_digest"]
+    k.command("register_inventory", "metadata-inventory", {"parent_unit_id": "paper:A", "inventory_revision": "metadata-whole",
+        "parent_evidence_revision": artifact["artifact_id"], "parent_consumed_input_revision": input_revision, "mode": "whole",
+        "required_units": ["paper:A"], "optional_units": [], "section_mapping_revisions": {}})
+    k.command("set_inventory", "metadata-current-inventory", {"parent_unit_id": "paper:A", "generation_id": "g",
+        "inventory_revision": "metadata-whole", "expected_revision": 0, "expected_record_revision": 1,
+        "desired_recipe_digest": recipe})
     k.command("set_requirement", "metadata-requirement", {"unit_id": "paper:A", "generation_id": "g",
-        "consumed_input_revision": input_revision, "recipe_digest": recipe, "expected_revision": 1,
+        "consumed_input_revision": input_revision, "recipe_digest": recipe,
+        "inventory_revision": "metadata-whole", "expected_revision": k.get_requirement("paper:A", "g")["revision"],
         "expected_record_revision": 1})
     job = k.command("enqueue", "metadata-job", {"unit_id": "paper:A", "generation_id": "g",
         "consumed_input_revision": input_revision, "recipe_digest": recipe})

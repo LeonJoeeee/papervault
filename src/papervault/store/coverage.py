@@ -535,7 +535,7 @@ def query_coverage(repository, scope=None, *, consumed_input_revision="current",
         inventory, _, _ = _inventory_context(parent, expected_inventory_revision)
         sections, section_covered, required_outcomes = _sections(parent, members, {u["unit_id"]: u for _, u in members},
                                                expected_inventory_revision, with_outcomes=True)
-        record = members[0][0].get("record") or {}
+        record = (parent[0].get("record") if parent else members[0][0].get("record")) or {}
         tier_coverage = {}
         for tier, eligible_tiers in (("fulltext", {"fulltext"}), ("abstract", {"fulltext", "abstract"}),
                                      ("metadata", {"fulltext", "abstract", "metadata"})):

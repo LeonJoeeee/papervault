@@ -174,7 +174,11 @@ def test_section_serving_eligibility_rechecks_typed_parent_and_current_inventory
     parent["inventories"] = [{"inventory_revision": "v1", "parent_evidence_revision": "e1", "mode": "sections",
         "required_units": ["section:S"], "optional_units": [], "section_mapping_revisions": {"section:S": 1}}]
     parent["current_inventory"] = {"inventory_revision": "v1", "invalidated": False}
-    assert next(unit for unit in query([parent, section])["units"] if unit["unit_id"] == "section:S")["source_eligible"]
+    initial = query([section, parent])
+    assert next(unit for unit in initial["units"] if unit["unit_id"] == "section:S")["source_eligible"]
+    if parent_kind == "paper":
+        assert initial["records"][0]["title"] == parent["record"]["title"]
+        assert initial["records"][0]["doi"] == parent["record"]["doi"]
     if change == "quarantine":
         parent["unit"]["quarantine"] = True
     else:

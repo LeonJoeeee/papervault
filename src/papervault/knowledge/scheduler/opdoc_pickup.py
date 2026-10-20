@@ -93,6 +93,8 @@ documents finish in a later round. A processing row with no queued document stil
 """
 from __future__ import annotations
 
+from papervault.store import knowledge_runtime
+
 import asyncio
 import logging
 import os
@@ -337,6 +339,8 @@ async def drain_pending(rag) -> dict:
     one bad file is routed to `failed/` and logged; the drain always completes so the scheduler
     loop keeps turning. (The caller in `main_loop` also wraps this in a belt-and-braces except.)
     """
+    await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority,
+        "catalog" if knowledge_runtime.knowledge_jobs_mode() == "postgres" else "legacy")
     pending = _pending_dir()
     # `deferred` = left in pending on a TRANSIENT block (MinerU down): neither ingested nor
     # failed, will retry next round. Distinct from `disabled` (source flag OFF) so the summary
@@ -447,6 +451,8 @@ async def drain_pending(rag) -> dict:
             log.debug("opdoc pickup: %s build paused; input remains pending", key)
             counts["deferred"] += 1
             break
+        except knowledge_runtime.KnowledgeAuthorityError:
+            raise
         except Exception as e:  # noqa: BLE001 — one bad file must NOT crash the scheduler loop
             log.exception("opdoc pickup: %s FAILED to ingest → failed/ (%r)", key, e)
             _move(path, failed_dir)
@@ -460,7 +466,13 @@ async def drain_pending(rag) -> dict:
             done = result.get("done", 0) if isinstance(result, dict) else 0
             error = result.get("error", 0) if isinstance(result, dict) else 0
             sections = result.get("sections", done + error) if isinstance(result, dict) else 0
-            if done > 0 and error == 0:
+            if isinstance(result, dict) and result.get("catalog_queued") is True:
+                _move(path, processed_dir)
+                _discard_staged(staged_md, processed_dir)
+                _disabled_logged.discard(str(path))
+                counts["queued"] = counts.get("queued", 0) + 1
+                log.info("opdoc pickup: captured %s → processed/; %d catalog job(s) queued", key, result.get("queued", 0))
+            elif done > 0 and error == 0:
                 # FULL success: every section built.
                 log.info("opdoc pickup: ingested %s (force=%s) → processed/ %s", key, force, result)
                 _move(path, processed_dir)

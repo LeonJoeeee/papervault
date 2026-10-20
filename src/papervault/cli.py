@@ -6,6 +6,8 @@
 """
 from __future__ import annotations
 
+from papervault.store import knowledge_runtime
+
 import os
 import sys
 from pathlib import Path
@@ -501,14 +503,19 @@ def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None, force: b
     # Co-write gate (blocker, PR #54): refuse while the live service is active — an operator
     # doc ingest writing the same ledger + graph next to a serving instance risks DB co-write
     # corruption. Reuses the shared systemd gate (eval uses the same one, issue #32).
-    require_services_stopped(
-        override_env="KS_INGEST_ALLOW_COTENANCY",
-        reason=("operator-doc ingest is a maintenance-window operation that writes the SAME "
-                "ledger + graph the live service is concurrently serving — a co-writer risks "
-                "DB co-write corruption."),
-    )
+    catalog_mode = knowledge_runtime.knowledge_jobs_mode() == "postgres"
+    knowledge_runtime.assert_knowledge_authority("catalog" if catalog_mode else "legacy")
+    if not catalog_mode:
+        require_services_stopped(
+            override_env="KS_INGEST_ALLOW_COTENANCY",
+            reason=("operator-doc ingest is a maintenance-window operation that writes the SAME "
+                    "ledger + graph the live service is concurrently serving — a co-writer risks "
+                    "DB co-write corruption."),
+        )
 
     async def _go() -> dict:
+        if catalog_mode:
+            return await ingest_document(None, kind, key, str(path), max_tokens=max_tokens, force=force)
         from papervault.knowledge.ledger.store import close_pool
         from papervault.knowledge.store.graph import close_graph, get_graph
 
@@ -529,6 +536,10 @@ def ingest_doc(path: Path, kind: str, key: str, max_tokens: int | None, force: b
         result = asyncio.run(_go())
     except AlreadyIngestedError as e:
         raise click.ClickException(str(e))
+    if result.get("catalog_queued"):
+        click.echo(f"queued {result['key']} ({result['kind']}): {result['sections']} section(s) — "
+                   f"queued={result.get('queued', 0)} generation={result.get('generation_id', result.get('generation', 'unknown'))}")
+        return
     purged = result.get("purged")
     if purged:
         msg = (f"purged prior '{key}': {purged['ledger_rows_deleted']} ledger row(s), "

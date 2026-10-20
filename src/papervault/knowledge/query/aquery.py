@@ -32,6 +32,7 @@ unit-test offline against canned dicts with no LightRAG running (tests/test_quer
 from __future__ import annotations
 
 import logging
+import asyncio
 import os
 from typing import Any
 
@@ -184,17 +185,24 @@ def _assess_coverage(metadata: dict[str, Any] | None, data: dict[str, Any]) -> s
 
 
 async def query(intent: str, rag: Any = None) -> dict[str, Any]:
-    """v1 out-feed (§5.4): query(intent) → {answer, cited_papers, kb_coverage}.
+    """Pin catalog selection once across all retrieval facets and synthesis."""
+    owned = rag is None
+    if owned:
+        from papervault.knowledge.store.catalog_serving import get_query_graph
 
-    `rag` is the LightRAG singleton; if None it's resolved via store.graph.get_graph()
-    (workspace-gated). Passing it in lets callers (and the MCP server) share one gated
-    instance with the ingest loop.
-    """
-    if rag is None:
-        from papervault.knowledge.store.graph import get_graph
+        rag = await get_query_graph()
+    try:
+        result = await _query(intent, rag)
+        if owned and hasattr(rag, "validate"):
+            await asyncio.to_thread(rag.validate)
+        return result
+    finally:
+        if owned and hasattr(rag, "close"):
+            await rag.close()
 
-        rag = await get_graph()
 
+async def _query(intent: str, rag: Any) -> dict[str, Any]:
+    """Unchanged retrieval/synthesis pipeline over one already pinned store view."""
     # #29: surface reranker degradation on the LIVE path (run_eval already does, via rec["meta"]).
     # The rerank hook (store/lightrag_init) increments a process-global counter + logs LOUD on each
     # OOM/failure, then silently falls back to original-order chunks — so at the data layer a

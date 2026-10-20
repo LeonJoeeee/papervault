@@ -38,6 +38,8 @@ This module never opens a graph itself; the caller owns the instance + workspace
 """
 from __future__ import annotations
 
+from papervault.store import knowledge_runtime
+
 import asyncio
 import logging
 from collections import defaultdict
@@ -80,6 +82,7 @@ async def reconcile_terminal(
     Without it a subset run_round would still收口 (and stuck_guard→error) processing rows
     OUTSIDE the subset — defeating the "一小撮固定 keys" intent and racing other rounds.
     """
+    knowledge_runtime.assert_knowledge_authority("legacy")
     led = await ledger.load(PAPER)
     proc = [r for r in led.values() if r.status == "processing"]
     if only_keys is not None:
@@ -159,6 +162,7 @@ async def reconcile_healed(rag, *, only_keys: Optional[Iterable[str]] = None) ->
     Covers every ingest_source (operator-doc rows drift the same way). only_keys (subset entry,
     blocker ③): limit to those paper keys, like reconcile_terminal.
     """
+    knowledge_runtime.assert_knowledge_authority("legacy")
     # Operator documents paused mid-ingest retain processing; finish those on a later round too.
     rows = await ledger.load_by_status((*_FAILED_LEDGER_STATUSES, "processing"))
     if only_keys is not None:
@@ -198,6 +202,11 @@ async def run_round(
     keys instead of the full ~4k-paper vault (which would burn the §6.5 throughput budget
     and break PROD-SAFETY rule (4)'s small-subset/serial intent).
     """
+    if knowledge_runtime.knowledge_jobs_mode() == "postgres":
+        knowledge_runtime.assert_knowledge_authority("catalog")
+        from .catalog_service import run_catalog_round
+        return await run_catalog_round(only_keys=only_keys)
+    knowledge_runtime.assert_knowledge_authority("legacy")
     only = set(only_keys) if only_keys is not None else None
 
     idx = load_clean_index()
@@ -294,6 +303,11 @@ async def main_loop(rag, *, interval: float = DEFAULT_ROUND_INTERVAL,
 
     取消(asyncio.CancelledError)即优雅退出(进程死=回 ledger + 重启走 reconcile 续上)。
     """
+    if knowledge_runtime.knowledge_jobs_mode() == "postgres":
+        knowledge_runtime.assert_knowledge_authority("catalog")
+        from .catalog_service import run_catalog_loop
+        return await run_catalog_loop(interval=interval)
+    knowledge_runtime.assert_knowledge_authority("legacy")
     await ledger.ensure_schema()
     log.info("scheduler main_loop started (interval=%ss, stuck_limit=%s)", interval, stuck_limit)
     try:

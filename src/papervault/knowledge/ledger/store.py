@@ -29,6 +29,8 @@ load/count_by_status/delete)全部按当前 workspace 过滤。workspace 不由 
 """
 from __future__ import annotations
 
+from papervault.store import knowledge_runtime
+
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -188,6 +190,7 @@ async def ensure_schema() -> None:
     which refuses prod 'l0' without explicit opt-in). It is verified only on l0_probe; a
     prod migration is deferred to the user. All steps are idempotent / re-runnable.
     """
+    knowledge_runtime.assert_knowledge_authority("legacy")
     ws = _workspace()  # gate first (refuses prod 'l0' without opt-in) + value for backfill
     async with _conn() as conn:
         await conn.execute(_CREATE_TABLE)
@@ -298,6 +301,7 @@ async def upsert(
     duplicate_of: Optional[str] = None,
     duplicate_content_hash: Optional[str] = None,
 ) -> None:
+    knowledge_runtime.assert_knowledge_authority("legacy")
     if status not in VALID_STATUS:
         raise ValueError(f"invalid ledger status: {status!r} (allowed: {sorted(VALID_STATUS)})")
     ws = _workspace()
@@ -417,6 +421,7 @@ async def count_by_status(ingest_source: str) -> dict[str, int]:
 
 
 async def delete(ingest_source: str, source_id: str) -> None:
+    knowledge_runtime.assert_knowledge_authority("legacy")
     ws = _workspace()
     async with _conn() as conn:
         await conn.execute(

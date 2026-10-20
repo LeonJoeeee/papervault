@@ -30,6 +30,8 @@ CLI (`python -m papervault.knowledge.cli`), NOT on the MCP surface.
 """
 from __future__ import annotations
 
+from papervault.store import knowledge_runtime
+
 import asyncio
 import logging
 import math
@@ -141,6 +143,33 @@ async def _embedding_stack_ok() -> bool:
 # in uvicorn's loop — the same loop query() uses — so get_graph()'s singleton binds correctly.
 _bg_task: Optional[asyncio.Task] = None
 _startup_task: Optional[asyncio.Task] = None
+_authority_task: Optional[asyncio.Task] = None
+
+
+def _authority_checked(task: asyncio.Task) -> None:
+    if not task.cancelled() and (error := task.exception()) is not None:
+        log.error("Knowledge authority check failed; scheduler disabled and knowledge queries refused until restart: %s", error)
+
+
+async def _ensure_knowledge_authority() -> dict:
+    """Retain one process-lifetime check; a slow catalog never blocks the event loop.
+
+    Cancellation of a client/startup waiter must not cancel the database thread
+    or cause a second connection. Both the result and rejection stay cached.
+    Mutating runtime entry points continue to enforce authority independently.
+    """
+    global _authority_task
+    if _authority_task is None:
+        expected = "catalog" if knowledge_runtime.knowledge_jobs_mode() == "postgres" else "legacy"
+        _authority_task = asyncio.create_task(
+            asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, expected), name="ks-authority-check")
+        _authority_task.add_done_callback(_authority_checked)
+    return await asyncio.shield(_authority_task)
+
+
+def _startup_finished(task: asyncio.Task) -> None:
+    if not task.cancelled():
+        task.exception()  # Startup may outlive its bounded initial waiter.
 
 
 async def _wait_selfcheck_retry(delay: float) -> None:
@@ -157,15 +186,22 @@ def _selfcheck_retry_delay() -> float:
 
 
 async def _start_once() -> bool:
+    mode = knowledge_runtime.knowledge_jobs_mode()
+    await _ensure_knowledge_authority()
     if not await _embedding_stack_ok():
         return False
-    from papervault.knowledge.scheduler.round import DEFAULT_ROUND_INTERVAL, main_loop
-    from papervault.knowledge.store.graph import get_graph
+    from papervault.knowledge.scheduler.round import DEFAULT_ROUND_INTERVAL
 
     global _bg_task
     interval = float(os.getenv("KS_AUTO_INGEST_INTERVAL_SEC", str(DEFAULT_ROUND_INTERVAL)))
-    rag = await get_graph()
-    _bg_task = asyncio.create_task(main_loop(rag, interval=interval), name="ks-auto-ingest")
+    if mode == "postgres":
+        from papervault.knowledge.scheduler.catalog_service import run_catalog_loop
+        _bg_task = asyncio.create_task(run_catalog_loop(interval=interval), name="ks-auto-ingest")
+    else:
+        from papervault.knowledge.scheduler.round import main_loop
+        from papervault.knowledge.store.graph import get_graph
+        rag = await get_graph()
+        _bg_task = asyncio.create_task(main_loop(rag, interval=interval), name="ks-auto-ingest")
     log.info("S4 scheduler task started at server startup (interval=%ss)", interval)
     return True
 
@@ -174,6 +210,10 @@ async def _retry_start() -> None:
     """Own one startup attempt at a time, retrying failures without blocking serving."""
     global _startup_task
     try:
+        await _ensure_knowledge_authority()
+        if not _auto_ingest_enabled():
+            log.info("auto-ingest DISABLED (set KS_AUTO_INGEST_ENABLED=true to opt in)")
+            return
         while _auto_ingest_enabled():
             try:
                 if await _start_once():
@@ -194,12 +234,15 @@ async def start_background() -> None:
 
     Wait at most KS_STARTUP_AWAIT_SEC (default 3s; 0 skips waiting). A slow graph/model
     initialization continues in the background, with failed attempts retried automatically.
+    Authority is checked once off-loop even when ingestion is disabled. A rejected
+    authority disables knowledge queries/writers while library serving continues.
     """
+    knowledge_runtime.knowledge_jobs_mode()  # Validate the local selector without database I/O.
     global _startup_task
     if _bg_task is not None or _startup_task is not None:
         return
-    if not _auto_ingest_enabled():
-        log.info("auto-ingest DISABLED (set KS_AUTO_INGEST_ENABLED=true to opt in)")
+    if _authority_task is not None and (not _auto_ingest_enabled() or
+            (_authority_task.done() and not _authority_task.cancelled() and _authority_task.exception() is not None)):
         return
     try:
         timeout = float(os.getenv("KS_STARTUP_AWAIT_SEC", "3"))
@@ -212,6 +255,7 @@ async def start_background() -> None:
     # This task owns both the initial attempt and retries; timeout must not cancel an
     # in-progress graph initialization or launch a competing attempt against the singleton.
     _startup_task = asyncio.create_task(_retry_start(), name="ks-embedding-retry")
+    _startup_task.add_done_callback(_startup_finished)
     try:
         await asyncio.wait_for(asyncio.shield(_startup_task), timeout=timeout)
     except asyncio.TimeoutError:
@@ -220,6 +264,10 @@ async def start_background() -> None:
             "HTTP serving continues while initialization/retries run in the background",
             timeout,
         )
+    except Exception:
+        # Knowledge rejection must not prevent the unified library HTTP service
+        # from binding. The retained authority task fails every knowledge query.
+        log.error("Knowledge background startup refused; library serving remains available")
 
 
 async def stop_background() -> None:
@@ -393,6 +441,7 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     stop = asyncio.Event()
     heartbeat = asyncio.create_task(_progress_heartbeat(ctx, stop)) if ctx else None
     try:
+        await _ensure_knowledge_authority()
         return await _query(intent=intent)
     finally:
         if heartbeat is not None:

@@ -1,0 +1,35 @@
+# Catalog-owned knowledge publication and coverage
+
+Status: implementation of the accepted [P4 design, issue #278](https://github.com/LeonJoeeee/papervault/issues/278); activation requires the evidence and writer handoff below.
+
+## Context
+
+The ledger, LightRAG document status and library previously described different units and could disagree about completion. A processed backend document does not establish which input or recipe produced it, whether publication was accepted, or whether every required output remains available. P4 executes the constitution and refactor plan recorded in [ADR-0007](0007-papervault-constitution.md). It shares its publication primitives with P5; this slice does not implement backup or garbage collection.
+
+## Decision
+
+Postgres catalog commands own typed units, immutable input manifests and recipes, logical jobs and appended attempts, publication receipts, generation manifests and version selections. Execution, achieved tier, quarantine, publication and observed availability are separate dimensions. Stable operation IDs make committed commands replayable; optimistic revisions, database leases, authority epochs and monotonically increasing fences reject stale mutations. Outbox delivery preserves the attempt's submission identity and conservative accounting after an ambiguous external outcome.
+
+Inputs are captured into immutable, content-addressed files under the configured knowledge store before admission. Artifact hashes and byte lengths describe the consumed bytes; the library's catalog revision remains a separate concurrency guard. Section mappings bind the exact parent evidence and segmentation revision. An expected inventory chooses whole-document or required-section coverage without counting both.
+
+LightRAG's existing extraction, merge, deletion, embedding and query algorithms remain in use. Each attempt writes private deltas over a pinned logical aggregate. Postgres KV/vector and Neo4j graph adapters resolve the latest replacement row across the pinned layers before retrieval or traversal. Durable tombstones mask inherited deletions; replacement summaries come from the existing LightRAG reducers. This preserves shared entities and cross-document graph paths without allowing an unpublished contribution to alter the served aggregate. Model-specific vector tables require prepared backend schema. Runtime connection acquisition must not run LightRAG's legacy schema migrations.
+
+A recoverable sealed receipt binds the submission, attempt, fence, unit, input, recipe, generation, aggregate base and verified output inventory. Publication rechecks that base and current eligibility before atomically registering lineage, publication history, selections, a new manifest, audit and downstream work. A conflicting aggregate base requires a new admitted attempt; it cannot append an unrebased delta. Candidate publication never moves production. Promotion checks a complete candidate against current requirements. Durable staging, recovery and reader pins protect namespaces across these transitions; no GC is activated here.
+
+Vector-producing recipes bind a generation to an immutable embedding contract. Model identity, dimensions and embedding implementation must remain compatible across its aggregate. A model change needs a new generation; serving refuses to query an older generation with a different configured embedder. Other recipe changes retain their own exact logical job identities and explicit desired mappings.
+
+Serving pins one exact catalog manifest before retrieval, graph traversal, aggregation and cache access. It refuses a mixed aggregate containing an ineligible selected contribution rather than exposing its effects through another document. Eligibility and the serving pointer are checked again before returning a response. Direct legacy graph writers are rejected after authority handoff.
+
+Backend collectors record nonauthoritative, identity-qualified observations. A processed document status alone cannot heal a job. Missing or corrupt published material retains its history and creates deduplicated repair work. Repair rebuilds use an isolated candidate, admitted only in the operator's monthly reboot window of at most two hours; promotion remains an explicit command.
+
+The catalog-only coverage read performs no refresh or repair. A complete result needs the exact selected publication, compatible input/recipe/inventory and fresh positive verification for every required output. The default observation age is 300 seconds, based on backend observation time. Verified empty graphs require explicit evidence and applicable byte proofs. Unknown provenance, missing identity and stale observations receive no completeness credit.
+
+## Consequences and activation
+
+`PAPERVAULT_KNOWLEDGE_JOBS` defaults to `legacy`. Selecting `postgres` requires an already committed catalog authority epoch and Postgres library authority. The configuration flag cannot transfer authority. Legacy ledger methods remain readable for historical comparison; their writers and direct legacy backend mutation entry points fail after handoff.
+
+Legacy imports preserve raw keys, states, timestamps and available counter semantics in quarantined, non-executable records. They do not fabricate historical attempts, inputs, recipes, publication or dispatch tokens. Durable change capture, aligned C0/C1 checkpoints, verified privilege revocation and backend worker fencing precede the authority transaction. Software rollback preserves catalog authority and accepted mutations. A reverse migration requires a separate design and rehearsal.
+
+The [P4 rehearsal procedure](../specs/2026-10-20-p4-knowledge-handoff.md) describes the administrative interfaces and required evidence. Dedicated Postgres and actual backend tests, real-material coverage differences and an independent review are activation requirements. Unit tests and schema definitions alone do not establish them. In particular, the layered vector query uses latest-row selection before similarity search; its query plan and latency at corpus scale require measurement before activation.
+
+The current durable representation writes complete immutable manifest inventories and cumulative receipt mappings. Across many publications this has quadratic metadata growth, despite compact shared read projections. Structural sharing and corpus-scale storage/write measurements remain unresolved activation concerns; no capacity or maintenance-window performance is claimed by this implementation.

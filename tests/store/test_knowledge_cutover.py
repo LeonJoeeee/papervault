@@ -1,5 +1,6 @@
 """The writer handoff requires a complete capture and durable source/backend fences."""
 import copy
+import os
 
 from psycopg import sql
 import pytest
@@ -138,7 +139,7 @@ def test_capture_statement_lock_blocks_other_writer_before_row_changes_and_reser
 
     capture = source_capture(repo)
     insert = sql.SQL("INSERT INTO {} VALUES ('probe','paper',%s,'done',0,%s)").format(repo._table("ks_ledger"))
-    with psycopg.connect(repo.connection.info.dsn, autocommit=True) as other:
+    with psycopg.connect(os.environ["PAPERVAULT_CATALOG_TEST_DSN"], autocommit=True) as other:
         other.execute("SET lock_timeout='50ms'")
         with repo.connection.transaction():
             repo.connection.execute(insert, ("A", "doc:A"))

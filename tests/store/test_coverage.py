@@ -142,6 +142,22 @@ def test_missing_contract_or_quarantine_blocks_coverage():
     assert query([source])["units"][0]["indexed"] is False
 
 
+@pytest.mark.parametrize("contract", [
+    {"required": ["graph"]},
+    {"required": ["graph"], "not_applicable": None},
+    {"required": ["graph"], "not_applicable": "vectors"},
+    {"required": ["graph"], "not_applicable": ["graph"]},
+])
+def test_incomplete_or_conflicting_output_contract_never_receives_coverage_credit(contract):
+    source = row()
+    source["recipe"]["output_contract"]["fulltext"] = contract
+    unit = query([source])["units"][0]
+    assert unit["readable"] is True
+    assert unit["tier_covered"] is False
+    assert unit["indexed"] is False
+    assert "missing_or_invalid_recipe_output_contract" in unit["reasons"]
+
+
 def test_unknown_expected_inventory_prevents_record_completeness():
     source = row()
     source["requirement"]["inventory_revision"] = None

@@ -1,5 +1,6 @@
 """P4 transactions on an explicitly configured disposable PostgreSQL only."""
 from concurrent.futures import ThreadPoolExecutor
+import os
 
 import psycopg
 from psycopg import sql
@@ -190,7 +191,7 @@ def test_two_connections_can_claim_one_job_only_once(knowledge):
     job = prepare(knowledge)
     r = knowledge.repository
     def run(number):
-        with psycopg.connect(r.connection.info.dsn, autocommit=True) as conn:
+        with psycopg.connect(os.environ["PAPERVAULT_CATALOG_TEST_DSN"], autocommit=True) as conn:
             other = KnowledgeRepository(PostgresCatalogRepository(conn, schema=r.schema))
             try:
                 return claim(other, job, "concurrent" + str(number))
@@ -795,7 +796,7 @@ def prepare_published_section(k, *, paper_parent=False, previous_whole=False):
         k.command("register_input", "source-input:"+unit, {"unit_id": unit,
             "consumed_input_revision": input_revision, "manifest": manifest})
     recipe = k.command("register_recipe", "source-recipe", {"recipe": {"schema_version": 1,
-        "output_contract": {"fulltext": {"required": ["graph"]}}}})["recipe_digest"]
+        "output_contract": {"fulltext": {"required": ["graph"], "not_applicable": []}}}})["recipe_digest"]
     k.command("create_generation", "source-generation", {"generation_id": "g", "candidate": False})
     if previous_whole:
         k.command("register_input", "old-whole-input", {"unit_id": parent, "consumed_input_revision": "old-parent-input",
@@ -944,22 +945,81 @@ def test_shadow_capture_does_not_seed_before_final_parked_checkpoint_handoff(rep
 
 
 @pytest.mark.parametrize("paper_parent", [False, True])
-def test_section_inventory_parent_evidence_replaces_excluded_whole_requirement_in_read_view(knowledge, paper_parent):
+@pytest.mark.parametrize("previous_whole", [False, True])
+def test_section_inventory_parent_evidence_replaces_excluded_whole_requirement_in_read_view(
+        knowledge, paper_parent, previous_whole):
     from papervault.store.coverage import query_coverage
 
     k = knowledge
-    parent, _, _ = prepare_published_section(k, paper_parent=paper_parent, previous_whole=True)
+    parent, _, _ = prepare_published_section(k, paper_parent=paper_parent, previous_whole=previous_whole)
     historical = k.get_requirement(parent, "g")
-    assert historical["excluded"] and historical["consumed_input_revision"] == "old-parent-input"
+    if previous_whole:
+        assert historical["excluded"] and historical["consumed_input_revision"] == "old-parent-input"
+    else:
+        assert historical is None
     row = next(row for row in k.coverage_rows(parent) if row["unit"]["unit_id"] == parent)
     assert row["requirement"]["inventory_parent_selector"] is True
     assert row["requirement"]["consumed_input_revision"] == "parent-input"
-    parent_coverage = next(unit for unit in query_coverage(k)["units"] if unit["unit_id"] == parent)
+    coverage = query_coverage(k)
+    parent_coverage = next(unit for unit in coverage["units"] if unit["unit_id"] == parent)
     assert parent_coverage["readable"] is True
+    section_coverage = next(unit for unit in coverage["units"] if unit["unit_id"] == "section:S")
+    assert section_coverage["source_eligible"] is True
+    assert section_coverage["tier_covered"] is True
+    assert section_coverage["indexed"] is True
+    assert section_coverage["roles"][0]["state"] == "present"
+    assert coverage["totals"]["indexed"] == 1
+    assert coverage["records"][0]["sections"] == {
+        "required": 1, "complete": 1, "missing": 0, "stale": 0, "unknown": 0, "excluded": 0}
     serving = {entry["unit_id"]: entry for entry in k.get_serving_manifest()["entries"]}
-    assert serving[parent]["eligible"] is False
+    if previous_whole:
+        assert serving[parent]["eligible"] is False
     assert serving["section:S"]["eligible"] is True
     assert k.get_requirement(parent, "g") == historical
+
+
+@pytest.mark.parametrize("paper_parent", [False, True])
+@pytest.mark.parametrize("state", ["missing", "unknown", "stale"])
+def test_section_serving_requires_fresh_available_parent_evidence(knowledge, paper_parent, state):
+    from datetime import datetime, timezone
+    from papervault.store.coverage import query_coverage
+
+    k = knowledge
+    parent, _, publication = prepare_published_section(k, paper_parent=paper_parent, previous_whole=True)
+    rows = k.coverage_rows(parent)
+    parent_row = next(row for row in rows if row["unit"]["unit_id"] == parent)
+    previous = {key: value for key, value in
+                next(obs for obs in parent_row["observations"] if obs["role"] == "input_evidence").items()
+                if key != "ingested_at"}
+    now = datetime.now(timezone.utc)
+    assert next(e for e in k.get_serving_manifest(evaluation_time=now)["entries"]
+                if e["unit_id"] == "section:S")["eligible"]
+    # Refresh section evidence at evaluation time so a zero age limit expires
+    # only the parent evidence, without sleeps or unrelated output failures.
+    if state == "stale":
+        for row in rows:
+            if row["unit"]["unit_id"] != "section:S":
+                continue
+            for obs in row["observations"]:
+                observation_id = "refreshed:" + obs["observation_id"]
+                payload = {key: value for key, value in obs.items() if key != "ingested_at"}
+                k.command("observe", observation_id, {**payload, "observation_id": observation_id,
+                    "observed_at": now.isoformat()})
+    else:
+        k.command("observe", "parent-evidence-unavailable", {**previous,
+            "observation_id": "parent-evidence-unavailable", "state": state, "observed_at": now.isoformat()})
+    age = 0 if state == "stale" else 300
+    coverage = query_coverage(k, evaluation_time=now, max_observation_age=age)
+    by_unit = {unit["unit_id"]: unit for unit in coverage["units"]}
+    assert by_unit[parent]["readable"] is False
+    assert by_unit[parent]["input_roles"][0]["state"] == state
+    assert by_unit["section:S"]["tier_covered"] is True
+    assert by_unit["section:S"]["source_eligible"] is False
+    assert coverage["totals"]["indexed"] == 0
+    serving = k.get_serving_manifest(evaluation_time=now, max_observation_age=age)
+    assert next(e for e in serving["entries"] if e["unit_id"] == "section:S")["eligible"] is False
+    assert k.get_selection("section:S", "g")["derivation_id"] == publication["derivation_id"]
+    assert len(k._rows("publications")) == 1
 
 
 def test_admission_limit_does_not_starve_active_job_behind_closed_candidate_jobs(knowledge):

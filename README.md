@@ -496,7 +496,7 @@ variables, never values in a committed configuration):
 
 Use the actual installed table names, including any embedding-model suffixes. A
 missing role or incompatible schema refuses capture. The source catalog must have
-the explicit P5b knowledge-schema migration (version 6); capture does not migrate
+the explicit knowledge-schema migration (version 7 with P5c); capture does not migrate
 the source. Run the preview first; the
 orchestrator can schedule the applied `--due` command weekly after arranging drain:
 
@@ -566,14 +566,118 @@ candidate/catalog rows against an atomically recorded digest and rejects extra
 Neo4j indexes or constraints. Replay preserves completed
 admissions, stops on errors or deadline, and may resume in a later permitted monthly
 window; it cannot extend a consumed window in the same month. All drill/replay
-candidate generations are permanently marked sample and cannot promote. This
-release contains no promotion or disposable-extract GC tool.
+candidate generations created by the P5b replay tool are permanently marked sample
+and cannot promote. P5c's separate candidate fork/promotion path is described below.
 
 Weekly cadence is a scheduling policy, not a committed RPO; acceptable loss and
 full-system recovery time remain unqualified. Sample elapsed time is not full RTO,
 especially where source strata or rebuild work were unavailable. RAID and these
 local copies share the host failure domain. Off-host replication and host-loss/
 disaster recovery remain outside P5b and are not satisfied by this evidence.
+
+## Disposable extracts and isolated maintenance
+
+P5c adds `scripts/maintain_derivatives.py` for catalog inspection, explicit extract
+disposition, monthly windows, resumable GC, candidate forks and promotion. It disables
+dotenv discovery, requires an explicit DSN environment name, schema and vault, and
+defaults to a read-only plan. Catalog scheduling remains opt-in; the default is
+`PAPERVAULT_KNOWLEDGE_JOBS=legacy`. The orchestrator owns production activation and
+the monthly reboot drill. Worker rehearsals use disposable stores and `/tmp` roots.
+
+Every registered extract starts **protected**. An operator may mark only its
+immutable markdown output disposable using a reason, nonce and exact retention
+revision. Eligibility begins **90 days after accepted supersession**, regardless of
+file age. Pre-P5c receipts start protected; historical superseded receipts start
+their conservative clock at migration and require a verified explicit vault binding.
+Source inputs, receipts, current heads, selected records, live generations, queued
+jobs, reader pins and unresolved recovery/job pins remain protected. Reader pins
+expire within two hours; job/recovery pins require an explicit reviewed disposition.
+
+GC commits a permanent deletion intent before filesystem IO and checks reference
+admission under the same catalog writer lock. A tombstoned identity cannot acquire
+new references. It verifies the exact path, hash, size and single-link regular file
+through directory descriptors, rejects symlinks, and unlinks only that `output.md`.
+A failed unlink or lost catalog response retains its intent; retry resumes the same
+deletion under a fresh valid lease. Filesystem/catalog writers must use the normal
+fences; administrative writers must be drained during maintenance. Recovery sets
+accept valid disposal evidence while still verifying every source and receipt.
+Pre-GC snapshots conservatively keep their existing protected-byte retention; GC
+does not change snapshot cadence or automatically prune those older packages.
+
+Use `inspect` to obtain the current authority, window, retention revisions and
+eligibility reasons. Supply a JSON payload for every other action:
+
+```bash
+.venv/bin/python scripts/maintain_derivatives.py inspect --dsn-env MAINTENANCE_CATALOG_DSN --catalog-schema <schema> --vault <vault> --operation-id inspect
+.venv/bin/python scripts/maintain_derivatives.py gc --dsn-env MAINTENANCE_CATALOG_DSN --catalog-schema <schema> --vault <vault> --payload gc.json --operation-id gc-batch
+# Apply only in the explicitly recorded window; one batch names at most 100 completions.
+.venv/bin/python scripts/maintain_derivatives.py gc --dsn-env MAINTENANCE_CATALOG_DSN --catalog-schema <schema> --vault <vault> --payload gc.json --operation-id gc-batch --owner <operator> --window-id <window> --apply
+```
+
+| Action | Required JSON payload |
+| --- | --- |
+| `window` | `window_id`, `kind: "monthly_reboot"`, timezone-qualified `starts_at`/`ends_at` (at most 7,200 seconds), `operator_nonce`, `expected_revision` from authority's `maintenance_revision` |
+| `disposition` | `completion_id`, boolean `disposable`, `reason`, `operator_nonce`, `expected_revision` from `retention_revision` |
+| `gc` | `completion_ids`: 1–100 distinct explicit completion IDs |
+| `fork` | new `generation_id`, active `source_generation_id`, `expected_manifest_revision`, `expected_requirements_revision` |
+| `promote` | candidate `generation_id`, `expected_manifest_revision`, `expected_requirements_revision`, `expected_serving_revision` |
+
+For `inspect`, an optional payload containing `generation_id` includes that generation's
+revision. Fork and promotion require `--owner`/`--window-id` on apply, just as GC does.
+The tool holds a fenced maintenance lease and rechecks it before committing. Fork
+queues work in a fresh candidate with no selected output. The ordinary scheduler
+builds it only inside the monthly window with funded capacity. Candidate publication
+never changes production selection. Both scheduler awaits and guarded backend
+operations cancel at the window deadline. Already-sent remote operations can have
+unknown outcomes; their private versions and capacity remain protected until verified.
+Promotion requires a complete compatible
+manifest, fresh output observations and exact current revisions; a sample generation
+cannot promote. Preserve the operation ID and payload when retrying a lost response.
+
+Catalog intake and new execution reserve physical space under a shared
+`<knowledge_root>/maintenance/capacity` root. The **2 TB** cap and **80%** alert include
+filesystem derivatives, outstanding reservations and the external usage census.
+Insufficient capacity blocks new work and preserves current/protected bytes; there
+is no emergency deletion. `PAPERVAULT_CATALOG_EXECUTION_BYTES` is a positive per-job
+estimate (default 1 GiB), including scratch and output, not a hard quota. Admission
+requires headroom for outstanding jobs' output plus twice the new estimate for
+its reservation and output.
+Unknown execution outcomes keep their reservation across restart until verified
+receipt recovery; unknown files are never automatically cleared. Completed external
+growth remains charged until a qualified census started after settlement covers it.
+Receipt recovery
+and publication of already sealed work remain available when new admission stops.
+
+`PAPERVAULT_DERIVATIVE_USAGE_FILE` must point to an operator-owned mode-0600 JSON
+census refreshed within 300 seconds, with `scope: {vault_root, knowledge_root}`,
+timezone-qualified `measured_at`, and nonnegative `backend_bytes`. Include external
+PostgreSQL/Neo4j derivatives and retained sets outside the two filesystem roots;
+the runtime also measures catalog relation bytes. Missing, stale or mismatched
+measurements block new work, including metadata intake. An explicitly measured
+zero is valid for a metadata-only fixture. This is conservative admission
+accounting; per-job estimates and Neo4j size estimates do not establish an exact
+disk quota or corpus-scale capacity qualification. The 80% threshold logs a capacity
+alert. A census marked `metadata_sample: true` cannot fund physical execution.
+
+Generate the census with `scripts/measure_derivative_usage.py`. Reuse the explicit
+snapshot source configuration above and add `extra_derivative_roots`, listing retained
+recovery sets and every other derivative filesystem root outside `vault/extracts`
+and `knowledge_root` (an explicit empty list affirms none). The output's parent must
+already exist. Both PostgreSQL and Neo4j adapters are required unless
+`metadata_sample: true` proves that the catalog has only metadata dependencies.
+The preview only prints measurements; `--apply` atomically publishes the protected
+census. Refresh it at least every 300 seconds while new work is being admitted.
+
+```bash
+.venv/bin/python scripts/measure_derivative_usage.py --config source-with-capacity-roots.json --output <usage.json>
+.venv/bin/python scripts/measure_derivative_usage.py --config source-with-capacity-roots.json --output <usage.json> --apply
+```
+
+`scripts/drill_derivative_maintenance.py` exercises the protocol in a new disposable
+PostgreSQL fixture and small isolated filesystem roots. The recorded P5c rehearsal
+in [baseline evidence](docs/baselines.md) covers deletion retries, preserved source
+hashes, capacity refusal, isolated candidate publication and guarded promotion.
+Its metadata-only timings do not qualify full-text rebuilds or production RTO.
 
 ## Releases
 

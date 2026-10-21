@@ -13,7 +13,10 @@ from .repository import payload_hash
 
 
 def publish_extraction(k, operation_id, payload):
+    from .extract_lifecycle import admit_input, admit_completion, published_extract
     completion = payload["completion"]
+    admit_completion(k, completion["completion_id"])
+    admit_input(k, completion["input_manifest"])
     ExtractionStore(payload["vault"]).verify(completion)
     completion_id = completion["completion_id"]
     result = {"registration": "registered", "completion_id": completion_id,
@@ -106,6 +109,7 @@ def publish_extraction(k, operation_id, payload):
                   unit_id=unit["unit_id"])
     else:
         k._insert("extraction_heads", {"unit_id": unit["unit_id"], "completion_id": completion_id})
+    published_extract(k, completion_id, payload["vault"], head["completion_id"] if head else None)
     outbox(k, "extraction_completed", {**result, "record_key": selected.key, "unit_id": unit["unit_id"],
         "output_inventory": completion["output_inventory"]}, stable_id="distill-extraction:" + completion_id)
     return result

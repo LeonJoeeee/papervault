@@ -1,0 +1,16 @@
+Final store preflight: 3 failed, 690 passed, 4 skipped in 96.76s; exit 1.
+All three failures were parameter cases of:
+tests/store/test_knowledge_commands.py::test_inventory_selection_invalidates_stale_included_requirements_before_snapshot
+AttributeError: 'Repository' object has no attribute 'get_input'
+
+Cause: P5c intentionally revalidates a required input when set_inventory admits it.
+The existing test double omitted consumed_input_revision and get_input because
+inventory selection previously did not inspect input references. The fixture now
+supplies section-input and an empty immutable input manifest. Its original
+invalidated/inventory_revision/excluded assertions are unchanged; no guard or
+assertion was disabled.
+
+Focused fixture check: 29 passed in 0.63s; exit 0.
+Final dedicated store check: 693 passed, 4 skipped in 157.88s; exit 0.
+Final suite: 3932 passed, 2 skipped, 167 deselected, 4 warnings in 297.19s; exit 0.
+This is a fixture repair followed by final validation, not a flaky retry.

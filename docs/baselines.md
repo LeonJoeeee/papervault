@@ -305,6 +305,71 @@ guarantee. The [operational procedure](../README.md#coordinated-recovery) record
 drain requirements, retention protection and these limits; this run made no live
 activation or production-window claim.
 
+## P5c isolated maintenance rehearsal — 2026-10-21
+
+The [P5c rehearsal](baselines/p5c-20261021-staging-01/results.json) exercised
+disposable-extract GC and candidate rebuild/promotion in a task-owned PostgreSQL
+container and new `/tmp` roots. It used four synthetic extraction receipts sharing
+one source and three metadata parents. No live catalog, live vault, Neo4j store,
+external model or GPU was used.
+
+| Measurement | Staging result |
+| --- | ---: |
+| Whole instrument | 1.445 s |
+| GC window work, including injected failure and retry | 0.076 s |
+| Candidate rebuild and guarded promotion | 0.482 s |
+| Recorded window allowance, per catalog | 120 s |
+| Observed serving interruption | 0 s |
+| Preserved extraction receipts | 4 |
+
+Serving availability was checked by reading an eligible serving manifest after
+each candidate publication and refused promotion; it was not continuously probed.
+The [GC evidence](baselines/p5c-20261021-staging-01/gc.json) records the real
+ninety-day refusal, protected/current refusals, a committed deletion intent after
+an injected unlink failure, and successful retry under the same deletion identity.
+Only the disposable markdown disappeared; source, protected/current output hashes
+and all receipts remained. Superseded fixture rows were explicitly aged by a
+test-only database update after proving the real retention refusal.
+
+The [rebuild evidence](baselines/p5c-20261021-staging-01/rebuild.json) records
+capacity exhaustion with zero new claims and unchanged file inventories. Three
+funded metadata jobs then rebuilt an isolated candidate. Candidate publications
+kept the prior serving manifest, incomplete/stale promotion requests were refused,
+and exact current revisions promoted the complete compatible candidate. All
+refusals and applied commands appear in the
+[action record](baselines/p5c-20261021-staging-01/actions.json).
+
+```bash
+P5C_DRILL_DSN='host=127.0.0.1 port=32786 dbname=p5c_drill user=p5c_drill' \
+  .venv/bin/python scripts/drill_derivative_maintenance.py \
+  --dsn-env P5C_DRILL_DSN \
+  --root /tmp/papervault-284.9HQAzZ/rehearsal/final/source-root \
+  --evidence /tmp/papervault-284.9HQAzZ/rehearsal/final/evidence \
+  --drill-id p5c-20261021-staging-01 --disposable
+```
+
+The [environment record](baselines/p5c-20261021-staging-01/environment.json)
+identifies the disposable endpoint, schemas, package version and code hashes.
+The [verification log](baselines/p5c-20261021-staging-01/verification.log) and
+[artifact hashes](baselines/p5c-20261021-staging-01/hashes.json) retain the checked
+result independently of the disposable container and staging files.
+The [validation record](baselines/p5c-20261021-staging-01/validation.json) binds
+commands, exit codes and source hashes: **3,932 passed** in the full non-integration
+suite, **693 passed** in the dedicated PostgreSQL/store run, and Ruff passed.
+The suite retains two existing skips and excludes 167 integration cases; the
+broader store run skips four existing Neo4j cases without supplied endpoints.
+The [regression record](baselines/p5c-20261021-staging-01/regression-evidence.log)
+explains the repaired unit fixture, with its original assertions retained.
+Both [scoped reviews](baselines/p5c-20261021-staging-01/scoped-review.log) found no
+remaining blockers. The task-owned container was removed after verification;
+[fixture disposition](baselines/p5c-20261021-staging-01/fixture-disposition.json)
+identifies the preserved evidence and disposable staging files.
+
+This synthetic metadata rehearsal does not qualify full-text/graph/vector rebuild
+cost, production downtime, full-system RTO or host-failure recovery. The orchestrator
+owns production activation, the monthly reboot drill, current-main CI and the
+independent integration verdict. Defaults remain legacy.
+
 ## Arbitration rules (how these numbers may change)
 
 1. **Quality is a hard constraint**: a retrieval-affecting change flips its default only

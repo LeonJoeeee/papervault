@@ -744,7 +744,20 @@ class KnowledgeRepository:
         if not acquired:
             raise ClaimRejected("recovery barrier fences backend writes")
         try:
-            async with self._locked_namespace(claim, task):
+            job, _, _ = valid_claim(self, claim, allow_sealed=False)
+            duration = None
+            if self.get_generation(job["target_generation"])["state"] == "candidate":
+                window = self.get_active_maintenance_window()
+                if not window:
+                    raise ClaimRejected("candidate claim outside monthly maintenance window")
+                stamp = self.connection.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+                duration = (window["ends_at"] - stamp).total_seconds()
+                if duration <= 0:
+                    raise ClaimRejected("candidate claim outside monthly maintenance window")
+            # Bound cooperative backend IO and lock waits independently of the
+            # scheduler. An interrupted remote call has unknown disposition;
+            # its private namespace/recovery pin remains protected.
+            async with asyncio.timeout(duration), self._locked_namespace(claim, task):
                 yield self
         finally:
             self.connection.execute("SELECT pg_advisory_unlock_shared(hashtextextended(%s,0))", (recovery_key,))

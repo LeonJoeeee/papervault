@@ -255,7 +255,8 @@ class PostgresCatalogRepository:
             changed = self.connection.execute(sql.SQL(
                 "INSERT INTO {}(version,name) VALUES(4,'P4 catalog knowledge commands'),"
                 "(5,'P5a extraction derivation registration'),"
-                "(6,'P5b isolated recovery generations') "
+                "(6,'P5b isolated recovery generations'),"
+                "(7,'P5c disposable extract lifecycle') "
                 "ON CONFLICT(version) DO NOTHING RETURNING version"
             ).format(self._table("schema_version"))).fetchone()
             if changed:
@@ -313,6 +314,14 @@ class PostgresCatalogRepository:
             raise StaleWrite(record.key, expected_revision, current.revision if current else None)
         if current and replace(current, revision=0) == replace(record, revision=0):
             return False
+        if record.payload.get("extraction_completion_id") or any(
+                record.payload.get(field) for field in ("pdf_path", "md_path", "txt_path")):
+            exists = self.connection.execute("SELECT to_regclass(%s) AS name",
+                (self.schema + ".extract_deletions",)).fetchone()
+            if exists["name"]:
+                from .extract_lifecycle import admit_record
+                from .knowledge import KnowledgeRepository
+                admit_record(KnowledgeRepository(self), record.payload)
         columns = sql.SQL(", ").join(map(sql.Identifier, _RECORD_COLUMNS))
         updates = sql.SQL(", ").join(sql.SQL("{} = EXCLUDED.{}").format(
             sql.Identifier(c), sql.Identifier(c),

@@ -1,0 +1,29 @@
+Task-local independent review; not the orchestrator Goal/Floor integration verdict.
+Reviewers: Codex gpt-6-astra at max, native isolated review agents; read-only review.
+
+GC/maintenance review: no remaining blocking findings after fixes. Review covered
+reference admission and aliases, selected/inherited lineage and inventory parents,
+reader/job/recovery pins, exact permanent tombstones, retry/restore behavior,
+transaction durability and maintenance deadlines including namespace lock waits.
+Reviewer exercised 14 targeted regressions, followed by two deadline/lock-wait
+regressions; maintained tests include these cases. Final read-only delta review
+confirmed recovery-barrier-before-claim ordering and the actual successor
+publication/GC race test; no blockers, edits or further test runs. Note: older pre-GC recovery
+sets conservatively retain their existing protected-byte retention.
+
+Capacity review: no remaining blocking findings. Reviewer ran 107 focused tests
+and two real-PostgreSQL regressions for funded aggregate rebase and sealed-receipt
+recovery after restart/lease expiry. Review covered durable attempt ownership,
+census lag, cancellation, physical output headroom, deadlines and recovery.
+Final read-only delta review accepted measurement-start timestamps, rejection of
+metadata-only census sweeping physical charges, protection of unrecognized census
+output files, and the existing inventory-test fixture's required input metadata.
+No tests were rerun for that final small-delta inspection.
+
+Limits: backend sizing and execution budgets remain estimates; unknown/cancelled
+intake may need explicit reconciliation. Earlier snapshot/replay entry points are
+outside this runtime gate. Already-sent remote operations have unknown disposition
+until observed. None of these notes authorizes live activation or a CI fallback.
+
+Final test/drill artifacts are recorded separately in validation.json. Review did
+not issue the independent integration verdict or observe final-head CI.

@@ -1,0 +1,14 @@
+{
+  "command": "docker rm -f 893b90a2b348461ad9a624240e710570b323744ce26da2c7367c96e5e6484a8b",
+  "container_id": "893b90a2b348461ad9a624240e710570b323744ce26da2c7367c96e5e6484a8b",
+  "container_name": "papervault-p5c-284-rehearsal",
+  "disposition": "removed after final successful rehearsal and verified durable evidence copy",
+  "durable_evidence": "docs/baselines/p5c-20261021-staging-01",
+  "exit_code": 0,
+  "image": "pgvector/pgvector:pg16",
+  "ownership": "task-created issue284-labelled synthetic rehearsal fixture",
+  "staging_root": "/tmp/papervault-284.9HQAzZ/rehearsal/final/source-root",
+  "staging_root_disposition": "disposable synthetic fixture; retained in task scratch for caller inspection",
+  "storage": "tmpfs /var/lib/postgresql/data; no live mounts",
+  "task_branch_and_worktree": "retained for orchestrator integration and teardown"
+}

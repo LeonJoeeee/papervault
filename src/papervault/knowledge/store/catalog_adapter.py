@@ -25,10 +25,130 @@ _PG_STORES = ("full_docs", "text_chunks", "full_entities", "full_relations",
               "entity_chunks", "relation_chunks", "llm_response_cache", "doc_status",
               "chunks_vdb", "entities_vdb", "relationships_vdb")
 _recipe = ContextVar("catalog_execution_recipe", default=None)
+_retirement = ContextVar("catalog_retirement_rebuild", default=None)
 
 
 def current_execution_recipe():
     return _recipe.get()
+
+
+class _RetirementRebuild:
+    """Validate pinned deletion inputs without changing LightRAG's reducers."""
+    def __init__(self, original):
+        self.original = original
+
+    async def __call__(self, *args, **kwargs):
+        bound = _retirement.get()
+        if bound is None or kwargs.get("knowledge_graph_inst") is not bound["graph"]:
+            return await self.original(*args, **kwargs)
+        try:
+            await self._validate(kwargs)
+        except Exception as exc:
+            bound["error"] = exc
+            raise
+        config = dict(kwargs["global_config"])
+        roles = dict(config.get("role_llm_funcs", {}))
+        callback = roles.get("extract")
+        if callback is not None:
+            async def observed(*callback_args, **callback_kwargs):
+                from papervault.knowledge.store.build_breaker import BuildPausedError
+
+                try:
+                    return await callback(*callback_args, **callback_kwargs)
+                except Exception as exc:
+                    # The pinned LLM queue/cache can wrap the original pause.
+                    # Retain its typed root before the rebuild worker swallows it.
+                    cause, seen = exc, set()
+                    while cause is not None and id(cause) not in seen:
+                        seen.add(id(cause))
+                        if isinstance(cause, BuildPausedError):
+                            bound["pause"] = cause
+                            break
+                        cause = cause.__cause__
+                    raise
+
+            roles["extract"] = observed
+            config["role_llm_funcs"] = roles
+        bound["config"] = config
+        await self.original(*args, **{**kwargs, "global_config": config})
+        if bound["pause"] is not None:
+            # Also stop deletion before it removes the document's retry state.
+            raise bound["pause"]
+        if bound["error"] is not None:
+            raise bound["error"]
+
+    @staticmethod
+    async def _validate(kwargs):
+        import lightrag.operate as operate
+
+        entities, relations = kwargs["entities_to_rebuild"], kwargs["relationships_to_rebuild"]
+        required = {chunk for targets in (entities, relations) for chunks in targets.values() for chunk in chunks}
+        if not required:
+            return
+        cached = await operate._get_cached_extraction_results(kwargs["llm_response_cache"], required,
+            text_chunks_storage=kwargs["text_chunks_storage"])
+        if set(cached) != required:
+            raise RuntimeError("retirement rebuild requires cached extraction for every remaining chunk; "
+                               "isolated rebuild required")
+        parsed = {}
+        for chunk, results in cached.items():
+            parsed[chunk] = [await operate._rebuild_from_extraction_result(
+                text_chunks_storage=kwargs["text_chunks_storage"], extraction_result=result,
+                chunk_id=chunk, timestamp=stamp) for result, stamp in results]
+        config = kwargs["global_config"]
+        for kind, targets, limit in ((0, entities, "max_source_ids_per_entity"),
+                                      (1, relations, "max_source_ids_per_relation")):
+            for target, chunks in targets.items():
+                limited = operate.apply_source_ids_limit(chunks, config[limit],
+                    config.get("source_ids_limit_method") or "KEEP", identifier=str(target))
+                keys = [target] if kind == 0 else [target, tuple(reversed(target))]
+                descriptions = [row.get("description") for chunk in limited
+                    for extraction in parsed[chunk] for key in keys for row in extraction[kind].get(key, [])]
+                # Entity-from-relationship and current-description fallbacks can
+                # retain retired evidence. They need an isolated rebuild instead.
+                if not any(isinstance(value, str) and value.strip() for value in descriptions):
+                    raise RuntimeError(f"retirement rebuild lacks attributable description for {target}; "
+                                       "isolated rebuild required")
+
+
+class _RetirementSummary:
+    """Reject empty original summaries, including cache hits and map groups."""
+    def __init__(self, original, config_position, *, tuple_result=False):
+        self.original, self.config_position, self.tuple_result = original, config_position, tuple_result
+
+    async def __call__(self, *args, **kwargs):
+        from lightrag.utils import remove_think_tags
+
+        bound = _retirement.get()
+        config = kwargs.get("global_config", args[self.config_position] if len(args) > self.config_position else None)
+        result = await self.original(*args, **kwargs)
+        if bound is not None and config is bound.get("config"):
+            value = result[0] if self.tuple_result else result
+            if not isinstance(value, str) or not sanitize_text_for_encoding(remove_think_tags(value)).strip():
+                error = RuntimeError("retirement rebuild produced an empty summary; isolated rebuild required")
+                bound["error"] = error
+                raise error
+        return result
+
+
+@contextmanager
+def _retirement_rebuild(rag):
+    import lightrag.lightrag as dependency
+    import lightrag.operate as operate
+
+    if not isinstance(dependency.rebuild_knowledge_from_chunks, _RetirementRebuild):
+        dependency.rebuild_knowledge_from_chunks = _RetirementRebuild(dependency.rebuild_knowledge_from_chunks)
+    for name, position, tuple_result in (("_summarize_descriptions", 3, False),
+                                         ("_handle_entity_relation_summary", 4, True)):
+        original = getattr(operate, name)
+        if not isinstance(original, _RetirementSummary):
+            setattr(operate, name, _RetirementSummary(original, position, tuple_result=tuple_result))
+    state = {"graph": rag.chunk_entity_relation_graph, "pause": None, "error": None}
+    token = _retirement.set(state)
+    try:
+        yield state
+    finally:
+        _retirement.reset(token)
 
 
 class _RecipePrompts(Mapping):
@@ -169,8 +289,15 @@ class CatalogLightRAGAdapter:
                 if retired and retired.get("achieved_tier") == "metadata":
                     continue
                 raise RuntimeError("retired contribution lacks verified document identity")
-            result = await rag.adelete_by_doc_id(old_doc)
+            with _retirement_rebuild(rag) as rebuild:
+                result = await rag.adelete_by_doc_id(old_doc)
+            if rebuild["pause"] is not None:
+                raise rebuild["pause"]
             messages = [result.message]
+            if rebuild["error"] is not None:
+                detail = str(rebuild["error"])
+                raise RetirementFailure(retired_id, old_doc, result.status, messages + [detail],
+                                        {"rebuild_validation_error": detail})
             if result.status != "success":
                 # Missing document status does not prove the inherited graph,
                 # vectors or shared summaries no longer contain this document.

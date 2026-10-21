@@ -606,8 +606,8 @@ async def test_real_cache_isolation_and_catalog_rejects_sealed_or_stale_writes(b
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [None, "entity", "no-cache"])
-async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggregate(backend, monkeypatch, failure):
+@pytest.mark.parametrize("failure", [None, "entity", "no-cache", "mixed-cache", "no-description"])
+async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggregate(backend, monkeypatch, failure, tmp_path):
     from lightrag.utils import compute_mdhash_id
     from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
 
@@ -615,6 +615,9 @@ async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggr
     old = await backend.open(old_claim, for_deletion=True)
     await _merge(old, "Shared", ["description from retired document"], "old")
     await _merge(old, "Exclusive", ["only retired evidence"], "old")
+    incomplete = failure in {"mixed-cache", "no-description"}
+    if incomplete:
+        await _merge(old, "CachedPeer", ["retired peer evidence"], "old")
     await old.full_docs.upsert({"old-doc": {"content": "old evidence", "file_path": "old"}})
     stamp = datetime.now(timezone.utc).isoformat()
     await old.doc_status.upsert({"old-doc": {"status": "processed", "content_summary": "old",
@@ -622,7 +625,8 @@ async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggr
         "created_at": stamp, "updated_at": stamp, "file_path": "old"}})
     await old.text_chunks.upsert({"old:0": {"tokens": 2, "chunk_order_index": 0,
         "full_doc_id": "old-doc", "content": "old evidence", "file_path": "old"}})
-    await old.full_entities.upsert({"old-doc": {"entity_names": ["Shared", "Exclusive"], "count": 2}})
+    old_entities = ["Shared", "Exclusive"] + (["CachedPeer"] if incomplete else [])
+    await old.full_entities.upsert({"old-doc": {"entity_names": old_entities, "count": len(old_entities)}})
     await old.full_relations.upsert({"old-doc": {"relation_pairs": [], "count": 0}})
     await backend.seal(old_claim, old, doc_id="old-doc")
 
@@ -631,33 +635,82 @@ async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggr
     await _merge(other, "Shared", ["description from retained document"], "other")
     await other.text_chunks.upsert({"other:0": {"tokens": 4, "chunk_order_index": 0,
         "full_doc_id": "other-doc", "content": "retained evidence", "file_path": "other",
-        "llm_cache_list": [] if failure == "no-cache" else ["retained-extraction"]}})
+        "llm_cache_list": [] if failure in {"no-cache", "mixed-cache"} else ["retained-extraction"]}})
     await other.llm_response_cache.upsert({"retained-extraction": {"cache_type": "extract",
         "chunk_id": "other:0", "original_prompt": "fixture extraction", "return":
         "entity<|#|>Shared<|#|>concept<|#|>description from retained document\n<|COMPLETE|>"}})
+    if incomplete:
+        await _merge(other, "CachedPeer", ["retained peer evidence"], "other-peer")
+        await other.text_chunks.upsert({"other-peer:0": {"tokens": 4, "chunk_order_index": 0,
+            "full_doc_id": "other-doc", "content": "retained peer evidence", "file_path": "other",
+            "llm_cache_list": ["retained-peer-extraction"]}})
+        await other.llm_response_cache.upsert({"retained-peer-extraction": {"cache_type": "extract",
+            "chunk_id": "other-peer:0", "original_prompt": "fixture peer extraction", "return":
+            "entity<|#|>CachedPeer<|#|>concept<|#|>retained peer evidence\n<|COMPLETE|>"}})
+        if failure == "no-description":
+            await other.llm_response_cache.upsert({"retained-extraction": {"cache_type": "extract",
+                "chunk_id": "other:0", "original_prompt": "fixture extraction", "return":
+                "entity<|#|>Unrelated<|#|>concept<|#|>unrelated cached evidence\n<|COMPLETE|>"}})
     parent_receipt = await backend.seal(other_claim, other)
 
     k = backend.repository
     replacement_input = "input:retirement-replacement"
     data = b"replacement evidence"
+    manifest = {"metadata_revision": "2", "artifacts": [{"artifact_id": hashlib.sha256(data).hexdigest(),
+        "sha256": hashlib.sha256(data).hexdigest(), "byte_length": len(data)}], "upstream_derivation_ids": []}
+    replacement_recipe = old_claim["recipe_digest"]
+    if incomplete:
+        from copy import deepcopy
+        from lightrag.prompt import PROMPTS
+        from papervault.knowledge.scheduler import catalog_intake
+        from papervault.knowledge.scheduler.catalog_inputs import ImmutableInputStore
+
+        input_store = ImmutableInputStore(tmp_path / "retirement-inputs")
+        manifest = {"metadata_revision": "2", "tier": "metadata",
+            "artifacts": [input_store.capture(b'{"title":"metadata downgrade"}', role="metadata")],
+            "upstream_derivation_ids": []}
+        recipe = deepcopy(k.get_recipe(old_claim["recipe_digest"]))
+        recipe["prompts"] = deepcopy(dict(PROMPTS))
+        recipe["output_contract"]["metadata"] = {"required": ["metadata", "graph", "tombstones"]}
+        replacement_recipe = k.command("register_recipe", "retirement:metadata-recipe", {"recipe": recipe})["recipe_digest"]
+        monkeypatch.setattr(catalog_intake, "effective_distill_recipe", lambda: deepcopy(recipe))
     k.command("register_input", "retirement:input", {"unit_id": old_claim["unit_id"],
-        "consumed_input_revision": replacement_input, "manifest": {"metadata_revision": "2",
-        "artifacts": [{"artifact_id": hashlib.sha256(data).hexdigest(),
-                       "sha256": hashlib.sha256(data).hexdigest(), "byte_length": len(data)}],
-        "upstream_derivation_ids": []}})
+        "consumed_input_revision": replacement_input, "manifest": manifest})
     requirement = k.get_requirement(old_claim["unit_id"], "acceptance")
     k.command("set_requirement", "retirement:requirement", {"unit_id": old_claim["unit_id"],
-        "consumed_input_revision": replacement_input, "recipe_digest": old_claim["recipe_digest"],
+        "consumed_input_revision": replacement_input, "recipe_digest": replacement_recipe,
         "generation_id": "acceptance", "expected_revision": requirement["revision"],
         "expected_record_revision": backend.catalog.get("retirement-old").revision})
     job = k.command("enqueue", "retirement:enqueue", {"unit_id": old_claim["unit_id"],
-        "consumed_input_revision": replacement_input, "recipe_digest": old_claim["recipe_digest"],
+        "consumed_input_revision": replacement_input, "recipe_digest": replacement_recipe,
         "generation_id": "acceptance"})
     claim = k.command("claim", "retirement:claim", {"job_id": job["job_id"],
         "expected_revision": job["revision"], "authority_epoch": 1, "lease_seconds": 600})
     backend.namespaces.append(claim["namespace"])
     assert claim["retired_receipt_ids"] == ["receipt:" + old_claim["attempt_id"]]
     delta = await backend.open(claim, for_deletion=True)
+    if incomplete:
+        from papervault.store.knowledge import RetirementFailure
+
+        async def factory(*args, **kwargs):
+            async def finalize():
+                for store in delta._index_storages():
+                    await store.finalize()
+            delta.finalize_storages = finalize
+            return delta
+
+        with pytest.raises(RetirementFailure) as caught:
+            await CatalogLightRAGAdapter(k, rag_factory=factory).submit_metadata(claim, manifest, input_store)
+        assert "isolated rebuild required" in caught.value.evidence["rebuild_validation_error"]
+        residual = await backend.open(claim, for_deletion=True)
+        # The inherited graph/vector still carry the retired contribution. The
+        # refusal protects serving until an isolated rebuild can repair it.
+        assert "old:0" in (await residual.chunk_entity_relation_graph.get_node("Shared"))["source_id"]
+        vector = await residual.entities_vdb.get_by_id(compute_mdhash_id("Shared", prefix="ent-"))
+        assert "old:0" in vector["chunk_ids"]
+        assert k.get_submission(claim["submission_id"])["receipt_id"] is None
+        assert k.get_job(claim["job_id"])["state"] == "running"
+        return
     if failure == "entity":
         async def reject_rebuild(*args, **kwargs):
             raise OSError("disposable backend entity write rejected")
@@ -667,13 +720,20 @@ async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggr
 
         with pytest.raises(RetirementFailure) as caught:
             await CatalogLightRAGAdapter(k)._retire(delta, claim)
-        # The original deletion succeeded after its reducer swallowed the error;
-        # only operation history carries the failure, so no receipt may be sealed.
-        assert caught.value.status == "success"
+        if failure == "no-cache":
+            # Prevalidation now stops deletion before the original reducer's
+            # no-cache success path, retaining document retry state explicitly.
+            assert caught.value.status == "fail"
+            assert "every remaining chunk" in caught.value.evidence["rebuild_validation_error"]
+            assert await delta.doc_status.get_by_id("old-doc") is not None
+        else:
+            # Actual backend errors are still swallowed by the original reducer;
+            # operation history must reject its successful deletion result.
+            assert caught.value.status == "success"
+            assert caught.value.messages[0] == "Document old-doc successfully deleted"
+            assert any("Failed" in message for message in caught.value.messages)
         assert k.get_submission(claim["submission_id"])["receipt_id"] is None
         assert k.get_job(claim["job_id"])["state"] == "running"
-        assert caught.value.messages[0] == "Document old-doc successfully deleted"
-        assert any("Failed" in message or "cannot rebuild" in message for message in caught.value.messages)
         return
     await CatalogLightRAGAdapter(k)._retire(delta, claim)
 

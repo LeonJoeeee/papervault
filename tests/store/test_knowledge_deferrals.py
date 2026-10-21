@@ -295,3 +295,92 @@ async def test_pause_after_lease_loss_preserves_unknown_attempt_for_expiry(knowl
     assert k.get_reducer(job["unit_id"], job["consumed_input_revision"]) is None
     assert len(k.list_outbox(kind="submission")) == 1
     assert [event["event"] for event in k._rows("knowledge_attempt_events")] == ["claimed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pause", ["peak", "cooldown"])
+async def test_metadata_retirement_llm_pause_preserves_failure_budget(knowledge, tmp_path, monkeypatch, pause):
+    """The pinned rebuild swallows its LLM pause before deletion returns success."""
+    from copy import deepcopy
+
+    from lightrag.prompt import PROMPTS
+    from papervault.knowledge.scheduler import catalog_intake
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+    from papervault.knowledge.scheduler.catalog_inputs import make_input_manifest
+    from papervault.knowledge.store.build_breaker import BuildBreaker, BuildPausedError, BuildSchedule
+    from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
+    from papervault.store.knowledge import ClaimRejected
+    from tests.knowledge.test_catalog_retirement import memory_rag_for_retirement
+    from tests.store.test_knowledge_postgres import receipt
+
+    monkeypatch.setenv("KS_REDISTILL_MAX_ATTEMPTS", "2")
+    k = knowledge
+    store, old_job = prepare_fulltext(k, tmp_path)
+    old_claim = claim(k, old_job, "published-fulltext-claim")
+    old_receipt = receipt(old_claim)
+    old_receipt["provider_observations"]["doc_id"] = "old-doc"
+    k.command("seal_namespace", "published-fulltext-seal", {"claim": old_claim, "receipt": old_receipt})
+    k.command("publish_derivation", "published-fulltext", {**old_claim, "receipt": old_receipt,
+        "expected_revision": old_claim["revision"], "expected_selection_revision": 0, "select": True})
+    k.command("acknowledge_outbox", "published-fulltext-ack", {"outbox_id": "submit:" + old_claim["submission_id"]})
+    artifact = store.capture(b'{"title":"one"}', role="metadata")
+    manifest, input_revision = make_input_manifest("paper:A", {"title": "one"}, [artifact], tier="metadata")
+    k.command("register_input", "downgrade-input", {"unit_id": "paper:A", "consumed_input_revision": input_revision,
+                                                  "manifest": manifest})
+    recipe = {"schema_version": 1, "prompts": deepcopy(dict(PROMPTS)), "output_contract": {
+        "metadata": {"required": ["metadata", "tombstones"], "not_applicable": ["graph", "vectors"]}}}
+    digest = k.command("register_recipe", "downgrade-recipe", {"recipe": recipe})["recipe_digest"]
+    monkeypatch.setattr(catalog_intake, "effective_distill_recipe", lambda: deepcopy(recipe))
+    k.command("set_requirement", "downgrade-requirement", {"unit_id": "paper:A", "generation_id": "g",
+        "consumed_input_revision": input_revision, "recipe_digest": digest,
+        "expected_revision": k.get_requirement("paper:A", "g")["revision"], "expected_record_revision": 1})
+    job = k.command("enqueue", "downgrade-job", {"unit_id": "paper:A", "generation_id": "g",
+        "consumed_input_revision": input_revision, "recipe_digest": digest})
+    job = fail_once(k, job)
+    before = k.get_reducer("paper:A", input_revision)
+    assert before["failure_streak"] == 1 and not before["parked"]
+    admitted = claim(k, job, "downgrade-pause-claim")
+    schedule = BuildSchedule(enabled=pause == "peak", tz=timezone.utc,
+        now=lambda: datetime(2026, 10, 21, 10, tzinfo=timezone.utc))
+    breaker = BuildBreaker(threshold=1, cooldown_s=600, clock=lambda: 0, schedule=schedule)
+    if pause == "cooldown":
+        breaker.record_failure()
+    with pytest.raises(BuildPausedError) as paused:
+        breaker.before_call()
+    rag = await memory_rag_for_retirement(admitted, pause=paused.value)
+
+    async def factory(*args, **kwargs):
+        return rag
+
+    adapter = CatalogLightRAGAdapter(k, rag_factory=factory, input_store=store)
+    scheduler = CatalogScheduler(k, adapter, store, breaker=_OpenBuildGate())
+    summary = {"observations": 0, "discrepancies": 0, "delivered": 0, "completed": 0,
+               "published": 0, "repairs": 0}
+    row = next(row for row in k.list_outbox(kind="submission") if row["submission_id"] == admitted["submission_id"])
+    await scheduler._deliver(row, summary)
+    assert len(rag.llm_calls) == 1 and rag.finalized
+    assert k.get_job(job["job_id"])["state"] == "queued"
+    attempt = k.get_attempt(admitted["attempt_id"])
+    assert attempt["outcome"] == "deferred" and attempt["accepted"] and not attempt["sealed"]
+    assert attempt["cost_state"] == "unknown"
+    assert k.get_reducer("paper:A", input_revision) == before
+    assert summary["paused"] is True and summary["discrepancies"] == summary["repairs"] == 0
+    assert not k._rows("knowledge_discrepancies") and not k._rows("knowledge_repairs")
+    assert not k.list_outbox(kind="submission")
+    events = k._rows("knowledge_attempt_events", attempt_id=admitted["attempt_id"])
+    assert events[-1]["event"] == "deferred"
+    assert not any(event["detail"].get("failure_streak_event") for event in events)
+    assert len(k._rows("publications")) == 1
+    assert k.get_pin("attempt-pin:" + admitted["attempt_id"])["kind"] == "recovery"
+    with pytest.raises(ClaimRejected):
+        k.command("record_tombstone", "paused-retirement-stale-write", {
+            "claim": admitted, "role": "graph", "output_id": "stale"})
+    resumed = claim(k, k.get_job(job["job_id"]), "resume-retirement")
+    assert resumed["fencing_token"] > admitted["fencing_token"]
+    assert resumed["namespace"] != admitted["namespace"]
+    assert k.get_reducer("paper:A", input_revision) == before
+    # An actual failed execution still spends the next failure and parks.
+    k.command("fail", "real-failure-after-retirement-pause", {**resumed,
+        "expected_revision": resumed["revision"], "error": {"kind": "verified_failure"}})
+    reducer = k.get_reducer("paper:A", input_revision)
+    assert reducer["failure_streak"] == 2 and reducer["parked"] is True

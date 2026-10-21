@@ -136,13 +136,14 @@ Check collection and the target refusal cases, then execute the actual backend c
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q -rs
 ```
 
-Expected results: **102 tests collected**, **72 passed, 30 deselected** for the refusal
-check, **96 passed, 6 deselected** for all target checks (no connections), and
-**102 passed**, exit **0**, for acceptance. Six skipped
+Expected results: **104 tests collected**, **72 passed, 32 deselected** for the refusal
+check, **96 passed, 8 deselected** for all target checks (no connections), and
+**104 passed**, exit **0**, for acceptance. Eight skipped
 real-store tests mean missing explicit credentials and do not constitute acceptance.
 The real-store test names identify original merge summaries/shared-entity traversal,
 latest-version vector visibility/top-k/tombstones, cache/sealed/stale-write isolation,
-and retirement with clean rebuild, backend write failure and missing-cache variants.
+and retirement with clean rebuild, backend write failure, missing/partial-cache and
+unattributable-description variants.
 Any setup, assertion or cleanup error is a failed acceptance run.
 
 There is no operator namespace parameter: each fixture creates a random
@@ -194,6 +195,8 @@ Candidate publication does not promote it. `promote_generation` requires exact c
 Inject crashes before/after external acceptance, after durable outputs but before catalog registration, after catalog commit but before its response, and before outbox acknowledgement. Recover by stable submission/operation IDs and persisted receipts. An ambiguous outcome retains conservative cost and pending work; delivery retries do not become attempts. A stale fence cannot register its outputs. Lost published material retains publication history and queues a deduplicated isolated repair, admitted only during the monthly maintenance window.
 
 Exercise peak-window and breaker pauses during an admitted build. A valid deferral settles and fences the attempt, acknowledges delivery and queues the job without a failure-streak event or parking change; the round stops further admission. Uncertain charges and recovery pins remain. Actual lease loss retains the abandoned-attempt behavior. For retirement, inject rebuild failures despite deletion success and verify that no receipt is sealed or publication selected, with a discrepancy and repair recorded. `not_found` is unverified retirement and cannot be accepted as proof that an inherited contribution is absent.
+
+Include partial extraction-cache loss, caches without descriptions for an affected entity or relationship, and empty normalized summaries from both callbacks and cache hits. All must refuse retirement before sealing, even when LightRAG reports successful deletion. Exercise typed peak/breaker pauses inside the original retirement summary callback: they must reach the catalog deferral command without a failure-streak event, discrepancy or repair. Also advance a migration checkpoint through another row, then attempt enrichment from the older checkpoint; it must leave all accepted projections and the newer report unchanged. Reissue enrichment against the current checkpoint before handoff.
 
 Rollback after handoff keeps the catalog database, authority epoch, audit, outbox, accepted receipts and external-attempt accounting. Deploy only a catalog-compatible binary. Do not restore a frozen pre-cutover database or select the legacy flag. Returning authority to the ledger needs a separately designed and rehearsed reverse migration.
 

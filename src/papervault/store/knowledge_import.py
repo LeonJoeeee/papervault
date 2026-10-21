@@ -304,6 +304,11 @@ class LegacyImportRepository:
                     _validate_enrichment(old_job["detail"]["evidence"], event, old_job, values)
             elif head:
                 raise OperationConflict("legacy projection disappeared independently of the importer")
+            # A row can keep its source version while another row advances the
+            # accepted source checkpoint. Its projection must still match that
+            # checkpoint's complete report; an older report cannot enrich it.
+            if not advance and (not old_job or any(old_job[field] != value for field, value in values.items())):
+                raise OperationConflict("older source checkpoint cannot change an accepted projection")
             projections.append((identity, head, old_job, values))
         return checkpoint, advance, projections
 

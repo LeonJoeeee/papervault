@@ -491,3 +491,35 @@ def test_same_version_plan_cannot_discard_accepted_evidence(repo, lost_evidence)
     with pytest.raises(OperationConflict, match="regress|enrich|evidence"):
         importer.apply(losing, operation_id="losing")
     assert schema_rows(repo) == before
+
+
+def test_older_checkpoint_cannot_enrich_projection_outside_accepted_report(repo):
+    from papervault.store.knowledge import OperationConflict
+    from papervault.store.knowledge_cutover import CutoverRepository
+    from papervault.store.knowledge_import import plan_legacy_import
+    from papervault.store.repository import payload_hash
+
+    importer = parked_importer(repo)
+    k = importer.knowledge
+    raw = snapshot([source(status="error_parked", attempts=7, quarantine=True), source("B")])
+    changes = [{"sequence": 11, "operation": "UPDATE", "old": source("B"),
+                "new": source("B", status="error", attempts=4)}]
+    initial = plan_legacy_import(raw)
+    initial_result = importer.apply(initial, operation_id="old-checkpoint")
+    accepted = plan_legacy_import(raw, changes=changes, final_checkpoint=11)
+    importer.apply(accepted, operation_id="current-checkpoint")
+    older_enriched = plan_legacy_import(raw, mappings=[mapping()])
+    before = schema_rows(repo)
+    assert importer.apply(initial, operation_id="old-checkpoint") == initial_result
+    assert schema_rows(repo) == before
+    with pytest.raises(OperationConflict, match="older.*checkpoint|checkpoint.*older"):
+        importer.apply(older_enriched, operation_id="older-enrichment")
+    assert schema_rows(repo) == before
+    current_enriched = plan_legacy_import(raw, mappings=[mapping()], changes=changes, final_checkpoint=11)
+    assert importer.apply(current_enriched, operation_id="current-enrichment")["projected"] == 1
+    checkpoint = k._rows("knowledge_import_checkpoints")[0]
+    assert checkpoint["checkpoint"]["last_sequence"] == 11
+    assert checkpoint["plan_digest"] == payload_hash(current_enriched)
+    k.command("create_generation", "generation", {"generation_id": "g", "candidate": False})
+    assert CutoverRepository(repo).commit_handoff(handoff_evidence(current_enriched), expected_epoch=1,
+                                                operation_id="handoff")["authority_epoch"] == 2

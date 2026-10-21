@@ -1,0 +1,72 @@
+........................................................................ [  1%]
+........................................................................ [  3%]
+........................................................................ [  5%]
+........................................................................ [  7%]
+................s....................................................... [  9%]
+........................................................................ [ 11%]
+......................ss................................................ [ 13%]
+........................................................................ [ 15%]
+........................................................................ [ 17%]
+........................................................................ [ 19%]
+........................................................................ [ 20%]
+........................................................................ [ 22%]
+........................................................................ [ 24%]
+........................................................................ [ 26%]
+........................................................................ [ 28%]
+........................................................................ [ 30%]
+........................................................................ [ 32%]
+........................................................................ [ 34%]
+........................................................................ [ 36%]
+........................................................................ [ 38%]
+........................................................................ [ 40%]
+........................................................................ [ 41%]
+........................................................................ [ 43%]
+........................................................................ [ 45%]
+........................................................................ [ 47%]
+........................................................................ [ 49%]
+........................................................................ [ 51%]
+........................................................................ [ 53%]
+........................................................................ [ 55%]
+........................................................................ [ 57%]
+........................................................................ [ 59%]
+........................................................................ [ 61%]
+........................................................................ [ 62%]
+........................................................................ [ 64%]
+........................................................................ [ 66%]
+........................................................................ [ 68%]
+........................................................................ [ 70%]
+........................................................................ [ 72%]
+........................................................................ [ 74%]
+........................................................................ [ 76%]
+........................................................................ [ 78%]
+........................................................................ [ 80%]
+........................................................................ [ 81%]
+.................ssssss................................................. [ 83%]
+.........ss.......................ssssssssssssss..................ssssss [ 85%]
+ssssssssssssssssssssssssssssss........................................ss [ 87%]
+ssssssssssssssssssssssss.sssssssssssssssss....s..............sssssssss.s [ 89%]
+ssssssss.....ss...........ss...sssssssssssssssssssssssssssssssssssssssss [ 91%]
+ssssssssssssssss.....................sssssssssssssssssssssssssssssss..ss [ 93%]
+sssssssssssssss......................sssssssssssssssssss..ssssssssssssss [ 95%]
+sssssssssssssssssssssssssss.sssssssssssssssssssss....................... [ 97%]
+........................................................................ [ 99%]
+.................................                                        [100%]
+=============================== warnings summary ===============================
+tests/library/test_llm_stream.py::test_real_wrapper_joins_content_and_retains_usage
+  /home/leon/lab/papervault/.claude/worktrees/283-p5b-coordinated-recovery-snapshots-and-restore-r/.venv/lib/python3.13/site-packages/litellm/litellm_core_utils/model_response_utils.py:190: PydanticDeprecatedSince211: Accessing the 'model_computed_fields' attribute on the instance is deprecated. Instead, you should access this attribute from the model class. Deprecated in Pydantic V2.11 to be removed in V3.0.
+    if attr_name.startswith("_") or callable(getattr(delta, attr_name)) or attr_name.startswith("model_"):
+
+tests/library/test_llm_stream.py::test_real_wrapper_joins_content_and_retains_usage
+  /home/leon/lab/papervault/.claude/worktrees/283-p5b-coordinated-recovery-snapshots-and-restore-r/.venv/lib/python3.13/site-packages/litellm/litellm_core_utils/model_response_utils.py:190: PydanticDeprecatedSince211: Accessing the 'model_fields' attribute on the instance is deprecated. Instead, you should access this attribute from the model class. Deprecated in Pydantic V2.11 to be removed in V3.0.
+    if attr_name.startswith("_") or callable(getattr(delta, attr_name)) or attr_name.startswith("model_"):
+
+tests/library/test_llm_stream.py::test_real_wrapper_joins_content_and_retains_usage
+  /home/leon/lab/papervault/.claude/worktrees/283-p5b-coordinated-recovery-snapshots-and-restore-r/.venv/lib/python3.13/site-packages/litellm/litellm_core_utils/model_response_utils.py:150: PydanticDeprecatedSince211: Accessing the 'model_computed_fields' attribute on the instance is deprecated. Instead, you should access this attribute from the model class. Deprecated in Pydantic V2.11 to be removed in V3.0.
+    or callable(getattr(choice, attr_name))
+
+tests/library/test_llm_stream.py::test_real_wrapper_joins_content_and_retains_usage
+  /home/leon/lab/papervault/.claude/worktrees/283-p5b-coordinated-recovery-snapshots-and-restore-r/.venv/lib/python3.13/site-packages/litellm/litellm_core_utils/model_response_utils.py:150: PydanticDeprecatedSince211: Accessing the 'model_fields' attribute on the instance is deprecated. Instead, you should access this attribute from the model class. Deprecated in Pydantic V2.11 to be removed in V3.0.
+    or callable(getattr(choice, attr_name))
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+3464 passed, 313 skipped, 165 deselected, 4 warnings in 168.52s (0:02:48)

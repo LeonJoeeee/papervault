@@ -209,6 +209,83 @@ failures are silently ignored by this frozen script, so a successful process exi
 not validate indexed coverage. The orchestrator reported a successful live run for the frozen
 artifact; reruns require these same input paths and database settings.
 
+## P5b isolated recovery drill — 2026-10-21
+
+The final staging run [p5b-20261021-staging-03](baselines/p5b-20261021-staging-03/results.json)
+restored and replayed **100 distinct parent papers** in empty isolated targets.
+It used the census of distinct titles in the tracked 12 landmark pools, preserving
+111 pool memberships, 91 papers with DOI and 9 without, and decade strata from
+the 1940s through the 2020s. The [sample inventory](baselines/p5b-20261021-staging-03/sample.json)
+records every parent, source hash, stratum and omission. This is metadata evidence:
+authentic abstracts/full text, operator documents/notebooks/textbooks, section-built
+parents, extraction-engine/OCR strata and real graph/vector derivations were
+unavailable. One synthetic 3D vector row and two graph nodes/one edge tested physical
+store restoration; they do not count toward the 100 parents or qualify those missing
+strata.
+
+| Measurement | Final staging result |
+| --- | ---: |
+| Source admission through normal claims and publication | 94.695 s |
+| Coordinated snapshot and verification | 2.719 s |
+| Restoration, including physical backend readback | 5.439 s |
+| Replay, including new receipts and final readback | 109.043 s |
+| Whole staging instrument | 218.543 s |
+| Peak worker RSS | 1,123,512 KiB |
+| Sampled peak allocated staging bytes, including reservation | 649,216,000 |
+| Owned database bytes at completion | 318,824,448 |
+| External model/GPU calls and external model cost | 0 / 0 / $0 |
+
+Filesystem usage was sampled every 0.1 seconds; database-server peak resources and
+host energy cost were not measured. These figures are **not a full-system RTO**.
+The explicit staging root was `/tmp/papervault-p5b.AyG3Bq/staging-03`. The dedicated
+`p5b_catalog_test` database and task-owned loopback Neo4j containers supplied isolated
+stores. The [environment record](baselines/p5b-20261021-staging-03/environment.json)
+names every schema, endpoint, code hash and command. Staging source, package and
+target directories are disposable reproducible fixtures; their durable manifests,
+receipts and measurements are committed here.
+
+```bash
+.venv/bin/python /tmp/p5b-test-env.py .venv/bin/python scripts/drill_recovery.py \
+  --root /tmp/papervault-p5b.AyG3Bq/staging-03 \
+  --evidence docs/baselines/p5b-20261021-staging-03 \
+  --drill-id p5b-20261021-staging-03 \
+  --neo4j-source bolt://127.0.0.1:32780 --neo4j-target bolt://127.0.0.1:32781 --apply
+```
+
+The [snapshot manifest](baselines/p5b-20261021-staging-03/snapshot-manifest.json),
+[backup inclusion](baselines/p5b-20261021-staging-03/backup-inclusion.json),
+[recipes](baselines/p5b-20261021-staging-03/recipes.json),
+[restore receipt](baselines/p5b-20261021-staging-03/restore-receipt.json),
+[replay receipt](baselines/p5b-20261021-staging-03/replay-receipt.json),
+[verification log](baselines/p5b-20261021-staging-03/verification.log) and
+[hashes](baselines/p5b-20261021-staging-03/hashes.json) establish inclusion of all seven
+components, all 11 PostgreSQL derivative roles and the graph fixture. Replay used
+100 original metadata inputs/recipes and generated 100 new normal receipts in a
+permanently non-promotable sample generation. Source serving selection was unchanged.
+No failures occurred in this final run. The [first attempt](baselines/p5b-20261021-staging-01/failure.json)
+stopped on a missing-DOI payload validation error before capture; its traceback and
+hashes remain recorded. The [second run](baselines/p5b-20261021-staging-02/results.json)
+succeeded before subsequent verifier/restore hardening and is historical evidence,
+superseded by run 03 for the final implementation.
+
+[Validation evidence](baselines/p5b-20261021-staging-03/validation.json) records the
+exact commands, exit codes and logs: 3,464 non-integration tests passed (313 skipped,
+165 deselected), 575 dedicated PostgreSQL tests passed (the two Neo4j tests skipped
+there passed separately), and Ruff passed. The
+[regression log](baselines/p5b-20261021-staging-03/regression-evidence.log) preserves
+representative failing-then-passing checks, including snapshot completeness,
+checkpoint consistency and exact JSON/timezone restoration. GitHub CI remains a
+separate integration gate.
+
+Operational storage remains `/data/p5b-recovery` and `/data/p5b-drills`, with the
+2 TB derivative soft cap and 80% alert. The orchestrator owns the weekly operational
+snapshot activation and production drill in the monthly reboot window (at most two
+hours). Weekly snapshots with four rolling complete sets do not establish a measured
+RPO. Same-host RAID copies provide no off-host or host-failure/disaster recovery
+guarantee. The [operational procedure](../README.md#coordinated-recovery) records
+drain requirements, retention protection and these limits; this run made no live
+activation or production-window claim.
+
 ## Arbitration rules (how these numbers may change)
 
 1. **Quality is a hard constraint**: a retrieval-affecting change flips its default only

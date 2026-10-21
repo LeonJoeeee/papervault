@@ -29,6 +29,14 @@ def payload_hash(payload: object) -> str:
     return hashlib.sha256(canonical_json(payload).encode("utf-8")).hexdigest()
 
 
+def render_catalog_ddl(ddl: str, schema: str) -> str:
+    """Qualify SQL objects while preserving authority/store value literals."""
+    quoted = sql.Identifier(schema).as_string()
+    ddl = re.sub(r"\bcatalog(?=\.)", lambda _: quoted, ddl)
+    return re.sub(r"(CREATE\s+SCHEMA\s+IF\s+NOT\s+EXISTS\s+)catalog(?=\s*;)",
+                  lambda match: match[1]+quoted, ddl, flags=re.IGNORECASE)
+
+
 def normalized_identity(value: str | None) -> str | None:
     """F0 comparison normalization; retain arXiv versions pending identity adjudication."""
     return value.strip().lower() or None if value else None
@@ -212,7 +220,7 @@ class PostgresCatalogRepository:
     def ensure_schema(self, *, audit: AuditEvent) -> None:
         with self._write(audit):
             ddl = files("papervault.store").joinpath("schema.sql").read_text()
-            ddl = re.sub(r"\bcatalog\b", lambda _: sql.Identifier(self.schema).as_string(), ddl)
+            ddl = render_catalog_ddl(ddl, self.schema)
             self.connection.execute(ddl)
             row = self.connection.execute(sql.SQL(
                 "INSERT INTO {} (version, name) VALUES (1, 'P1 shadow catalog') "
@@ -226,6 +234,59 @@ class PostgresCatalogRepository:
             ).format(self._table("schema_version"))).fetchone()
             if row:
                 self._finish(None, audit)
+
+    def ensure_knowledge_schema(self, *, audit: AuditEvent) -> None:
+        """Explicit administrative P4 migration; ordinary startup never calls it."""
+        with self._write(audit):
+            ddl = files("papervault.store").joinpath("knowledge_schema.sql").read_text()
+            ddl = render_catalog_ddl(ddl, self.schema)
+            self.connection.execute(ddl)
+            # Existing registrations predate transactional P4 capture. Seed
+            # unknown pending requirements at this explicit migration boundary.
+            records = list(self.connection.execute(sql.SQL("SELECT key,revision,payload FROM {}").format(
+                self._table("records"))))
+            with self.connection.cursor() as cursor:
+                cursor.executemany(sql.SQL("INSERT INTO {}(record_key,record_revision,payload_digest) "
+                    "VALUES(%s,%s,%s) ON CONFLICT DO NOTHING").format(self._table("knowledge_pending_inputs")),
+                    [(r["key"], r["revision"], payload_hash(r["payload"])) for r in records])
+                if cursor.rowcount > 0:
+                    self.connection.execute(sql.SQL("UPDATE {} SET requirements_revision=requirements_revision+1").format(
+                        self._table("knowledge_runtime")))
+            changed = self.connection.execute(sql.SQL(
+                "INSERT INTO {}(version,name) VALUES(4,'P4 catalog knowledge commands') "
+                "ON CONFLICT(version) DO NOTHING RETURNING version"
+            ).format(self._table("schema_version"))).fetchone()
+            if changed:
+                self._finish(None, audit)
+
+    def _track_knowledge_requirement_change(self, record: Record, revision: int):
+        """Capture and invalidate in the Library writer transaction, when installed."""
+        exists = self.connection.execute("SELECT to_regclass(%s) AS name",
+            (self.schema + ".knowledge_pending_inputs",)).fetchone()
+        if not exists or not exists["name"]:
+            return
+        self.connection.execute(sql.SQL(
+            "INSERT INTO {}(record_key,record_revision,payload_digest) VALUES(%s,%s,%s) "
+            "ON CONFLICT DO NOTHING"
+        ).format(self._table("knowledge_pending_inputs")), (record.key, revision, record.payload_sha256))
+        affected = list(self.connection.execute(sql.SQL(
+            "UPDATE {} r SET invalidated=TRUE,revision=r.revision+1 FROM {} u "
+            "WHERE r.unit_id=u.unit_id AND u.record_key=%s RETURNING r.generation_id"
+        ).format(self._table("knowledge_requirements"), self._table("units")), (record.key,)))
+        affected.extend(self.connection.execute(sql.SQL(
+            "UPDATE {} i SET invalidated=TRUE,revision=i.revision+1 FROM {} u "
+            "WHERE i.parent_unit_id=u.unit_id AND u.record_key=%s RETURNING i.generation_id"
+        ).format(self._table("current_inventories"), self._table("units")), (record.key,)))
+        self.connection.execute(sql.SQL(
+            "UPDATE {} SET requirements_revision=requirements_revision+1 WHERE singleton"
+        ).format(self._table("knowledge_runtime")))
+        from .knowledge import KnowledgeRepository
+        from .knowledge_commands import outbox, snapshot
+        knowledge = KnowledgeRepository(self)
+        outbox(knowledge, "capture_input", {"record_key": record.key, "record_revision": revision},
+               stable_id=f"capture:{record.key}:{revision}")
+        for generation_id in sorted({row["generation_id"] for row in affected}):
+            snapshot(knowledge, generation_id)
 
     def get(self, key: str) -> Record | None:
         row = self.connection.execute(sql.SQL("SELECT {} FROM {} WHERE key = %s").format(
@@ -267,6 +328,7 @@ class PostgresCatalogRepository:
             actual = self.get(record.key)
             raise StaleWrite(record.key, expected_revision, actual.revision if actual else None)
         if changed:
+            self._track_knowledge_requirement_change(record, expected_revision + 1)
             self._finish(record.key, audit)
         return bool(changed)
 
@@ -352,7 +414,7 @@ class PostgresCatalogRepository:
             row = self.connection.execute(sql.SQL(
                 "UPDATE {} SET state = %s, finished_at = now() "
                 "WHERE id = %s AND attempts = %s AND lease_id = %s "
-                "AND state IN ('queued', 'dispatched') RETURNING key"
+                "AND kind <> 'distill' AND state IN ('queued', 'dispatched') RETURNING key"
             ).format(self._table("jobs")), (outcome, job_id, expected_attempt, expected_lease)).fetchone()
             if not row:
                 raise StaleCompletion(f"stale completion for {job_id}")
@@ -407,6 +469,8 @@ class PostgresCatalogRepository:
         values = asdict(job)
         old = self.connection.execute(sql.SQL("SELECT * FROM {} WHERE id = %s").format(
             self._table("jobs")), (job.id,)).fetchone()
+        if job.kind == "distill" or (old and old["kind"] == "distill"):
+            raise StaleCompletion("knowledge jobs require fenced KnowledgeRepository commands")
         if values["enqueued_at"] is None:
             values["enqueued_at"] = old["enqueued_at"] if old else datetime.now(timezone.utc)
         if old == values:

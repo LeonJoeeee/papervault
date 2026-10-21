@@ -41,6 +41,7 @@ def _clean_env_and_task(monkeypatch):
     ):
         monkeypatch.delenv(var, raising=False)
     server._bg_task = None
+    server._authority_task = None
     server._startup_task = None
     server._embed_probe_task = None
     yield
@@ -50,6 +51,7 @@ def _clean_env_and_task(monkeypatch):
     if server._startup_task is not None:
         server._startup_task.cancel()
         server._startup_task = None
+    server._authority_task = None
     task = server._bg_task
     server._bg_task = None
     if task is not None:

@@ -22,6 +22,8 @@
 """
 from __future__ import annotations
 
+from papervault.store import knowledge_runtime
+
 import hashlib
 import logging
 import re
@@ -100,6 +102,7 @@ async def _clear_insert_path(rag, key: str) -> tuple[Optional[str], int]:
     against it), or None when the path is clear. Only stale markers are ever deleted.
     `get_doc_by_file_basename` returns the oldest match, so this re-queries after each delete.
     """
+    knowledge_runtime.assert_knowledge_authority("legacy")
     basename = normalize_document_file_path(file_path(key))
     purged = 0
     while True:
@@ -301,6 +304,7 @@ async def record_duplicate(ingest_source: str, source_id: str, own_doc_id: str,
     Retain the source's own doc_id: removal/force-ingest must never delete its twin.
     The snapshot lets reconcile notice when that twin has been rebuilt with different content.
     """
+    knowledge_runtime.assert_knowledge_authority("legacy")
     await ledger.upsert(ingest_source, source_id, doc_id=own_doc_id,
                         status="done_meta", fingerprint=fingerprint,
                         duplicate_of=twin_doc_id, duplicate_content_hash=content_hash)
@@ -308,6 +312,7 @@ async def record_duplicate(ingest_source: str, source_id: str, own_doc_id: str,
 
 async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
     """items = [(rec, fp)]. 两段式:批量 enqueue → 单次 process(§6.1)。"""
+    knowledge_runtime.assert_knowledge_authority("legacy")
     inputs: list[str] = []
     ids: list[str] = []
     fpaths: list[str] = []
@@ -433,6 +438,7 @@ def _result_status(r) -> Optional[str]:
 async def remove_one(rag, key: str, *, delete_ledger: bool) -> str:
     """adelete_by_doc_id;4-way status(§6.1)。返回 removed|pending|error。
     delete_ledger=True(真删,REMOVE_PHASE)/ False(REDISTILL 先删旧 doc,留 ledger 行重插)。"""
+    knowledge_runtime.assert_knowledge_authority("legacy")
     did = doc_id(key)
     r = await rag.adelete_by_doc_id(did)
     status = _result_status(r)
@@ -458,6 +464,8 @@ async def rollback_abstract_docs(rag, *, apply: bool) -> dict:
     is never deleted (skipped and reported), and a delete LightRAG refuses leaves the row as it was.
     The caller must hold the pipeline idle — the CLI refuses while papervault.service runs.
     """
+    if apply:
+        knowledge_runtime.assert_knowledge_authority("legacy")
     led = await ledger.load("paper")
     rows = sorted((r for r in led.values()
                    if is_abstract_fp(r.fingerprint) or r.status == "done_abstract"),

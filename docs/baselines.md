@@ -139,6 +139,18 @@ This legacy instrument checks file existence and processed-path membership, not 
 content hashes, or revision-compatible publication. It counts pool entries, not deduplicated
 works, and its match rule differs from the historical R1 lenient title matcher.
 
+P4 adds `scripts/coverage_report.py` as a separate version-qualified instrument. It preserves
+the frozen pools and denominator, reports the legacy comparison separately, and reads current
+catalog-selected inputs, recipes, inventories, publications and observations. The owner-approved
+headline counts **full-text publications only** with exact readable evidence and fresh verification
+of every required output; abstract and metadata tiers are labeled separately. Observation age is
+at most **300 seconds**, measured from `observed_at`. Unverified legacy material stays unknown and
+retained in the denominator until verification/rebuild. The report preserves exact pool-entry and
+unit/version differences, including missing required sections. The frozen artifact does not supply
+complete historical per-entry identities or receipts; unavailable historical provenance is explicit.
+Neither this instrument nor numerical agreement rewrites the F0 ruler or proves the P4 handoff.
+See the [P4 evidence procedure](specs/2026-10-20-p4-knowledge-handoff.md).
+
 | frozen landmark pool | entries | metadata | readable | indexed |
 | --- | --- | --- | --- | --- |
 | broad-cr-spectra | 8 | 8 | 8 | 8 |

@@ -253,3 +253,41 @@ def test_pg_fixture_uses_only_explicit_test_dsn(monkeypatch, request, dsn):
     monkeypatch.setattr(psycopg, "connect", connect)
     with pytest.raises(ConnectionSelected):
         request.getfixturevalue("repo")
+
+
+@pytest.mark.parametrize("disposable", [None, "1"])
+def test_backend_test_connections_are_scrubbed_and_only_exposed_to_integration_fixture(tmp_path, disposable):
+    source = Path(__file__).resolve().parents[1] / "conftest.py"
+    shutil.copyfile(source, tmp_path / "conftest.py")
+    targets = {"PAPERVAULT_BACKEND_TEST_DSN": "host=staging.invalid dbname=p4_rehearsal user=test password=fixture",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_URI": "bolt://staging.invalid:7687",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_USER": "fixture",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_PASSWORD": "fixture",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE": "p4_rehearsal",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE": disposable,
+        "NEO4J_URI": "bolt://production.invalid:7687"}
+    (tmp_path / "test_probe.py").write_text("TARGETS = " + repr(targets) + "\n" + textwrap.dedent('''
+        import os
+        import pytest
+
+        assert all(name not in os.environ for name in TARGETS)
+
+        @pytest.mark.integration
+        def test_explicit_targets(backend_test_targets):
+            assert backend_test_targets == TARGETS
+            assert all(name not in os.environ for name in TARGETS)
+            assert os.environ["PYTHON_DOTENV_DISABLED"] == "1"
+            assert "POSTGRES_HOST" not in os.environ
+            assert "NEO4J_URI" not in os.environ
+
+        def test_unit_cannot_request_targets(request):
+            with pytest.raises(pytest.fail.Exception, match="integration"):
+                request.getfixturevalue("backend_test_targets")
+    '''))
+    env = dict(os.environ)
+    env.update(HOSTILE_ENV, **{key: value for key, value in targets.items() if value is not None},
+               PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")
+    result = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 passed" in result.stdout

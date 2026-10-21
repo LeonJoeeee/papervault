@@ -93,6 +93,13 @@ def assert_safe_workspace() -> str:
 # space_physics factory pack reproduces the 11-type list verbatim.
 ENTITY_TYPES = get_domain().entity_types
 
+
+def _execution_model(role):
+    from papervault.knowledge.store.catalog_adapter import current_execution_recipe
+
+    recipe = current_execution_recipe()
+    return recipe["configured_models"][role] if recipe is not None else route(role)
+
 # Graph extraction/merge use standard; query keywords use flash. The endpoint owns effort.
 async def build_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
     """LightRAG's ``llm_model_func``: route by role, and gate the BUILD role on the build-path
@@ -101,7 +108,7 @@ async def build_llm(prompt, system_prompt=None, history_messages=None, **kwargs)
     # In the pinned LightRAG text-mode config, only query keyword extraction
     # carries response_format. Override any inherited model with this role's level.
     role = "keyword" if kwargs.get("response_format") else "build"
-    kwargs["model"] = route(role)
+    kwargs["model"] = _execution_model(role)
     if role != "build":
         return await mimo_complete(
             prompt, system_prompt=system_prompt, history_messages=history_messages, **kwargs
@@ -127,12 +134,44 @@ async def get_graph() -> LightRAG:
     """Singleton LightRAG (v3 full config). Workspace via NEO4J_WORKSPACE/POSTGRES_WORKSPACE env;
     gated by assert_safe_workspace() (refuses prod 'l0' without KS_ALLOW_PROD_WORKSPACE=1)."""
     global _RAG
+    from papervault.store.knowledge_runtime import assert_knowledge_authority
+
+    assert_knowledge_authority("legacy")
     if _RAG is not None:
         return _RAG
 
-    assert_safe_workspace()  # SDD §6.0/§6.5 — structural prod-safety, before any instance/IO
+    _RAG = await _initialize_graph()
+    return _RAG
 
-    working_dir = CONFIG.lightrag.working_dir
+
+async def build_catalog_graph(repository, claim, *, working_dir=None, read_only=False):
+    """Construct a private graph without process-global workspace mutation."""
+    from papervault.knowledge.store.catalog_storage import (
+        install_layered_storage, register_catalog_storages, storage_binding,
+    )
+
+    register_catalog_storages()
+    with storage_binding(repository, claim, read_only=read_only):
+        rag = await _initialize_graph(namespace=claim["namespace"],
+                                      working_dir=working_dir, read_only=read_only)
+    try:
+        install_layered_storage(rag, repository, claim, read_only=read_only)
+    except BaseException:
+        await rag.finalize_storages()
+        raise
+    return rag
+
+
+async def _initialize_graph(*, namespace=None, working_dir=None, read_only=False):
+    if namespace is None:
+        assert_safe_workspace()  # Legacy environment-based guard.
+
+    working_dir = working_dir or CONFIG.lightrag.working_dir
+    if namespace is not None:
+        from lightrag.utils import validate_workspace
+
+        validate_workspace(namespace)
+        working_dir = str(Path(working_dir) / namespace)
     Path(working_dir).mkdir(parents=True, exist_ok=True)
 
     # V2 (SDD §6.0/§6.9.2): mutate module-level lightrag.prompt.PROMPTS BEFORE the LightRAG
@@ -147,10 +186,13 @@ async def get_graph() -> LightRAG:
 
     apply_kw_prompt_compat()
 
+    catalog_options = ({"workspace": namespace, "enable_llm_cache": not read_only}
+                       if namespace is not None else {})
     rag = LightRAG(
+        **catalog_options,
         working_dir=working_dir,
         llm_model_func=build_llm,
-        llm_model_name=route("build"),
+        llm_model_name=_execution_model("build"),
         llm_model_max_async=int(os.getenv("KS_LLM_MAX_ASYNC", "32")),        # 硬 LLM 天花板。默认 32(2026-06-04):6-key 时代 conc16 把 2400-chunk 抽取拖过 480s worker(59/100 error)→曾锁 8;补到 24 key 后 conc_probe 实测 conc12/24/36/48 全 0 error、max ≤83s«480s(争抢消失,~1.3 调用/key)。env 可调,应大致随活 key 数走(§7)
         max_parallel_insert=int(os.getenv("KS_MAX_PARALLEL_INSERT", "16")),  # 文档在飞数(默认 2 = 隐藏瓶颈)
         embedding_func_max_async=int(os.getenv("KS_EMBED_MAX_ASYNC", "16")), # embedding 并发(默认 8 = 隐藏瓶颈);三旋钮缺一不可(§7)
@@ -178,10 +220,10 @@ async def get_graph() -> LightRAG:
         # section. The domain pack renders the closed 11-type list + negative exclusions.
         addon_params={"language": "English",
                       "entity_types_guidance": get_domain().entity_types_guidance},
-        graph_storage="Neo4JStorage",
-        kv_storage="PGKVStorage",
-        vector_storage="PGVectorStorage",
-        doc_status_storage="PGDocStatusStorage",
+        graph_storage="CatalogNeo4JStorage" if namespace else "Neo4JStorage",
+        kv_storage="CatalogPGKVStorage" if namespace else "PGKVStorage",
+        vector_storage="CatalogPGVectorStorage" if namespace else "PGVectorStorage",
+        doc_status_storage="CatalogPGDocStatusStorage" if namespace else "PGDocStatusStorage",
         embedding_func=EmbeddingFunc(embedding_dim=1024, max_token_size=8192, func=_bge_embed),
         # V1 (SDD §6.9.1): wire the bge-reranker-v2-m3 rerank path. Without rerank_model_func,
         # LightRAG's enable_rerank=True default (base.py:160) silently no-ops (F18). lazy-loaded.
@@ -202,9 +244,11 @@ async def get_graph() -> LightRAG:
     await rag.initialize_storages()
     from lightrag.kg.shared_storage import initialize_pipeline_status
 
-    await initialize_pipeline_status()
-    _RAG = rag
-    return _RAG
+    if namespace is None:
+        await initialize_pipeline_status()
+    else:
+        await initialize_pipeline_status(workspace=namespace)
+    return rag
 
 
 async def close_graph() -> None:

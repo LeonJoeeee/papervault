@@ -52,6 +52,8 @@ and incremental re-ingest of appended notebooks (#47) — v1 is push-once.
 """
 from __future__ import annotations
 
+from papervault.store import knowledge_runtime
+
 import asyncio
 import hashlib
 import logging
@@ -355,6 +357,7 @@ async def enqueue_sections(rag, sections: list[DocSection]) -> dict:
     """The SHARED LightRAG insertion path (same two-phase batch enqueue distill_batch
     uses for papers): enqueue all sections by doc_id, then process once. No ledger here —
     kept pure over the LightRAG boundary so tests mock just `rag`."""
+    await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, "legacy")
     if not sections:
         return {"queued": 0}
     inputs = [s.text for s in sections]
@@ -381,6 +384,7 @@ async def _reconcile_sections(rag, ingest_source: str, sections: list[DocSection
     left orphaned in `processing` forever (which would also silently block a future re-ingest).
     round.py needs a per-key counter because it re-scans every round; a single synchronous
     pass collapses that to 'not PROCESSED now → error'."""
+    await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, "legacy")
     from lightrag.base import DocStatus
 
     by_doc = {s.doc_id: s for s in sections}
@@ -439,6 +443,7 @@ async def _purge_sections(rag, ingest_source: str, base_sid: str, key: str) -> d
     an unexpected status is logged LOUD and counted, but the ledger row is still cleared so the
     wedge is always broken (a fresh re-ingest reuses the SAME doc_ids, so a surviving orphan is
     then overwritten by the re-insert)."""
+    await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, "legacy")
     existing = await ledger.load(ingest_source)  # {source_id: LedgerRecord}, workspace-scoped
     victims = [
         rec for sid, rec in existing.items()
@@ -469,6 +474,7 @@ async def _purge_sections(rag, ingest_source: str, base_sid: str, key: str) -> d
 
 async def purge_key(rag, kind: str, key: str) -> dict:
     """Validate a provenance key then purge its LightRAG docs + ledger rows (#79 --force)."""
+    await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, "legacy")
     ingest_source, base_sid = validate_key(kind, key)
     return await _purge_sections(rag, ingest_source, base_sid, key)
 
@@ -497,6 +503,13 @@ async def ingest_document(
     """
     check_source_enabled(kind)
     ingest_source, base_sid = validate_key(kind, key)  # fail-fast on a malformed key
+    if knowledge_runtime.knowledge_jobs_mode() == "postgres":
+        await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, "catalog")
+        from papervault.knowledge.scheduler.catalog_service import capture_operator_document
+        result = await capture_operator_document(kind, key, path, force=force, tokenizer=tokenizer,
+                                                 max_tokens=max_tokens, read_text=read_text)
+        return {"key": key, "kind": kind, **result}
+    await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, "legacy")
     # #79 --force: clear a prior (possibly half-committed) ingest of this key BEFORE the
     # push-once check, so a wedged key can be re-ingested instead of being refused forever.
     purged = await _purge_sections(rag, ingest_source, base_sid, key) if force else None

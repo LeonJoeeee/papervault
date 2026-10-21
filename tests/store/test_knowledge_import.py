@@ -160,7 +160,8 @@ def test_duplicate_docstatus_only_identity_is_explicit_duplicate_not_just_two_or
     assert plan["sets"]["duplicates"][0]["identity"] == ["probe", "orphan"]
 
 
-def test_independent_audited_job_edit_is_preserved_and_reimport_refuses_new_delta(repo):
+@pytest.mark.parametrize("same_source_version", [False, True])
+def test_independent_audited_job_edit_is_preserved_and_reimport_refuses_new_delta(repo, same_source_version):
     from papervault.store.knowledge import OperationConflict
     from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
     from papervault.store.repository import AuditEvent, PendingJob, Record
@@ -179,9 +180,131 @@ def test_independent_audited_job_edit_is_preserved_and_reimport_refuses_new_delt
         audit=AuditEvent("operator", "reviewed-legacy-job"))
     plan = plan_legacy_import(snapshot(), changes=[{"sequence": 11, "operation": "UPDATE", "old": source(),
         "new": source(status="error", attempts=4)}], final_checkpoint=11)
+    if same_source_version:
+        plan = plan_legacy_import(snapshot(), mappings=[{**mapping(), "mapping_revision": 2}])
     with pytest.raises(OperationConflict, match="independent"):
         importer.apply(plan, operation_id="next-delta")
     assert importer.knowledge._one("jobs", id=head["job_id"])["detail"] == edited_detail
+
+
+def handoff_evidence(plan):
+    from papervault.store.knowledge_cutover import DRAIN_FIELDS, VALIDATION_FIELDS
+
+    checkpoint = plan["checkpoint"]
+    return {"source": plan["source"], "capture_id": plan["capture_id"],
+        "final_sequence": checkpoint["last_sequence"],
+        "source_fence": {"capture_id": plan["capture_id"], "final_sequence": checkpoint["last_sequence"],
+            "fenced": True, "legacy_dml_revoked": True, "fence_id": "test-fence", "revoked_roles": ["legacy"],
+            "permission_checks": [{"role": "legacy", "can_write": False}],
+            "final_row_count": checkpoint["final_row_count"], "final_rows_digest": checkpoint["final_rows_digest"]},
+        "drain": {**dict.fromkeys(DRAIN_FIELDS, True), "receipt": "test-backend-fence"},
+        "validation": {**dict.fromkeys(VALIDATION_FIELDS, True), "receipt": "test-key-validation"}}
+
+
+@pytest.mark.parametrize("mapping_precedes_unit", [False, True])
+@pytest.mark.parametrize("quarantined", [False, True])
+def test_same_source_mapping_resolution_preserves_parking_through_handoff(repo, mapping_precedes_unit, quarantined):
+    from papervault.store.knowledge import ClaimRejected
+    from papervault.store.knowledge_cutover import CutoverRepository
+    from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
+    from papervault.store.repository import AuditEvent, Record
+
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    importer = LegacyImportRepository(repo)
+    importer.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    raw = snapshot([source(status="error_parked", attempts=3, quarantine=quarantined,
+                           quarantine_reason="operator parking", quarantine_scope="unit")])
+    initial = plan_legacy_import(raw, mappings=[mapping()] if mapping_precedes_unit else [])
+    importer.apply(initial, operation_id="unresolved-import")
+    k = importer.knowledge
+    head = k._rows("knowledge_import_heads")[0]
+    assert k._one("jobs", id=head["job_id"])["unit_id"] is None
+    original_events = importer.source_versions("ledger-test")
+    repo.upsert(Record.from_payload("A", {"key": "A", "title": "one"}), expected_revision=0,
+                audit=AuditEvent("test", "record"))
+    k.command("register_unit", "unit", {"unit_id": "paper:A", "kind": "paper", "record_key": "A", "identity": "A"})
+    enriched = plan_legacy_import(raw, mappings=[mapping()])
+    result = importer.apply(enriched, operation_id="resolved-import")
+    assert result["inserted"] == 0 and result["projected"] == 1
+    projected = k._one("jobs", id=head["job_id"])
+    assert projected["unit_id"] == "paper:A" and projected["key"] == "A"
+    assert projected["detail"]["mapping_resolution"] == "verified"
+    assert projected["detail"]["evidence"] == enriched["events"][0]
+    assert importer.source_versions("ledger-test") == original_events
+    assert importer.apply(enriched, operation_id="resolved-replay")["projected"] == 0
+    assert k._one("jobs", id=head["job_id"]) == projected
+    k.command("create_generation", "generation", {"generation_id": "g", "candidate": False})
+    k.command("register_input", "input", {"unit_id": "paper:A", "consumed_input_revision": "input1",
+        "manifest": {"metadata_revision": "1", "artifacts": [], "upstream_derivation_ids": []}})
+    assert k.get_reducer("paper:A", "input1") is None
+    assert CutoverRepository(repo).commit_handoff(handoff_evidence(enriched), expected_epoch=1,
+                                                operation_id="handoff")["authority_epoch"] == 2
+    recipe = k.command("register_recipe", "recipe", {"recipe": {"schema_version": 1,
+        "output_contract": {"fulltext": {"required": ["graph"], "not_applicable": []}}}})["recipe_digest"]
+    desired = {"unit_id": "paper:A", "generation_id": "g", "consumed_input_revision": "input1", "recipe_digest": recipe}
+    k.command("set_requirement", "requirement", {**desired, "expected_revision": 0,
+                                                "expected_record_revision": repo.get("A").revision})
+    job = k.command("enqueue", "enqueue", desired)
+    claim = k.command("claim", "claim", {"job_id": job["job_id"], "expected_revision": job["revision"], "authority_epoch": 2})
+    assert claim["claimed"] is False and claim["parked"] is True and claim["attempt_id"] is None
+    assert claim["quarantined"] is quarantined
+    assert k.get_reducer("paper:A", "input1")["failure_streak"] == 3
+    assert k.get_unit("paper:A")["quarantine"] is quarantined
+    if quarantined:
+        assert k.get_unit("paper:A")["quarantine_reason"]["details"][0]["reason"] == "operator parking"
+    with pytest.raises(ClaimRejected, match="parked|quarantine"):
+        k.command("claim", "claim-again", {"job_id": job["job_id"], "expected_revision": claim["revision"], "authority_epoch": 2})
+    assert k.get_job(job["job_id"])["attempts"] == 0
+    assert k._rows("knowledge_attempt_events") == []
+    assert len(k._rows("knowledge_legacy_checkpoint_applications")) == 1
+
+
+def test_stale_import_cannot_remap_a_newer_source_projection(repo):
+    from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
+    from papervault.store.repository import AuditEvent
+
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    importer = LegacyImportRepository(repo)
+    importer.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    newer = plan_legacy_import(snapshot(), changes=[{"sequence": 11, "operation": "UPDATE", "old": source(),
+        "new": source(status="error_parked", attempts=4)}], final_checkpoint=11)
+    importer.apply(newer, operation_id="newer")
+    before = importer.knowledge._rows("jobs")
+    assert importer.apply(plan_legacy_import(snapshot(), mappings=[mapping()]), operation_id="stale")["projected"] == 0
+    assert importer.knowledge._rows("jobs") == before
+    assert importer.knowledge._rows("knowledge_import_checkpoints")[0]["checkpoint"]["last_sequence"] == 11
+
+
+@pytest.mark.parametrize("mapping_precedes_unit", [False, True])
+def test_handoff_rejects_resolved_report_with_unprojected_mapping(repo, mapping_precedes_unit):
+    from papervault.store.knowledge_cutover import CutoverRepository
+    from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
+    from papervault.store.repository import AuditEvent, Record, payload_hash
+
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    importer = LegacyImportRepository(repo)
+    importer.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    raw = snapshot([source(status="error_parked")])
+    importer.apply(plan_legacy_import(raw, mappings=[mapping()] if mapping_precedes_unit else []), operation_id="initial")
+    k = importer.knowledge
+    repo.upsert(Record.from_payload("A", {"key": "A", "title": "one"}), expected_revision=0,
+                audit=AuditEvent("test", "record"))
+    k.command("register_unit", "unit", {"unit_id": "paper:A", "kind": "paper", "record_key": "A", "identity": "A"})
+    k.command("create_generation", "generation", {"generation_id": "g", "candidate": False})
+    enriched = plan_legacy_import(raw, mappings=[mapping()])
+    if not mapping_precedes_unit:
+        # Reproduce a checkpoint left by the old importer: enriched report and
+        # checkpoint committed, but the unchanged-source projection was skipped.
+        audit = AuditEvent("test", "old-importer-checkpoint")
+        with repo._write(audit):
+            digest = payload_hash(enriched)
+            k._insert("knowledge_import_reports", {"plan_digest": digest, "source": enriched["source"],
+                "capture_id": enriched["capture_id"], "report": enriched})
+            k._update("knowledge_import_checkpoints", {"plan_digest": digest}, source=enriched["source"], capture_id=enriched["capture_id"])
+            repo._finish(None, audit)
+    with pytest.raises(ValueError, match="projection"):
+        CutoverRepository(repo).commit_handoff(handoff_evidence(enriched), expected_epoch=1, operation_id="handoff")
+    assert k.get_authority_state()["authority"] == "legacy"
 
 
 def test_projection_guard_checks_full_last_imported_row_not_only_owner_and_source_version():

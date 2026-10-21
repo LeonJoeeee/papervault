@@ -22,9 +22,6 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-_VARIABLES = ("PAPERVAULT_BACKEND_TEST_DSN",) + tuple(
-    "PAPERVAULT_BACKEND_TEST_NEO4J_" + suffix
-    for suffix in ("URI", "USER", "PASSWORD", "DATABASE"))
 _MODEL = "pv_acceptance_fixture"
 _DIM = 3
 
@@ -148,7 +145,7 @@ class BackendAcceptance:
         self.resources.extend(stores)
         for store in stores:
             await store.initialize()
-        assert graph._DATABASE == os.environ["PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE"]
+        assert graph._DATABASE == os.environ["NEO4J_DATABASE"]
         rag = SimpleNamespace(chunk_entity_relation_graph=graph, llm_response_cache=cache,
                               entity_chunks=chunks, entities_vdb=vectors, config=config)
         install_layered_storage(rag, self.repository, claim, read_only=read_only)
@@ -191,9 +188,9 @@ class BackendAcceptance:
 
 
 @pytest.fixture
-async def backend(monkeypatch):
+async def backend(monkeypatch, backend_test_targets):
     # This check precedes importing runtime storage or making ANY connection.
-    targets = {key: os.environ.get(key) for key in _VARIABLES}
+    targets = backend_test_targets
     missing = [key for key, value in targets.items() if not value]
     if missing:
         pytest.skip("real backend acceptance requires all explicit credentials: " + ", ".join(missing))
@@ -225,7 +222,7 @@ async def backend(monkeypatch):
         "connection_retry_attempts": 1, "connection_retry_backoff": 0.0,
         "connection_retry_backoff_max": 0.0, "pool_close_timeout": 5.0}
     monkeypatch.setattr(ClientManager, "get_config", staticmethod(lambda **kwargs: dict(config)))
-    schema = "backend_acceptance_" + uuid.uuid4().hex
+    schema = "catalog_backend_acceptance_" + uuid.uuid4().hex
     harness, catalog_created = None, False
     with psycopg.connect(targets["PAPERVAULT_BACKEND_TEST_DSN"], autocommit=True, connect_timeout=5) as conn:
         plan = prepare_postgres(conn, embedding_dim=_DIM, embedding_model_name=_MODEL)

@@ -113,6 +113,62 @@ async def test_retrieval_uses_one_selected_aggregate_instead_of_one_query_per_un
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_reason", ["no_results", "backend_unavailable", None])
+async def test_empty_selected_retrieval_reaches_public_empty_coverage_but_real_failures_raise(monkeypatch, failure_reason):
+    from papervault.knowledge.query import aquery
+    from papervault.knowledge.store.catalog_serving import CatalogServingFacade
+
+    async def factory(*args, **kwargs):
+        class Rag:
+            async def aquery_data(self, query, param):
+                return {"status": "failure", "message": "Query returned no results", "data": {},
+                        "metadata": {"failure_reason": failure_reason, "mode": "mix"}}
+
+            async def finalize_storages(self):
+                pass
+        return Rag()
+
+    repo = Repository()
+    facade = await CatalogServingFacade.pin(repo, rag_factory=factory)
+    monkeypatch.setattr(aquery, "_QUERY_VARIANT", "single")
+    try:
+        if failure_reason == "no_results":
+            result = await aquery.query("empty", rag=facade)
+            assert result["kb_coverage"] == "empty"
+            assert result["cited_papers"] == [] and result["cited_sources"] == []
+        else:
+            with pytest.raises(RuntimeError, match="retrieval failed"):
+                await aquery.query("empty", rag=facade)
+    finally:
+        await facade.close()
+    assert not repo.pin_active
+
+
+@pytest.mark.asyncio
+async def test_no_results_still_rechecks_eligibility_after_retrieval():
+    from papervault.knowledge.store.catalog_serving import CatalogServingFacade
+
+    repo = Repository()
+
+    async def factory(*args, **kwargs):
+        class Rag:
+            async def aquery_data(self, query, param):
+                repo.current["entries"][0]["eligible"] = False
+                return {"status": "failure", "data": {}, "metadata": {"failure_reason": "no_results"}}
+
+            async def finalize_storages(self):
+                pass
+        return Rag()
+
+    facade = await CatalogServingFacade.pin(repo, rag_factory=factory)
+    try:
+        with pytest.raises(RuntimeError, match="ineligible"):
+            await facade.aquery_data("empty", None)
+    finally:
+        await facade.close()
+
+
+@pytest.mark.asyncio
 async def test_policy_change_fails_before_next_facet_reads_pinned_namespace():
     from papervault.knowledge.store.catalog_serving import CatalogServingFacade
 

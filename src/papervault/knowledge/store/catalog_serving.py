@@ -128,7 +128,9 @@ class CatalogServingFacade:
             return {"status": "success", "data": {}}
         graph = await self._graph()
         result = await graph.aquery_data(query, param)
-        if result.get("status") != "success":
+        empty = (result.get("status") == "failure"
+                 and (result.get("metadata") or {}).get("failure_reason") == "no_results")
+        if result.get("status") != "success" and not empty:
             raise RuntimeError("selected aggregate retrieval failed")
         await asyncio.to_thread(self.validate)
         return result

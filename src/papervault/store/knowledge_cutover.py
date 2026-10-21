@@ -60,9 +60,11 @@ def validate_handoff_evidence(checkpoint, evidence):
         raise ValueError("key-level dispositions/references/quarantine/accounting/external-attempt validation required")
 
 
-def validate_legacy_projection(head, job, event):
+def validate_legacy_projection(head, job, event, *, expected_evidence=None):
     """Reject source/reference/counter drift before changing authority."""
     validate_projection_unchanged(head, job)
+    source_evidence = event["evidence"] if event else {}
+    expected = expected_evidence if expected_evidence is not None else source_evidence
     if (not job or not event or job["kind"] != "distill_legacy_unverified" or job["state"] != "quarantined"
             or not job["quarantine"] or job["detail"].get("source_version") != head["source_version"]
             or not job["detail"].get("excluded") or job.get("achieved_tier") is not None
@@ -70,7 +72,9 @@ def validate_legacy_projection(head, job, event):
             or job.get("recipe_digest") is not None or job.get("target_generation") is not None
             or job["detail"].get("deleted") != head["deleted"]
             or head["event_digest"] != event["event_digest"]
-            or job["detail"].get("evidence") != event["evidence"]
+            or job["detail"].get("evidence") != expected
+            or any(expected.get(field) != source_evidence.get(field) for field in (
+                "source", "capture_id", "source_row_id", "source_version", "operation", "raw", "deleted", "event_digest"))
             or job["detail"].get("legacy_consecutive_failures") != event["evidence"]["raw"].get("attempts")):
         raise ValueError("legacy projection source/disposition/quarantine/counter validation failed")
 
@@ -269,6 +273,14 @@ class CutoverRepository:
             if not checkpoint:
                 raise ValueError("no imported final capture checkpoint")
             validate_handoff_evidence(checkpoint["checkpoint"], evidence)
+            report = k._one("knowledge_import_reports", plan_digest=checkpoint["plan_digest"])
+            if not report or report["source"] != evidence["source"] or report["capture_id"] != evidence["capture_id"]:
+                raise ValueError("final keyed disposition report missing")
+            expected_events = {}
+            for event in report["report"]["events"]:
+                previous = expected_events.get(event["source_row_id"])
+                if previous is None or event["source_version"] > previous["source_version"]:
+                    expected_events[event["source_row_id"]] = event
             imported = k._rows("knowledge_import_events", source=evidence["source"], capture_id=evidence["capture_id"])
             first, last = checkpoint["checkpoint"]["snapshot_sequence"], evidence["final_sequence"]
             versions = {event["source_version"] for event in imported if event["source_version"] > first}
@@ -279,15 +291,24 @@ class CutoverRepository:
                 job = k._one("jobs", id=head["job_id"])
                 event = next((event for event in imported if event["source_row_id"] == head["source_row_id"]
                               and event["source_version"] == head["source_version"]), None)
-                validate_legacy_projection(head, job, event)
+                expected = expected_events.pop(head["source_row_id"], None)
+                if expected is None:
+                    raise ValueError("legacy projection absent from final report")
+                validate_legacy_projection(head, job, event, expected_evidence=expected)
+                mapping = expected.get("mapping") or {}
+                unit = k.get_unit(mapping.get("unit_id")) if mapping else None
+                compatible = bool(unit and unit["kind"] == mapping.get("kind")
+                                  and unit["record_key"] == mapping.get("record_key"))
+                if (job["unit_id"] != (unit["unit_id"] if compatible else None)
+                        or job["key"] != (unit["record_key"] if compatible else None)
+                        or job["detail"].get("mapping_resolution") != (
+                            "verified" if compatible else "missing_or_conflicting_catalog_unit")):
+                    raise ValueError("legacy projection mapping is not resolved against current catalog units")
                 if not head["deleted"]:
                     current_rows.append(event["evidence"]["raw"])
-            if (len(current_rows) != checkpoint["checkpoint"]["final_row_count"]
+            if (expected_events or len(current_rows) != checkpoint["checkpoint"]["final_row_count"]
                     or payload_hash(sorted(current_rows, key=source_row_id)) != checkpoint["checkpoint"]["final_rows_digest"]):
                 raise ValueError("final source row set differs from imported projection")
-            report = k._one("knowledge_import_reports", plan_digest=checkpoint["plan_digest"])
-            if not report or report["source"] != evidence["source"] or report["capture_id"] != evidence["capture_id"]:
-                raise ValueError("final keyed disposition report missing")
             if any(not event["evidence"].get("quarantine") or not event["evidence"].get("excluded")
                    or not event["evidence"].get("dispositions") for event in imported):
                 raise ValueError("source evidence has unrecorded or conforming legacy dispositions")

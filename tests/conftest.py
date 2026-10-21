@@ -21,6 +21,14 @@ import pytest
 if Version(version("python-dotenv")) < Version("1.2"):
     raise pytest.UsageError("Test isolation requires python-dotenv>=1.2; run uv sync --extra dev")
 
+# Capture explicit backend-test inputs before scrubbing them from the process.
+# Only the marked integration fixture can access this snapshot; runtime settings
+# and ordinary tests retain the same isolated environment.
+_BACKEND_TEST_VARIABLES = ("PAPERVAULT_BACKEND_TEST_DSN",) + tuple(
+    "PAPERVAULT_BACKEND_TEST_NEO4J_" + suffix
+    for suffix in ("URI", "USER", "PASSWORD", "DATABASE"))
+_BACKEND_TEST_TARGETS = {name: os.environ.get(name) for name in _BACKEND_TEST_VARIABLES}
+
 # Denylist: application flags/paths/tuning, knowledge stores and libpq discovery,
 # OCR/model settings, provider credentials/endpoints, and legacy library settings.
 # Prefixes also cover future settings in these namespaces. Keep shell/runtime vars
@@ -116,6 +124,14 @@ def pytest_collection_modifyitems(config, items):
         base_name = getattr(item, "originalname", None) or item.name
         if base_name in _INTEGRATION_NAMES:
             item.add_marker(pytest.mark.integration)
+
+
+@pytest.fixture
+def backend_test_targets(request):
+    """Explicit opt-in only; the backend harness validates targets before connecting."""
+    if request.node.get_closest_marker("integration") is None:
+        pytest.fail("backend_test_targets is restricted to integration tests", pytrace=False)
+    return dict(_BACKEND_TEST_TARGETS)
 
 
 @pytest.fixture(autouse=True)

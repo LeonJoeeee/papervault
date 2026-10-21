@@ -210,7 +210,7 @@ class LegacyImportRepository:
                     k._insert("knowledge_import_events", {**version_identity, "event_digest": event["event_digest"], "evidence": event})
                     inserted += 1
                 head = k._one("knowledge_import_heads", **identity)
-                if head and head["source_version"] >= event["source_version"]:
+                if head and head["source_version"] > event["source_version"]:
                     continue
                 job_id = "legacy-unverified:" + payload_hash(identity)
                 old_job = k._one("jobs", id=job_id)
@@ -234,6 +234,10 @@ class LegacyImportRepository:
                     if head is None or old_job["detail"].get("source_version") != head["source_version"]:
                         raise OperationConflict("legacy projection source version changed independently")
                     validate_projection_unchanged(head, old_job)
+                    # Source history is immutable, but its mapping/disposition
+                    # evidence and catalog-unit resolution may be enriched.
+                    if all(old_job[field] == value for field, value in values.items()):
+                        continue
                     projection = k._update("jobs", values, id=job_id)
                 else:
                     projection = k._insert("jobs", {"id": job_id, **values})

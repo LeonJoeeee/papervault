@@ -40,6 +40,85 @@ model-specific test tables additively and cleans only its generated namespaces a
 schema; shared tables/indexes remain. Missing target variables skip these cases and provide
 no backend acceptance evidence.
 
+### Staging backend acceptance commands
+
+Run the harness in a fresh lane-local Python process against an operator-provisioned,
+dedicated database on each **staging** backend. For example, name both databases
+`p4_backend_rehearsal`; a staging hostname alone is insufficient. Names must contain a
+delimited `test` or `rehearsal` token. Known live/default names are rejected before
+connecting, including `papervault_catalog`, `knowledge_system` and `neo4j`. The Neo4j
+database must already exist. Never use `--allow-live` for this acceptance run.
+
+The orchestrator supplies these five environment variables through its existing credential
+channel; do not load the service's `.env` or publish their values:
+
+| Variable | Required value |
+| --- | --- |
+| `PAPERVAULT_BACKEND_TEST_DSN` | Explicit staging PostgreSQL host, port, dbname, user and password, e.g. libpq `host=STAGING_HOST port=5432 dbname=p4_backend_rehearsal user=TEST_USER password=TEST_PASSWORD`. URI DSNs are also supported; TLS options follow the DSN. |
+| `PAPERVAULT_BACKEND_TEST_NEO4J_URI` | Explicit staging Bolt URI, including the port and applicable TLS scheme. |
+| `PAPERVAULT_BACKEND_TEST_NEO4J_USER` | Dedicated staging test user. |
+| `PAPERVAULT_BACKEND_TEST_NEO4J_PASSWORD` | That user's password. |
+| `PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE` | Existing dedicated Neo4j database, e.g. `p4_backend_rehearsal`. |
+
+Pytest captures these five explicit inputs before scrubbing application environment
+variables. Only the integration-marked `backend_test_targets` fixture exposes that
+snapshot to the harness, which validates both database names before any connection.
+The variables stay absent from the runtime environment; dotenv loading remains disabled.
+
+The PostgreSQL role needs schema/table/index creation, fixture DML and cleanup permissions;
+pgvector must be installed or the role must be allowed to create its extension. The Neo4j
+role needs index creation, graph reads and fixture writes/deletions in its dedicated
+database. The fixture rejects an already initialized legacy PostgreSQL pool; use a fresh
+pytest process instead of a service interpreter. No runtime `POSTGRES_*` fallback supplies
+the backend connection.
+
+Review the exact fixture schema plan without any connection or write:
+
+```sh
+.venv/bin/python scripts/prepare_knowledge_backend.py --embedding-dim 3 --embedding-model-name pv_acceptance_fixture
+```
+
+Expected stdout is JSON with `dependency: lightrag-hku==1.5.4`, `embedding_dim: 3`,
+the `postgres`/`neo4j` additive statements and vector tables ending in
+`_pv_acceptance_fixture_3d`. Exit **0** only establishes that the plan was generated.
+The harness prepares this plan itself; no separate `--execute` command is required.
+The fixture's three-dimensional embedder and summary provider make no GPU or LLM calls.
+
+Check collection and the target refusal cases, then execute the actual backend cases:
+
+```sh
+.venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py --collect-only -q
+.venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -k refuses -q
+.venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q -rs
+```
+
+Expected results: **11 tests collected**, **8 passed, 3 deselected** for the refusal
+check (no connections), and **11 passed**, exit **0**, for acceptance. Three skipped
+real-store tests mean missing explicit credentials and do not constitute acceptance.
+The three real-store test names identify original merge summaries/shared-entity traversal,
+latest-version vector visibility/top-k/tombstones, and cache/sealed/stale-write isolation.
+Any setup, assertion or cleanup error is a failed acceptance run.
+
+There is no operator namespace parameter: each fixture creates a random
+`catalog_backend_acceptance_<uuid>` catalog schema and catalog-admitted `pv_<48 hex digits>`
+attempt namespaces. PostgreSQL stores ownership in `workspace`; Neo4j stores it in
+`_pv_namespace`. Readers pin selected layers before graph traversal/vector ranking/cache
+access and reject writes through the read-only adapter. The **harness itself is mutating**:
+it writes fixture outputs, seals/publishes test receipts, reclaims an expired test attempt,
+and creates additive schema/index objects. Cleanup deletes rows/nodes only for its recorded
+attempt namespaces and drops its catalog schema. Shared backend tables, extension and
+indexes remain; interruption can leave test-owned material for operator inspection.
+These commands neither inspect nor modify live stores. Read-only guarantees apply to
+the schema-plan command, collection/refusal checks, serving adapters and the source
+`dry-run` below, not to the backend acceptance fixture.
+
+For the separate dedicated-Postgres acceptance suite, supply
+`PAPERVAULT_CATALOG_TEST_DSN` explicitly and run `.venv/bin/pytest tests/store -q`.
+That fixture creates/drops unique `catalog_test_<uuid>` schemas; it does not use
+`PAPERVAULT_BACKEND_TEST_DSN`. Record the head SHA, commands, exit codes, case counts and
+non-secret output on the PR. Corpus-scale query plans/latency and real-material R2
+dispositions require their own evidence; these fixture results do not establish them.
+
 For a read-only source inspection, invoke the importer with an explicit source DSN and source identity, or supply a previously authorized snapshot:
 
 ```sh
@@ -52,7 +131,7 @@ This action opens a read-only transaction and installs no capture objects. Add e
 
 1. Initialize a dedicated catalog using `--action initialize-catalog --catalog-dsn ... --operation-id ...`. This installs the shared schema and importer explicitly; runtime startup performs no schema migration. Initialize exactly one active generation with `KnowledgeRepository.command('create_generation', stable_operation_id, {'generation_id': generation_id, 'candidate': False})`. No legacy output is selected automatically.
 2. On a dedicated source clone, `--action install-capture --source-dsn ... --source-id ...` installs durable inserts/updates/deletes capture and a transactionally ordered counter. `--action capture-snapshot` takes the aligned snapshot and C0 under a source-table lock. Retain source configuration and schema evidence. A rollback consumes no sequence number. TRUNCATE and capture-history edits are rejected.
-3. Use `--action apply --snapshot ... --catalog-dsn ... --operation-id ...` to import stable source-row/version identities. Reapply, interrupt and resume. Verify that newer catalog-owned projections are not overwritten. Compare keyed matches, ledger-only and document-status-only units, duplicates, conflicts and provenance gaps; every item needs a disposition. Unknown legacy identities remain quarantined, non-executable and excluded from conforming coverage. Imported failure streaks and parking transfer once without replaying success/failure events or inventing historical attempts.
+3. Use `--action apply --snapshot ... --catalog-dsn ... --operation-id ...` to import stable source-row/version identities. Reapply, interrupt and resume. When mappings or catalog units become resolved, reapply with a new operation ID even if source versions are unchanged: the importer refreshes guarded projections while retaining immutable source events. Handoff compares projections to the final report and current unit mappings and refuses unprojected resolutions. Verify that newer catalog-owned projections are not overwritten. Compare keyed matches, ledger-only and document-status-only units, duplicates, conflicts and provenance gaps; every item needs a disposition. Unknown legacy identities remain quarantined, non-executable and excluded from conforming coverage. Imported failure streaks and parking transfer once without replaying success/failure events or inventing historical attempts.
 4. Shadow-compare compatible checkpoints with the catalog-only coverage and import reports. Comparison must not dispatch, repair, publish or change serving. The importer's audited migration writes are distinct from comparison. Preserve original attempt/counter checkpoints and independently inventory external work with uncertain outcomes.
 5. Stop dispatch and pipeline admission. Drain in-flight work, or fence both catalog completions and backend writes. Stop/isolate LightRAG internal workers that cannot honor attempt ownership. Record actual evidence for all five drain fields: `dispatch_stopped`, `pipeline_admission_stopped`, `inflight_drained`, `backend_writes_fenced`, `internal_workers_stopped`, plus a durable receipt. Setting fields true is an attestation, not a substitute for performing the operations.
 6. `--action freeze-source --legacy-role ... --evidence ...` takes the final writer lock, installs the durable DML fence, revokes table and column DML from named legacy roles and PUBLIC, and verifies effective privileges, including inherited grants. An inherited privilege or owner/superuser capability that remains writable prevents a successful fence. Capture final C1; `--action capture-delta --after C0` returns changes through the final checkpoint. Apply every change and prove the contiguous sequence, exact final row set and digest.

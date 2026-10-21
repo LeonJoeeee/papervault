@@ -7,16 +7,10 @@
     "run": "https://github.com/LeonJoeeee/papervault/actions/runs/39597528140",
     "test": "success"
   },
-  "base_update": {
-    "command": "git fetch origin main",
-    "exit_code": 0,
-    "result": "origin/main still equals assigned base and original HEAD; no divergent commits to rebase"
-  },
   "baseline": {
     "ruff": "passed; exit 0",
     "suite": "3791 passed, 2 skipped, 167 deselected, 4 warnings in 272.46s; exit 0"
   },
-  "branch": "task/284-p5c-disposable-extract-gc-and-isolated-rebuild-p",
   "checks": [
     {
       "command": ".venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/store -q --basetemp=/tmp/papervault-284.9HQAzZ/final-store-fixed",
@@ -87,7 +81,6 @@
     "record": "scoped-review.log",
     "result": "no blocking findings"
   },
-  "initial_status": "git status --porcelain -uall: empty",
   "issue": "https://github.com/LeonJoeeee/papervault/issues/284",
   "limits": [
     "synthetic metadata rehearsal, not a production monthly drill",
@@ -97,38 +90,13 @@
     "pre-GC snapshots conservatively retain their existing protected-byte retention",
     "defaults remain legacy; no live activation"
   ],
-  "publication": {
-    "integration_verdict": "pending orchestrator",
-    "pr": null,
-    "reason": "2026-10-21T12:17:23Z governing issue comment: worker should not attempt GitHub writes; orchestrator publishes"
-  },
   "recorded_at": "2026-10-21T13:27:15.163428+00:00",
   "semver": "minor: additive disposable-extract maintenance, capacity admission and operator tooling; legacy activation defaults preserved",
-  "task_head_ci": {
-    "checks": [
-      "test",
-      "build",
-      "lint",
-      "merged-result / <base sha> / <head sha>"
-    ],
-    "status": "unreported; orchestrator publication required"
-  },
   "test_environment": {
     "HF_HOME": "/tmp/papervault-284.9HQAzZ/hf",
     "TMPDIR": "/tmp/papervault-284.9HQAzZ",
     "XDG_CACHE_HOME": "/tmp/papervault-284.9HQAzZ/cache",
     "dedicated_catalog": "p5c_catalog_test/p5c_test via supplied /tmp/p5c-test-env.py; no live catalog or service dotenv"
-  },
-  "tree_accounting": {
-    "baseline": "clean",
-    "container_disposition": "fixture-disposition.json",
-    "disposable": [
-      "lane .venv and test/lint/__pycache__ caches",
-      "/tmp/papervault-284.9HQAzZ synthetic fixtures, logs and dependency cache"
-    ],
-    "maintained": "task code, tests, version fields, invalidated existing docs and this baseline evidence",
-    "preserve": "committed branch and docs/baselines/p5c-20261021-staging-01; no required artifact exists only in scratch",
-    "unknown_or_inherited_changes": []
   },
   "version": "0.10.0"
 }

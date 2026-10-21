@@ -61,6 +61,111 @@ def test_backend_usage_is_counted_before_any_reservation(tmp_path):
     assert reserved(gate) == 0
 
 
+def race_gate(tmp_path, usage):
+    from papervault.store.scheduler_capacity import SchedulerCapacity
+
+    return SchedulerCapacity(tmp_path / "capacity", derivative_roots=(tmp_path / "outputs",),
+                             estimated_bytes=40, backend_usage=usage, soft_cap=100)
+
+
+def attempt_admission(gate, kind):
+    try:
+        if kind == "acquire":
+            gate.acquire("new-job")
+        else:
+            with gate.intake():
+                pass
+    except ValueError:
+        return False
+    return True
+
+
+@pytest.mark.parametrize("kind", ["acquire", "intake"])
+def test_admission_census_cannot_race_newer_settlement(tmp_path, monkeypatch, kind):
+    """A samples 40; B materializes 40 and settles; A must not fund another 40."""
+    import fcntl
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event, get_ident
+
+    sampled, resume, settlement_progress = Event(), Event(), Event()
+    settlement_thread = []
+    backend = [40]
+    owner = race_gate(tmp_path, lambda physical: backend[0])
+    claim = {"job_id": "old-job", "attempt_id": "old-attempt", "submission_id": "old-submission"}
+    owner.acquire("old-job")
+    owner.bind("old-job", claim)
+    protected = tmp_path / "protected-source"
+    protected.write_bytes(b"source")
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    current = outputs / "current-version"
+    current.write_bytes(b"current")
+
+    def read_old_census(physical):
+        value = backend[0]
+        sampled.set()
+        assert resume.wait(5)
+        return value
+
+    # Observe a real blocking lock without timing sleeps. The old implementation
+    # lets B finish; the fix must block B until A has accounted for its reservation.
+    flock = fcntl.flock
+
+    def observed_lock(fd, operation):
+        if settlement_thread == [get_ident()] and operation == fcntl.LOCK_EX:
+            try:
+                return flock(fd, operation | fcntl.LOCK_NB)
+            except BlockingIOError:
+                settlement_progress.set()
+        return flock(fd, operation)
+
+    monkeypatch.setattr(fcntl, "flock", observed_lock)
+    contender = race_gate(tmp_path, read_old_census)
+
+    def settle():
+        settlement_thread.append(get_ident())
+        backend[0] = 80
+        try:
+            return owner.release("old-job", claim=claim, reconciled=True)
+        finally:
+            settlement_progress.set()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        admission = pool.submit(attempt_admission, contender, kind)
+        try:
+            assert sampled.wait(5)
+            settlement = pool.submit(settle)
+            assert settlement_progress.wait(5)
+        finally:
+            resume.set()
+        admitted = admission.result(timeout=5)
+        assert settlement.result(timeout=5) is True
+    assert admitted is False, "stale census admitted backend 80 + new budget 40 over cap 100"
+    restarted = race_gate(tmp_path, lambda physical: backend[0])
+    assert attempt_admission(restarted, kind) is False
+    assert reserved(restarted) == 0
+    assert protected.read_bytes() == b"source"
+    assert current.read_bytes() == b"current"
+
+
+@pytest.mark.parametrize("kind", ["acquire", "intake"])
+@pytest.mark.parametrize("settlement_first", [False, True])
+def test_ordered_settlement_and_admission_remain_funded(tmp_path, kind, settlement_first):
+    backend = [40]
+    gate = race_gate(tmp_path, lambda physical: backend[0])
+    claim = {"job_id": "old-job", "attempt_id": "attempt", "submission_id": "submission"}
+    gate.acquire("old-job")
+    gate.bind("old-job", claim)
+    if not settlement_first:
+        assert attempt_admission(race_gate(tmp_path, lambda physical: backend[0]), kind) is False
+        assert reserved(gate) == 40
+    backend[0] = 80
+    assert gate.release("old-job", claim=claim, reconciled=True)
+    restarted = race_gate(tmp_path, lambda physical: backend[0])
+    assert attempt_admission(restarted, kind) is False
+    assert reserved(restarted) == 0
+
+
 class OpenBreaker:
     def allows(self):
         return True
@@ -500,6 +605,31 @@ def test_completed_external_growth_stays_charged_until_new_census(tmp_path):
     assert reserved(gate) == 0
 
 
+@pytest.mark.parametrize("sweeper", ["intake", "acquire"])
+def test_owner_can_readmit_after_another_worker_reconciles_spent_charge(tmp_path, sweeper):
+    owner = make_gate(tmp_path)
+    census = {"backend_bytes": 1000, "measured_at": datetime.now(timezone.utc).isoformat()}
+    owner.backend_usage = lambda physical: dict(census)
+    old = {"job_id": "job", "attempt_id": "old", "submission_id": "old-submission"}
+    owner.acquire("job")
+    owner.bind("job", old)
+    assert owner.release("job", claim=old, reconciled=True) is False
+    assert reserved(owner) == 1000
+    census.update(backend_bytes=2000, measured_at=datetime.now(timezone.utc).isoformat())
+    other = make_gate(tmp_path)
+    other.backend_usage = lambda physical: dict(census)
+    assert attempt_admission(other, sweeper) is True
+    if sweeper == "acquire":
+        assert other.release("new-job") is True
+    assert reserved(owner) == 0
+    assert owner.acquire("job", reuse=False)["admitted"] is True
+    new = {"job_id": "job", "attempt_id": "new", "submission_id": "new-submission"}
+    owner.bind("job", new)
+    with pytest.raises(ValueError, match="identity"):
+        owner.release("job", claim=old, reconciled=True)
+    assert reserved(owner) == 1000
+
+
 @pytest.mark.asyncio
 async def test_no_attempt_claim_result_releases_unexecuted_capacity(tmp_path):
     scheduler, repository, adapter, gate = scheduler_fixture(tmp_path)
@@ -672,7 +802,7 @@ async def test_cancellation_resistant_active_submit_cannot_be_reexecuted(tmp_pat
         await asyncio.sleep(0)
 
 
-def test_integer_measurement_uses_start_time_before_concurrent_settlement(tmp_path):
+def test_integer_measurement_keeps_unsettled_output_charged(tmp_path):
     import threading
 
     gate = make_gate(tmp_path)
@@ -703,12 +833,14 @@ def test_integer_measurement_uses_start_time_before_concurrent_settlement(tmp_pa
     worker.start()
     try:
         assert measuring.wait(5)
-        assert gate.release("job", claim=claim, reconciled=True) is False
     finally:
+        # Admission now serializes sampling with settlement. Complete this census
+        # before settling; an older later census still cannot clear the charge.
         finish.set()
         worker.join(5)
     assert not errors
     assert observed == [2000]
+    assert gate.release("job", claim=claim, reconciled=True) is False
     assert reserved(gate) == 1000
 
 

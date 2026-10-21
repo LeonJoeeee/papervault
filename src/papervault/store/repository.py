@@ -314,14 +314,16 @@ class PostgresCatalogRepository:
             raise StaleWrite(record.key, expected_revision, current.revision if current else None)
         if current and replace(current, revision=0) == replace(record, revision=0):
             return False
-        if record.payload.get("extraction_completion_id") or any(
-                record.payload.get(field) for field in ("pdf_path", "md_path", "txt_path")):
+        lifecycle = None
+        if any(payload.get(field) for payload in (record.payload, current.payload if current else {})
+               for field in ("extraction_completion_id", "pdf_path", "md_path", "txt_path")):
             exists = self.connection.execute("SELECT to_regclass(%s) AS name",
                 (self.schema + ".extract_deletions",)).fetchone()
             if exists["name"]:
-                from .extract_lifecycle import admit_record
+                from . import extract_lifecycle
                 from .knowledge import KnowledgeRepository
-                admit_record(KnowledgeRepository(self), record.payload)
+                lifecycle = KnowledgeRepository(self)
+                extract_lifecycle.admit_record(lifecycle, record.payload)
         columns = sql.SQL(", ").join(map(sql.Identifier, _RECORD_COLUMNS))
         updates = sql.SQL(", ").join(sql.SQL("{} = EXCLUDED.{}").format(
             sql.Identifier(c), sql.Identifier(c),
@@ -339,6 +341,8 @@ class PostgresCatalogRepository:
             actual = self.get(record.key)
             raise StaleWrite(record.key, expected_revision, actual.revision if actual else None)
         if changed:
+            if lifecycle is not None:
+                extract_lifecycle.record_selection_changed(lifecycle, current.payload if current else {}, record.payload)
             self._track_knowledge_requirement_change(record, expected_revision + 1)
             self._finish(record.key, audit)
         return bool(changed)

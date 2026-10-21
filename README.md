@@ -587,8 +587,13 @@ the monthly reboot drill. Worker rehearsals use disposable stores and `/tmp` roo
 Every registered extract starts **protected**. An operator may mark only its
 immutable markdown output disposable using a reason, nonce and exact retention
 revision. Eligibility begins **90 days after accepted supersession**, regardless of
-file age. Pre-P5c receipts start protected; historical superseded receipts start
-their conservative clock at migration and require a verified explicit vault binding.
+file age: the clock starts when the last extraction head or record selection ceases.
+Reselecting an older output cancels that clock; removing its last selection starts
+a new ninety-day interval. Record selections include physical path aliases.
+Pre-P5c receipts start protected. Their migration timestamp is provisional: first
+verified vault binding establishes a conservative clock from current selections,
+since earlier absolute-path and alias selections cannot be reconstructed without
+that root. An unselected historical output waits ninety days from that binding.
 Source inputs, receipts, current heads, selected records, live generations, queued
 jobs, reader pins and unresolved recovery/job pins remain protected. Reader pins
 expire within two hours; job/recovery pins require an explicit reviewed disposition.
@@ -645,6 +650,10 @@ its reservation and output.
 Unknown execution outcomes keep their reservation across restart until verified
 receipt recovery; unknown files are never automatically cleared. Completed external
 growth remains charged until a qualified census started after settlement covers it.
+Admission samples the census and counts reservations inside the same serialization
+boundary used by settlement. A controlled build pause settles the exact deferred
+attempt, including after restart, while keeping its partial output charged until
+a later census covers it. Recovery pins and uncertain cost records remain intact.
 Receipt recovery
 and publication of already sealed work remain available when new admission stops.
 
@@ -678,6 +687,9 @@ PostgreSQL fixture and small isolated filesystem roots. The recorded P5c rehears
 in [baseline evidence](docs/baselines.md) covers deletion retries, preserved source
 hashes, capacity refusal, isolated candidate publication and guarded promotion.
 Its metadata-only timings do not qualify full-text rebuilds or production RTO.
+The pre-existing P5b isolated recovery-replay caller constructs its scheduler without
+the runtime capacity gate. Its staging reservation does not establish P5c admission
+accounting for replay jobs; this remains a separate recovery-replay limitation.
 
 ## Releases
 

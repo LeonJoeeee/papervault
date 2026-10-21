@@ -17,9 +17,9 @@
       "sha256": "6906ef6a9a1415419f333f8590d8a06690a623458895a2791e647a7a6731f54e"
     },
     {
-      "byte_length": 860,
+      "byte_length": 666,
       "path": "fixture-disposition.json",
-      "sha256": "67c53bd64262b8ec98952d054cf96144d429f96ff2dc723b1c7e87399d801381"
+      "sha256": "a29cc0dc6cef1b88f8bc217fcb5438935a62d3d87364f65290781aa816b1ca68"
     },
     {
       "byte_length": 4916,
@@ -62,9 +62,9 @@
       "sha256": "90160ad8abbf89abfc42574a16669b9131514263b57f4a4c5d29bd896de507d0"
     },
     {
-      "byte_length": 7554,
+      "byte_length": 6273,
       "path": "validation.json",
-      "sha256": "a244630faf464bf5fee469ff5a980e48678d3cbc3db60427f20a7993e3affe87"
+      "sha256": "2304aa6fec20b98b3374e87edeb54bd83024d88d1dec05952b0056ddc79f4108"
     },
     {
       "byte_length": 390,

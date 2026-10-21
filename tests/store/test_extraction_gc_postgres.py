@@ -210,6 +210,9 @@ def test_catalog_record_reference_blocks_gc_and_late_reference_is_rejected(super
     assert "referenced" in row(api().plan_gc(k, vault), first)["reasons"]
     k.repository.upsert(Record.from_payload("B", {"key": "B", "title": "New selection"}),
         expected_revision=1, audit=AuditEvent("test", "advance"))
+    with pytest.raises(ClaimRejected, match="retention"):
+        api().collect_extract(k, vault, first["completion_id"], claim)
+    age(k, first)
     api().collect_extract(k, vault, first["completion_id"], claim)
     with pytest.raises(ClaimRejected, match="tombston"):
         k.repository.upsert(record, expected_revision=2, audit=AuditEvent("test", "late_reference"))
@@ -232,6 +235,9 @@ def test_record_aliases_protect_bytes_and_cannot_reenter_after_tombstone(superse
         api().collect_extract(k, vault, first["completion_id"], claim)
     k.repository.upsert(Record.from_payload("B", {"key": "B", "title": "New selection"}),
         expected_revision=1, audit=AuditEvent("test", "advance"))
+    with pytest.raises(ClaimRejected, match="retention"):
+        api().collect_extract(k, vault, first["completion_id"], claim)
+    age(k, first)
     api().collect_extract(k, vault, first["completion_id"], claim)
     with pytest.raises(ClaimRejected, match="tombston"):
         k.repository.upsert(record, expected_revision=2, audit=AuditEvent("test", "late_alias"))
@@ -416,16 +422,108 @@ def test_set_inventory_cannot_readmit_tombstoned_input(superseded):
             'generation_id': desired['generation_id'], 'expected_revision': 0})
 
 
-def test_reader_manifest_cannot_readmit_tombstoned_input(superseded):
+def test_excluded_historical_input_gc_does_not_block_valid_reader(superseded):
     k, first, _, vault, lease = ready(superseded)
     desired = consumer(k, first)
     command(k, 'create_generation', {'generation_id': 'active', 'candidate': False})
     command(k, 'set_requirement', {**desired, 'generation_id': 'active', 'excluded': True})
+    command(k, 'register_unit', {'unit_id': 'unrelated', 'kind': 'operator_document', 'identity': 'unrelated'})
+    command(k, 'register_input', {'unit_id': 'unrelated', 'consumed_input_revision': 'unrelated-input',
+        'manifest': {'metadata_revision': 'new', 'artifacts': [], 'upstream_derivation_ids': []}})
+    command(k, 'set_requirement', {**desired, 'unit_id': 'unrelated', 'generation_id': 'active',
+        'consumed_input_revision': 'unrelated-input'})
+    pointer = k.get_serving_manifest()
+    before = command(k, 'pin_manifest', {'owner': 'early-reader', 'generation_id': 'active',
+        'manifest_revision': pointer['manifest_revision'], 'expected_serving_revision': pointer['revision']})
+    assert before['pin_id']
     api().collect_extract(k, vault, first['completion_id'], lease)
     pointer = k.get_serving_manifest()
+    after = command(k, 'pin_manifest', {'owner': 'late-reader', 'generation_id': 'active',
+        'manifest_revision': pointer['manifest_revision'], 'expected_serving_revision': pointer['revision']})
+    assert after['pin_id'] != before['pin_id']
+    # Exclusion must not erase the permanent reference-admission fence.
     with pytest.raises(ClaimRejected, match='tombston'):
-        command(k, 'pin_manifest', {'owner': 'late-reader', 'generation_id': 'active',
-            'manifest_revision': pointer['manifest_revision'], 'expected_serving_revision': pointer['revision']})
+        command(k, 'set_requirement', {**desired, 'generation_id': 'active', 'expected_revision': 1})
+
+
+@pytest.mark.parametrize('selection', ['completion_id', 'relative_path', 'absolute_path', 'symlink'])
+def test_retention_starts_when_last_record_selection_ceases(extraction_catalog, tmp_path, selection):
+    k, vault = extraction_catalog, tmp_path
+    first = frozen(k, vault)
+    publish(k, first, vault)
+    output = first['output_inventory'][0]['path']
+    if selection == 'completion_id':
+        fields = {'extraction_completion_id': first['completion_id']}
+    elif selection == 'relative_path':
+        fields = {'md_path': output}
+    elif selection == 'absolute_path':
+        fields = {'md_path': str(vault / output)}
+    else:
+        alias = vault / 'selected.md'
+        alias.symlink_to(vault / output)
+        fields = {'md_path': str(alias)}
+
+    def select(key, value):
+        record = k.repository.get(key)
+        payload = dict(record.payload) if record else {'key': key, 'title': key}
+        for field in ('extraction_completion_id', 'md_path'):
+            payload.pop(field, None)
+        k.repository.upsert(Record.from_payload(key, {**payload, **value}),
+            expected_revision=record.revision if record else 0, audit=AuditEvent('test', 'selection'))
+
+    select('A', fields)
+    select('B', fields)
+    second = frozen(k, vault, previous=first['completion_id'])
+    publish(k, second, vault, expected_head_revision=1)
+    policy(k, first, vault)
+    assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] is None
+    select('A', {})
+    assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] is None
+    start = datetime.now(timezone.utc)
+    select('B', {})
+    retained = k._one('extract_retention', completion_id=first['completion_id'])
+    assert start <= retained['superseded_at'] <= datetime.now(timezone.utc)
+    assert 'retention' in row(api().plan_gc(k, vault), first)['reasons']
+    age(k, first)
+    assert row(api().plan_gc(k, vault), first)['eligible']
+    # Selecting an old output cancels its elapsed clock. A new removal starts over.
+    select('B', fields)
+    assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] is None
+    start = datetime.now(timezone.utc)
+    select('B', {})
+    assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] >= start
+    assert not row(api().plan_gc(k, vault), first)['eligible']
+    assert (vault / output).is_file()
+    assert (vault / second['output_inventory'][0]['path']).is_file()
+
+
+@pytest.mark.parametrize('alias', ['absolute', 'symlink'])
+@pytest.mark.parametrize('still_selected', [False, True])
+def test_first_vault_binding_establishes_conservative_migrated_selection_clock(superseded, alias, still_selected):
+    k, first, _, vault = superseded
+    # P5a migrations have no verified vault binding or reliable selection clock.
+    k.connection.execute(sql.SQL('UPDATE {} SET vault=NULL WHERE completion_id=%s').format(
+        k.repository._table('extract_retention')), (first['completion_id'],))
+    selected = vault / first['output_inventory'][0]['path']
+    if alias == 'symlink':
+        link = vault / 'selected.md'
+        link.symlink_to(selected)
+        selected = link
+    k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'Migrated selection',
+        'md_path': str(selected)}), expected_revision=0, audit=AuditEvent('test', 'migrated_selection'))
+    age(k, first)
+    start = datetime.now(timezone.utc)
+    if not still_selected:
+        k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'New selection'}),
+            expected_revision=1, audit=AuditEvent('test', 'advance'))
+    bound = policy(k, first, vault)
+    if still_selected:
+        assert bound['superseded_at'] is None
+        k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'New selection'}),
+            expected_revision=1, audit=AuditEvent('test', 'advance'))
+    assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] >= start
+    assert not row(api().plan_gc(k, vault), first)['eligible']
+    assert (vault / first['output_inventory'][0]['path']).is_file()
 
 
 def test_current_selection_protects_old_input_after_desired_input_advances(superseded):

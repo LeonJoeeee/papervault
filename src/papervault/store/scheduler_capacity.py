@@ -16,7 +16,7 @@ This is conservative admission accounting, not an exact on-disk guarantee.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 import fcntl
 import asyncio
@@ -111,6 +111,31 @@ class SchedulerCapacity:
         if plan.get("alert"):
             log.warning("derivative capacity 80%% alert: projected=%s soft_cap=%s held=%s",
                         plan["projected_bytes"], plan["soft_cap_bytes"], plan["reserved_bytes"])
+
+    @contextmanager
+    def _accounting(self):
+        """Serialize census + reservation inventory with settlement across workers.
+
+        Always acquire this before the physical inventory lock. Keep it only for
+        accounting, never across the caller's execution or asynchronous intake.
+        """
+        root_fd = _open_directory(self.root, create=True)
+        lock_fd = None
+        name = ".scheduler-accounting.lock"
+        try:
+            lock_fd = os.open(name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                              0o600, dir_fd=root_fd)
+            _regular(os.fstat(lock_fd))
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _check_binding(self.root, root_fd)
+            _verify_object(root_fd, name, lock_fd)
+            yield
+        except OSError as exc:
+            raise ValueError("capacity accounting serialization unavailable") from exc
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+            os.close(root_fd)
 
     def _usage(self, physical):
         try:
@@ -258,13 +283,15 @@ class SchedulerCapacity:
             return
         entered = False
         try:
-            extra, stamp, metadata_sample = self._usage(False)
-            self._reconcile_spent(stamp, metadata_sample=metadata_sample)
-            estimate = self.estimated_bytes() if callable(self.estimated_bytes) else self.estimated_bytes
-            _sizes(estimate, extra, self.soft_cap)
-            with reserve_capacity(self.root, "intake-" + uuid4().hex,
-                    estimated_bytes=estimate, derivative_roots=self.derivative_roots,
-                    extra_used_bytes=extra, soft_cap=self.soft_cap) as plan:
+            with ExitStack() as reservations:
+                with self._accounting():
+                    extra, stamp, metadata_sample = self._usage(False)
+                    self._reconcile_spent(stamp, metadata_sample=metadata_sample)
+                    estimate = self.estimated_bytes() if callable(self.estimated_bytes) else self.estimated_bytes
+                    _sizes(estimate, extra, self.soft_cap)
+                    plan = reservations.enter_context(reserve_capacity(self.root, "intake-" + uuid4().hex,
+                        estimated_bytes=estimate, derivative_roots=self.derivative_roots,
+                        extra_used_bytes=extra, soft_cap=self.soft_cap))
                 entered = True
                 self._report(plan)
                 token = _intake_scope.set((self, plan))
@@ -275,24 +302,35 @@ class SchedulerCapacity:
                     raise
                 finally:
                     _intake_scope.reset(token)
+                    with self._accounting():
+                        reservations.close()
         except Exception as exc:
             if entered:
                 raise
             raise CapacityAdmissionError("capacity admission unavailable for new intake") from exc
 
     def acquire(self, job_id: str, *, physical: bool = True, reuse: bool = True) -> dict:
+        with self._accounting():
+            return self._acquire(job_id, physical=physical, reuse=reuse)
+
+    def _acquire(self, job_id, *, physical, reuse):
         identity, filename, metadata = self._names(job_id)
         extra, stamp, metadata_sample = self._usage(physical)
         self._reconcile_spent(stamp, metadata_sample=metadata_sample)
         estimate = self.estimated_bytes() if callable(self.estimated_bytes) else self.estimated_bytes
         _sizes(estimate, extra, self.soft_cap)
         if job_id in self._held:
-            if not reuse:
-                raise ValueError("unreconciled scheduler capacity reservation prevents new admission")
             with self._record(job_id) as record:
-                if record is None or record[1]["state"] != "held":
+                if record is None:
+                    # Another worker may have reconciled our spent charge. Only
+                    # forget the cache; orphan/replacement files still block below.
+                    self._held.pop(job_id)
+                elif not reuse:
+                    raise ValueError("unreconciled scheduler capacity reservation prevents new admission")
+                elif record[1]["state"] != "held":
                     raise ValueError("unreconciled scheduler capacity reservation prevents execution")
-            return self._held[job_id][0]
+                else:
+                    return self._held[job_id][0]
         if (self.root / metadata).exists() or (self.root / filename).exists():
             raise ValueError("unreconciled scheduler capacity reservation requires receipt recovery")
         with reserve_capacity(self.root, identity, estimated_bytes=estimate,
@@ -350,6 +388,10 @@ class SchedulerCapacity:
         Physical settlement is retained until a qualified census begun after it;
         recovery never releases a replacement attempt's reservation by job alone.
         """
+        with self._accounting():
+            return self._release(job_id, claim=claim, reconciled=reconciled)
+
+    def _release(self, job_id, *, claim, reconciled):
         if job_id not in self._held and not reconciled:
             return False
         with self._record(job_id) as record:

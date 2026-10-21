@@ -8,7 +8,5 @@
   "image": "pgvector/pgvector:pg16",
   "ownership": "task-created issue284-labelled synthetic rehearsal fixture",
   "staging_root": "/tmp/papervault-284.9HQAzZ/rehearsal/final/source-root",
-  "staging_root_disposition": "disposable synthetic fixture; retained in task scratch for caller inspection",
-  "storage": "tmpfs /var/lib/postgresql/data; no live mounts",
-  "task_branch_and_worktree": "retained for orchestrator integration and teardown"
+  "storage": "tmpfs /var/lib/postgresql/data; no live mounts"
 }

@@ -462,6 +462,7 @@ class CatalogScheduler:
                 try:
                     self._command_once("defer_attempt", "defer:" + claim["attempt_id"], {**current,
                         "expected_revision": latest["revision"], "reason": {"kind": "BuildPausedError"}})
+                    self._release_capacity(claim["job_id"], summary, claim=current, reconciled=True)
                 except ClaimRejected:
                     self._discrepancy("pause_deferral_claim_rejected", claim)
                     summary["discrepancies"] += 1
@@ -614,6 +615,13 @@ class CatalogScheduler:
                 continue
             if self.capacity_gate is not None and not self._candidate_allowed(job):
                 continue
+            if job["state"] == "queued" and attempt and attempt["outcome"] == "deferred":
+                # Recover a crash between catalog deferral and capacity settlement.
+                # Partial bytes stay charged until a census begun after settlement;
+                # the exact old claim cannot release another attempt's reservation.
+                deferred = self._current_claim(job)
+                if deferred:
+                    self._release_capacity(job["job_id"], summary, claim=deferred, reconciled=True)
             if not self._reserve_job(job, summary, admission=True):
                 continue
             try:

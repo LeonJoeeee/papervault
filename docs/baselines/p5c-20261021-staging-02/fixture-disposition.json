@@ -1,0 +1,16 @@
+{
+  "command": "docker rm -f 9231ae8d722e44e30685831a25739c55576334ba9f0424d5925a6280331e49e8 cc2b0a5691eaba87cbcbb315550ae72c8fa25fed50d3046e4c579bcb640b9c61",
+  "container_id": "cc2b0a5691eaba87cbcbb315550ae72c8fa25fed50d3046e4c579bcb640b9c61",
+  "container_name": "papervault-p5c-284-final-ny0oHU",
+  "disposition": "removed after successful rehearsal and verified evidence copy",
+  "exit_code": 0,
+  "image": "pgvector/pgvector:pg16",
+  "image_id": "sha256:00ba258a66dac104fd5171074a0084462a64a1369d8513f3d0a634e2f24d15bc",
+  "labels": {
+    "papervault.fixture": "ny0oHU",
+    "papervault.issue": "284"
+  },
+  "source_material": "synthetic metadata and extraction fixtures",
+  "staging_root": "/tmp/p5c-continuation-ny0oHU/drill-final/source",
+  "storage": "tmpfs /var/lib/postgresql/data; no bind or volume mounts"
+}

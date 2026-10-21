@@ -353,22 +353,44 @@ identifies the disposable endpoint, schemas, package version and code hashes.
 The [verification log](baselines/p5c-20261021-staging-01/verification.log) and
 [artifact hashes](baselines/p5c-20261021-staging-01/hashes.json) retain the checked
 result independently of the disposable container and staging files.
-The [validation record](baselines/p5c-20261021-staging-01/validation.json) binds
+The initial [validation record](baselines/p5c-20261021-staging-01/validation.json) binds
 commands, exit codes and source hashes: **3,932 passed** in the full non-integration
 suite, **693 passed** in the dedicated PostgreSQL/store run, and Ruff passed.
 The suite retains two existing skips and excludes 167 integration cases; the
 broader store run skips four existing Neo4j cases without supplied endpoints.
 The [regression record](baselines/p5c-20261021-staging-01/regression-evidence.log)
 explains the repaired unit fixture, with its original assertions retained.
-Both [scoped reviews](baselines/p5c-20261021-staging-01/scoped-review.log) found no
+Both initial [scoped reviews](baselines/p5c-20261021-staging-01/scoped-review.log) found no
 remaining blockers. The task-owned container was removed after verification;
 [fixture disposition](baselines/p5c-20261021-staging-01/fixture-disposition.json)
 identifies the preserved evidence and disposable staging files.
 
+A [second rehearsal](baselines/p5c-20261021-staging-02/results.json) exercised the
+same protocol with serialized capacity accounting and selection-based retention
+clocks. The instrument took **1.296 s**, with **0.034 s** of GC window work and
+**0.348 s** for candidate rebuild/promotion, within each **120 s** window. Observed
+manifest-read interruption remained **0 s**, using the same sampling method.
+Its [environment](baselines/p5c-20261021-staging-02/environment.json),
+[actions](baselines/p5c-20261021-staging-02/actions.json),
+[GC](baselines/p5c-20261021-staging-02/gc.json) and
+[rebuild](baselines/p5c-20261021-staging-02/rebuild.json) records retain exact code
+hashes, refusals and preservation evidence independently of the removed fixture.
+The [regressions](baselines/p5c-20261021-staging-02/regression-evidence.log) show
+failing-first admission/settlement interleavings, deferred-job restart recovery,
+foreign reservation settlement, excluded-entry reader admission and last-selection
+retention, including initially unbound migrated vaults. The
+[scoped source review](baselines/p5c-20261021-staging-02/scoped-review.log) found no
+remaining critical or important findings; it did not provide an integration verdict.
+The second [validation record](baselines/p5c-20261021-staging-02/validation.json)
+binds the corrected code to **3,950 passed**, two skipped and 167 deselected in the
+non-integration suite, **703 passed** and four Neo4j skips in the dedicated
+PostgreSQL/store run, and a passing Ruff check. The four dependency deprecation
+warnings match the baseline. [Validation hashes](baselines/p5c-20261021-staging-02/validation-hashes.json)
+cover the retained evidence; the first rehearsal's measurements remain unchanged.
+
 This synthetic metadata rehearsal does not qualify full-text/graph/vector rebuild
-cost, production downtime, full-system RTO or host-failure recovery. The orchestrator
-owns production activation, the monthly reboot drill, current-main CI and the
-independent integration verdict. Defaults remain legacy.
+cost, production downtime, full-system RTO or host-failure recovery. Defaults remain
+legacy.
 
 ## Arbitration rules (how these numbers may change)
 

@@ -28,8 +28,7 @@ def published_extract(k, completion_id, vault, previous):
     if previous:
         old = k._one("extract_retention", completion_id=previous)
         require(old, "predecessor retention record missing; run the explicit migration")
-        k._update("extract_retention", {"superseded_at": now(k), "revision": old["revision"] + 1},
-            completion_id=previous)
+        _selection_clock(k, old)
 
 
 def admit_completion(k, completion_id):
@@ -91,9 +90,45 @@ def admit_record(k, payload):
         ("pdf_path", "md_path", "txt_path") if payload.get(field)]})
 
 
+def _selected_by_record(payload, completion_id, paths, vault):
+    return payload.get("extraction_completion_id") == completion_id or any(
+        paths.intersection(_locators({"path": payload.get(field)}, vault))
+        for field in ("pdf_path", "md_path", "txt_path"))
+
+
+def _selection_clock(k, retained):
+    """Start retention only after the last head/record selection has ceased."""
+    identity = retained["completion_id"]
+    output = k.get_extraction_receipt(identity)["receipt"]["output_inventory"][0]
+    paths = _locators(output, retained["vault"])
+    selected = k._one("extraction_heads", completion_id=identity) or any(
+        _selected_by_record(record.payload, identity, paths, retained["vault"])
+        for record in k.repository.all())
+    stamp = None if selected else now(k)
+    if stamp != retained["superseded_at"]:
+        k._update("extract_retention", {"superseded_at": stamp, "revision": retained["revision"] + 1},
+                  completion_id=identity)
+
+
+def record_selection_changed(k, before, after):
+    """Track selection transitions in the same writer transaction as record IO."""
+    fields = ("extraction_completion_id", "pdf_path", "md_path", "txt_path")
+    if all(before.get(field) == after.get(field) for field in fields):
+        return
+    for retained in k._rows("extract_retention"):
+        identity = retained["completion_id"]
+        output = k.get_extraction_receipt(identity)["receipt"]["output_inventory"][0]
+        paths = _locators(output, retained["vault"])
+        was_selected = _selected_by_record(before, identity, paths, retained["vault"])
+        is_selected = _selected_by_record(after, identity, paths, retained["vault"])
+        if was_selected != is_selected:
+            _selection_clock(k, retained)
+
+
 def manifest_inputs(k, manifest):
     """Include inherited selected receipts, even when desired entries changed."""
-    revisions = {entry["consumed_input_revision"] for entry in manifest.get("entries", [])}
+    revisions = {entry["consumed_input_revision"] for entry in manifest.get("entries", [])
+                 if not entry.get("excluded")}
     revisions.update(inventory["parent_consumed_input_revision"] for inventory in
         manifest.get("expected_inventories", {}).values() if inventory.get("parent_consumed_input_revision"))
     for entry in manifest.get("entries", []):
@@ -208,8 +243,14 @@ def dispatch_lifecycle(k, action, p):
         vault = str(checked_path(Path(p["vault"])))
         require(old["vault"] in {None, vault}, "extract vault differs from publication")
         ExtractionStore(vault).verify(k.get_extraction_receipt(p["completion_id"])["receipt"])
-        return k._update("extract_retention", {"disposable": p["disposable"], "vault": vault,
+        retained = k._update("extract_retention", {"disposable": p["disposable"], "vault": vault,
             "revision": old["revision"] + 1}, completion_id=p["completion_id"])
+        if old["vault"] is None:
+            # Migration cannot reconstruct past absolute-path/alias selections
+            # without a verified root. First binding starts a conservative clock.
+            _selection_clock(k, retained)
+            return k._one("extract_retention", completion_id=p["completion_id"])
+        return retained
 
     if action == "acquire_maintenance_lease":
         require(p.get("resource") in {"extract_gc", "rebuild"} and p.get("owner"), "invalid maintenance lease owner/resource")

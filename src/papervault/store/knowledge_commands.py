@@ -437,10 +437,12 @@ def dispatch(k, action, operation_id, p):
 
     if action == "create_generation":
         candidate = p.get("candidate", True)
+        require(type(p.get("sample", False)) is bool, "generation sample marker must be boolean")
         if not candidate:
             require(not k._rows("generations", state="active"), "active generation already exists; use promotion")
         immutable(k, "generations", {"generation_id": p["generation_id"]},
-            {"state": "candidate" if candidate else "active", "requirements_revision": state(k)["requirements_revision"]})
+            {"state": "candidate" if candidate else "active", "requirements_revision": state(k)["requirements_revision"],
+             "sample": p.get("sample", False)})
         if not k.get_generation(p["generation_id"])["manifest_revision"]:
             snapshot(k, p["generation_id"])
         return k.get_generation(p["generation_id"])
@@ -453,7 +455,7 @@ def dispatch(k, action, operation_id, p):
         require(not k.get_generation(p["generation_id"]), "fork requires a fresh generation")
         k._insert("generations", {"generation_id": p["generation_id"], "state": "candidate",
             "requirements_revision": runtime["requirements_revision"], "source_generation_id": source["generation_id"],
-            "source_manifest_revision": source["manifest_revision"]})
+            "source_manifest_revision": source["manifest_revision"], "sample": source.get("sample", False)})
         k.connection.execute(sql.SQL("INSERT INTO {}(unit_id,generation_id,consumed_input_revision,recipe_digest,"
             "record_revision,inventory_revision,invalidated,excluded,enqueue_mode) SELECT unit_id,%s,consumed_input_revision,recipe_digest,"
             "record_revision,inventory_revision,invalidated,excluded,enqueue_mode FROM {} WHERE generation_id=%s").format(
@@ -902,6 +904,7 @@ def dispatch(k, action, operation_id, p):
         require(type(observation_age) in {int, float} and math.isfinite(observation_age) and 0 <= observation_age <= 300,
                 "promotion observation age must be finite and at most 300 seconds")
         generation = require(k.get_generation(p["generation_id"]), "generation missing")
+        require(not generation.get("sample"), "sample generations cannot be promoted")
         runtime = state(k)
         require(generation["state"] == "candidate", "only candidate can promote")
         require(p["expected_manifest_revision"] == generation["manifest_revision"] and

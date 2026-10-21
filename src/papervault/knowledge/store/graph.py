@@ -163,6 +163,54 @@ async def build_catalog_graph(repository, claim, *, working_dir=None, read_only=
 
 
 async def _initialize_graph(*, namespace=None, working_dir=None, read_only=False):
+    from papervault.store.fencing import writer_lease
+
+    root = Path(working_dir or CONFIG.lightrag.working_dir)
+    lease = writer_lease(root, None)
+    try:
+        rag = await _construct_graph(namespace=namespace, working_dir=str(root), read_only=read_only)
+    except BaseException:
+        lease.close()
+        raise
+    original_finalize = rag.finalize_storages
+    failures = set()
+    guarded = {}
+
+    async def finalize():
+        # LightRAG logs and swallows individual finalizer exceptions. Observe
+        # them at the storage boundary before allowing a coordinated snapshot.
+        for name in ("full_docs", "text_chunks", "full_entities", "full_relations", "entity_chunks",
+                     "relation_chunks", "entities_vdb", "relationships_vdb", "chunks_vdb",
+                     "chunk_entity_relation_graph", "llm_response_cache", "doc_status"):
+            storage = getattr(rag, name, None)
+            if storage is None or name in guarded:
+                continue
+            original = storage.finalize
+
+            async def checked_finalize(original=original, name=name):
+                try:
+                    await original()
+                except BaseException:
+                    failures.add(name)
+                    raise
+
+            storage.finalize = checked_finalize
+            guarded[name] = storage
+        await original_finalize()
+        for name, storage in guarded.items():
+            if getattr(storage, "_pending_vector_docs", None) or getattr(storage, "_pending_vector_deletes", None):
+                failures.add(name)
+        if failures:
+            # Upstream marks failed stores finalized, so subsequent calls must
+            # also fail closed. Process drain/operator recovery is required.
+            raise RuntimeError("storage finalization failed or left pending writes: " + ", ".join(sorted(failures)))
+        lease.close()
+
+    rag.finalize_storages = finalize
+    return rag
+
+
+async def _construct_graph(*, namespace=None, working_dir=None, read_only=False):
     if namespace is None:
         assert_safe_workspace()  # Legacy environment-based guard.
 
@@ -253,4 +301,6 @@ async def _initialize_graph(*, namespace=None, working_dir=None, read_only=False
 
 async def close_graph() -> None:
     global _RAG
+    if _RAG is not None:
+        await _RAG.finalize_storages()
     _RAG = None

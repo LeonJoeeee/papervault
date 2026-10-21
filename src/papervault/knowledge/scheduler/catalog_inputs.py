@@ -20,6 +20,12 @@ class ImmutableInputStore:
         self.root.mkdir(parents=True, exist_ok=True)
 
     def capture(self, data: bytes, *, role: str) -> dict:
+        from papervault.store.fencing import writer_lease
+
+        with writer_lease(self.root.parent, None):
+            return self._capture(data, role=role)
+
+    def _capture(self, data: bytes, *, role: str) -> dict:
         if not isinstance(data, bytes) or not role:
             raise ValueError("captured input requires bytes and a role")
         digest = hashlib.sha256(data).hexdigest()

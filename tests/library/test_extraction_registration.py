@@ -32,6 +32,165 @@ def completions(library):
         library.root.glob("extracts/versions/*/completion.json"))]
 
 
+def missing_arxiv_firecrawl(library, paper, monkeypatch, *, persist_before_capture):
+    """Real preflight/queue/gates; only the source responses are replaced."""
+    from types import SimpleNamespace
+    from papervault.library import download
+    from papervault.library.download_sources import arxiv, firecrawl
+    from papervault.store.extraction import ExtractionStore
+
+    library.pdf_path(paper.key).unlink(missing_ok=True)
+    paper.pdf_path = None
+    paper.doi, paper.arxiv_id = "10.1234/corrected", "2601.99999"
+    library.save(force=True, durable=True)
+    library._save_min_interval = 3600  # Capture must bypass an ordinary queue save's debounce.
+    # Exercise the real not_found branch and real PDF miss before Firecrawl.
+    monkeypatch.setattr(download, "_STRATEGIES", [("arxiv", download._try_arxiv)])
+    monkeypatch.setattr(arxiv, "_lookup_arxiv_record", lambda identifier: arxiv._ArxivRecord(
+        requested_id=identifier, status="not_found", reason="base_record_not_found"))
+    monkeypatch.setenv("FIRECRAWL_API_URL", "http://127.0.0.1:3002")
+    body = "# Measured evidence\n" + "The measured value is forty-two. " * 80
+
+    def response(url, **kwargs):
+        assert paper.arxiv_id == "" and paper.doi == "10.1234/corrected"
+        assert kwargs["json"]["url"] == "https://doi.org/10.1234/corrected"
+        if persist_before_capture:
+            library.save(force=True, durable=True)
+        return SimpleNamespace(ok=True, json=lambda: {"success": True, "data": {"markdown": body}})
+
+    monkeypatch.setattr(firecrawl.requests, "post", response)
+    capture = ExtractionStore.capture
+    observed = []
+
+    def observe_capture(store, **kwargs):
+        request = capture(store, **kwargs)
+        if library._catalog_backend:
+            with library._catalog_backend._repository() as repo:
+                record = repo.get(paper.key)
+            persisted, revision = record.payload, record.revision
+        else:
+            persisted = json.loads(library.index_path.read_bytes())["papers"][paper.key]
+            revision = None
+        observed.append((request, persisted, revision))
+        return request
+
+    monkeypatch.setattr(ExtractionStore, "capture", observe_capture)
+    return observed
+
+
+@pytest.mark.parametrize("persist_before_capture", [False, True])
+@pytest.mark.parametrize("interrupt_delivery", [False, True])
+async def test_corrected_download_identity_survives_json_capture_and_restart(
+        extraction, monkeypatch, persist_before_capture, interrupt_delivery):
+    from papervault.library.services import extraction_registration as registration
+    from papervault.library.services.download_queue import DownloadQueue
+    from papervault.store.extraction import ExtractionStore
+
+    library, paper = extraction
+    observed = missing_arxiv_firecrawl(library, paper, monkeypatch,
+                                      persist_before_capture=persist_before_capture)
+    delivered = []
+    queue = DownloadQueue(library, on_success=delivered.append)
+    original = registration.deliver_completion
+
+    def crash(*args, **kwargs):
+        raise ConnectionError("stopped after durable output")
+
+    if interrupt_delivery:
+        monkeypatch.setattr(registration, "deliver_completion", crash)
+        with pytest.raises(ConnectionError, match="stopped after durable output"):
+            await queue._process_one_inner(paper.key, 0)
+        assert not delivered and paper.extraction_completion_id is None
+    else:
+        await queue._process_one_inner(paper.key, 0)
+        assert delivered == [paper.key]
+    completion, = list(ExtractionStore(library.root).completions())
+    request, persisted, revision = observed[0]
+    # The corrected state must already be durable even if no queue save runs.
+    assert persisted["arxiv_id"] == ""
+    assert request["source_catalog_revision"] == revision is None
+    assert completion["unit_evidence"]["identity"]["arxiv_id"] == ""
+    assert completion["authority_epoch"] is None
+    library.save(force=True, durable=True)  # A later queue/flush save is harmless.
+    library.close()
+    monkeypatch.setattr(registration, "deliver_completion", original)
+    restarted = Library(library.root, authority="json")
+    try:
+        before = restarted.manifest_path.read_text()
+        assert registration.recover_completions(restarted) == {
+            "recovered": int(interrupt_delivery), "blocked": []}
+        assert registration.recover_completions(restarted) == {"recovered": 0, "blocked": []}
+        assert restarted.get(paper.key).extraction_completion_id == completion["completion_id"]
+        assert ExtractionStore(library.root).completion(completion["completion_id"]) == completion
+        assert restarted.manifest_path.read_text() == before
+        assert restarted.get(paper.key).extract_attempts == 0
+    finally:
+        restarted.close()
+
+
+def test_json_capture_serializes_snapshot_with_index_rotation(extraction, monkeypatch):
+    from pathlib import Path
+    from threading import Event, Thread, current_thread
+    from filelock import FileLock
+    from papervault.library import store as library_store
+    from papervault.library.services.extraction_registration import begin_extraction
+
+    library, paper = extraction
+    rotated, release_writer, reading_snapshot = Event(), Event(), Event()
+    save, atomic_write = library.save, library_store._atomic_write
+    read_bytes, acquire = Path.read_bytes, FileLock.acquire
+    errors = []
+
+    def concurrent_save():
+        try:
+            save(force=True, durable=True)
+        except Exception as exc:
+            errors.append(exc)
+
+    writer = Thread(target=concurrent_save, daemon=True)
+
+    def pause_replacement(path, *args, **kwargs):
+        if current_thread() is writer and path == library.index_path:
+            assert not path.exists(), "the real writer has rotated index.json to its backup"
+            rotated.set()
+            assert release_writer.wait(5)
+        return atomic_write(path, *args, **kwargs)
+
+    def save_before_rotation(**kwargs):
+        save(**kwargs)
+        writer.start()
+        assert rotated.wait(5)
+        reading_snapshot.set()
+
+    def snapshot_lock(lock, *args, **kwargs):
+        if current_thread() is not writer and reading_snapshot.is_set():
+            release_writer.set()
+        return acquire(lock, *args, **kwargs)
+
+    def snapshot_read(path):
+        try:
+            return read_bytes(path)
+        finally:
+            if path == library.index_path and reading_snapshot.is_set():
+                # Without the writer lock this read sees the actual missing index;
+                # release the writer afterward so a failed regression leaves no thread.
+                release_writer.set()
+
+    monkeypatch.setattr(library_store, "_atomic_write", pause_replacement)
+    monkeypatch.setattr(library, "save", save_before_rotation)
+    monkeypatch.setattr(FileLock, "acquire", snapshot_lock)
+    monkeypatch.setattr(Path, "read_bytes", snapshot_read)
+    try:
+        request = begin_extraction(paper, library, b"%PDF input")
+        assert request["unit_evidence"]["identity"]["key"] == paper.key
+        assert request["source_catalog_revision"] is None
+    finally:
+        release_writer.set()
+        if writer.ident is not None:
+            writer.join(timeout=5)
+        assert not writer.is_alive() and not errors
+
+
 def test_legacy_success_retains_exact_pending_evidence(extraction):
     library, paper = extraction
     output = asyncio.run(extract.extract_md(paper, library))

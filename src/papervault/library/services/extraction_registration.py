@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 from contextlib import nullcontext
 from importlib.metadata import PackageNotFoundError, version
@@ -81,37 +82,58 @@ def effective_recipe(engine: str, *, request=None, llm=None) -> dict:
 
 def begin_extraction(paper, library, source: bytes, *, engine="mineru2.5-pro",
                      source_role="pdf", request=None, llm=None):
+    from ..models import Paper
+
     authority_library = getattr(library, "_extraction_live", library)
     backend = authority_library._catalog_backend
-    record = backend.persisted.get(paper.key) if backend else None
-    authority = _authority(authority_library)
-    previous = paper.extraction_completion_id
-    alias = library.md_path(paper.key)
-    guard = {"previous_completion_id": previous,
-             "previous_output_sha256": hashlib.sha256(alias.read_bytes()).hexdigest() if alias.is_file() else None,
-             "identity": paper.model_dump(mode="json", include=_IDENTITY_FIELDS)}
-    if authority["authority"] == "catalog":
-        from papervault.store.knowledge import KnowledgeRepository
-        with backend._repository() as repository:
-            knowledge = KnowledgeRepository(repository)
-            unit = knowledge.get_unit_for_record(paper.key)
-            head = knowledge.get_extraction_head(unit["unit_id"]) if unit else None
-        # Merge adoption can select another unit's output without changing this
-        # unit's catalog head. Capture both predecessors, including absent heads.
-        guard["catalog_previous_completion_id"] = head["completion_id"] if head else None
-    # A staged verified blank fill belongs to the consumed metadata. The unit
-    # remains the existing live catalog identity until guarded writeback adopts it.
-    unit_paper = authority_library.get(paper.key) if authority_library is not library else paper
-    captured = ExtractionStore(library.root).capture(
-        record_key=paper.key, metadata=paper.model_dump(mode="json"), source=source,
-        source_role=source_role, recipe=effective_recipe(engine, request=request, llm=llm), guard=guard,
-        unit_evidence={"kind": "paper", "record_key": paper.key,
-                       "identity": unit_paper.model_dump(mode="json", include=_IDENTITY_FIELDS)},
-        source_catalog_revision=record.revision if record else None,
-        authority_epoch=authority["authority_epoch"] if authority["authority"] == "catalog" else None)
-    if authority_library is not library:
-        captured["staged_claim"] = paper.reopen_claim.model_dump(mode="json")
-    return captured
+    with _write_lock(authority_library):
+        authority = _authority(authority_library)
+        if authority_library is library:
+            # Acquisition can correct identity before its queue's final save.
+            # Commit that state before binding evidence to a catalog revision;
+            # the same durable boundary makes JSON crash recovery coherent.
+            library.save(force=True, durable=True)
+        record = backend.persisted.get(paper.key) if backend else None
+        if backend:
+            if record is None:
+                raise StaleExtraction("extraction record is not persisted before capture")
+            unit_paper = Paper.model_validate(record.payload)
+        else:
+            # JSON saves rotate the primary before replacing it. Read under the
+            # same writer lock, after save() has released its own lock instance.
+            with FileLock(str(authority_library.root / ".write.lock"), timeout=30):
+                unit_paper = Paper.model_validate(json.loads(
+                    authority_library.index_path.read_bytes())["papers"][paper.key])
+        identity = unit_paper.model_dump(mode="json", include=_IDENTITY_FIELDS)
+        # Detach all captured values from the mutable queue object. A mutation
+        # during save cannot pair a newer identity with the acknowledged revision.
+        paper = paper.model_copy(deep=True)
+        if authority_library is library and paper.model_dump(mode="json", include=_IDENTITY_FIELDS) != identity:
+            raise StaleExtraction("extraction identity changed across capture persistence")
+        alias = library.md_path(paper.key)
+        guard = {"previous_completion_id": paper.extraction_completion_id,
+                 "previous_output_sha256": hashlib.sha256(alias.read_bytes()).hexdigest() if alias.is_file() else None,
+                 "identity": paper.model_dump(mode="json", include=_IDENTITY_FIELDS)}
+        if authority["authority"] == "catalog":
+            from papervault.store.knowledge import KnowledgeRepository
+            with backend._repository() as repository:
+                knowledge = KnowledgeRepository(repository)
+                unit = knowledge.get_unit_for_record(paper.key)
+                head = knowledge.get_extraction_head(unit["unit_id"]) if unit else None
+            # Merge adoption can select another unit's output without changing this
+            # unit's catalog head. Capture both predecessors, including absent heads.
+            guard["catalog_previous_completion_id"] = head["completion_id"] if head else None
+        # Staged verified fills remain an explicit transition: consumed metadata
+        # can differ from the persisted unit until guarded writeback accepts it.
+        captured = ExtractionStore(library.root).capture(
+            record_key=paper.key, metadata=paper.model_dump(mode="json"), source=source,
+            source_role=source_role, recipe=effective_recipe(engine, request=request, llm=llm), guard=guard,
+            unit_evidence={"kind": "paper", "record_key": paper.key, "identity": identity},
+            source_catalog_revision=record.revision if record else None,
+            authority_epoch=authority["authority_epoch"] if authority["authority"] == "catalog" else None)
+        if authority_library is not library:
+            captured["staged_claim"] = paper.reopen_claim.model_dump(mode="json")
+        return captured
 
 
 def _check_current(library, paper, completion, *, registered_head=False):

@@ -89,8 +89,12 @@ class CatalogService:
                         continue
                     if kind == "extraction_completed" and row["payload"].get("extraction_completion_id") != payload["completion_id"]:
                         head = repo.get_extraction_head(payload["unit_id"])
-                        if head and head["completion_id"] == payload["completion_id"]:
+                        origin = repo.get_unit(payload["unit_id"])
+                        if (head and head["completion_id"] == payload["completion_id"]
+                                and origin["record_key"] == record_key):
                             continue  # Registration committed; Library projection/save has not.
+                        # An aliased origin's head is historical. Once its canonical
+                        # destination selects another output, no origin projection is due.
                         self._command("acknowledge_outbox", {"outbox_id": event["outbox_id"]},
                                       operation_id="ack:" + event["outbox_id"])
                         recovered += 1  # A newer completion superseded this input; history stays.

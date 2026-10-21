@@ -269,6 +269,139 @@ def test_catalog_runtime_commits_before_success(extraction_catalog, tmp_path, mo
         library.close()
 
 
+@pytest.mark.parametrize("authority", ["legacy", "catalog"])
+@pytest.mark.parametrize("persist_before_capture", [False, True])
+@pytest.mark.parametrize("interrupt_delivery", [False, True])
+async def test_corrected_download_identity_registers_and_recovers(
+        extraction_catalog, tmp_path, monkeypatch, catalog_test_dsn,
+        authority, persist_before_capture, interrupt_delivery):
+    from papervault.library import Library
+    from papervault.library.services import extraction_registration as registration
+    from papervault.library.services.download_queue import DownloadQueue
+    from tests.library.test_extraction_registration import missing_arxiv_firecrawl
+
+    k = extraction_catalog
+    library, paper = runtime_library(k, tmp_path, monkeypatch, catalog_test_dsn)
+    if authority == "legacy":
+        k.connection.execute(sql.SQL("UPDATE {} SET authority='legacy'").format(
+            k.repository._table("knowledge_runtime")))
+        monkeypatch.delenv("PAPERVAULT_KNOWLEDGE_JOBS")
+    original = registration.deliver_completion
+    observed = missing_arxiv_firecrawl(library, paper, monkeypatch,
+                                      persist_before_capture=persist_before_capture)
+    initial_revision = k.repository.get("A").revision
+    delivered = []
+    queue = DownloadQueue(library, on_success=delivered.append)
+
+    def crash(*args, **kwargs):
+        raise ConnectionError("stopped after durable output")
+
+    try:
+        if interrupt_delivery:
+            monkeypatch.setattr(registration, "deliver_completion", crash)
+            with pytest.raises(ConnectionError, match="stopped after durable output"):
+                await queue._process_one_inner("A", 0)
+            assert not delivered and paper.extraction_completion_id is None
+        else:
+            await queue._process_one_inner("A", 0)
+            assert delivered == ["A"]
+        completion, = list(ExtractionStore(tmp_path).completions())
+        request, persisted, revision = observed[0]
+        assert persisted["arxiv_id"] == "" and persisted["doi"] == "10.1234/corrected"
+        assert request["source_catalog_revision"] == revision > initial_revision
+        assert request["unit_evidence"]["identity"]["arxiv_id"] == ""
+        assert completion["authority_epoch"] == (1 if authority == "catalog" else None)
+        assert count(k, "derivations") == int(authority == "catalog" and not interrupt_delivery)
+        # Registration failure cannot leave the identity correction for this save.
+        library.save(force=True, durable=True)
+        if interrupt_delivery:
+            assert k.repository.get("A").revision == revision
+    finally:
+        library.close()
+    monkeypatch.setattr(registration, "deliver_completion", original)
+    if authority == "legacy":
+        k.connection.execute(sql.SQL("UPDATE {} SET authority='catalog'").format(
+            k.repository._table("knowledge_runtime")))
+        monkeypatch.setenv("PAPERVAULT_KNOWLEDGE_JOBS", "postgres")
+    restarted = Library(tmp_path, authority="postgres")
+    try:
+        before = restarted.manifest_path.read_text()
+        assert registration.recover_completions(restarted) == {
+            "recovered": int(interrupt_delivery), "blocked": []}
+        restarted.save(force=True, durable=True)
+        assert registration.recover_completions(restarted) == {"recovered": 0, "blocked": []}
+        assert k.get_extraction_receipt(completion["completion_id"])["receipt"] == completion
+        assert ExtractionStore(tmp_path).completion(completion["completion_id"]) == completion
+        assert count(k, "derivations") == count(k, "extraction_receipts") == 1
+        assert len(k.list_outbox(kind="extraction_completed")) == 1
+        assert count(k, "knowledge_attempts") == count(k, "knowledge_attempt_events") == 0
+        assert restarted.get("A").extract_attempts == 0
+        assert restarted.manifest_path.read_text() == before
+    finally:
+        restarted.close()
+
+
+def test_capture_refuses_identity_changed_during_save(
+        extraction_catalog, tmp_path, monkeypatch, catalog_test_dsn):
+    from papervault.library.services.extraction_registration import begin_extraction, StaleExtraction
+
+    library, paper = runtime_library(extraction_catalog, tmp_path, monkeypatch, catalog_test_dsn)
+    original = library._catalog_backend.save
+
+    def concurrent_change(papers):
+        original(papers)
+        paper.doi = "10.1234/concurrent"
+
+    monkeypatch.setattr(library._catalog_backend, "save", concurrent_change)
+    try:
+        with pytest.raises(StaleExtraction, match="identity.*capture"):
+            begin_extraction(paper, library, b"%PDF input")
+        assert not (tmp_path / "extracts" / "inputs").exists()
+    finally:
+        library.close()
+
+
+def test_capture_waiting_for_catalog_does_not_block_registration_identity_lock(
+        extraction_catalog, tmp_path, monkeypatch, catalog_test_dsn):
+    from threading import Event, Thread, current_thread
+    from papervault.library.services.extraction_registration import begin_extraction
+
+    library, paper = runtime_library(extraction_catalog, tmp_path, monkeypatch, catalog_test_dsn)
+    waiting = Event()
+    result, errors = [], []
+    save_lock = library._catalog_save_lock
+    acquire = save_lock.acquire
+
+    def observe_acquire(*args, **kwargs):
+        if current_thread() is worker:
+            waiting.set()
+        return acquire(*args, **kwargs)
+
+    def capture():
+        try:
+            result.append(begin_extraction(paper, library, b"%PDF input"))
+        except Exception as exc:
+            errors.append(exc)
+
+    worker = Thread(target=capture, daemon=True)
+    monkeypatch.setattr(save_lock, "acquire", observe_acquire)
+    try:
+        # RegistrationService owns the catalog lock before Library.find takes
+        # the identity lock. Capture must not hold the latter while waiting.
+        with save_lock:
+            worker.start()
+            assert waiting.wait(5)
+            acquired = library._merge_execution_lock.acquire(timeout=1)
+            if acquired:
+                library._merge_execution_lock.release()
+        worker.join(timeout=5)
+        assert not worker.is_alive()
+        assert acquired, "capture and registration acquire their locks in opposite orders"
+        assert not errors and len(result) == 1
+    finally:
+        library.close()
+
+
 def test_catalog_failure_withholds_success_and_recovers_lost_reply(
         extraction_catalog, tmp_path, monkeypatch, catalog_test_dsn):
     import asyncio
@@ -377,7 +510,8 @@ def test_intake_registers_pending_and_delivers_exact_lineage_once(extraction_cat
 
 
 @pytest.mark.parametrize("pending", [False, True])
-def test_merged_extraction_keeps_origin_lineage(extraction_catalog, tmp_path, pending):
+@pytest.mark.parametrize("replace_adopted", [False, True])
+def test_merged_extraction_keeps_origin_lineage(extraction_catalog, tmp_path, pending, replace_adopted):
     from papervault.knowledge.scheduler.catalog_inputs import ImmutableInputStore
     from papervault.knowledge.scheduler.catalog_intake import CatalogIntake
     from papervault.knowledge.scheduler.catalog_service import CatalogService
@@ -405,10 +539,31 @@ def test_merged_extraction_keeps_origin_lineage(extraction_catalog, tmp_path, pe
     assert receipt["receipt"]["record_key"] == "A"
     assert receipt["unit_id"] != unit["unit_id"]
     assert manifest["upstream_derivation_ids"] == ["extraction-derivation:" + completion["completion_id"]]
+    if replace_adopted:
+        from papervault.store.extraction import register_completion
+
+        row = k.repository.get("B")
+        store = ExtractionStore(tmp_path)
+        request = store.capture(record_key="B", metadata=row.payload, source=b"fresh provider response",
+            source_role="provider_markdown", recipe=completion["recipe"],
+            guard={"identity": {"key": "B", "title": "Canonical paper"},
+                   "previous_completion_id": completion["completion_id"], "catalog_previous_completion_id": None},
+            unit_evidence={"kind": "paper", "record_key": "B", "identity": {"key": "B", "title": "Canonical paper"}},
+            source_catalog_revision=row.revision, authority_epoch=1)
+        fresh = store.finalize(request, b"# New canonical output")
+        register_completion(k, tmp_path, fresh)
+        k.repository.upsert(Record.from_payload("B", {**row.payload,
+            "extraction_completion_id": fresh["completion_id"], "md_path": fresh["output_inventory"][0]["path"]}),
+            expected_revision=row.revision, audit=AuditEvent("test", "select_fresh"))
+        assert k.get_extraction_head(receipt["unit_id"])["completion_id"] == completion["completion_id"]
     service = CatalogService(k, intake, None)
     service.recover_intake()
     assert not k.list_outbox(kind="extraction_completed")
-    assert len(k.list_jobs()) == 1
+    assert len(k.list_jobs()) == 1 + int(replace_adopted)
+    if replace_adopted:
+        requirement = k.get_requirement(unit["unit_id"], "active")
+        selected = k.get_input(requirement["consumed_input_revision"])["manifest"]
+        assert selected["upstream_derivation_ids"] == ["extraction-derivation:" + fresh["completion_id"]]
     assert count(k, "knowledge_attempts") == 0
 
 

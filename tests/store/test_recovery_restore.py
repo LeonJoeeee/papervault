@@ -218,3 +218,67 @@ def test_completed_restore_revalidates_catalog(package, target_catalog, tmp_path
     with pytest.raises(ValueError, match="catalog"):
         module.restore_recovery_set(path, target, target_generation="restored", catalog_connection=connection,
                                    catalog_schema=schema, apply=True)
+
+
+@pytest.mark.parametrize("damage", ["missing", "added", "definition"])
+def test_completed_restore_revalidates_installed_catalog_indexes(package, target_catalog, tmp_path, damage):
+    module = restore_module()
+    path, _ = package
+    connection, schema = target_catalog
+    options = {"target_generation": "restored", "catalog_connection": connection,
+               "catalog_schema": schema, "apply": True}
+    target = tmp_path / "target"
+    receipt = module.restore_recovery_set(path, target, **options)
+    assert module.restore_recovery_set(path, target, **options) == receipt
+    if damage in {"missing", "definition"}:
+        connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(schema, "records_status_idx")))
+    if damage in {"added", "definition"}:
+        name = "extra_index" if damage == "added" else "records_status_idx"
+        connection.execute(sql.SQL("CREATE INDEX {} ON {} (title)").format(
+            sql.Identifier(name), sql.Identifier(schema, "records")))
+    with pytest.raises(ValueError, match="catalog index"):
+        module.restore_recovery_set(path, target, **options)
+
+
+@pytest.mark.parametrize("damage", ["candidate", "new_manifest", "new_record"])
+def test_completed_restore_revalidates_new_catalog_rows(package, target_catalog, tmp_path, damage):
+    module = restore_module()
+    path, _ = package
+    connection, schema = target_catalog
+    options = {"target_generation": "restored", "catalog_connection": connection,
+               "catalog_schema": schema, "apply": True}
+    target = tmp_path / "target"
+    module.restore_recovery_set(path, target, **options)
+    if damage == "candidate":
+        connection.execute(sql.SQL("UPDATE {} SET state='retired' WHERE generation_id='restored'").format(
+            sql.Identifier(schema, "generations")))
+    elif damage == "new_manifest":
+        table = sql.Identifier(schema, "generation_manifests")
+        connection.execute(sql.SQL("INSERT INTO {} SELECT generation_id,manifest_revision+1,"
+            "requirements_revision,manifest,created_at FROM {} WHERE generation_id='restored'").format(table, table))
+    else:
+        connection.execute(sql.SQL("INSERT INTO {} (key,download_status,payload_version,payload) "
+            "VALUES ('unaccounted','pending',1,'{{\"key\":\"unaccounted\"}}')").format(sql.Identifier(schema, "records")))
+    with pytest.raises(ValueError, match="catalog"):
+        module.restore_recovery_set(path, target, **options)
+
+
+def test_interrupted_restore_rejects_rows_added_before_candidate(package, target_catalog, tmp_path, monkeypatch):
+    module = restore_module()
+    path, _ = package
+    connection, schema = target_catalog
+    options = {"target_generation": "restored", "catalog_connection": connection,
+               "catalog_schema": schema, "apply": True}
+    original = module._restore_candidate
+
+    def interrupt(*args):
+        raise OSError("interrupted before candidate")
+
+    monkeypatch.setattr(module, "_restore_candidate", interrupt)
+    with pytest.raises(OSError, match="before candidate"):
+        module.restore_recovery_set(path, tmp_path / "target", **options)
+    connection.execute(sql.SQL("INSERT INTO {} (key,download_status,payload_version,payload) "
+        "VALUES ('unaccounted','pending',1,'{{\"key\":\"unaccounted\"}}')").format(sql.Identifier(schema, "records")))
+    monkeypatch.setattr(module, "_restore_candidate", original)
+    with pytest.raises(ValueError, match="catalog"):
+        module.restore_recovery_set(path, tmp_path / "target", **options)

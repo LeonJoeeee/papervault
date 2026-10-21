@@ -189,3 +189,29 @@ async def test_replay_recovers_receipt_after_lost_completion_response(package, t
         catalog_connection=connection, catalog_schema=schema, apply=True)
     assert result == json.loads(frozen)
     assert result["attempt_count"] == 2
+
+
+async def test_isolated_replay_records_unit_quarantine_reset(package, target_catalog, tmp_path):
+    from papervault.store.recovery import snapshot
+    from papervault.store.recovery_source import CoordinatedSource
+    from papervault.store.knowledge import KnowledgeRepository
+    from papervault.store.repository import PostgresCatalogRepository
+
+    _, source = package
+    unit = source._rows("units")[0]
+    reason = {"reason": "source execution uncertain", "scope": "unit", "origin": "test"}
+    source.command("set_quarantine", "quarantine-before-snapshot", {"unit_id": unit["unit_id"],
+        "expected_revision": unit["revision"], "quarantine": True, "reason": reason})
+    captured = snapshot(CoordinatedSource(source.repository, vault=tmp_path / "vault",
+        knowledge_root=tmp_path / "knowledge", metadata_sample=True), tmp_path / "quarantined-sets",
+        apply=True, sample=True)
+    path = tmp_path / "quarantined-sets" / captured["snapshot_id"]
+    connection, schema = target_catalog
+    result = await replay_module().replay_recovery_set(path, tmp_path / "replay", source_generation="source",
+        target_generation="replayed", catalog_connection=connection, catalog_schema=schema, apply=True)
+    assert len(result["receipts"]) == 2
+    disposition = result.get("unit_quarantine_disposition")
+    assert disposition == {"policy": "reset_in_isolated_replay", "reset_units": [
+        {"unit_id": unit["unit_id"], "source_revision": unit["revision"] + 1, "source_reason": reason}]}
+    assert source.get_unit(unit["unit_id"])["quarantine"] is True
+    assert KnowledgeRepository(PostgresCatalogRepository(connection, schema=schema)).get_unit(unit["unit_id"])["quarantine"] is False

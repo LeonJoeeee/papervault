@@ -316,6 +316,13 @@ def _verify_graph(transaction, exported, mapping):
         raise ValueError("restored graph properties or inventory changed")
 
 
+def _graph_schema(session):
+    constraints = list(session.run("SHOW CONSTRAINTS YIELD name,createStatement RETURN name,createStatement"))
+    indexes = list(session.run("SHOW INDEXES YIELD name,type,owningConstraint,createStatement "
+        "WHERE type<>'LOOKUP' AND owningConstraint IS NULL RETURN name,createStatement"))
+    return {row["name"]: row["createStatement"] for row in constraints + indexes}
+
+
 def restore_neo4j_store(driver, exported, *, database, uri, disposable=False, operation_id=None):
 
     hosts, port = _graph_endpoint(uri)
@@ -365,16 +372,16 @@ def restore_neo4j_store(driver, exported, *, database, uri, disposable=False, op
             transaction.commit()
         # Neo4j does not mix schema updates with graph updates in one transaction.
         # A failed schema install leaves an explicit unaccepted target for resume.
-        for item in exported["constraints"] + exported["indexes"]:
-            constraints = list(session.run("SHOW CONSTRAINTS YIELD name,createStatement RETURN name,createStatement"))
-            indexes = list(session.run("SHOW INDEXES YIELD name,type,owningConstraint,createStatement "
-                "WHERE type<>'LOOKUP' AND owningConstraint IS NULL RETURN name,createStatement"))
-            existing = {row["name"]: row["createStatement"] for row in constraints + indexes}
-            if item["name"] in existing and existing[item["name"]] != item["createStatement"]:
-                raise ValueError("restored graph schema changed")
-            if item["name"] not in existing:
-                session.run(item["createStatement"]).consume()
+        expected = {row["name"]: row["createStatement"] for row in exported["constraints"] + exported["indexes"]}
+        existing = _graph_schema(session)
+        if any(expected.get(name) != definition for name, definition in existing.items()):
+            raise ValueError("restored graph schema changed")
+        for name, definition in expected.items():
+            if name not in existing:
+                session.run(definition).consume()
         session.run("CALL db.awaitIndexes(300)").consume()
+        if _graph_schema(session) != expected:
+            raise ValueError("restored graph schema inventory differs")
     return {"database": database, "uri": uri, "nodes": len(ids),
             "relationships": len(exported["relationships"]), "node_id_mapping": mapping,
             "verified_export_sha256": fingerprint}

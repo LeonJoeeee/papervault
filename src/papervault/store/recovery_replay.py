@@ -61,6 +61,10 @@ def replay_plan(package, *, source_generation, parent_ids=None):
     return manifest, catalog, {"source_generation": source_generation, "parent_ids": sorted(chosen),
         "units": [row for row in tables["units"] if row["unit_id"] in needed],
         "requirements": requirements, "inventories": inventories, "inputs": inputs, "recipes": recipes,
+        "unit_quarantine_disposition": {"policy": "reset_in_isolated_replay", "reset_units": [
+            {"unit_id": row["unit_id"], "source_revision": row["revision"], "source_reason": row["quarantine_reason"]}
+            for row in sorted(tables["units"], key=lambda row: row["unit_id"])
+            if row["unit_id"] in needed and row["quarantine"]]},
         "sections": [row for row in tables["section_mappings"] if row["unit_id"] in needed],
         "physical": any(row["manifest"]["tier"] != "metadata" for row in inputs)}
 
@@ -265,6 +269,7 @@ async def replay_recovery_set(package, target, *, source_generation, target_gene
                 "source_snapshot_id": manifest["snapshot_id"], "source_manifest_sha256": binding["manifest_sha256"],
                 "source_generation": source_generation, "parent_ids": plan["parent_ids"],
                 "source_content_recipes": [row["recipe_digest"] for row in plan["recipes"]],
+                "unit_quarantine_disposition": plan["unit_quarantine_disposition"],
                 "original_receipt_ids": [row["receipt_id"] for row in catalog["tables"]["knowledge_receipts"]],
                 "operation_recipe": {"name": "papervault-replay", "implementation_sha256": digest_file(Path(__file__))["sha256"]},
                 "receipts": receipts, "serving_generation_id": None,

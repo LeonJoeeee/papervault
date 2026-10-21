@@ -85,11 +85,13 @@ def metadata_recipe():
 async def execute(args, parents):
     import psycopg
     from psycopg import sql
+    from papervault.store.adapter import LibraryAdapter
     from papervault.store.extraction import write_once
+    from papervault.store.importer import import_catalog
     from papervault.store.knowledge import KnowledgeRepository
-    from papervault.store.repository import AuditEvent, PostgresCatalogRepository, Record, canonical_json
+    from papervault.store.repository import AuditEvent, PostgresCatalogRepository, canonical_json
     from papervault.store.recovery import checked_path, digest_file, file_inventory, snapshot, verify_recovery_set
-    from papervault.store.recovery_postgres import validate_catalog_target
+    from papervault.store.recovery_postgres import catalog_indexes, validate_catalog_target, verify_catalog_indexes
     from papervault.store.recovery_source import CoordinatedSource
     from papervault.store.recovery_restore import restore_recovery_set
     from papervault.store.recovery_replay import replay_recovery_set
@@ -181,13 +183,18 @@ async def execute(args, parents):
             inputs = ImmutableInputStore(knowledge / "catalog_inputs")
             recipe = metadata_recipe()
             intake = CatalogIntake(k, inputs, vault, recipe=recipe)
+            payloads = {}
             for parent in parents:
                 paper = parent["paper"]
                 payload = {"key": parent["key"], "title": paper["title"], "doi": paper.get("doi") or "",
                     "year": paper.get("year"), "authors": [paper["first_author"]], "source": "tracked-landmark-pool",
                     "terminal_state": {"retrieval": "eligible", "policy": "clear", "merge": "canonical"}}
-                source_repo.upsert(Record.from_payload(parent["key"], payload), expected_revision=0,
-                    audit=AuditEvent("drill", "metadata_source"))
+                payloads[parent["key"]] = payload
+            write_once(vault / "index.json", canonical_json({"version": 1, "papers": payloads}).encode())
+            imported = import_catalog(LibraryAdapter.from_snapshot(vault / "index.json"), source_repo)
+            assert imported["difference_rate"] == 0
+            assert all(imported["target_identity_indexes"][field]["state"] == "created" for field in ("doi", "arxiv_id"))
+            for parent in parents:
                 intake.capture_record(source_repo.get(parent["key"]))
             write_once(vault / "metadata-source.json", canonical_json(parents).encode())
             adapter = CatalogLightRAGAdapter(k, working_dir=str(knowledge), input_store=inputs)
@@ -231,7 +238,17 @@ async def execute(args, parents):
                 neo4j_target=neo_target, apply=True)
             timings["restore_seconds"] = time.monotonic() - phase
             save("restore-receipt.json", restored)
+            catalog = json.loads((package / "catalog/data.json").read_bytes())
+            restored_repo = PostgresCatalogRepository(target_conn, schema=schemas["restore"])
+            verify_catalog_indexes(restored_repo, catalog)
+            restored_indexes = catalog_indexes(restored_repo)
+            assert {"records_doi_unique", "records_arxiv_id_unique"} <= restored_indexes.keys()
+            save("catalog-indexes.json", {"checkpoint": catalog["checkpoint"],
+                "source_indexes": catalog["indexes"], "restored_indexes": restored_indexes,
+                "import_identity_indexes": imported["target_identity_indexes"],
+                "verified": True, "comparison": "exact index names, tables and definitions with only the indexed relation rebound"})
             log.append(f"restore: {len(manifest['parent_inventory'])} parents; verified bytes, backend readback, original history, new fenced receipt")
+            log.append(f"catalog indexes: {len(restored_indexes)} installed definitions verified, including importer DOI/arXiv uniqueness")
             print("restoration verified", flush=True)
             phase = time.monotonic()
             replayed = await replay_recovery_set(package, root / "replay", source_generation="source", target_generation="replayed",

@@ -16,8 +16,8 @@ from psycopg.conninfo import conninfo_to_dict
 
 from .extraction import fsync_directory, write_once
 from .recovery import _atomic_json, checked_path, child, digest_file, verify_recovery_set
-from .recovery_postgres import restore_catalog_state, validate_catalog_state, validate_catalog_target
-from .repository import AuditEvent, PostgresCatalogRepository, canonical_json
+from .recovery_postgres import restore_catalog_state, validate_catalog_state, validate_catalog_target, verify_catalog_indexes
+from .repository import AuditEvent, PostgresCatalogRepository, canonical_json, payload_hash
 
 
 def copy_verified_file(source, destination, expected):
@@ -72,14 +72,22 @@ def _verify_catalog_contents(connection, schema, catalog, operation_id):
         raise ValueError("restored catalog is missing")
     with connection.transaction():
         connection.execute("SET LOCAL TIME ZONE 'UTC'")
+        verify_catalog_indexes(PostgresCatalogRepository(connection, schema=schema), catalog)
+        tables = {row["tablename"] for row in connection.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname=%s", (schema,))}
+        if tables != set(catalog["tables"]):
+            raise ValueError("restored catalog table inventory changed")
+        candidate = connection.execute(sql.SQL("SELECT detail FROM {} WHERE event='recovery_candidate_created' "
+            "AND detail->>'operation_id'=%s").format(sql.Identifier(schema, "audit")), (operation_id,)).fetchone()
         for name, rows in catalog["rows_json"].items():
             if name in {"knowledge_runtime", "writer_fence"}:
                 continue
             actual = [row["encoded"] for row in connection.execute(sql.SQL(
                 "SELECT to_jsonb(t)::text AS encoded FROM {} t").format(sql.Identifier(schema, name)))]
-            # Recovery adds a candidate and audited operation records, but may
-            # never rewrite/remove any original checkpoint row.
-            if Counter(rows) - Counter(actual):
+            # Before candidate creation, only the fence/epoch and audit may
+            # differ. Afterward, its atomic digest binds every added data row.
+            if (Counter(rows) - Counter(actual)
+                    or (not candidate and name != "audit" and Counter(rows) != Counter(actual))):
                 raise ValueError("restored catalog history changed: " + name)
         row = connection.execute(sql.SQL("SELECT fence_id FROM {}").format(sql.Identifier(schema, "writer_fence"))).fetchone()
         if not row or row["fence_id"] != "recovery:" + operation_id:
@@ -89,6 +97,43 @@ def _verify_catalog_contents(connection, schema, catalog, operation_id):
             (catalog["rows_json"]["knowledge_runtime"][0], catalog["checkpoint"]["authority_epoch"] + 1)).fetchone()
         if not matches or not matches["matches"]:
             raise ValueError("restored catalog runtime/epoch changed")
+        if candidate and _catalog_rows_digest(connection, schema) != candidate["detail"]["catalog_contents_sha256"]:
+            raise ValueError("restored catalog candidate/content rows changed")
+
+
+def _catalog_rows_digest(connection, schema):
+    """Bind all target rows after candidate creation, including added rows.
+
+    Audit is append-only operation evidence: the original rows are checked above,
+    and materialization appends its receipt hash after this digest is committed.
+    """
+    with connection.transaction():
+        connection.execute("SET LOCAL TIME ZONE 'UTC'")
+        tables = [row["tablename"] for row in connection.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname=%s AND tablename<>'audit' ORDER BY tablename", (schema,))]
+        return payload_hash({name: sorted(row["encoded"] for row in connection.execute(sql.SQL(
+            "SELECT to_jsonb(t)::text AS encoded FROM {} t").format(sql.Identifier(schema, name)))) for name in tables})
+
+
+def _restore_candidate(restored, state, sample):
+    from .knowledge import KnowledgeRepository
+    op = state["operation_id"]
+    with restored._write(AuditEvent("recovery", "recovery_candidate_created")):
+        row = restored.connection.execute(sql.SQL("SELECT detail FROM {} WHERE event='recovery_candidate_created' "
+            "AND detail->>'operation_id'=%s").format(restored._table("audit")), (op,)).fetchone()
+        if row:
+            digest = row["detail"]["catalog_contents_sha256"]
+            if _catalog_rows_digest(restored.connection, restored.schema) != digest:
+                raise ValueError("restored catalog candidate/content rows changed")
+        else:
+            KnowledgeRepository(restored).command("create_generation", op + ":generation", {
+                "generation_id": state["binding"]["target_generation"], "candidate": True, "sample": sample})
+            digest = _catalog_rows_digest(restored.connection, restored.schema)
+            # Atomic with candidate creation: losing the progress-file write
+            # cannot adopt a subsequently modified candidate on resume.
+            restored._finish(None, AuditEvent("recovery", "recovery_candidate_created", {
+                "operation_id": op, "catalog_contents_sha256": digest}))
+    return digest
 
 
 def restore_recovery_set(package, target, *, target_generation, catalog_connection=None,
@@ -214,9 +259,7 @@ def restore_recovery_set(package, target, *, target_generation, catalog_connecti
             _atomic_json(state_path, state)
             restored = PostgresCatalogRepository(catalog_connection, schema=catalog_schema)
             restored.fence_id = state["components"]["catalog"]["fence_id"]
-            from .knowledge import KnowledgeRepository
-            KnowledgeRepository(restored).command("create_generation", state["operation_id"] + ":generation", {
-                "generation_id": target_generation, "candidate": True, "sample": manifest["sample"]})
+            catalog_digest = _restore_candidate(restored, state, manifest["sample"])
             receipt = {"schema_version": 1, "kind": "restore_materialization",
                 "receipt_id": "restore-receipt:" + state["operation_id"], "operation_id": state["operation_id"],
                 "attempt_id": state["operation_id"] + ":" + str(state["attempts"]),
@@ -224,6 +267,7 @@ def restore_recovery_set(package, target, *, target_generation, catalog_connecti
                 "acceptance_scope": "isolated_recovery", "target_generation": target_generation,
                 "source_snapshot_id": manifest["snapshot_id"], "source_manifest_sha256": binding["manifest_sha256"],
                 "sample": manifest["sample"], "target_root": str(target),
+                "catalog_contents_sha256": catalog_digest,
                 "original_receipt_ids": [row["receipt_id"] for row in catalog["tables"]["knowledge_receipts"]],
                 "original_derivation_ids": [row.get("derivation_id", row["id"]) for row in catalog["tables"]["derivations"]],
                 "source_content_recipes": [row["recipe_digest"] for row in catalog["tables"]["recipes"]],

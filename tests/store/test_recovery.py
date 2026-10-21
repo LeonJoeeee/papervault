@@ -105,16 +105,20 @@ def test_snapshot_stops_at_maintenance_deadline_and_cannot_rotate_retention(tmp_
     monkeypatch.setattr(module, "MAX_WINDOW_SECONDS", 0.02)
     source = FrozenSource()
     original = source.export
+    export_finished = False
 
     def slow(destination, checkpoint):
+        nonlocal export_finished
         time.sleep(0.1)
+        export_finished = True
         return original(destination, checkpoint)
 
     source.export = slow
-    started = time.monotonic()
     with pytest.raises((TimeoutError, ValueError), match="maintenance|two-hour"):
         module.snapshot(source, tmp_path, apply=True)
-    assert time.monotonic() - started < 0.09
+    # Assert that the deadline interrupts export, rather than measuring the
+    # unrelated setup/fsync/cleanup cost against a host scheduling threshold.
+    assert not export_finished
     assert not (tmp_path / "retention.json").exists()
     assert not source.registered
 

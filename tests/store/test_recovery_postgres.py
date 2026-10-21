@@ -301,3 +301,117 @@ def test_registered_extraction_inputs_use_their_retained_vault_location(extracti
     shutil.copytree(vault / "extracts", package / "extracts/vault")
     (package / "sources").mkdir()
     verify_file_dependencies(package, catalog)
+
+
+def test_imported_identity_indexes_survive_coordinated_restore(repo, catalog_test_dsn, tmp_path):
+    from papervault.store.adapter import LibraryAdapter
+    from papervault.store.importer import import_catalog
+    from papervault.store.recovery import snapshot, verify_recovery_set
+    from papervault.store.recovery_restore import restore_recovery_set
+    from papervault.store.recovery_source import CoordinatedSource
+
+    vault, knowledge = tmp_path / "vault", tmp_path / "knowledge"
+    vault.mkdir()
+    knowledge.mkdir()
+    source = vault / "index.json"
+    source.write_text(json.dumps({"papers": {"A": {"key": "A", "title": "Imported identity",
+        "doi": "10.1234/recovery", "arxiv_id": "2501.12345"}}}))
+    report = import_catalog(LibraryAdapter.from_snapshot(source), repo)
+    assert report["target_identity_indexes"]["doi"]["state"] == "created"
+    assert report["target_identity_indexes"]["arxiv_id"]["state"] == "created"
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "recovery_schema"))
+    # A non-bundled expression/partial index, including a schema-looking literal,
+    # catches index allowlists and unsafe global schema-name replacements.
+    literal = " ON " + sql.Identifier(repo.schema, "records").as_string() + " "
+    repo.connection.execute(sql.SQL("CREATE INDEX {} ON {} (lower(title)) WHERE source <> {}").format(
+        sql.Identifier('extra "title" index'), repo._table("records"), sql.Literal(literal)))
+    manifest = snapshot(CoordinatedSource(repo, vault=vault, knowledge_root=knowledge, metadata_sample=True),
+                        tmp_path / "sets", sample=True, apply=True)
+    package = tmp_path / "sets" / manifest["snapshot_id"]
+    assert verify_recovery_set(package) == manifest
+    target = "catalog_recovery_" + uuid4().hex
+    with psycopg.connect(catalog_test_dsn, autocommit=True) as connection:
+        try:
+            restore_recovery_set(package, tmp_path / "restored", target_generation="restored",
+                catalog_connection=connection, catalog_schema=target, apply=True)
+            indexes = {row["indexname"] for row in connection.execute(
+                "SELECT indexname FROM pg_indexes WHERE schemaname=%s", (target,))}
+            assert {"records_doi_unique", "records_arxiv_id_unique", 'extra "title" index'} <= indexes
+            for field, identity in (("doi", "10.1234/recovery"), ("arxiv_id", "2501.12345")):
+                with pytest.raises(psycopg.errors.UniqueViolation):
+                    connection.execute(sql.SQL("INSERT INTO {} (key,download_status,payload_version,payload,{}) "
+                        "VALUES ('duplicate','pending',1,'{{\"key\":\"duplicate\"}}',%s)").format(
+                            sql.Identifier(target, "records"), sql.Identifier(field)), (identity,))
+            captured = json.loads((package / "catalog/data.json").read_bytes())
+            assert set(captured["indexes"]) == indexes
+            definition = connection.execute("SELECT indexdef FROM pg_indexes WHERE schemaname=%s AND indexname=%s",
+                (target, 'extra "title" index')).fetchone()["indexdef"]
+            assert literal in definition
+        finally:
+            connection.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(target)))
+
+
+@pytest.mark.parametrize("damage", ["missing", "omitted", "changed"])
+def test_catalog_index_inventory_is_bound_to_checkpoint(repo, damage):
+    module = recovery_pg()
+    seed(repo)
+    with module.catalog_barrier(repo, "indexes") as checkpoint:
+        exported = module.export_catalog_state(repo, checkpoint)
+    # Default {} lets the old exporter reach the fail-closed assertion too.
+    indexes = exported.setdefault("indexes", {})
+    if damage == "missing":
+        exported.pop("indexes")
+    elif damage == "omitted":
+        indexes.pop("records_status_idx", None)
+    else:
+        indexes["records_status_idx"] = {"table": "records", "definition": "corrupt"}
+    with pytest.raises(ValueError, match="index"):
+        module.validate_catalog_state(exported)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_restore_matches_installed_nonconstraint_index_changes(repo, catalog_test_dsn, changed):
+    module = recovery_pg()
+    seed(repo)
+    repo.connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(repo.schema, "records_status_idx")))
+    if changed:
+        repo.connection.execute(sql.SQL("CREATE INDEX records_status_idx ON {} (title)").format(repo._table("records")))
+    with module.catalog_barrier(repo, "changed-index") as checkpoint:
+        exported = module.export_catalog_state(repo, checkpoint)
+    target = "catalog_recovery_" + uuid4().hex
+    with psycopg.connect(catalog_test_dsn, autocommit=True) as connection:
+        try:
+            module.restore_catalog_state(connection, target, exported, recovery_id="changed-index")
+            index = connection.execute("SELECT indexdef FROM pg_indexes WHERE schemaname=%s AND indexname='records_status_idx'",
+                                       (target,)).fetchone()
+            if changed:
+                assert index["indexdef"] == f"CREATE INDEX records_status_idx ON {target}.records USING btree (title)"
+            else:
+                assert index is None
+        finally:
+            connection.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(target)))
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_restore_reconciles_stronger_default_index_before_loading(repo, catalog_test_dsn, changed):
+    module = recovery_pg()
+    seed(repo)
+    repo.connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(repo.schema, "generations_one_active")))
+    if changed:
+        repo.connection.execute(sql.SQL("CREATE UNIQUE INDEX generations_one_active ON {} (generation_id)").format(
+            repo._table("generations")))
+    # These rows are legal under the captured installed indexes, but collide
+    # under the bundled default. Restore must not impose a different index set.
+    repo.connection.execute(sql.SQL("INSERT INTO {} (generation_id,state,requirements_revision) "
+        "VALUES ('one','active',0),('two','active',0)").format(repo._table("generations")))
+    with module.catalog_barrier(repo, "changed-unique-index") as checkpoint:
+        exported = module.export_catalog_state(repo, checkpoint)
+    target = "catalog_recovery_" + uuid4().hex
+    with psycopg.connect(catalog_test_dsn, autocommit=True) as connection:
+        try:
+            module.restore_catalog_state(connection, target, exported, recovery_id="changed-unique-index")
+            rows = connection.execute(sql.SQL("SELECT generation_id FROM {} WHERE state='active' ORDER BY generation_id").format(
+                sql.Identifier(target, "generations"))).fetchall()
+            assert [row["generation_id"] for row in rows] == ["one", "two"]
+        finally:
+            connection.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(target)))

@@ -11,13 +11,55 @@ from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
-from .repository import AuditEvent, PostgresCatalogRepository, render_catalog_ddl
+from .repository import AuditEvent, PostgresCatalogRepository, payload_hash, render_catalog_ddl
 
 
 def _tables(repository):
     return [row["name"] for row in repository.connection.execute(
         "SELECT tablename AS name FROM pg_tables WHERE schemaname=%s ORDER BY tablename",
         (repository.schema,))]
+
+
+def catalog_indexes(repository):
+    """Read every installed index, independently of bundled migration DDL.
+
+    Stable deparsing quotes every identifier and qualifies relations regardless
+    of the caller's search path. Roll back this read-only scope to restore both
+    settings, including when nested inside the coordinated checkpoint.
+    """
+    with repository.connection.transaction(force_rollback=True):
+        repository.connection.execute("SET LOCAL search_path=pg_catalog")
+        repository.connection.execute("SET LOCAL quote_all_identifiers=on")
+        rows = repository.connection.execute(
+            "SELECT c.relname AS name,t.relname AS table,pg_get_indexdef(i.indexrelid) AS definition,"
+            "i.indisvalid AND i.indisready AND i.indislive AS usable "
+            "FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
+            "JOIN pg_class t ON t.oid=i.indrelid JOIN pg_namespace n ON n.oid=t.relnamespace "
+            "WHERE n.nspname=%s ORDER BY c.relname", (repository.schema,)).fetchall()
+        if any(not row["usable"] for row in rows):
+            raise ValueError("catalog index is not valid/ready for recovery")
+        return {row["name"]: {key: row[key] for key in ("table", "definition")} for row in rows}
+
+
+def _rebind_catalog_index(name, index, source, target):
+    # Change only the indexed relation. Expressions and predicate literals may
+    # contain the source schema's spelling and must retain their exact meaning.
+    prefix = (r'\A(CREATE (?:UNIQUE )?INDEX ' + re.escape(sql.Identifier(name).as_string())
+              + r' ON (?:ONLY )?)' + re.escape(sql.Identifier(source, index["table"]).as_string()) + ' ')
+    match = re.match(prefix, index["definition"])
+    if not match:
+        raise ValueError("invalid recovery catalog index definition: " + name)
+    return match[1] + sql.Identifier(target, index["table"]).as_string() + ' ' + index["definition"][match.end():]
+
+
+def _target_indexes(state, schema):
+    return {name: {**index, "definition": _rebind_catalog_index(
+        name, index, state["checkpoint"]["schema"], schema)} for name, index in state["indexes"].items()}
+
+
+def verify_catalog_indexes(repository, state):
+    if catalog_indexes(repository) != _target_indexes(state, repository.schema):
+        raise ValueError("restored catalog index inventory/definitions differ")
 
 
 @contextmanager
@@ -56,7 +98,8 @@ def catalog_barrier(repository, backup_id):
                 repository._table("audit"))).fetchone()
             checkpoint = {**clock, "schema": repository.schema, "backup_id": backup_id,
                           "authority_epoch": runtime["authority_epoch"], "audit_head": audit["head"],
-                          "timeline": "not_observed_logical_snapshot", "catalog_tables": names}
+                          "timeline": "not_observed_logical_snapshot", "catalog_tables": names,
+                          "catalog_indexes_sha256": payload_hash(catalog_indexes(repository))}
             yield checkpoint
     finally:
         for key in reversed(acquired):
@@ -66,6 +109,9 @@ def catalog_barrier(repository, backup_id):
 def export_catalog_state(repository, checkpoint):
     if checkpoint.get("schema") != repository.schema or checkpoint.get("catalog_tables") != _tables(repository):
         raise ValueError("catalog schema changed after checkpoint")
+    indexes = catalog_indexes(repository)
+    if payload_hash(indexes) != checkpoint.get("catalog_indexes_sha256"):
+        raise ValueError("catalog index inventory changed after checkpoint")
     tables, columns, rows_json = {}, {}, {}
     for name in checkpoint["catalog_tables"]:
         table = repository._table(name)
@@ -92,13 +138,21 @@ def export_catalog_state(repository, checkpoint):
         name = row["sequencename"]
         sequences[name] = repository.connection.execute(sql.SQL("SELECT last_value,is_called FROM {}").format(
             sql.Identifier(repository.schema, name))).fetchone()
-    return {"schema_version": 1, "checkpoint": checkpoint, "tables": tables, "columns": columns,
+    return {"schema_version": 2, "checkpoint": checkpoint, "tables": tables, "columns": columns, "indexes": indexes,
             "schema_files": schema_files, "sequences": sequences, "rows_json": rows_json}
 
 
 def validate_catalog_state(state):
-    if state.get("schema_version") != 1:
-        raise ValueError("unsupported recovery catalog schema")
+    if state.get("schema_version") != 2:
+        raise ValueError("unsupported recovery catalog schema; installed index state required")
+    indexes = state.get("indexes")
+    if not isinstance(indexes, dict) or payload_hash(indexes) != state["checkpoint"].get("catalog_indexes_sha256"):
+        raise ValueError("recovery catalog index inventory differs from checkpoint")
+    for name, index in indexes.items():
+        if (not isinstance(index, dict) or index.get("table") not in state["tables"]
+                or not isinstance(index.get("definition"), str)):
+            raise ValueError("invalid recovery catalog index inventory")
+        _rebind_catalog_index(name, index, state["checkpoint"]["schema"], state["checkpoint"]["schema"])
     names = set(state.get("schema_files", {}))
     if names not in ({"schema.sql", "knowledge_schema.sql"},
                      {"schema.sql", "knowledge_schema.sql", "knowledge_migration_schema.sql"}):
@@ -155,6 +209,18 @@ def restore_catalog_state(connection, schema, state, *, recovery_id):
             connection.execute(render_catalog_ddl(artifact["content"], schema))
         if set(_tables(repository)) != set(state["tables"]):
             raise ValueError("recovery schema does not represent every source catalog table")
+        installed = catalog_indexes(repository)
+        expected = _target_indexes(state, schema)
+        constrained = {row["name"] for row in connection.execute(
+            "SELECT i.relname AS name FROM pg_constraint c JOIN pg_class i ON i.oid=c.conindid "
+            "JOIN pg_namespace n ON n.oid=i.relnamespace WHERE n.nspname=%s AND c.contype IN ('p','u','x')", (schema,))}
+        for name, index in installed.items():
+            if expected.get(name) != index:
+                if name in constrained:
+                    raise ValueError("recovery catalog index conflicts with bundled constraint: " + name)
+                # Reconcile only fresh target defaults, before loading rows
+                # that may be legal under a different installed unique index.
+                connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(schema, name)))
         constraints = list(connection.execute("SELECT c.conname,t.relname,c.condeferrable,c.condeferred "
             "FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_namespace n ON n.oid=t.relnamespace "
             "WHERE n.nspname=%s AND c.contype='f'", (schema,)))
@@ -193,6 +259,12 @@ def restore_catalog_state(connection, schema, state, *, recovery_id):
         for name, sequence in state["sequences"].items():
             connection.execute("SELECT setval(%s::regclass,%s,%s)",
                 (str(sql.Identifier(schema, name).as_string(connection)), sequence["last_value"], sequence["is_called"]))
+        for name, index in expected.items():
+            if installed.get(name) != index:
+                connection.execute(index["definition"])
+        # Bundled primary/unique indexes are already installed. Compare those
+        # definitions too; mismatches roll back the entire new target schema.
+        verify_catalog_indexes(repository, state)
         connection.execute(sql.SQL("UPDATE {} SET fence_id=%s").format(repository._table("writer_fence")), (fence,))
         epoch = state["checkpoint"]["authority_epoch"] + 1
         connection.execute(sql.SQL("UPDATE {} SET authority_epoch=%s").format(repository._table("knowledge_runtime")), (epoch,))

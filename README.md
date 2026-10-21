@@ -446,7 +446,8 @@ The worker's staging runs use explicit isolated `/tmp` roots, recorded in
 weekly operational snapshots and production drills in the monthly reboot window
 (at most two hours). No timer or live backup configuration is activated by this PR.
 
-A complete set contains the catalog schema, exact row encodings, sequence state,
+A complete set contains the catalog schema, installed index definitions (including
+importer-installed DOI/arXiv uniqueness), exact row encodings, sequence state,
 checkpoint/epoch/audit boundary; the entire vault including source bytes, extraction
 inputs/versions and operational ledgers; knowledge inputs/local state; recipes and
 receipts; all PostgreSQL KV/cache/doc-status/vector tables including retained extra
@@ -529,6 +530,11 @@ with matching extensions. Neo4j requires a distinct empty endpoint/database and
 `"disposable": true`; source aliases and populated unowned targets are rejected.
 Reruns resume only a target bound to the same operation and package. The packaged
 DDL is trusted operator material, not an import format for untrusted third parties.
+Catalog export format 2 binds the full installed index inventory to the checkpoint.
+Restore recreates additional indexes and compares every definition with the source,
+including on resume; invalid/unready indexes and older packages without index state
+are refused. An index definition incompatible with the bundled table constraints
+rolls back the empty catalog target rather than silently weakening its integrity.
 
 ```bash
 .venv/bin/python scripts/rebuild_derivatives.py --mode restore --package <set> --root <empty-target> --generation restored
@@ -541,7 +547,12 @@ fence and epoch, and records a separate materialization receipt. Copied dispatch
 remains disabled; that receipt cannot supply fresh live acceptance. Replay imports
 only selected original inputs/recipes into a fresh candidate catalog and runs the
 normal admission, execution, readback, sealing and publication path, producing new
-attempts and receipts. It never imports historical runnable jobs. Physical replay
+attempts and receipts. Isolated replay explicitly resets unit-level execution
+quarantine on fresh units; its plan and receipt record each affected unit's original
+revision and reason under `unit_quarantine_disposition`. Record-level policy and
+quarantine remain enforced, and the source is unchanged. This reset is scoped to
+non-promotable sample execution, not a live quarantine release. It never imports
+historical runnable jobs. Physical replay
 requires `"physical_replay": true`, explicit isolated PostgreSQL/Neo4j targets, the
 exact supported recipe, and its installed models/providers. It does not substitute
 a different transform when the original recipe is unavailable. Metadata replay
@@ -550,7 +561,9 @@ address (with the same `hostaddr`, if present); DNS, multi-host and alternate
 address routing are rejected. Runtime tables must resolve to the owned target
 schema, including on resume, before any backend write.
 
-Both paths recheck completed materializations on resume. Replay preserves completed
+Both paths recheck completed materializations on resume. Restore verifies its added
+candidate/catalog rows against an atomically recorded digest and rejects extra
+Neo4j indexes or constraints. Replay preserves completed
 admissions, stops on errors or deadline, and may resume in a later permitted monthly
 window; it cannot extend a consumed window in the same month. All drill/replay
 candidate generations are permanently marked sample and cannot promote. This

@@ -80,3 +80,32 @@ def test_graph_resume_verifies_its_operation_and_committed_data(isolated_graphs)
                 session.run("MATCH (n:PaperVaultCatalogEntity {_pv_namespace:$ns}) DETACH DELETE n", ns=token).consume()
         with target.session() as session:
             session.run("MATCH (n:_PapervaultRecovery {operation_id:$op}) DELETE n", op=token).consume()
+
+
+@pytest.mark.parametrize("kind", ["INDEX", "CONSTRAINT"])
+def test_graph_resume_refuses_added_schema_objects(isolated_graphs, kind):
+    from papervault.store.recovery_backends import Neo4jStore, restore_neo4j_store
+    (source, source_uri), (target, target_uri) = isolated_graphs
+    token = uuid4().hex
+    name = "extra_" + token
+    with source.session() as session:
+        session.run("CREATE (:PaperVaultCatalogEntity {_pv_namespace:$ns,entity_id:'Earth'})", ns=token).consume()
+    try:
+        store = Neo4jStore(source, database="neo4j", uri=source_uri)
+        with store.barrier():
+            exported = store.export()
+        options = {"database": "neo4j", "uri": target_uri, "disposable": True, "operation_id": token}
+        restore_neo4j_store(target, exported, **options)
+        with target.session() as session:
+            statement = (f"CREATE INDEX {name} FOR (n:PaperVaultCatalogEntity) ON (n.entity_id)" if kind == "INDEX"
+                         else f"CREATE CONSTRAINT {name} FOR (n:PaperVaultCatalogEntity) REQUIRE n.entity_id IS UNIQUE")
+            session.run(statement).consume()
+        with pytest.raises(ValueError, match="schema"):
+            restore_neo4j_store(target, exported, **options)
+    finally:
+        with target.session() as session:
+            session.run(f"DROP {kind} {name} IF EXISTS").consume()
+            session.run("MATCH (n:_PapervaultRecovery {operation_id:$op}) DELETE n", op=token).consume()
+        for driver in (source, target):
+            with driver.session() as session:
+                session.run("MATCH (n:PaperVaultCatalogEntity {_pv_namespace:$ns}) DETACH DELETE n", ns=token).consume()

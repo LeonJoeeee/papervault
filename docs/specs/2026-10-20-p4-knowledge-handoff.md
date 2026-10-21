@@ -27,7 +27,8 @@ The real-store harness uses `PAPERVAULT_BACKEND_TEST_DSN` and
 `PAPERVAULT_BACKEND_TEST_NEO4J_URI`, `PAPERVAULT_BACKEND_TEST_NEO4J_USER`,
 `PAPERVAULT_BACKEND_TEST_NEO4J_PASSWORD`, `PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE`.
 The Neo4j test database must already exist. Both database names must identify a dedicated
-test/rehearsal target. Run:
+test/rehearsal target, with the explicitly guarded disposable Neo4j Community exception
+described below. Run:
 
 ```sh
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q
@@ -44,13 +45,22 @@ no backend acceptance evidence.
 
 Run the harness in a fresh lane-local Python process against an operator-provisioned,
 dedicated database on each **staging** backend. For example, name both databases
-`p4_backend_rehearsal`; a staging hostname alone is insufficient. Names must contain a
-delimited `test` or `rehearsal` token. Known live/default names are rejected before
-connecting, including `papervault_catalog`, `knowledge_system` and `neo4j`. The Neo4j
-database must already exist. Never use `--allow-live` for this acceptance run.
+`p4_backend_rehearsal`. Names must contain a delimited `test` or `rehearsal` token.
+PostgreSQL live/default names, including `papervault_catalog`, `knowledge_system` and
+`postgres`, remain rejected before connecting. The Neo4j database must already exist.
+Neo4j Community's default `neo4j` database is accepted only when the operator explicitly
+sets `PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE=1` **and** its target URI has a different
+normalized host/port from the service's configured live `NEO4J_URI`. The operator must
+supply that live URI through the existing configuration/credential channel before pytest
+starts; tests never load `.env`. Missing or invalid URIs are refused. URI schemes and
+credentials do not distinguish endpoints; host case, trailing dots, implicit Bolt port
+7687 and equivalent loopback addresses are normalized. This exception applies only to
+the exact database name `neo4j`; it does not relax PostgreSQL or production preparation
+guards. Never use the CLI's `--allow-live` for this acceptance run.
 
-The orchestrator supplies these five environment variables through its existing credential
-channel; do not load the service's `.env` or publish their values:
+The orchestrator supplies the five connection variables and, for the default-database
+exception, the two guard inputs through its existing configuration/credential channel;
+do not load the service's `.env` or publish their values:
 
 | Variable | Required value |
 | --- | --- |
@@ -58,10 +68,13 @@ channel; do not load the service's `.env` or publish their values:
 | `PAPERVAULT_BACKEND_TEST_NEO4J_URI` | Explicit staging Bolt URI, including the port and applicable TLS scheme. |
 | `PAPERVAULT_BACKEND_TEST_NEO4J_USER` | Dedicated staging test user. |
 | `PAPERVAULT_BACKEND_TEST_NEO4J_PASSWORD` | That user's password. |
-| `PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE` | Existing dedicated Neo4j database, e.g. `p4_backend_rehearsal`. |
+| `PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE` | Existing dedicated Neo4j database, e.g. `p4_backend_rehearsal`, or `neo4j` on the guarded disposable target. |
+| `PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE` | Optional; exactly `1` is required to permit the disposable default `neo4j` database. Other values do not opt in. |
+| `NEO4J_URI` | Required for that exception: the service's configured live URI, used only to reject a matching target host/port. Keep the staging URI in `PAPERVAULT_BACKEND_TEST_NEO4J_URI`. |
 
-Pytest captures these five explicit inputs before scrubbing application environment
-variables. Only the integration-marked `backend_test_targets` fixture exposes that
+Pytest captures these five required inputs and the two optional guard inputs before
+scrubbing application environment variables. Only the integration-marked
+`backend_test_targets` fixture exposes that
 snapshot to the harness, which validates both database names before any connection.
 The variables stay absent from the runtime environment; dotenv loading remains disabled.
 
@@ -84,16 +97,44 @@ the `postgres`/`neo4j` additive statements and vector tables ending in
 The harness prepares this plan itself; no separate `--execute` command is required.
 The fixture's three-dimensional embedder and summary provider make no GPU or LLM calls.
 
+For Neo4j 5 Community, the sanctioned target is a throwaway `neo4j:5-community`
+container with a **fresh volume** on an alternate port. The operator provisions it;
+the worker does not start or reconfigure any live service. For example, after supplying
+the staging password and the service's configured live `NEO4J_URI` through the existing
+channel, and confirming loopback port 17687 differs from the live endpoint and is free:
+
+```sh
+export NEO4J_URI="${NEO4J_URI:?Supply the configured live Neo4j URI before starting pytest}"
+export PAPERVAULT_BACKEND_TEST_NEO4J_USER=neo4j
+export PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE=neo4j
+export PAPERVAULT_BACKEND_TEST_NEO4J_URI=bolt://127.0.0.1:17687
+export PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE=1
+export NEO4J_AUTH="neo4j/${PAPERVAULT_BACKEND_TEST_NEO4J_PASSWORD:?Supply a fresh staging password}"
+P4_NEO4J_VOLUME="$(docker volume create)"
+P4_NEO4J_CONTAINER="$(docker run -d --publish 127.0.0.1:17687:7687 \
+  --mount "type=volume,source=$P4_NEO4J_VOLUME,target=/data" \
+  --env NEO4J_AUTH neo4j:5-community)"
+unset NEO4J_AUTH
+```
+
+Wait for that container's Bolt service to become ready before running the harness.
+Use only this newly created volume, never the live `ks-neo4jdata` volume or an existing
+data directory. PostgreSQL still needs an explicitly named test/rehearsal database.
+Retain the container/volume identifiers with the run evidence for inspection and
+operator cleanup after acceptance; this procedure performs no automatic deletion.
+
 Check collection and the target refusal cases, then execute the actual backend cases:
 
 ```sh
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py --collect-only -q
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -k refuses -q
+.venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -k 'refuses or accepts' -q
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q -rs
 ```
 
-Expected results: **11 tests collected**, **8 passed, 3 deselected** for the refusal
-check (no connections), and **11 passed**, exit **0**, for acceptance. Three skipped
+Expected results: **37 tests collected**, **30 passed, 7 deselected** for the refusal
+check, **34 passed, 3 deselected** for all target checks (no connections), and
+**37 passed**, exit **0**, for acceptance. Three skipped
 real-store tests mean missing explicit credentials and do not constitute acceptance.
 The three real-store test names identify original merge summaries/shared-entity traversal,
 latest-version vector visibility/top-k/tombstones, and cache/sealed/stale-write isolation.

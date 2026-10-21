@@ -27,7 +27,11 @@ if Version(version("python-dotenv")) < Version("1.2"):
 _BACKEND_TEST_VARIABLES = ("PAPERVAULT_BACKEND_TEST_DSN",) + tuple(
     "PAPERVAULT_BACKEND_TEST_NEO4J_" + suffix
     for suffix in ("URI", "USER", "PASSWORD", "DATABASE"))
-_BACKEND_TEST_TARGETS = {name: os.environ.get(name) for name in _BACKEND_TEST_VARIABLES}
+# The default Neo4j database exception also needs an explicit disposable opt-in
+# and the service's configured URI. Capture both without loading any .env.
+_BACKEND_TEST_OPTIONAL_VARIABLES = ("PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE", "NEO4J_URI")
+_BACKEND_TEST_TARGETS = {name: os.environ.get(name)
+                         for name in _BACKEND_TEST_VARIABLES + _BACKEND_TEST_OPTIONAL_VARIABLES}
 
 # Denylist: application flags/paths/tuning, knowledge stores and libpq discovery,
 # OCR/model settings, provider credentials/endpoints, and legacy library settings.

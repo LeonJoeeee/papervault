@@ -4,10 +4,12 @@ Set ALL PAPERVAULT_BACKEND_TEST_DSN and PAPERVAULT_BACKEND_TEST_NEO4J_
 {URI,USER,PASSWORD,DATABASE}, then run:
   pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q
 
-Both database names must explicitly contain a test/rehearsal token. Preparation
-adds the pinned tables/indexes to these dedicated databases; it never creates a
-Neo4j database. Cleanup deletes only this test's random attempt namespaces and
-its own disposable catalog schema. Shared backend tables/indexes remain.
+Database names must contain a test/rehearsal token. Neo4j Community may use
+"neo4j" only with PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE=1 and a different
+host/port from the operator-supplied live NEO4J_URI. Preparation adds the pinned
+tables/indexes; it never creates a Neo4j database. Cleanup deletes only this
+test's random attempt namespaces and its disposable catalog schema. Shared
+backend tables/indexes remain.
 """
 from __future__ import annotations
 
@@ -15,8 +17,11 @@ import hashlib
 import inspect
 import os
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -43,6 +48,28 @@ def _embedding_contract():
         "packages": {"lightrag-hku": version("lightrag-hku"), "numpy": version("numpy")}}
 
 
+def _neo4j_address(uri):
+    """Compare endpoints independently of scheme, credentials and loopback spelling."""
+    if not uri:
+        raise ValueError("disposable Neo4j requires explicit target and configured live URIs")
+    try:
+        parsed = urlsplit(uri)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        raise ValueError("invalid Neo4j URI host/port") from None
+    if parsed.scheme not in {"bolt", "bolt+s", "bolt+ssc", "neo4j", "neo4j+s", "neo4j+ssc"} or not host or port == 0:
+        raise ValueError("invalid Neo4j URI scheme or host/port")
+    host = host.lower().rstrip(".")
+    try:
+        address = ip_address(host)
+    except ValueError:
+        pass
+    else:
+        address = getattr(address, "ipv4_mapped", None) or address
+        host = "localhost" if address.is_loopback else address.compressed
+    return host, 7687 if port is None else port
+
+
 def _guard_targets(targets):
     from psycopg.conninfo import conninfo_to_dict
     from scripts.prepare_knowledge_backend import _check_target
@@ -51,8 +78,25 @@ def _guard_targets(targets):
     if not all(pg.get(key) for key in ("dbname", "host", "user", "password")):
         raise ValueError("backend acceptance DSN requires explicit host/database/user/password")
     _check_target(pg["dbname"], allow_live=False)
-    _check_target(targets["PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE"], allow_live=False)
+    database = targets["PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE"]
+    if database == "neo4j":
+        if targets.get("PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE") != "1":
+            raise ValueError("default neo4j requires explicit disposable opt-in; live administration is refused")
+        if _neo4j_address(targets.get("PAPERVAULT_BACKEND_TEST_NEO4J_URI")) == _neo4j_address(targets.get("NEO4J_URI")):
+            raise ValueError("disposable Neo4j target must differ from the configured live host/port")
+    else:
+        _check_target(database, allow_live=False)
     return pg
+
+
+def _prepare_neo4j(driver, targets):
+    from scripts.prepare_knowledge_backend import prepare_neo4j
+
+    _guard_targets(targets)
+    database = targets["PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE"]
+    # Only this harness's validated disposable-default case may bypass the
+    # preparation helper's name check. Production/CLI guards stay unchanged.
+    return prepare_neo4j(driver, database=database, allow_live=database == "neo4j")
 
 
 @pytest.mark.parametrize("pg_database,neo_database", [
@@ -66,6 +110,88 @@ def test_backend_acceptance_refuses_live_or_unqualified_targets_before_connectin
         _guard_targets({"PAPERVAULT_BACKEND_TEST_DSN":
             f"host=localhost dbname={pg_database} user=fixture password=fixture",
             "PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE": neo_database})
+
+
+@pytest.mark.parametrize("disposable,target_uri,live_uri", [
+    (None, "bolt://localhost:17687", "bolt://localhost:7687"),
+    ("0", "bolt://localhost:17687", "bolt://localhost:7687"),
+    ("true", "bolt://localhost:17687", "bolt://localhost:7687"),
+    ("1", "bolt://localhost:7687", "bolt://localhost:7687"),
+    ("1", "neo4j+s://LIVE.EXAMPLE:7687", "bolt://live.example"),
+    ("1", "bolt://live.example.:7687", "neo4j://live.example:7687"),
+    ("1", "bolt://127.0.0.1:7687", "bolt://localhost:7687"),
+    ("1", "bolt://[::1]:7687", "bolt://localhost:7687"),
+    ("1", "bolt://[::ffff:127.0.0.1]:7687", "bolt://localhost:7687"),
+    ("1", "bolt://localhost:17687", None),
+    ("1", "bolt://localhost:17687", ""),
+    ("1", "bolt://localhost:17687", "not-a-uri"),
+    ("1", "bolt://localhost:17687", "bolt://localhost:invalid"),
+    ("1", None, "bolt://localhost:7687"),
+    ("1", "not-a-uri", "bolt://localhost:7687"),
+    ("1", "bolt://localhost:invalid", "bolt://localhost:7687"),
+    ("1", "bolt://localhost:0", "bolt://localhost:7687"),
+    ("1", "http://localhost:17687", "bolt://localhost:7687"),
+])
+def test_backend_acceptance_refuses_unsafe_disposable_neo4j_targets(disposable, target_uri, live_uri):
+    with pytest.raises(ValueError):
+        _guard_targets({"PAPERVAULT_BACKEND_TEST_DSN":
+            "host=staging.invalid dbname=p4_rehearsal user=fixture password=fixture",
+            "PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE": "neo4j",
+            "PAPERVAULT_BACKEND_TEST_NEO4J_URI": target_uri,
+            "PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE": disposable,
+            "NEO4J_URI": live_uri})
+
+
+@pytest.mark.parametrize("target_uri,live_uri", [
+    ("bolt://localhost:17687", "bolt://localhost:7687"),
+    ("neo4j://staging.invalid:7687", "bolt://live.invalid:7687"),
+    ("bolt+ssc://[::1]:17687", "neo4j+s://localhost"),
+    ("bolt://staging.invalid", "bolt://live.invalid:7687"),
+])
+def test_backend_acceptance_accepts_disposable_default_on_separate_address(target_uri, live_uri):
+    targets = {"PAPERVAULT_BACKEND_TEST_DSN":
+        "host=staging.invalid dbname=p4_rehearsal user=fixture password=fixture",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE": "neo4j",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_URI": target_uri,
+        "PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE": "1", "NEO4J_URI": live_uri}
+    assert _guard_targets(targets)["dbname"] == "p4_rehearsal"
+
+    class Driver:
+        def __init__(self):
+            self.statements = []
+
+        @contextmanager
+        def session(self, *, database):
+            assert database == "neo4j"
+            yield self
+
+        def run(self, statement):
+            self.statements.append(statement)
+            return self
+
+        def consume(self):
+            pass
+
+    driver = Driver()
+    assert _prepare_neo4j(driver, targets) == {"indexes": 3}
+    assert len(driver.statements) == 3
+    assert all(query.startswith("CREATE INDEX IF NOT EXISTS") for query in driver.statements)
+
+    # The preparation entry itself revalidates the target before opening a session.
+    targets["NEO4J_URI"] = target_uri
+    with pytest.raises(ValueError):
+        _prepare_neo4j(driver, targets)
+    assert len(driver.statements) == 3
+
+
+@pytest.mark.parametrize("database", ["postgres", "papervault_catalog", "knowledge_system", "papervault"])
+def test_backend_acceptance_refuses_postgres_defaults_with_disposable_neo4j(database):
+    with pytest.raises(ValueError, match="rehearsal|live"):
+        _guard_targets({"PAPERVAULT_BACKEND_TEST_DSN":
+            f"host=staging.invalid dbname={database} user=fixture password=fixture",
+            "PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE": "neo4j",
+            "PAPERVAULT_BACKEND_TEST_NEO4J_URI": "bolt://localhost:17687",
+            "PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE": "1", "NEO4J_URI": "bolt://localhost:7687"})
 
 
 class BackendAcceptance:
@@ -191,7 +317,8 @@ class BackendAcceptance:
 async def backend(monkeypatch, backend_test_targets):
     # This check precedes importing runtime storage or making ANY connection.
     targets = backend_test_targets
-    missing = [key for key, value in targets.items() if not value]
+    optional = {"PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE", "NEO4J_URI"}
+    missing = [key for key, value in targets.items() if key not in optional and not value]
     if missing:
         pytest.skip("real backend acceptance requires all explicit credentials: " + ", ".join(missing))
     pg = _guard_targets(targets)
@@ -199,7 +326,7 @@ async def backend(monkeypatch, backend_test_targets):
     import psycopg
     from psycopg import sql
     from neo4j import GraphDatabase
-    from scripts.prepare_knowledge_backend import prepare_neo4j, prepare_postgres
+    from scripts.prepare_knowledge_backend import prepare_postgres
 
     # Override only test configuration; storage classes, clients, queries and
     # catalog namespace gates below are the real implementations.
@@ -231,7 +358,7 @@ async def backend(monkeypatch, backend_test_targets):
                       targets["PAPERVAULT_BACKEND_TEST_NEO4J_PASSWORD"])) as driver:
             # Explicit database must exist; fail here instead of runtime's
             # upstream-compatible missing-database fallback to the default DB.
-            prepare_neo4j(driver, database=targets["PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE"])
+            _prepare_neo4j(driver, targets)
             try:
                 catalog = PostgresCatalogRepository(conn, schema=schema)
                 catalog.ensure_schema(audit=AuditEvent("backend-test", "schema"))

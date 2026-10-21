@@ -1,20 +1,70 @@
 """Root test config: environment isolation + the `integration` marker.
 
-Unit tests (the CI set) must not touch live infrastructure. This machine may export
-prod env (PAPER_LIBRARY_PATH etc.) pointing at a real vault; strip the vault vars so
-unit tests get clean defaults / their own tmp fixtures. Tests needing GPU / Postgres /
-Neo4j / network / a live LLM are marked `integration` and excluded from CI via
+Unit tests (the CI set) must not touch live infrastructure. Disable dotenv loading
+and scrub production configuration before application imports and each test's fixtures.
+Catalog tests use JSON unless they explicitly opt into the guarded test DSN.
+Tests needing GPU / Postgres / Neo4j / network / a live LLM are marked `integration` and excluded from CI via
 `pytest -m "not integration"`; run the full suite on reference hardware.
 """
 import os
 import sys
+from importlib.metadata import version
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
+from packaging.version import Version
 import pytest
 
-# --- environment isolation (before any papervault.config import resolves paths) ---
-for _v in ("PAPER_LIBRARY_PATH", "PAPERVAULT_VAULT", "PAPERVAULT_DATA"):
-    os.environ.pop(_v, None)
+# --- environment isolation (before ANY application import, including child conftests) ---
+# Older dotenv ignores the subprocess-safe disable flag. Refuse that environment
+# before collecting tests; the prescribed uv sync installs the locked 1.2.2 release.
+if Version(version("python-dotenv")) < Version("1.2"):
+    raise pytest.UsageError("Test isolation requires python-dotenv>=1.2; run uv sync --extra dev")
+
+# Denylist: application flags/paths/tuning, knowledge stores and libpq discovery,
+# OCR/model settings, provider credentials/endpoints, and legacy library settings.
+# Prefixes also cover future settings in these namespaces. Keep shell/runtime vars
+# (PATH, HOME, CUDA_VISIBLE_DEVICES, pytest options, etc.) for the test runner.
+# The ONLY inherited application opt-in is the dedicated catalog test DSN; the
+# catalog_test_dsn fixture validates it before a PostgreSQL connection is possible.
+_PRODUCTION_ENV_PREFIXES = (
+    "PAPERVAULT_", "KS_", "NEO4J_", "POSTGRES_", "PG", "MINERU_", "OPENALEX_",
+    "PAPER_", "LIGHTRAG_", "BGE_", "MIMO_", "OPENAI_", "ANTHROPIC_", "LLM_",
+    "FIRECRAWL_", "ZOTERO_",
+)
+_PRODUCTION_ENV_NAMES = {
+    "ADS_API_TOKEN", "CORE_API_KEY", "WILEY_TDM_TOKEN", "ELSEVIER_TDM_API_KEY",
+    "ANNAS_ARCHIVE_API_KEY", "UNPAYWALL_EMAIL", "ENTITY_EXTRACTION_USE_JSON", "RERANK_TIMEOUT",
+}
+# Even the default key-pool/data paths must not discover operator state under HOME.
+_TEST_DATA = TemporaryDirectory(prefix="papervault-tests-")
+_TEST_ENV_DEFAULTS = {
+    "PYTHON_DOTENV_DISABLED": "1",  # Also prevents .env reads in subprocesses.
+    "PAPERVAULT_DATA": _TEST_DATA.name,
+    "PAPERVAULT_CATALOG_AUTHORITY": "json",
+    "PAPERVAULT_TERMINAL_V2": "0",
+    "PAPERVAULT_IDENTITY_V2": "0",
+    "PAPERVAULT_REOPEN_V2": "0",
+    "PAPERVAULT_POLITE_V2": "0",
+    "PAPERVAULT_MERGE_V2": "0",
+    "PAPERVAULT_STOPRULES_V2": "0",
+    "PAPERVAULT_LLM_GATEWAY": "0",
+    # Tests assert immediate saves unless they explicitly exercise debouncing (#34).
+    "PAPERVAULT_SAVE_MIN_INTERVAL_S": "0",
+    "PAPERVAULT_BIB_MIN_INTERVAL_S": "0",
+}
+
+
+def _is_production_setting(name):
+    return name != "PAPERVAULT_CATALOG_TEST_DSN" and (
+        name.startswith(_PRODUCTION_ENV_PREFIXES) or name in _PRODUCTION_ENV_NAMES
+    )
+
+
+for _name in tuple(os.environ):
+    if _is_production_setting(_name):
+        del os.environ[_name]
+os.environ.update(_TEST_ENV_DEFAULTS)
 
 # The eval harness modules are flat scripts that cross-import by bare name
 # (`import backbone`, `import stats`); put their dir on sys.path so those resolve.
@@ -68,14 +118,18 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.integration)
 
 
-# The lab .env (loaded by papervault.config at import) may opt into save debouncing;
-# tests must see the shipped defaults (off) unless a test sets its own value (issue #34).
-os.environ["PAPERVAULT_SAVE_MIN_INTERVAL_S"] = "0"
-os.environ["PAPERVAULT_BIB_MIN_INTERVAL_S"] = "0"
+@pytest.fixture(autouse=True)
+def _isolate_test_environment(monkeypatch):
+    """Reset leaks before fixtures; tests opt into their settings with monkeypatch."""
+    for name in tuple(os.environ):
+        if _is_production_setting(name):
+            monkeypatch.delenv(name)
+    for name, value in _TEST_ENV_DEFAULTS.items():
+        monkeypatch.setenv(name, value)
 
 
 @pytest.fixture(autouse=True)
-def _reset_search_breaker():
+def _reset_search_breaker(_isolate_test_environment):
     """The #115 per-backend circuit breaker keeps PROCESS-LIFETIME state keyed by
     backend name. Without a reset it leaks across tests: three tests in a row
     degrading ``semantic_scholar`` would open its circuit, and the NEXT test's

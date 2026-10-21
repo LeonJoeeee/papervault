@@ -554,8 +554,6 @@ async def extract_md(paper: Paper, library: Library, *,
 
     Idempotent: an md already on disk is terminal truth and is never re-OCR'd.
     """
-    md_path = library.md_path(paper.key)
-
     # An md already on disk is terminal truth. We do NOT re-OCR a firecrawl-md
     # paper just because a real PDF later appears: per D5 ("if firecrawl's grab
     # is no good, it stays no good") a firecrawl text-only paper that passed the
@@ -569,7 +567,7 @@ async def extract_md(paper: Paper, library: Library, *,
     if not force and library.has_extract(paper.key, "md"):
         from .services.extraction_registration import require_selected_registration
         require_selected_registration(library, paper)
-        return md_path.read_text()
+        return library.md_path(paper.key).read_text()
     if not library.has_pdf(paper.key):
         return None
 

@@ -125,7 +125,10 @@ class StagedAttempt:
         # from publishing these bundles outside guarded writeback.
         from papervault.store.extraction import ExtractionStore
         source = ExtractionStore(self.root)
-        for completion in source.completions():
+        # Cleanup must read strictly: skipping malformed evidence would delete
+        # its only copy when removing the stage below.
+        for path in sorted(source.versions.glob("[!.]*/completion.json")):
+            completion = source.completion(path.parent.name)
             ExtractionStore(self.live.root).retain_from(source, completion)
         self.library.close()
         shutil.rmtree(self.root)

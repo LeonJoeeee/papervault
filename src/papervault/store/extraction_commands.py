@@ -75,8 +75,10 @@ def publish_extraction(k, operation_id, payload):
     require(unit["kind"] == "paper" and not unit["quarantine"], "extraction unit ineligible")
     head = k.get_extraction_head(unit["unit_id"])
     revision(head, payload, "expected_head_revision")
-    if head:
-        require(head["completion_id"] == completion["guard"]["previous_completion_id"], "stale extraction head")
+    guard = completion["guard"]
+    if head or "catalog_previous_completion_id" in guard:
+        predecessor = guard.get("catalog_previous_completion_id", guard["previous_completion_id"])
+        require((head["completion_id"] if head else None) == predecessor, "stale extraction head")
     manifest = completion["input_manifest"]
     validate_input_manifest(manifest)
     require(completion["consumed_input_revision"] == "input:" + payload_hash(manifest), "extraction input digest differs")

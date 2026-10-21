@@ -55,6 +55,32 @@ async def test_staged_extraction_evidence_survives_authorized_writeback_and_clea
     assert ExtractionStore(lib.root).read_artifact(retained["input_manifest"]["artifacts"][0]) == b"observed provider markdown"
 
 
+async def test_malformed_staged_evidence_blocks_cleanup(vault):
+    from papervault.library.reopen_v2 import StagedAttempt
+    from papervault.library.services.extraction_registration import begin_extraction, finish_extraction
+
+    lib, paper = vault
+    claims, token = await prepare(vault)
+    assert await claims.pre_dispatch(token)
+    stage = StagedAttempt(lib, token)
+    try:
+        candidate = stage.library.get(paper.key)
+        request = begin_extraction(candidate, stage.library, b"observed provider markdown",
+            engine="firecrawl", source_role="provider_markdown")
+        completion = finish_extraction(candidate, stage.library, request, "# Retain this staged output")
+        output = stage.root / completion["output_inventory"][0]["path"]
+        receipt = output.parent / "completion.json"
+        receipt.write_bytes(b'{"incomplete":')
+
+        with pytest.raises(ValueError):
+            stage.cleanup()
+
+        assert output.read_text() == "# Retain this staged output"
+        assert receipt.read_bytes() == b'{"incomplete":'
+    finally:
+        stage.library.close()
+
+
 @pytest.mark.parametrize("disposition", ["expired", "identical", "uncommitted"])
 async def test_staged_evidence_survives_refusal_without_bypassing_claim(vault, disposition):
     from papervault.library.reopen_v2 import StagedAttempt

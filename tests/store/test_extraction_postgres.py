@@ -184,6 +184,38 @@ async def test_catalog_staged_blank_fill_and_completion_share_transaction(
         library.close()
 
 
+@pytest.mark.parametrize("existing_head", [False, True])
+def test_capture_fences_concurrent_catalog_head_change(
+        extraction_catalog, tmp_path, monkeypatch, catalog_test_dsn, existing_head):
+    import asyncio
+    from papervault.library import extract
+    from papervault.library.services.extraction_registration import begin_extraction
+    from papervault.store.extraction import register_completion
+
+    k = extraction_catalog
+    library, paper = runtime_library(k, tmp_path, monkeypatch, catalog_test_dsn)
+    try:
+        if existing_head:
+            asyncio.run(extract.extract_md(paper, library))
+            library.save(force=True, durable=True)
+        store = ExtractionStore(tmp_path)
+        source = library.pdf_path(paper.key).read_bytes()
+        winner_request = begin_extraction(paper, library, source)
+        stale_request = begin_extraction(paper, library, source)
+        winner = store.finalize(winner_request, b"# Winning concurrent output")
+        stale = store.finalize(stale_request, b"# Stale concurrent output")
+        register_completion(k, tmp_path, winner)
+        with pytest.raises(ClaimRejected, match="head|stale"):
+            register_completion(k, tmp_path, stale)
+        unit = k.get_unit_for_record(paper.key)
+        assert k.get_extraction_head(unit["unit_id"])["completion_id"] == winner["completion_id"]
+        assert k.get_extraction_receipt(stale["completion_id"]) is None
+        assert store.completion(stale["completion_id"]) == stale
+        assert count(k, "extraction_receipts") == 1 + int(existing_head)
+    finally:
+        library.close()
+
+
 def test_retained_staged_completion_requires_guarded_publication(extraction_catalog, tmp_path):
     k = extraction_catalog
     store = ExtractionStore(tmp_path)
@@ -398,5 +430,79 @@ def test_catalog_cannot_shortcut_success_for_refused_pending_output(
         with pytest.raises(ClaimRejected, match="identity"):
             asyncio.run(extract.extract_md(paper, library))
         assert count(k, "extraction_receipts") == 0
+    finally:
+        library.close()
+
+
+@pytest.mark.parametrize("recover_first", [False, True])
+async def test_lost_reply_then_merge_into_existing_head_allows_recovery_and_fresh_extraction(
+        extraction_catalog, tmp_path, monkeypatch, catalog_test_dsn, recover_first):
+    from papervault.library import extract
+    from papervault.library.merge_v2 import MergeStore
+    from papervault.library.services.extraction_registration import recover_completions
+
+    k = extraction_catalog
+    k.repository.upsert(Record.from_payload("B", {"key": "B", "title": "Merge destination",
+        "terminal_state": {"retrieval": "eligible", "policy": "clear", "merge": "canonical"}}),
+        expected_revision=0, audit=AuditEvent("test", "destination"))
+    library, origin = runtime_library(k, tmp_path, monkeypatch, catalog_test_dsn)
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    destination = library.get("B")
+    library.pdf_path("B").write_bytes(b"%PDF destination source")
+    original = KnowledgeRepository.command
+    lost = False
+
+    def command(self, action, operation_id, data):
+        nonlocal lost
+        result = original(self, action, operation_id, data)
+        if (action == "publish_derivation" and data.get("kind") == "extraction"
+                and data["record_key"] == "B" and not lost):
+            lost = True
+            raise ConnectionError("destination commit reply lost")
+        return result
+
+    try:
+        await extract.extract_md(origin, library)
+        library.save(force=True, durable=True)
+        origin_id = origin.extraction_completion_id
+        monkeypatch.setattr(KnowledgeRepository, "command", command)
+        with pytest.raises(ConnectionError, match="destination commit reply lost"):
+            await extract.extract_md(destination, library)
+        unit = k.get_unit_for_record("B")
+        committed_id = k.get_extraction_head(unit["unit_id"])["completion_id"]
+        committed = ExtractionStore(tmp_path).completion(committed_id)
+        assert not library.has_extract("B", "md")
+        assert destination.extraction_completion_id is None
+
+        assert await MergeStore(library).merge_records("B", "A") is destination
+        assert destination.extraction_completion_id == origin_id
+        assert k.get_extraction_head(unit["unit_id"])["completion_id"] == committed_id
+        assert k.get_extraction_receipt(origin_id)["receipt"]["record_key"] == "A"
+        before_recovery = library.manifest_path.read_text()
+        if recover_first:
+            report = recover_completions(library, key="B")
+            assert report["recovered"] == 1, "the committed destination head must remain recoverable"
+            assert report["blocked"] == []
+            assert destination.extraction_completion_id == committed_id
+            assert library.manifest_path.read_text() == before_recovery
+            library.save(force=True, durable=True)
+
+        await extract.extract_md(destination, library, force=True)
+        fresh_id = destination.extraction_completion_id
+        assert fresh_id not in {origin_id, committed_id}
+        fresh = ExtractionStore(tmp_path).completion(fresh_id)
+        assert fresh["guard"]["previous_completion_id"] == (committed_id if recover_first else origin_id)
+        assert fresh["guard"]["catalog_previous_completion_id"] == committed_id
+        assert k.get_extraction_head(unit["unit_id"])["completion_id"] == fresh_id
+        before_recovery = library.manifest_path.read_text()
+        assert recover_completions(library, key="B")["recovered"] == 0
+        assert recover_completions(library, key="B")["recovered"] == 0
+        assert destination.extraction_completion_id == fresh_id
+        assert library.manifest_path.read_text() == before_recovery
+        assert ExtractionStore(tmp_path).completion(committed_id) == committed
+        assert count(k, "derivations") == count(k, "extraction_receipts") == 3
+        assert len(k.list_outbox(kind="extraction_completed")) == 3
+        assert count(k, "knowledge_attempts") == count(k, "knowledge_attempt_events") == 0
+        assert destination.extract_attempts == 0
     finally:
         library.close()

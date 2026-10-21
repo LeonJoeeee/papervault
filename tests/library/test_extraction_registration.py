@@ -315,3 +315,58 @@ def test_completion_syncs_storage_ancestors_before_delivery(extraction, monkeypa
     monkeypatch.setattr(evidence, "fsync_directory", sync)
     monkeypatch.setattr(registration, "deliver_completion", deliver)
     asyncio.run(extract.extract_md(paper, library))
+
+
+def test_extract_returns_newly_recovered_version(extraction, monkeypatch):
+    from papervault.library.merge_v2 import MergeStore
+    from papervault.library.services import extraction_registration as registration
+    from papervault.store.extraction import ExtractionStore
+
+    library, paper = extraction
+    first = asyncio.run(extract.extract_md(paper, library))
+    first_path = library.root / paper.md_path
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    destination, _ = library.upsert({"title": "Canonical destination", "authors": ["B. Author"], "year": 2026})
+    paper = asyncio.run(MergeStore(library).merge_records(destination.key, paper.key))
+    assert library.md_path(paper.key) == first_path
+    request = registration.begin_extraction(paper, library, library.pdf_path(paper.key).read_bytes())
+    recovered_text = "# Recovered revision\nA different measured result."
+    completion = ExtractionStore(library.root).finalize(request, recovered_text.encode())
+    before = library.manifest_path.read_text()
+
+    async def no_execution(*_, **kw):
+        pytest.fail("recovery must return the retained output without another OCR call")
+
+    monkeypatch.setattr(extract, "extract_mineru", no_execution)
+    assert asyncio.run(extract.extract_md(paper, library)) == recovered_text
+    assert paper.extraction_completion_id == completion["completion_id"]
+    assert library.md_path(paper.key).read_text() == recovered_text
+    assert first_path.read_text() == first
+    assert paper.extract_attempts == 0
+    assert library.manifest_path.read_text() == before
+
+
+@pytest.mark.parametrize("malformed", [b'{"record_key":', b'\xff', b'null', b'[]', b'{}'])
+@pytest.mark.parametrize("per_key", [False, True])
+def test_malformed_completion_does_not_block_healthy_recovery(extraction, caplog, malformed, per_key):
+    from papervault.library.services.extraction_registration import begin_extraction, recover_completions
+    from papervault.store.extraction import ExtractionStore
+
+    library, paper = extraction
+    store = ExtractionStore(library.root)
+    request = begin_extraction(paper, library, library.pdf_path(paper.key).read_bytes())
+    completion = store.finalize(request, b"# Healthy retained output")
+    bad_path = store.versions / ("0" * 32) / "completion.json"
+    bad_path.parent.mkdir()
+    bad_path.write_bytes(malformed)
+    assert not library.manifest_path.exists()
+
+    report = recover_completions(library, key=paper.key if per_key else None)
+
+    assert report == {"recovered": 1, "blocked": []}
+    assert paper.extraction_completion_id == completion["completion_id"]
+    assert library.md_path(paper.key).read_text() == "# Healthy retained output"
+    assert bad_path.read_bytes() == malformed, "invalid evidence must remain available for diagnosis"
+    assert str(bad_path) in caplog.text
+    assert paper.extract_attempts == 0
+    assert not library.manifest_path.exists()

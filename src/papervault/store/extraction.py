@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,9 @@ from uuid import uuid4
 
 from .knowledge import canonical_recipe
 from .repository import canonical_json, payload_hash
+
+
+_log = logging.getLogger(__name__)
 
 
 def fsync_directory(path: Path) -> None:
@@ -125,7 +129,11 @@ class ExtractionStore:
         fsync_directory(self.vault)
         return completion
 
-    def verify(self, completion: dict) -> None:
+    @staticmethod
+    def _validate_evidence(completion: dict) -> list[dict]:
+        """Validate receipt metadata separately from its retained artifact bytes."""
+        if not isinstance(completion, dict):
+            raise ValueError("extraction completion must be an object")
         identity = completion.get("completion_id")
         if not isinstance(identity, str) or len(identity) != 32 or any(c not in "0123456789abcdef" for c in identity):
             raise ValueError("invalid extraction completion identity")
@@ -137,6 +145,12 @@ class ExtractionStore:
         if completion.get("evidence_digest") != payload_hash({
                 k: v for k, v in completion.items() if k != "evidence_digest"}):
             raise ValueError("extraction completion integrity failure")
+        guard = completion["guard"]
+        if (not isinstance(completion["record_key"], str) or not completion["record_key"]
+                or not isinstance(guard["identity"], dict)
+                or guard["previous_completion_id"] is not None
+                and not isinstance(guard["previous_completion_id"], str)):
+            raise ValueError("invalid extraction record/projection guard")
         manifest = completion["input_manifest"]
         if (completion["consumed_input_revision"] != "input:" + payload_hash(manifest)
                 or canonical_recipe(completion["recipe"]) != (completion["recipe"], completion["recipe_digest"])):
@@ -157,9 +171,12 @@ class ExtractionStore:
                 or output["verification"] != {"state": "present", "method": "sha256-length-readback",
                                               "evidence": {"verified": True}}):
             raise ValueError("extraction inventory is not immutable versioned evidence")
-        for artifact in inputs + outputs:
+        return inputs + outputs
+
+    def verify(self, completion: dict) -> None:
+        for artifact in self._validate_evidence(completion):
             self.read_artifact(artifact)
-        retained = self.path(f"extracts/versions/{identity}/completion.json")
+        retained = self.path(f"extracts/versions/{completion['completion_id']}/completion.json")
         if json.loads(retained.read_bytes()) != completion:
             raise ValueError("extraction receipt differs from retained completion")
 
@@ -167,7 +184,14 @@ class ExtractionStore:
         if not self.versions.exists():
             return
         for path in sorted(self.versions.glob("[!.]*/completion.json")):
-            completion = json.loads(path.read_bytes())
+            try:
+                completion = json.loads(path.read_bytes())
+                self._validate_evidence(completion)
+                if path.parent.name != completion["completion_id"]:
+                    raise ValueError("extraction completion directory identity differs")
+            except (OSError, ValueError, KeyError, TypeError):
+                _log.warning("Skipping malformed extraction completion: %s", path)
+                continue
             if key is None or completion["record_key"] == key:
                 yield completion
 

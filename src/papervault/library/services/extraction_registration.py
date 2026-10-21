@@ -90,6 +90,15 @@ def begin_extraction(paper, library, source: bytes, *, engine="mineru2.5-pro",
     guard = {"previous_completion_id": previous,
              "previous_output_sha256": hashlib.sha256(alias.read_bytes()).hexdigest() if alias.is_file() else None,
              "identity": paper.model_dump(mode="json", include=_IDENTITY_FIELDS)}
+    if authority["authority"] == "catalog":
+        from papervault.store.knowledge import KnowledgeRepository
+        with backend._repository() as repository:
+            knowledge = KnowledgeRepository(repository)
+            unit = knowledge.get_unit_for_record(paper.key)
+            head = knowledge.get_extraction_head(unit["unit_id"]) if unit else None
+        # Merge adoption can select another unit's output without changing this
+        # unit's catalog head. Capture both predecessors, including absent heads.
+        guard["catalog_previous_completion_id"] = head["completion_id"] if head else None
     # A staged verified blank fill belongs to the consumed metadata. The unit
     # remains the existing live catalog identity until guarded writeback adopts it.
     unit_paper = authority_library.get(paper.key) if authority_library is not library else paper
@@ -105,18 +114,18 @@ def begin_extraction(paper, library, source: bytes, *, engine="mineru2.5-pro",
     return captured
 
 
-def _check_current(library, paper, completion):
+def _check_current(library, paper, completion, *, registered_head=False):
     if paper.model_dump(mode="json", include=_IDENTITY_FIELDS) != completion["guard"]["identity"]:
         raise StaleExtraction("extraction identity changed during execution")
-    if paper.extraction_completion_id not in {
+    if not registered_head and paper.extraction_completion_id not in {
             completion["guard"]["previous_completion_id"], completion["completion_id"]}:
         raise StaleExtraction("extraction completion is stale")
     if paper.extraction_completion_id == completion["completion_id"]:
         return  # Already projected: a subsequent source revision cannot rewrite its history.
     alias = library.md_path(paper.key)
     current_hash = hashlib.sha256(alias.read_bytes()).hexdigest() if alias.is_file() else None
-    if current_hash not in {completion["guard"].get("previous_output_sha256"),
-                            completion["output_inventory"][0]["sha256"]}:
+    if not registered_head and current_hash not in {
+            completion["guard"].get("previous_output_sha256"), completion["output_inventory"][0]["sha256"]}:
         raise StaleExtraction("extraction output changed during execution")
     source = completion["input_manifest"]["artifacts"][0]
     if source["role"] == "pdf":
@@ -197,6 +206,23 @@ def adopt_staged_completion(paper, library, staged, completion):
         _project(library, paper, completion)
 
 
+def _registered_head_status(library, completion) -> bool | None:
+    """True for the current receipt, False for superseded, None for unregistered."""
+    from papervault.store.knowledge import KnowledgeRepository
+
+    if hasattr(library, "_extraction_live") or _authority(library)["authority"] != "catalog":
+        return None
+    with library._catalog_backend._repository() as repository:
+        knowledge = KnowledgeRepository(repository)
+        receipt = knowledge.get_extraction_receipt(completion["completion_id"])
+        if receipt is None:
+            return None
+        if receipt["receipt"] != completion:
+            raise ValueError("registered extraction differs from retained completion")
+        head = knowledge.get_extraction_head(receipt["unit_id"])
+        return bool(head and head["completion_id"] == completion["completion_id"])
+
+
 def recover_completions(library, *, key=None):
     from papervault.store.knowledge import ClaimRejected
 
@@ -205,18 +231,23 @@ def recover_completions(library, *, key=None):
         paper = library.get(completion["record_key"])
         if paper is None:
             continue
-        # Prior versions remain durable history, never replace a newer pointer.
-        if paper.extraction_completion_id not in {
-                completion["guard"]["previous_completion_id"], completion["completion_id"]}:
-            continue
         try:
             with _write_lock(library), FileLock(str(library.root / ".extraction-write.lock")):
+                registered_head = _registered_head_status(library, completion)
+                # A committed head survives a lost reply and merge adoption.
+                # Superseded receipts remain history even if their old local
+                # predecessor still matches after another lost reply.
+                if registered_head is False:
+                    continue
+                if registered_head is not True and paper.extraction_completion_id not in {
+                        completion["guard"]["previous_completion_id"], completion["completion_id"]}:
+                    continue
                 ExtractionStore(library.root).verify(completion)
                 claim = completion.get("staged_claim")
                 if claim and (not paper.reopen_claim or paper.reopen_claim.phase != "completed"
                               or paper.reopen_claim.lease_id != claim["lease_id"]):
                     raise StaleExtraction("staged extraction requires accepted guarded writeback")
-                _check_current(library, paper, completion)
+                _check_current(library, paper, completion, registered_head=registered_head is True)
                 deliver_completion(library, completion)
                 if paper.extraction_completion_id != completion["completion_id"]:
                     _project(library, paper, completion)

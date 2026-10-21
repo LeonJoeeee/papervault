@@ -54,7 +54,10 @@ normalized host/port from the service's configured live `NEO4J_URI`. The operato
 supply that live URI through the existing configuration/credential channel before pytest
 starts; tests never load `.env`. Missing or invalid URIs are refused. URI schemes and
 credentials do not distinguish endpoints; host case, trailing dots, implicit Bolt port
-7687 and equivalent loopback addresses are normalized. This exception applies only to
+7687 and equivalent loopback addresses are normalized. Numeric IPv4 aliases (including
+shortened, decimal, hexadecimal and octal forms), all of `127.0.0.0/8`, IPv6 loopback
+and `localhost` share one loopback identity. Empty, whitespace-containing and malformed
+hostnames are invalid, including in the supplied live URI. This exception applies only to
 the exact database name `neo4j`; it does not relax PostgreSQL or production preparation
 guards. Never use the CLI's `--allow-live` for this acceptance run.
 
@@ -132,9 +135,9 @@ Check collection and the target refusal cases, then execute the actual backend c
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q -rs
 ```
 
-Expected results: **37 tests collected**, **30 passed, 7 deselected** for the refusal
-check, **34 passed, 3 deselected** for all target checks (no connections), and
-**37 passed**, exit **0**, for acceptance. Three skipped
+Expected results: **99 tests collected**, **72 passed, 27 deselected** for the refusal
+check, **96 passed, 3 deselected** for all target checks (no connections), and
+**99 passed**, exit **0**, for acceptance. Three skipped
 real-store tests mean missing explicit credentials and do not constitute acceptance.
 The three real-store test names identify original merge summaries/shared-entity traversal,
 latest-version vector visibility/top-k/tombstones, and cache/sealed/stale-write isolation.

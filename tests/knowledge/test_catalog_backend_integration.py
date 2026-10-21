@@ -16,10 +16,12 @@ from __future__ import annotations
 import hashlib
 import inspect
 import os
+import re
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from ipaddress import ip_address
+from socket import inet_aton
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
@@ -29,6 +31,10 @@ pytestmark = pytest.mark.integration
 
 _MODEL = "pv_acceptance_fixture"
 _DIM = 3
+_LOOPBACK_ALIASES = (
+    "127.1", "127.0.1", "127.000.000.001", "0177.0.0.1", "0x7f000001",
+    "0x7f.0.0.1", "2130706433", "127.0.0.2", "127.255.255.255", "[::1]",
+)
 
 
 async def _fixture_embeddings(texts, **kwargs):
@@ -52,6 +58,9 @@ def _neo4j_address(uri):
     """Compare endpoints independently of scheme, credentials and loopback spelling."""
     if not uri:
         raise ValueError("disposable Neo4j requires explicit target and configured live URIs")
+    # urlsplit silently removes tabs/newlines; reject them before parsing.
+    if any(character.isspace() for character in uri):
+        raise ValueError("invalid Neo4j URI whitespace")
     try:
         parsed = urlsplit(uri)
         host, port = parsed.hostname, parsed.port
@@ -59,14 +68,23 @@ def _neo4j_address(uri):
         raise ValueError("invalid Neo4j URI host/port") from None
     if parsed.scheme not in {"bolt", "bolt+s", "bolt+ssc", "neo4j", "neo4j+s", "neo4j+ssc"} or not host or port == 0:
         raise ValueError("invalid Neo4j URI scheme or host/port")
-    host = host.lower().rstrip(".")
+    host = host.lower().removesuffix(".")
     try:
         address = ip_address(host)
     except ValueError:
-        pass
-    else:
+        try:
+            # Decode legacy numeric IPv4 spellings locally, without DNS resolution.
+            address = ip_address(inet_aton(host))
+        except OSError:
+            address = None
+    if address is not None:
         address = getattr(address, "ipv4_mapped", None) or address
         host = "localhost" if address.is_loopback else address.compressed
+    elif len(host) > 253 or not all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label)
+        for label in host.split(".")
+    ):
+        raise ValueError("invalid Neo4j URI hostname")
     return host, 7687 if port is None else port
 
 
@@ -122,6 +140,8 @@ def test_backend_acceptance_refuses_live_or_unqualified_targets_before_connectin
     ("1", "bolt://127.0.0.1:7687", "bolt://localhost:7687"),
     ("1", "bolt://[::1]:7687", "bolt://localhost:7687"),
     ("1", "bolt://[::ffff:127.0.0.1]:7687", "bolt://localhost:7687"),
+    *[("1", f"bolt://{host}:7687", "bolt://localhost:7687") for host in _LOOPBACK_ALIASES],
+    *[("1", "bolt://localhost:7687", f"bolt://{host}:7687") for host in _LOOPBACK_ALIASES],
     ("1", "bolt://localhost:17687", None),
     ("1", "bolt://localhost:17687", ""),
     ("1", "bolt://localhost:17687", "not-a-uri"),
@@ -142,11 +162,31 @@ def test_backend_acceptance_refuses_unsafe_disposable_neo4j_targets(disposable, 
             "NEO4J_URI": live_uri})
 
 
+@pytest.mark.parametrize("host", [
+    "bad host", ".", "", " ", "bad\thost", "bad\nhost", "bad\rhost",
+    "bad..host", "-bad.host", "bad-.host", "host..",
+])
+@pytest.mark.parametrize("invalid_side", ["PAPERVAULT_BACKEND_TEST_NEO4J_URI", "NEO4J_URI"])
+def test_backend_acceptance_refuses_malformed_neo4j_hosts(host, invalid_side):
+    targets = {"PAPERVAULT_BACKEND_TEST_DSN":
+        "host=staging.invalid dbname=p4_rehearsal user=fixture password=fixture",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_DATABASE": "neo4j",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_URI": "bolt://localhost:17687",
+        "PAPERVAULT_BACKEND_TEST_NEO4J_DISPOSABLE": "1", "NEO4J_URI": "bolt://localhost:7687"}
+    # A different port prevents endpoint equality from masking missing validation.
+    port = 17687 if invalid_side == "PAPERVAULT_BACKEND_TEST_NEO4J_URI" else 7687
+    targets[invalid_side] = f"bolt://{host}:{port}"
+    with pytest.raises(ValueError, match="invalid Neo4j URI"):
+        _guard_targets(targets)
+
+
 @pytest.mark.parametrize("target_uri,live_uri", [
     ("bolt://localhost:17687", "bolt://localhost:7687"),
     ("neo4j://staging.invalid:7687", "bolt://live.invalid:7687"),
     ("bolt+ssc://[::1]:17687", "neo4j+s://localhost"),
     ("bolt://staging.invalid", "bolt://live.invalid:7687"),
+    *[(f"bolt://{host}:17687", "bolt://localhost:7687") for host in _LOOPBACK_ALIASES],
+    *[("bolt://localhost:17687", f"bolt://{host}:7687") for host in _LOOPBACK_ALIASES],
 ])
 def test_backend_acceptance_accepts_disposable_default_on_separate_address(target_uri, live_uri):
     targets = {"PAPERVAULT_BACKEND_TEST_DSN":

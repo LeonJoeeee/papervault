@@ -75,14 +75,29 @@ class CatalogService:
         repo = self.repository
         scope = set(only_keys) if only_keys is not None else None
         recovered = 0
-        for kind in ("capture_input", "inventory_changed", "requirement_changed"):
+        for kind in ("extraction_completed", "capture_input", "inventory_changed", "requirement_changed"):
             for event in repo.list_outbox(kind=kind):
                 payload = event["payload"]
-                if kind == "capture_input":
-                    if scope is not None and payload["record_key"] not in scope:
+                if kind in {"capture_input", "extraction_completed"}:
+                    record_key = payload["record_key"]
+                    if kind == "extraction_completed":
+                        record_key = repo.resolve_record_alias(record_key)
+                    if scope is not None and record_key not in scope:
                         continue
-                    row = repo.get_record(payload["record_key"])
+                    row = repo.get_record(record_key)
                     if row is None:
+                        continue
+                    if kind == "extraction_completed" and row["payload"].get("extraction_completion_id") != payload["completion_id"]:
+                        head = repo.get_extraction_head(payload["unit_id"])
+                        origin = repo.get_unit(payload["unit_id"])
+                        if (head and head["completion_id"] == payload["completion_id"]
+                                and origin["record_key"] == record_key):
+                            continue  # Registration committed; Library projection/save has not.
+                        # An aliased origin's head is historical. Once its canonical
+                        # destination selects another output, no origin projection is due.
+                        self._command("acknowledge_outbox", {"outbox_id": event["outbox_id"]},
+                                      operation_id="ack:" + event["outbox_id"])
+                        recovered += 1  # A newer completion superseded this input; history stays.
                         continue
                     record = replace(Record.from_payload(row["key"], row["payload"]), revision=row["revision"])
                     if self.intake._capture_rows([record])["errors"]:

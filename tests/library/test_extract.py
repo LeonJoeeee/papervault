@@ -743,16 +743,18 @@ def test_extract_md_no_pdf_returns_none(tmp_path, monkeypatch):
     assert p.extract_attempts == 0
 
 
-# ----------- _save_md provenance (SDD §3.3 item 4c) -------------------------
+# ----------- completion provenance (SDD §3.3 item 4c) -------------------------
 
 
-def test_save_md_mineru_stamps_hardcoded_version(tmp_path):
-    """_save_md for a mineru md stamps the HARDCODED model id (non-empty even if
-    mineru is not importable), not a _pkg_version lookup."""
+def test_completion_mineru_stamps_hardcoded_version(tmp_path):
+    """The public provenance field retains the configured MinerU model identity."""
     lib = Library(tmp_path)
     p, _ = lib.upsert({"title": "Save md provenance paper title", "authors": ["A"],
                        "year": 2024, "doi": "10.1/savemd"})
-    extract._save_md(p, lib, "mineru2.5-pro", "# body\nreal md")
+    from papervault.library.services.extraction_registration import begin_extraction, finish_extraction
+    lib.pdf_path(p.key).write_bytes(b"%PDF source")
+    request = begin_extraction(p, lib, b"%PDF source")
+    finish_extraction(p, lib, request, "# body\nreal md")
     assert p.md_engine == "mineru2.5-pro"
     assert p.md_engine_version == "MinerU2.5-Pro-2605-1.2B"
     assert lib.has_extract(p.key, "md")

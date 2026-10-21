@@ -33,6 +33,91 @@ def tree_bytes(root):
     return {str(path.relative_to(root)): path.read_bytes() for path in root.rglob("*") if path.is_file()}
 
 
+async def test_staged_extraction_evidence_survives_authorized_writeback_and_cleanup(vault):
+    from papervault.library.reopen_v2 import StagedAttempt
+    from papervault.library.services.extraction_registration import begin_extraction, finish_extraction
+    from papervault.store.extraction import ExtractionStore
+
+    lib, paper = vault
+    claims, token = await prepare(vault)
+    assert await claims.pre_dispatch(token)
+    stage = StagedAttempt(lib, token)
+    staged_paper = stage.library.get(paper.key)
+    request = begin_extraction(staged_paper, stage.library, b"observed provider markdown",
+        engine="firecrawl", source_role="provider_markdown")
+    completion = finish_extraction(staged_paper, stage.library, request, "# Immutable staged output")
+    assert await stage.writeback(claims)
+    stage.cleanup()
+    retained = ExtractionStore(lib.root).completion(completion["completion_id"])
+    assert retained == completion
+    assert lib.get(paper.key).extraction_completion_id == completion["completion_id"]
+    assert (lib.root / lib.get(paper.key).md_path).read_text() == "# Immutable staged output"
+    assert ExtractionStore(lib.root).read_artifact(retained["input_manifest"]["artifacts"][0]) == b"observed provider markdown"
+
+
+async def test_malformed_staged_evidence_blocks_cleanup(vault):
+    from papervault.library.reopen_v2 import StagedAttempt
+    from papervault.library.services.extraction_registration import begin_extraction, finish_extraction
+
+    lib, paper = vault
+    claims, token = await prepare(vault)
+    assert await claims.pre_dispatch(token)
+    stage = StagedAttempt(lib, token)
+    try:
+        candidate = stage.library.get(paper.key)
+        request = begin_extraction(candidate, stage.library, b"observed provider markdown",
+            engine="firecrawl", source_role="provider_markdown")
+        completion = finish_extraction(candidate, stage.library, request, "# Retain this staged output")
+        output = stage.root / completion["output_inventory"][0]["path"]
+        receipt = output.parent / "completion.json"
+        receipt.write_bytes(b'{"incomplete":')
+
+        with pytest.raises(ValueError):
+            stage.cleanup()
+
+        assert output.read_text() == "# Retain this staged output"
+        assert receipt.read_bytes() == b'{"incomplete":'
+    finally:
+        stage.library.close()
+
+
+@pytest.mark.parametrize("disposition", ["expired", "identical", "uncommitted"])
+async def test_staged_evidence_survives_refusal_without_bypassing_claim(vault, disposition):
+    from papervault.library.reopen_v2 import StagedAttempt
+    from papervault.library.services.extraction_registration import begin_extraction, finish_extraction, recover_completions
+    from papervault.store.extraction import ExtractionStore
+
+    lib, paper = vault
+    body = "# Exact completed output"
+    if disposition == "identical":
+        lib.md_path(paper.key).write_text(body)
+        paper.md_path = str(lib.md_path(paper.key).relative_to(lib.root))
+        lib.save(force=True, durable=True)
+    claims, token = await prepare(vault)
+    assert await claims.pre_dispatch(token)
+    stage = StagedAttempt(lib, token)
+    candidate = stage.library.get(paper.key)
+    request = begin_extraction(candidate, stage.library, b"provider response",
+        engine="firecrawl", source_role="provider_markdown")
+    completion = finish_extraction(candidate, stage.library, request, body)
+    if disposition == "expired":
+        claims.clock = lambda: token.lease_expiry + 1
+        assert not await stage.writeback(claims)
+    elif disposition == "identical":
+        assert await stage.writeback(claims)
+    else:
+        ExtractionStore(lib.root).retain_from(ExtractionStore(stage.root), completion)
+    stage.cleanup()
+    assert ExtractionStore(lib.root).completion(completion["completion_id"]) == completion
+    report = recover_completions(lib)
+    if disposition == "identical":
+        assert paper.extraction_completion_id == completion["completion_id"]
+    else:
+        assert paper.extraction_completion_id is None
+        assert not lib.has_extract(paper.key, "md")
+        assert report["blocked"]
+
+
 def test_cli_dry_run_end_to_end_writes_nothing(vault):
     lib, paper = vault
     before = tree_bytes(lib.root)

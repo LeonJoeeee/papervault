@@ -100,6 +100,7 @@ class StagedAttempt:
         self.root = library.root / ".reopen-staging" / token.lease_id
         self.root.mkdir(parents=True, exist_ok=False)
         self.library = Library(self.root, authority="json")
+        self.library._extraction_live = library
         self.library._telemetry_live = library
         # The isolated artifacts do not own accounting. Merge generation
         # fencing must consult the same durable history as the live executor.
@@ -119,6 +120,16 @@ class StagedAttempt:
         return getattr(self.library, f"{kind}_path")(self.token.key)
 
     def cleanup(self) -> None:
+        # Execution evidence outlives a refused or byte-identical publication.
+        # Staged claim evidence prevents the ordinary extraction recovery path
+        # from publishing these bundles outside guarded writeback.
+        from papervault.store.extraction import ExtractionStore
+        source = ExtractionStore(self.root)
+        # Cleanup must read strictly: skipping malformed evidence would delete
+        # its only copy when removing the stage below.
+        for path in sorted(source.versions.glob("[!.]*/completion.json")):
+            completion = source.completion(path.parent.name)
+            ExtractionStore(self.live.root).retain_from(source, completion)
         self.library.close()
         shutil.rmtree(self.root)
 
@@ -184,7 +195,11 @@ class StagedAttempt:
                             # authorized blank fill, preserving existing adoption.
                             measurement_identity = identity_snapshot(self.before.model_copy(update=applied))
                     self.publication_uncertain = True
+                    new_extraction = (result.extraction_completion_id
+                        and result.extraction_completion_id != self.before.extraction_completion_id)
                     for kind, digest in changed.items():
+                        if kind == "md" and digest is not None and new_extraction:
+                            continue
                         live_path = getattr(self.live, f"{kind}_path")(paper.key)
                         if digest is None:
                             live_path.unlink(missing_ok=True)
@@ -197,6 +212,11 @@ class StagedAttempt:
                             os.replace(temporary, live_path)
                         _fsync_dir(live_path.parent, durable=True)
                         setattr(paper, f"{kind}_path", str(live_path.relative_to(self.live.root)) if digest else None)
+                    if new_extraction:
+                        from papervault.store.extraction import ExtractionStore
+                        from .services.extraction_registration import adopt_staged_completion
+                        completion = ExtractionStore(self.library.root).completion(result.extraction_completion_id)
+                        adopt_staged_completion(paper, self.live, self.library, completion)
                     for field in _RESULT_FIELDS:
                         if getattr(result, field) != getattr(self.before, field) and getattr(paper, field) == getattr(self.before, field):
                             setattr(paper, field, getattr(result, field))

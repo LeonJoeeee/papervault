@@ -454,6 +454,24 @@ class KnowledgeRepository:
             self.repository._table("supersession_events")), (derivation_id,)).fetchone()
         return {**row, "superseded_at": last["at"] if last and last["event"] == "superseded" else None}
 
+    def get_extraction_receipt(self, completion_id):
+        return self._one("extraction_receipts", completion_id=completion_id)
+
+    def get_extraction_head(self, unit_id):
+        return self._one("extraction_heads", unit_id=unit_id)
+
+    def extraction_origin(self, record_key, receipt):
+        """Authorize immutable source provenance through committed alias adoption."""
+        origin = receipt["receipt"]["record_key"]
+        unit = self.get_unit_for_record(origin)
+        if (not unit or unit["unit_id"] != receipt["unit_id"]
+                or self.repository.resolve_alias(origin) != record_key):
+            raise ClaimRejected("extraction origin does not belong to selected record")
+        return {"record_key": origin, "unit_id": unit["unit_id"]}
+
+    def resolve_record_alias(self, key):
+        return self.repository.resolve_alias(key)
+
     def get_manifest(self, generation_id, revision=None):
         generation = self.get_generation(generation_id)
         return self._one("generation_manifests", generation_id=generation_id,

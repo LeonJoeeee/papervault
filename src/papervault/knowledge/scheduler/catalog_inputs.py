@@ -83,7 +83,8 @@ _METADATA_FIELDS = ("title", "authors", "year", "venue", "volume", "issue", "pag
                     "publication_types")
 
 
-def capture_paper_input(record, unit_id: str, store: ImmutableInputStore, vault: Path) -> dict:
+def capture_paper_input(record, unit_id: str, store: ImmutableInputStore, vault: Path,
+                        *, extraction_receipt=None, extraction_origin=None) -> dict:
     from papervault.knowledge.ingest.abstract_doc import abstract_docs_enabled, build_abstract_doc
     from papervault.knowledge.ingest.distill import clean
     from papervault.knowledge.ingest.paper_library_client import PaperRecord
@@ -91,7 +92,32 @@ def capture_paper_input(record, unit_id: str, store: ImmutableInputStore, vault:
     vault = Path(vault).resolve()
     metadata = {key: record.payload.get(key) for key in _METADATA_FIELDS}
     text, artifacts, tier = None, [], "metadata"
+    completion_id = record.payload.get("extraction_completion_id")
+    upstream = []
+    if completion_id and record.payload.get("md_path"):
+        if not extraction_receipt:
+            raise InputUnavailable("extraction registration is pending")
+        from papervault.store.extraction import ExtractionStore
+        completion = extraction_receipt["receipt"]
+        origin = extraction_origin or {"record_key": record.key, "unit_id": unit_id}
+        if (completion["completion_id"] != completion_id or completion["record_key"] != origin["record_key"]
+                or extraction_receipt["unit_id"] != origin["unit_id"]):
+            raise InputUnavailable("extraction registration identity mismatch")
+        try:
+            evidence = ExtractionStore(vault)
+            evidence.verify(completion)
+            output = completion["output_inventory"][0]
+            if record.payload["md_path"] != output["path"]:
+                raise ValueError("selected extraction path differs from receipt")
+            data = evidence.read_artifact(output)
+        except (OSError, ValueError) as exc:
+            raise InputUnavailable("registered extraction output is unavailable or corrupt") from exc
+        artifacts = [store.capture(data, role="fulltext_evidence")]
+        text, tier = clean(data.decode("utf-8", errors="replace")), "fulltext"
+        upstream = ["extraction-derivation:" + completion_id]
     for field in ("md_path", "txt_path"):
+        if text is not None:
+            break
         relative = record.payload.get(field)
         if not relative:
             continue
@@ -117,6 +143,8 @@ def capture_paper_input(record, unit_id: str, store: ImmutableInputStore, vault:
         content = text.encode() if text is not None else canonical_json(metadata).encode()
         artifacts = [store.capture(content, role="abstract_metadata" if text else "metadata")]
     manifest, revision = make_input_manifest(unit_id, metadata, artifacts, tier=tier,
-                                           parent_evidence_revision=artifacts[0]["artifact_id"])
+        parent_evidence_revision=artifacts[0]["artifact_id"], upstream_derivation_ids=upstream)
+    manifest["extraction_provenance"] = "registered" if upstream else "legacy_unknown" if tier == "fulltext" else "not_applicable"
+    revision = "input:" + payload_hash(manifest)
     return {"manifest": manifest, "consumed_input_revision": revision, "tier": tier,
             "text": text if text is not None else canonical_json(metadata)}

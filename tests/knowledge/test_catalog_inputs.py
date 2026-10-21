@@ -134,3 +134,25 @@ def test_artifact_location_does_not_become_consumed_input_identity(tmp_path):
     _, before = make_input_manifest("unit-A", {}, [first], tier="fulltext")
     _, after = make_input_manifest("unit-A", {}, [second], tier="fulltext")
     assert before == after
+
+
+def test_pending_extraction_cannot_receive_conforming_capture(tmp_path):
+    from papervault.knowledge.scheduler.catalog_inputs import ImmutableInputStore, capture_paper_input, InputUnavailable
+    from papervault.store.repository import Record
+
+    (tmp_path / "output.md").write_text("Pending output")
+    record = Record.from_payload("A", {"key": "A", "md_path": "output.md",
+        "extraction_completion_id": "a" * 32})
+    with pytest.raises(InputUnavailable, match="registration"):
+        capture_paper_input(record, "unit-A", ImmutableInputStore(tmp_path / "captured"), tmp_path)
+
+
+def test_historical_extract_retains_explicit_provenance_gap(tmp_path):
+    from papervault.knowledge.scheduler.catalog_inputs import ImmutableInputStore, capture_paper_input
+    from papervault.store.repository import Record
+
+    (tmp_path / "historical.md").write_text("Unknown historical process")
+    result = capture_paper_input(Record.from_payload("A", {"key": "A", "md_path": "historical.md"}),
+        "unit-A", ImmutableInputStore(tmp_path / "captured"), tmp_path)
+    assert result["manifest"]["extraction_provenance"] == "legacy_unknown"
+    assert result["manifest"]["upstream_derivation_ids"] == []

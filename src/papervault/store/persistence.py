@@ -226,9 +226,11 @@ class PostgresPersistence:
                     if current is None or expected is None or current.revision != expected.revision:
                         raise StaleCompletion(f"catalog changed before completion for {token.key}")
                     self._active_repository, self._completion = repository, token
+                    repository.extraction_completion_token = token
                     self._working = (dict(self.persisted), copy.deepcopy(self.normalized))
                     yield
                 if self._deferred:
                     self._accept(*self._deferred)
             finally:
+                repository.extraction_completion_token = None
                 self._active_repository = self._completion = self._deferred = self._working = None

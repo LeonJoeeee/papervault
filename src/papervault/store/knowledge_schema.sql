@@ -188,6 +188,26 @@ ALTER TABLE catalog.derivations ADD COLUMN IF NOT EXISTS receipt_id TEXT REFEREN
 ALTER TABLE catalog.derivations ADD COLUMN IF NOT EXISTS origin_lineage JSONB NOT NULL DEFAULT '{}';
 ALTER TABLE catalog.derivations ADD COLUMN IF NOT EXISTS restoration_recipe_digest TEXT REFERENCES catalog.recipes;
 ALTER TABLE catalog.derivations ALTER COLUMN key DROP NOT NULL;
+-- P5a artifact receipts have no fictitious distillation job or attempt.
+CREATE TABLE IF NOT EXISTS catalog.extraction_receipts (
+ completion_id TEXT PRIMARY KEY,
+ receipt_id TEXT NOT NULL UNIQUE,
+ unit_id TEXT NOT NULL REFERENCES catalog.units,
+ generation_id TEXT NOT NULL UNIQUE,
+ receipt JSONB NOT NULL,
+ digest TEXT NOT NULL,
+ registered_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+);
+ALTER TABLE catalog.derivations ADD COLUMN IF NOT EXISTS extraction_receipt_id TEXT REFERENCES catalog.extraction_receipts(receipt_id);
+ALTER TABLE catalog.derivations ADD COLUMN IF NOT EXISTS extraction_generation_id TEXT REFERENCES catalog.extraction_receipts(generation_id);
+CREATE UNIQUE INDEX IF NOT EXISTS derivations_extraction_receipt ON catalog.derivations(extraction_receipt_id)
+ WHERE extraction_receipt_id IS NOT NULL;
+-- A completion fence only: this table confers no knowledge coverage or serving selection.
+CREATE TABLE IF NOT EXISTS catalog.extraction_heads (
+ unit_id TEXT PRIMARY KEY REFERENCES catalog.units,
+ completion_id TEXT NOT NULL REFERENCES catalog.extraction_receipts,
+ revision BIGINT NOT NULL DEFAULT 1
+);
 CREATE TABLE IF NOT EXISTS catalog.publications (
  publication_id TEXT PRIMARY KEY, derivation_id TEXT NOT NULL REFERENCES catalog.derivations(derivation_id),
  unit_id TEXT NOT NULL REFERENCES catalog.units, generation_id TEXT NOT NULL REFERENCES catalog.generations,
@@ -295,7 +315,7 @@ DO $$
 DECLARE name TEXT;
 BEGIN
  FOREACH name IN ARRAY ARRAY['unit_mappings','section_mappings','unit_inventories','input_manifests','recipes',
-  'generation_manifests','knowledge_receipts','derivations','publications','supersession_events',
+  'generation_manifests','knowledge_receipts','extraction_receipts','derivations','publications','supersession_events',
   'knowledge_attempt_events','knowledge_operations','observations','knowledge_pending_inputs','knowledge_output_tombstones',
   'knowledge_discrepancies','knowledge_maintenance_windows','knowledge_legacy_checkpoint_applications']
  LOOP

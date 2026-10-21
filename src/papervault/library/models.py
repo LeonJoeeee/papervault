@@ -347,6 +347,8 @@ class Paper(BaseModel):
     pdf_path: Optional[str] = None
     txt_path: Optional[str] = None
     md_path: Optional[str] = None
+    # New completions carry durable evidence; None explicitly means legacy provenance.
+    extraction_completion_id: Optional[str] = None
 
     # Provenance + version lock for idempotent extraction (see C-policy:
     # don't re-run extractors automatically when an upgrade is available).

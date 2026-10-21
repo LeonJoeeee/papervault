@@ -172,11 +172,77 @@ async def test_vector_query_resolves_layer_replacements_before_distance_and_top_
             return [{"entity_name": "Earth"}]
 
     db = LayeredPostgresDB(DB(), ["base", "delta"], [], "entities_vdb")
-    result = await db.query("SELECT entity_name FROM entity_vectors WHERE workspace=$1 "
+    result = await db.query("SELECT entity_name FROM LIGHTRAG_VDB_ENTITY WHERE workspace=$1 "
                             "AND content_vector <=> $4::vector < $2 "
                             "ORDER BY content_vector <=> $4::vector LIMIT $3",
                             ["delta", 0.8, 10, [0.5, 0.2]], multirows=True)
     assert result == [{"entity_name": "Earth"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("table", [
+    "LIGHTRAG_DOC_CHUNKS", "lightrag_llm_cache", "LIGHTRAG_VDB_ENTITY",
+    "lightrag_vdb_entity_pv_acceptance_fixture_3d",
+])
+async def test_layered_query_preserves_extract_expressions_and_rewrites_real_table(table):
+    from papervault.knowledge.store.catalog_storage import LayeredPostgresDB
+
+    class DB:
+        async def query(self, sql, params=None, **kwargs):
+            return sql, params, kwargs
+
+    query = ("SELECT EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at, "
+             "EXTRACT(EPOCH FROM update_time)::BIGINT AS updated_at "
+             f"FROM {table} WHERE workspace=$1 AND id=$2")
+    db = LayeredPostgresDB(DB(), ["base", "delta"], [], "text_chunks")
+    sql, params, options = await db.query(query, ["delta", "doc"], multirows=True)
+    assert f"SELECT DISTINCT ON (id) * FROM {table} " in sql
+    assert sql.endswith(
+        "SELECT EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at, "
+        "EXTRACT(EPOCH FROM update_time)::BIGINT AS updated_at "
+        "FROM _pv_visible WHERE workspace=ANY($1::varchar[]) AND id=$2")
+    assert params == [["base", "delta"], "doc", "{}"]
+    assert options == {"multirows": True}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", [
+    "FROM LIGHTRAG_DOC_FULL AS a JOIN LIGHTRAG_DOC_FULL AS b ON a.id=b.id",
+    "FROM (SELECT $2::varchar AS id) AS a JOIN LIGHTRAG_DOC_FULL AS b ON a.id=b.id",
+])
+async def test_layered_query_rewrites_genuine_from_and_join_references(source):
+    from papervault.knowledge.store.catalog_storage import LayeredPostgresDB
+
+    class DB:
+        async def query(self, sql, **kwargs):
+            return sql
+
+    db = LayeredPostgresDB(DB(), ["base", "delta"], [], "full_docs")
+    sql = await db.query(f"SELECT b.id {source} WHERE b.workspace=$1", ["delta", "doc"])
+    assert "SELECT DISTINCT ON (id) * FROM LIGHTRAG_DOC_FULL " in sql
+    assert "JOIN _pv_visible AS b ON a.id=b.id" in sql
+    assert sql.count("LIGHTRAG_DOC_FULL") == 1
+    assert sql.endswith("WHERE b.workspace=ANY($1::varchar[])")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("query", [
+    "SELECT EXTRACT(EPOCH FROM create_time) WHERE workspace=$1",
+    "SELECT * FROM unrelated WHERE workspace=$1",
+    "SELECT * FROM LIGHTRAG_DOC_FULL_extra WHERE workspace=$1",
+    "SELECT * FROM LIGHTRAG_VDB_ENTITY_unqualified WHERE workspace=$1",
+    "SELECT a.id FROM LIGHTRAG_DOC_FULL a JOIN LIGHTRAG_DOC_CHUNKS b ON a.id=b.id WHERE a.workspace=$1",
+])
+async def test_layered_query_refuses_unrecognized_or_mixed_table_reads_before_io(query):
+    from papervault.knowledge.store.catalog_storage import LayeredPostgresDB
+
+    class DB:
+        async def query(self, *args, **kwargs):
+            pytest.fail("unsupported reads must be refused before backend IO")
+
+    db = LayeredPostgresDB(DB(), ["base", "delta"], [], "full_docs")
+    with pytest.raises(RuntimeError):
+        await db.query(query, ["delta"])
 
 
 @pytest.mark.asyncio

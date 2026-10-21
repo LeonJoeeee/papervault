@@ -15,7 +15,7 @@ import re
 
 from lightrag.kg.neo4j_impl import Neo4JStorage
 from lightrag.kg.postgres_impl import (
-    ClientManager, PGDocStatusStorage, PGKVStorage, PGVectorStorage, PostgreSQLDB,
+    ClientManager, NAMESPACE_TABLE_MAP, PGDocStatusStorage, PGKVStorage, PGVectorStorage, PostgreSQLDB,
     namespace_to_table_name,
 )
 from lightrag.kg.shared_storage import get_namespace_lock
@@ -290,6 +290,15 @@ def resolve_layers(rows, layers, tombstones, role, key):
     return visible
 
 
+# Match only tables in the pinned preparation schema, including model-specific
+# vector tables. FROM inside EXTRACT is an expression, not a table clause.
+_PG_TABLE_READ = re.compile(
+    r"(?P<clause>\b(?:FROM|JOIN)\s+)(?P<table>" + "|".join(
+        re.escape(table) + (r"(?:_[a-zA-Z0-9_]+_[0-9]+d)?" if table.startswith("LIGHTRAG_VDB_") else "")
+        for table in NAMESPACE_TABLE_MAP.values()
+    ) + r")(?![\w.])", re.I)
+
+
 class LayeredPostgresDB:
     """Apply manifest selection before any upstream predicate or vector ranking."""
     def __init__(self, raw, layers, tombstones, role):
@@ -301,9 +310,12 @@ class LayeredPostgresDB:
     async def query(self, sql, params=None, multirows=False, **kwargs):
         params = list(params or [])
         workspace = re.search(r"\bworkspace\s*=\s*\$(\d+)", sql, re.I)
-        table = re.search(r"\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)", sql, re.I)
-        if workspace is None or table is None or not sql.lstrip().upper().startswith("SELECT"):
+        tables = list(_PG_TABLE_READ.finditer(sql))
+        if workspace is None or not tables or not sql.lstrip().upper().startswith("SELECT"):
             raise RuntimeError("layered storage refuses an unscoped backend read")
+        table = tables[0].group("table")
+        if any(match.group("table").lower() != table.lower() for match in tables):
+            raise RuntimeError("layered storage refuses a mixed-table backend read")
         position = int(workspace.group(1))
         if position > len(params):
             raise RuntimeError("backend workspace parameter absent")
@@ -319,12 +331,12 @@ class LayeredPostgresDB:
         # The visible CTE resolves overwrite/tombstone ownership BEFORE distance
         # filters and LIMIT in the original, unchanged LightRAG SQL query.
         visible = (
-            f"WITH _pv_visible AS (SELECT DISTINCT ON (id) * FROM {table.group(1)} "
+            f"WITH _pv_visible AS (SELECT DISTINCT ON (id) * FROM {table} "
             f"WHERE workspace=ANY({parameter}) "
             f"AND array_position({parameter},workspace) >= "
             f"COALESCE((${tombstone_position}::jsonb ->> id)::int,0) "
             f"ORDER BY id,array_position({parameter},workspace) DESC) ")
-        rewritten = sql[:table.start(1)] + "_pv_visible" + sql[table.end(1):]
+        rewritten = _PG_TABLE_READ.sub(r"\g<clause>_pv_visible", sql)
         rewritten = re.sub(r"\bworkspace\s*=\s*\$" + str(position) + r"\b",
                            f"workspace=ANY({parameter})", rewritten, flags=re.I)
         return await self.raw.query(visible + rewritten, params=params, multirows=multirows, **kwargs)

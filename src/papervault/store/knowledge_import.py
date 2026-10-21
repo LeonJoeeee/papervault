@@ -164,6 +164,43 @@ def validate_projection_unchanged(head, job):
         raise OperationConflict("legacy projection changed independently of the importer")
 
 
+def _retains_evidence(previous, proposed):
+    """Evidence may gain fields/observations, but accepted facts cannot disappear."""
+    if isinstance(previous, dict):
+        return isinstance(proposed, dict) and all(
+            key in proposed and _retains_evidence(value, proposed[key]) for key, value in previous.items())
+    if isinstance(previous, list):
+        return isinstance(proposed, list) and all(
+            any(_retains_evidence(value, candidate) for candidate in proposed) for value in previous)
+    return previous == proposed
+
+
+def _validate_enrichment(previous, proposed, old_job, values):
+    enriched_fields = {"mapping", "unit_id", "dispositions", "doc_status_evidence"}
+    fixed_evidence = {key: value for key, value in previous.items() if key not in enriched_fields}
+    if not _retains_evidence(fixed_evidence, proposed):
+        raise OperationConflict("same-version source evidence regression; enrichment required")
+    old_mapping, new_mapping = previous.get("mapping"), proposed.get("mapping")
+    verified = old_job["detail"].get("mapping_resolution") == "verified"
+    if verified:
+        if not new_mapping or values["detail"]["mapping_resolution"] != "verified":
+            raise OperationConflict("same-version projection mapping regression; enrichment required")
+        if any(old_mapping.get(key) != new_mapping.get(key) for key in ("unit_id", "kind", "record_key")):
+            raise OperationConflict("conflicting verified mapping for the same source version; projection remains quarantined")
+    if old_mapping and not _retains_evidence(old_mapping, new_mapping):
+        if verified or values["detail"]["mapping_resolution"] != "verified":
+            raise OperationConflict("same-version mapping evidence regression; enrichment required")
+    if not _retains_evidence(previous.get("doc_status_evidence", []), proposed.get("doc_status_evidence", [])):
+        raise OperationConflict("same-version document-status evidence regression; enrichment required")
+    reasons = set(previous["dispositions"])
+    if "matched" in proposed["dispositions"]:
+        reasons.discard("ledger_only")
+    if new_mapping:
+        reasons.discard("unmatched_unit")
+    if not reasons <= set(proposed["dispositions"]):
+        raise OperationConflict("same-version disposition evidence regression; enrichment required")
+
+
 class LegacyImportRepository:
     """Only owns migration history and ``distill_legacy_unverified`` projections."""
     def __init__(self, repository):
@@ -180,6 +217,96 @@ class LegacyImportRepository:
     def source_versions(self, source):
         return self.knowledge._rows("knowledge_import_events", source=source)
 
+    def _projection_values(self, event, identity):
+        mapping = event.get("mapping") or {}
+        unit = self.knowledge.get_unit(mapping.get("unit_id")) if mapping else None
+        compatible = bool(unit and unit["kind"] == mapping.get("kind")
+                          and unit["record_key"] == mapping.get("record_key"))
+        detail = {"migration_owner": identity, "source_version": event["source_version"],
+                  "legacy_consecutive_failures": event["legacy_consecutive_failures"],
+                  "counter_semantics": "consecutive_build_failures", "evidence": event,
+                  "mapping_resolution": "verified" if compatible else "missing_or_conflicting_catalog_unit",
+                  "excluded": True, "deleted": event["deleted"], "executable": False}
+        return {"kind": "distill_legacy_unverified", "key": unit["record_key"] if compatible else None,
+                "unit_id": unit["unit_id"] if compatible else None, "state": "quarantined", "attempts": 0,
+                "achieved_tier": None, "quarantine": True, "detail": detail,
+                "quarantine_reason": {"reasons": event["dispositions"], "legacy_unverified": True}}
+
+    def _preflight(self, plan):
+        """Validate the complete proposed projection under the catalog writer lock."""
+        k = self.knowledge
+        checkpoint_id = {"source": plan["source"], "capture_id": plan["capture_id"]}
+        checkpoint = k._one("knowledge_import_checkpoints", **checkpoint_id)
+        latest, seen = {}, {}
+        for event in plan["events"]:
+            if any(event[field] != checkpoint_id[field] for field in checkpoint_id):
+                raise OperationConflict("source event does not belong to the proposed plan")
+            identity = {**checkpoint_id, "source_row_id": event["source_row_id"]}
+            version = {**identity, "source_version": event["source_version"]}
+            event_digest = payload_hash({key: event[key] for key in (
+                "source", "capture_id", "source_row_id", "source_version", "operation", "raw", "deleted")})
+            if event_digest != event["event_digest"] or source_row_id(event["raw"]) != event["source_row_id"]:
+                raise OperationConflict("source event has conflicting identity/evidence")
+            stored = k._one("knowledge_import_events", **version)
+            version_key = (event["source_row_id"], event["source_version"])
+            if ((stored and stored["event_digest"] != event_digest)
+                    or (version_key in seen and seen[version_key] != event_digest)):
+                raise OperationConflict("source row/version has conflicting evidence")
+            seen[version_key] = event_digest
+            old = latest.get(event["source_row_id"])
+            if old is None or old["source_version"] < event["source_version"]:
+                latest[event["source_row_id"]] = event
+            elif old["source_version"] == event["source_version"] and old != event:
+                raise OperationConflict("source row/version has conflicting projection evidence")
+        last = plan["checkpoint"].get("last_sequence")
+        previous_last = checkpoint["checkpoint"].get("last_sequence") if checkpoint else None
+        advance = checkpoint is None or previous_last is None or (last is not None and last >= previous_last)
+        if checkpoint and last == previous_last:
+            previous_checkpoint = deepcopy(checkpoint["checkpoint"])
+            proposed_checkpoint = deepcopy(plan["checkpoint"])
+            if previous_checkpoint.get("external_attempts") == "unknown":
+                previous_checkpoint.pop("external_attempts", None)
+            if not _retains_evidence(previous_checkpoint, proposed_checkpoint):
+                raise OperationConflict("same-checkpoint evidence regression; enrichment required")
+            previous_report = k._one("knowledge_import_reports", plan_digest=checkpoint["plan_digest"])["report"]
+            for key in ("docstatus_only", "duplicates"):
+                # Ledger-row dispositions are checked against their accepted projections below.
+                previous_orphans = [row for row in previous_report["sets"][key] if "source_row_id" not in row]
+                proposed_orphans = [row for row in plan["sets"][key] if "source_row_id" not in row]
+                if not _retains_evidence(previous_orphans, proposed_orphans):
+                    raise OperationConflict("same-checkpoint orphan evidence regression; enrichment required")
+        heads = k._rows("knowledge_import_heads", **checkpoint_id)
+        if advance and any(head["source_row_id"] not in latest or
+                           latest[head["source_row_id"]]["source_version"] < head["source_version"] for head in heads):
+            raise OperationConflict("proposed checkpoint loses accepted source projection evidence")
+        projections = []
+        for event in latest.values():
+            identity = {**checkpoint_id, "source_row_id": event["source_row_id"]}
+            head = k._one("knowledge_import_heads", **identity)
+            if head and head["source_version"] > event["source_version"]:
+                continue
+            job_id = "legacy-unverified:" + payload_hash(identity)
+            old_job = k._one("jobs", id=job_id)
+            values = self._projection_values(event, identity)
+            if old_job:
+                if old_job["kind"] != "distill_legacy_unverified" or old_job["detail"].get("migration_owner") != identity:
+                    raise OperationConflict("import refuses to overwrite catalog-owned job")
+                if head is None or old_job["detail"].get("source_version") != head["source_version"]:
+                    raise OperationConflict("legacy projection source version changed independently")
+                validate_projection_unchanged(head, old_job)
+                if head.get("plan_digest"):
+                    lineage = k._one("knowledge_import_projections", **identity, revision=head["projection_revision"])
+                    if (not lineage or any(lineage[field] != head[field] for field in (
+                            "source_version", "plan_digest", "projection_digest"))
+                            or lineage["evidence"] != old_job["detail"]["evidence"]):
+                        raise OperationConflict("legacy projection accepted lineage changed independently")
+                if head["source_version"] == event["source_version"]:
+                    _validate_enrichment(old_job["detail"]["evidence"], event, old_job, values)
+            elif head:
+                raise OperationConflict("legacy projection disappeared independently of the importer")
+            projections.append((identity, head, old_job, values))
+        return checkpoint, advance, projections
+
     def apply(self, plan, *, operation_id):
         if not isinstance(operation_id, str) or not operation_id:
             raise ValueError("stable operation_id required")
@@ -195,67 +322,44 @@ class LegacyImportRepository:
             state = k.get_authority_state()
             if state["authority"] != "legacy":
                 raise ValueError("legacy projection imports are fenced after catalog handoff")
+            checkpoint, advance, projections = self._preflight(plan)
             if not k._one("knowledge_import_reports", plan_digest=digest):
                 k._insert("knowledge_import_reports", {"plan_digest": digest, "source": plan["source"],
                     "capture_id": plan["capture_id"], "report": plan})
             inserted, projected = 0, 0
             for event in plan["events"]:
-                identity = {field: event[field] for field in ("source", "capture_id", "source_row_id")}
-                version_identity = {**identity, "source_version": event["source_version"]}
-                stored = k._one("knowledge_import_events", **version_identity)
-                if stored:
-                    if stored["event_digest"] != event["event_digest"]:
-                        raise OperationConflict("source row/version has conflicting evidence")
-                else:
-                    k._insert("knowledge_import_events", {**version_identity, "event_digest": event["event_digest"], "evidence": event})
+                version = {field: event[field] for field in ("source", "capture_id", "source_row_id", "source_version")}
+                if not k._one("knowledge_import_events", **version):
+                    k._insert("knowledge_import_events", {**version, "event_digest": event["event_digest"], "evidence": event})
                     inserted += 1
-                head = k._one("knowledge_import_heads", **identity)
-                if head and head["source_version"] > event["source_version"]:
+            for identity, head, old_job, values in projections:
+                changed = not old_job or any(old_job[field] != value for field, value in values.items())
+                if not changed and head.get("plan_digest"):
                     continue
                 job_id = "legacy-unverified:" + payload_hash(identity)
-                old_job = k._one("jobs", id=job_id)
-                if old_job and (old_job["kind"] != "distill_legacy_unverified"
-                                or old_job["detail"].get("migration_owner") != identity):
-                    raise OperationConflict("import refuses to overwrite catalog-owned job")
-                mapping = event.get("mapping") or {}
-                unit = k.get_unit(mapping.get("unit_id")) if mapping else None
-                compatible = bool(unit and unit["kind"] == mapping.get("kind")
-                                  and unit["record_key"] == mapping.get("record_key"))
-                detail = {"migration_owner": identity, "source_version": event["source_version"],
-                          "legacy_consecutive_failures": event["legacy_consecutive_failures"],
-                          "counter_semantics": "consecutive_build_failures", "evidence": event,
-                          "mapping_resolution": "verified" if compatible else "missing_or_conflicting_catalog_unit",
-                          "excluded": True, "deleted": event["deleted"], "executable": False}
-                values = {"kind": "distill_legacy_unverified", "key": unit["record_key"] if compatible else None,
-                          "unit_id": unit["unit_id"] if compatible else None, "state": "quarantined", "attempts": 0,
-                          "achieved_tier": None, "quarantine": True, "detail": detail,
-                          "quarantine_reason": {"reasons": event["dispositions"], "legacy_unverified": True}}
-                if old_job:
-                    if head is None or old_job["detail"].get("source_version") != head["source_version"]:
-                        raise OperationConflict("legacy projection source version changed independently")
-                    validate_projection_unchanged(head, old_job)
-                    # Source history is immutable, but its mapping/disposition
-                    # evidence and catalog-unit resolution may be enriched.
-                    if all(old_job[field] == value for field, value in values.items()):
-                        continue
-                    projection = k._update("jobs", values, id=job_id)
+                if changed:
+                    projection = k._update("jobs", values, id=job_id) if old_job else k._insert("jobs", {"id": job_id, **values})
+                    projected += 1
                 else:
-                    projection = k._insert("jobs", {"id": job_id, **values})
+                    projection = old_job
+                event = values["detail"]["evidence"]
+                revision = (head.get("projection_revision") or 0) + 1 if head else 1
+                projection_digest = payload_hash(k._json(projection))
+                k._insert("knowledge_import_projections", {**identity, "revision": revision,
+                    "source_version": event["source_version"], "plan_digest": digest,
+                    "previous_plan_digest": head.get("plan_digest") if head else None,
+                    "projection_digest": projection_digest, "evidence": event})
                 head_values = {"source_version": event["source_version"], "job_id": job_id,
-                               "deleted": event["deleted"], "event_digest": event["event_digest"],
-                               "projection_digest": payload_hash(k._json(projection))}
+                    "deleted": event["deleted"], "event_digest": event["event_digest"],
+                    "projection_digest": projection_digest, "plan_digest": digest, "projection_revision": revision}
                 if head:
                     k._update("knowledge_import_heads", head_values, **identity)
                 else:
                     k._insert("knowledge_import_heads", {**identity, **head_values})
-                projected += 1
-            checkpoint_id = {"source": plan["source"], "capture_id": plan["capture_id"]}
-            checkpoint = k._one("knowledge_import_checkpoints", **checkpoint_id)
-            last = plan["checkpoint"].get("last_sequence")
-            previous_last = checkpoint["checkpoint"].get("last_sequence") if checkpoint else None
-            if previous_last is None or (last is not None and last >= previous_last):
+            if advance and (not checkpoint or checkpoint["plan_digest"] != digest):
                 values = {"checkpoint": plan["checkpoint"], "plan_digest": digest,
                           "revision": checkpoint["revision"] + 1 if checkpoint else 1}
+                checkpoint_id = {"source": plan["source"], "capture_id": plan["capture_id"]}
                 if checkpoint:
                     k._update("knowledge_import_checkpoints", values, **checkpoint_id)
                 else:

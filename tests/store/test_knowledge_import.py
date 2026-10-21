@@ -319,3 +319,175 @@ def test_projection_guard_checks_full_last_imported_row_not_only_owner_and_sourc
     from papervault.store.knowledge import OperationConflict
     with pytest.raises(OperationConflict, match="independent"):
         validate_projection_unchanged(head, job)
+
+
+def schema_rows(repo):
+    """Compare every durable row, including audit and operation histories."""
+    from psycopg import sql
+
+    tables = repo.connection.execute("SELECT table_name FROM information_schema.tables "
+        "WHERE table_schema=%s AND table_type='BASE TABLE' ORDER BY table_name", (repo.schema,)).fetchall()
+    return {table["table_name"]: sorted((repr(row) for row in repo.connection.execute(
+        sql.SQL("SELECT to_jsonb(t) AS row FROM {} t").format(repo._table(table["table_name"])))), key=str)
+        for table in tables}
+
+
+def parked_importer(repo):
+    from papervault.store.knowledge_import import LegacyImportRepository
+    from papervault.store.repository import AuditEvent, Record
+
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    importer = LegacyImportRepository(repo)
+    importer.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    for key in ("A", "B"):
+        repo.upsert(Record.from_payload(key, {"key": key, "title": key}), expected_revision=0,
+                    audit=AuditEvent("test", "record"))
+        importer.knowledge.command("register_unit", "unit:" + key,
+            {"unit_id": "paper:" + key, "kind": "paper", "record_key": key, "identity": key})
+    return importer
+
+
+def test_interrupted_unmapped_plan_cannot_replace_enriched_projection_or_handoff_parking(repo, monkeypatch):
+    from papervault.store.knowledge import OperationConflict
+    from papervault.store.knowledge_cutover import CutoverRepository
+    from papervault.store.knowledge_import import plan_legacy_import
+
+    importer = parked_importer(repo)
+    k = importer.knowledge
+    raw = snapshot([source(status="error_parked", attempts=7, quarantine=True,
+                           quarantine_reason="review required", quarantine_scope="unit")])
+    old_plan = plan_legacy_import(raw)
+    enriched = plan_legacy_import(raw, mappings=[mapping()], doc_status_rows=[
+        {"workspace": "probe", "doc_id": "doc:A", "status": "failed"}])
+    real_insert = k._insert
+
+    def interrupted_insert(table, values):
+        result = real_insert(table, values)
+        if table == "jobs":
+            raise RuntimeError("interrupted before import commit")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(k, "_insert", interrupted_insert)
+        with pytest.raises(RuntimeError, match="interrupted"):
+            importer.apply(old_plan, operation_id="interrupted-A")
+    importer.apply(enriched, operation_id="committed-B")
+    before = schema_rows(repo)
+    with pytest.raises(OperationConflict, match="regress|enrich|evidence"):
+        importer.apply(old_plan, operation_id="interrupted-A")
+    assert schema_rows(repo) == before
+    k.command("create_generation", "generation", {"generation_id": "g", "candidate": False})
+    k.command("register_input", "input", {"unit_id": "paper:A", "consumed_input_revision": "input1",
+        "manifest": {"metadata_revision": "1", "artifacts": [], "upstream_derivation_ids": []}})
+    CutoverRepository(repo).commit_handoff(handoff_evidence(enriched), expected_epoch=1, operation_id="handoff")
+    k.command("migrate_legacy_checkpoint", "checkpoint",
+              {"unit_id": "paper:A", "consumed_input_revision": "input1"})
+    reducer = k.get_reducer("paper:A", "input1")
+    assert reducer["failure_streak"] == 7 and reducer["parked"] is True
+    assert k.get_unit("paper:A")["quarantine"] is True
+    assert k.get_unit("paper:A")["quarantine_reason"]["details"][0]["reason"] == "review required"
+    projected = k._rows("jobs", kind="distill_legacy_unverified")[0]
+    assert projected["unit_id"] == "paper:A"
+
+
+def test_equal_source_version_verified_mapping_conflict_refuses_whole_plan_before_writes(repo, monkeypatch):
+    from papervault.store.knowledge import OperationConflict
+    from papervault.store.knowledge_import import plan_legacy_import
+
+    importer = parked_importer(repo)
+    raw = snapshot([source("B"), source(status="error_parked", attempts=7)])
+    accepted = plan_legacy_import(raw, mappings=[mapping()])
+    importer.apply(accepted, operation_id="accepted")
+    conflicting = plan_legacy_import(raw, mappings=[mapping("B", "paper:B"),
+        {**mapping(unit_id="paper:B"), "record_key": "B"}])
+    before = schema_rows(repo)
+    mutations = []
+    k = importer.knowledge
+    real_insert, real_update = k._insert, k._update
+
+    def record_insert(*args, **kwargs):
+        mutations.append(args[0])
+        return real_insert(*args, **kwargs)
+
+    def record_update(*args, **kwargs):
+        mutations.append(args[0])
+        return real_update(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(k, "_insert", record_insert)
+        patch.setattr(k, "_update", record_update)
+        with pytest.raises(OperationConflict, match="conflicting verified mapping"):
+            importer.apply(conflicting, operation_id="conflict")
+    assert mutations == []
+    assert schema_rows(repo) == before
+    projected = next(job for job in k._rows("jobs") if job["unit_id"] == "paper:A")
+    assert projected["quarantine"] is True
+    assert projected["detail"]["legacy_consecutive_failures"] == 7
+
+
+def test_same_version_projection_lineage_enriches_and_replay_does_not_append(repo):
+    from papervault.store.knowledge_import import plan_legacy_import
+    from papervault.store.repository import payload_hash
+
+    importer = parked_importer(repo)
+    old = plan_legacy_import(snapshot())
+    new = plan_legacy_import(snapshot(), mappings=[mapping()], doc_status_rows=[
+        {"workspace": "probe", "doc_id": "doc:A", "status": "processed"}])
+    importer.apply(old, operation_id="unmapped")
+    importer.apply(new, operation_id="enriched")
+    history = sorted(importer.knowledge._rows("knowledge_import_projections"), key=lambda row: row["revision"])
+    assert len(history) == 2
+    assert history[0]["plan_digest"] == payload_hash(old)
+    assert history[1]["plan_digest"] == payload_hash(new)
+    assert history[1]["previous_plan_digest"] == payload_hash(old)
+    assert history[1]["evidence"] == new["events"][0]
+    before = schema_rows(repo)
+    importer.apply(new, operation_id="enriched")
+    assert schema_rows(repo) == before
+    importer.apply(new, operation_id="equivalent-replay")
+    assert importer.knowledge._rows("knowledge_import_projections") == history
+    checkpoint = importer.knowledge._rows("knowledge_import_checkpoints")[0]
+    assert checkpoint["revision"] == 2
+
+
+def test_newer_source_version_may_change_verified_mapping(repo):
+    from papervault.store.knowledge_import import plan_legacy_import
+
+    importer = parked_importer(repo)
+    importer.apply(plan_legacy_import(snapshot(), mappings=[mapping()]), operation_id="initial")
+    newer = plan_legacy_import(snapshot(), mappings=[{**mapping(unit_id="paper:B"), "record_key": "B"}],
+        changes=[{"sequence": 11, "operation": "UPDATE", "old": source(),
+                  "new": source(status="error_parked", attempts=4)}], final_checkpoint=11)
+    importer.apply(newer, operation_id="new-version")
+    job = importer.knowledge._rows("jobs", kind="distill_legacy_unverified")[0]
+    assert job["unit_id"] == "paper:B" and job["key"] == "B"
+    assert job["detail"]["source_version"] == 11
+    assert job["detail"]["legacy_consecutive_failures"] == 4
+
+
+@pytest.mark.parametrize("lost_evidence", ["orphan", "matched", "disposition", "counter"])
+def test_same_version_plan_cannot_discard_accepted_evidence(repo, lost_evidence):
+    from papervault.store.knowledge import OperationConflict
+    from papervault.store.knowledge_import import plan_legacy_import
+
+    importer = parked_importer(repo)
+    statuses = [{"workspace": "probe", "doc_id": "doc:A", "status": "processed"},
+                {"workspace": "probe", "doc_id": "orphan", "status": "failed"}]
+    mappings = [mapping()]
+    if lost_evidence == "disposition":
+        statuses.append({"workspace": "probe", "doc_id": "doc:A", "status": "failed"})
+    accepted = plan_legacy_import(snapshot(), mappings=mappings, doc_status_rows=statuses)
+    importer.apply(accepted, operation_id="accepted")
+    if lost_evidence == "orphan":
+        statuses = statuses[:1]
+    elif lost_evidence == "matched":
+        statuses = statuses[1:]
+    elif lost_evidence == "disposition":
+        statuses = statuses[:2]
+    losing = plan_legacy_import(snapshot(), mappings=mappings, doc_status_rows=statuses)
+    if lost_evidence == "counter":
+        losing["events"][0]["legacy_consecutive_failures"] = 0
+    before = schema_rows(repo)
+    with pytest.raises(OperationConflict, match="regress|enrich|evidence"):
+        importer.apply(losing, operation_id="losing")
+    assert schema_rows(repo) == before

@@ -205,14 +205,21 @@ async def test_receipt_records_exact_document_content_hash():
 async def test_replacement_runs_original_deletion_rebuild_then_insert_and_binds_aggregate(tmp_path):
     from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
     from papervault.store.repository import payload_hash
-    from types import SimpleNamespace
 
     calls = []
     rag = verified_rag()
 
     async def delete(doc_id):
         calls.append(("delete", doc_id))
-        return SimpleNamespace(status="success")
+        from lightrag.base import DeletionResult
+        from tests.knowledge.test_catalog_retirement import _pipeline
+
+        rag.workspace = CLAIM["namespace"]
+        pipeline = await _pipeline(rag.workspace)
+        pipeline["history_messages"][:] = [f"Starting deletion for document: {doc_id}"]
+        return DeletionResult(status="success", doc_id=doc_id,
+                              message=f"Document {doc_id} successfully deleted",
+                              status_code=200, file_path="paper/one")
 
     async def insert(text, **kwargs):
         calls.append(("insert", text))
@@ -247,7 +254,6 @@ async def test_replacement_runs_original_deletion_rebuild_then_insert_and_binds_
 async def test_metadata_downgrade_removes_retired_graph_using_original_reducer(tmp_path):
     from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
     from papervault.knowledge.scheduler.catalog_inputs import ImmutableInputStore
-    from types import SimpleNamespace
 
     input_store = ImmutableInputStore(tmp_path / "inputs")
     artifact = input_store.capture(b'{"title":"metadata only"}', role="metadata")
@@ -259,7 +265,15 @@ async def test_metadata_downgrade_removes_retired_graph_using_original_reducer(t
 
     async def delete(doc_id):
         deleted.append(doc_id)
-        return SimpleNamespace(status="success")
+        from lightrag.base import DeletionResult
+        from tests.knowledge.test_catalog_retirement import _pipeline
+
+        rag.workspace = CLAIM["namespace"]
+        pipeline = await _pipeline(rag.workspace)
+        pipeline["history_messages"][:] = [f"Starting deletion for document: {doc_id}"]
+        return DeletionResult(status="success", doc_id=doc_id,
+                              message=f"Document {doc_id} successfully deleted",
+                              status_code=200, file_path="paper/one")
 
     async def finalize():
         pass

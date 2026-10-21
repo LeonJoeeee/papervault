@@ -169,6 +169,29 @@ _FIRST_CHUNK_S = float(os.getenv("KS_LLM_FIRST_CHUNK_S", "100"))
 _TRANSIENT_STATUSES = frozenset({408, 429})
 
 
+def effective_execution_settings() -> dict:
+    """Snapshot the values this process actually uses, without credentials.
+
+    These defaults are loaded at startup. Rereading the environment here would
+    give a recipe values that the running wrapper does not execute.
+    """
+    return {
+        "max_tokens": _DEFAULT_MAX_TOKENS,
+        "client_timeout": _CLIENT_TIMEOUT,
+        "stream": _STREAM,
+        "first_chunk_seconds": _FIRST_CHUNK_S,
+        "use_gateway": config.USE_GATEWAY,
+        "direct_max_rounds": _MAX_ROUNDS,
+        "direct_base_backoff": _BASE_BACKOFF,
+        "direct_backoff_jitter": _BACKOFF_JITTER,
+        "gateway_connection_retries": _GW_CONN_MAX_RETRIES,
+        "gateway_connection_backoff_cap": _GW_CONN_BACKOFF_CAP,
+        "gateway_transient_retries": _GW_TRANSIENT_RETRIES,
+        "gateway_transient_backoff_cap": _GW_TRANSIENT_BACKOFF_CAP,
+        "gateway_retry_budget_seconds": _GW_RETRY_BUDGET_S,
+    }
+
+
 def _retry_delay(attempt: int, cap: float) -> float:
     """Jittered exponential backoff for retry ``attempt`` (1-based), never above ``cap``."""
     return min((2.0 ** (attempt - 1)) * (0.5 + random.random()), cap)

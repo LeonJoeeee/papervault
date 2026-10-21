@@ -39,6 +39,7 @@ def effective_distill_recipe() -> dict:
     from papervault.knowledge.config import CONFIG
     from papervault.knowledge.store.extraction_prompt import apply_ks_extraction_prompt
     from papervault.knowledge.store.kw_prompt_compat import apply_kw_prompt_compat
+    from papervault.knowledge.store.llm import effective_execution_settings
     from papervault.llm_routing import route
 
     apply_ks_extraction_prompt(examples=True, exclusions=True)
@@ -46,7 +47,8 @@ def effective_distill_recipe() -> dict:
     package_root = Path(__file__).resolve().parents[1]
     sources = ("ingest/distill.py", "ingest/chunking.py", "ingest/abstract_doc.py",
                "store/build_pipeline.py", "store/extraction_prompt.py", "store/graph.py",
-               "store/kw_prompt_compat.py", "store/catalog_storage.py", "store/catalog_adapter.py")
+               "store/kw_prompt_compat.py", "store/catalog_storage.py", "store/catalog_adapter.py",
+               "store/llm.py")
     return {"schema_version": 1, "name": "papervault-distill",
             "packages": {name: metadata.version(name) for name in ("papervault", "lightrag-hku", "torch")},
             "code_sha256": {name: hashlib.sha256((package_root / name).read_bytes()).hexdigest() for name in sources},
@@ -62,6 +64,7 @@ def effective_distill_recipe() -> dict:
                 "max_parallel_insert": int(os.getenv("KS_MAX_PARALLEL_INSERT", "16")),
                 "embedding_max_async": int(os.getenv("KS_EMBED_MAX_ASYNC", "16")),
                 "llm_timeout": int(os.getenv("KS_LLM_TIMEOUT", "240")),
+                "llm_wrapper": effective_execution_settings(),
                 "embedding_dim": 1024, "embedding_max_token_size": 8192,
                 "entity_extract_cache": True},
             "extraction": {"max_gleaning": 1, "force_llm_summary_on_merge": 8, "language": "English"},

@@ -12,7 +12,8 @@ import inspect
 import json
 from datetime import datetime, timezone
 
-from papervault.store.knowledge import CLAIM_FIELDS, ClaimRejected, KnownExecutionFailure, validate_receipt
+from papervault.knowledge.store.build_breaker import BuildPausedError
+from papervault.store.knowledge import CLAIM_FIELDS, ClaimRejected, KnownExecutionFailure, RetirementFailure, validate_receipt
 from papervault.store.repository import payload_hash
 
 
@@ -302,7 +303,7 @@ class CatalogScheduler:
             if not receipt:
                 receipt = await self.adapter.lookup_submission(claim["submission_id"])
             attempt = self.repository.get_attempt(claim["attempt_id"])
-            if job["state"] in {"failed", "cancelled"} and attempt["outcome"] is not None:
+            if attempt["outcome"] == "deferred" or (job["state"] in {"failed", "cancelled"} and attempt["outcome"] is not None):
                 self._command_once("acknowledge_outbox", "ack:"+row["outbox_id"], {"outbox_id": row["outbox_id"]})
                 return False
             expires = datetime.fromisoformat(str(attempt["lease_expires_at"]).replace("Z", "+00:00"))
@@ -351,6 +352,31 @@ class CatalogScheduler:
             await self._collect(receipt, summary)
             if await self._finish(receipt, summary):
                 self._command_once("acknowledge_outbox", "ack:" + row["outbox_id"], {"outbox_id": row["outbox_id"]})
+            return True
+        except BuildPausedError:
+            latest = self.repository.get_job(claim["job_id"])
+            current = self._current_claim(latest)
+            if current and current["attempt_id"] == claim["attempt_id"]:
+                try:
+                    self._command_once("defer_attempt", "defer:" + claim["attempt_id"], {**current,
+                        "expected_revision": latest["revision"], "reason": {"kind": "BuildPausedError"}})
+                except ClaimRejected:
+                    self._discrepancy("pause_deferral_claim_rejected", claim)
+                    summary["discrepancies"] += 1
+            summary["paused"] = True
+            return True
+        except RetirementFailure as exc:
+            self._discrepancy("retirement_rebuild_unverified", claim, {
+                "retired_receipt_id": exc.retired_receipt_id, "doc_id": exc.doc_id,
+                "status": exc.status, "messages": list(exc.messages), "retirement_evidence": exc.evidence})
+            summary["discrepancies"] += 1
+            for publication in self.repository.get_receipt_publications(exc.retired_receipt_id):
+                repair = {"publication_id": publication["publication_id"], "role": "graph",
+                          "reason": "retirement_rebuild_unverified"}
+                self._command_once("request_repair", "repair:" + payload_hash(repair), repair)
+                summary["repairs"] += 1
+            # Private retirement output is unverified. Preserve this delivery's
+            # identity and charge for recovery, without completing or publishing.
             return True
         except KnownExecutionFailure as exc:
             latest = self.repository.get_job(claim["job_id"])
@@ -458,6 +484,8 @@ class CatalogScheduler:
             if row["kind"] == "submission" and included(row["payload"]) and delivered < self.max_admissions:
                 handled.add(row["outbox_id"])
                 delivered += bool(await self._deliver(row, summary))
+                if summary.get("paused"):
+                    return summary
         for job in self.repository.list_admission_jobs(scope):
             if summary["claimed"] >= max(0, self.max_admissions - delivered):
                 break
@@ -479,5 +507,7 @@ class CatalogScheduler:
         for row in self.repository.list_outbox(kind="submission"):
             if row["outbox_id"] not in handled and row["kind"] == "submission" and included(row["payload"]) and delivered < self.max_admissions:
                 delivered += bool(await self._deliver(row, summary))
+                if summary.get("paused"):
+                    return summary
         await self._collect_publication_events(summary)
         return summary

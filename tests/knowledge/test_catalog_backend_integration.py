@@ -271,7 +271,7 @@ class BackendAcceptance:
         self.namespaces.append(claim["namespace"])
         return claim
 
-    async def open(self, claim, *, read_only=False):
+    async def open(self, claim, *, read_only=False, for_deletion=False):
         from lightrag.kg.shared_storage import initialize_share_data
         from lightrag.utils import EmbeddingFunc
         from papervault.knowledge.store.catalog_storage import (
@@ -314,10 +314,39 @@ class BackendAcceptance:
         assert graph._DATABASE == os.environ["NEO4J_DATABASE"]
         rag = SimpleNamespace(chunk_entity_relation_graph=graph, llm_response_cache=cache,
                               entity_chunks=chunks, entities_vdb=vectors, config=config)
+        if for_deletion:
+            from functools import partial
+            from lightrag import LightRAG
+            from lightrag.kg.shared_storage import initialize_pipeline_status
+            from papervault.knowledge.store.catalog_storage import CatalogPGDocStatusStorage
+
+            specs = {"full_docs": (CatalogPGKVStorage, "full_docs"),
+                "text_chunks": (CatalogPGKVStorage, "text_chunks"),
+                "full_entities": (CatalogPGKVStorage, "full_entities"),
+                "full_relations": (CatalogPGKVStorage, "full_relations"),
+                "relation_chunks": (CatalogPGKVStorage, "relation_chunks"),
+                "doc_status": (CatalogPGDocStatusStorage, "doc_status"),
+                "chunks_vdb": (CatalogPGVectorStorage, "chunks"),
+                "relationships_vdb": (CatalogPGVectorStorage, "relationships")}
+            with storage_binding(self.repository, claim, read_only=read_only):
+                additional = {role: cls(namespace, claim["namespace"], config, embedding)
+                              for role, (cls, namespace) in specs.items()}
+            self.resources.extend(additional.values())
+            stores.extend(additional.values())
+            for role, store in additional.items():
+                await store.initialize()
+                setattr(rag, role, store)
+            rag.workspace = claim["namespace"]
+            config["workspace"] = rag.workspace
+            rag._index_storages = lambda: stores
+            rag._build_global_config = lambda: config
+            for method in ("adelete_by_doc_id", "_insert_done", "_update_delete_retry_state"):
+                setattr(rag, method, partial(getattr(LightRAG, method), rag))
+            await initialize_pipeline_status(workspace=rag.workspace)
         install_layered_storage(rag, self.repository, claim, read_only=read_only)
         return rag
 
-    async def seal(self, claim, rag, *, publish=True):
+    async def seal(self, claim, rag, *, publish=True, doc_id=None):
         from papervault.knowledge.store.catalog_adapter import _graph_inventory, _inventory
         from papervault.store.repository import payload_hash
 
@@ -343,6 +372,8 @@ class BackendAcceptance:
             "provider_observations": {"provider": "fixture", "model": "fixture-summary", "version": "1"},
             "origin_lineage": {}, "aggregate_layers": claim["base_aggregate_layers"] + [claim["namespace"]],
             "selected_unit_receipts": selected, "selected_unit_receipts_digest": payload_hash(selected)}
+        if doc_id is not None:
+            receipt["provider_observations"]["doc_id"] = doc_id
         async with self.repository.namespace_access(claim, seal=True):
             self.repository.command("seal_namespace", "seal:" + claim["attempt_id"],
                                     {"claim": claim, "receipt": receipt})
@@ -572,3 +603,94 @@ async def test_real_cache_isolation_and_catalog_rejects_sealed_or_stale_writes(b
     assert (await reader.llm_response_cache.get_by_id("cache-key"))["return"] == "published"
     assert not await reader.chunk_entity_relation_graph.has_node("Forbidden")
     assert not await reader.chunk_entity_relation_graph.has_node("Stale")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [None, "entity", "no-cache"])
+async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggregate(backend, monkeypatch, failure):
+    from lightrag.utils import compute_mdhash_id
+    from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
+
+    old_claim = backend.claim("retirement-old")
+    old = await backend.open(old_claim, for_deletion=True)
+    await _merge(old, "Shared", ["description from retired document"], "old")
+    await _merge(old, "Exclusive", ["only retired evidence"], "old")
+    await old.full_docs.upsert({"old-doc": {"content": "old evidence", "file_path": "old"}})
+    stamp = datetime.now(timezone.utc).isoformat()
+    await old.doc_status.upsert({"old-doc": {"status": "processed", "content_summary": "old",
+        "content_length": 12, "chunks_count": 1, "chunks_list": ["old:0"],
+        "created_at": stamp, "updated_at": stamp, "file_path": "old"}})
+    await old.text_chunks.upsert({"old:0": {"tokens": 2, "chunk_order_index": 0,
+        "full_doc_id": "old-doc", "content": "old evidence", "file_path": "old"}})
+    await old.full_entities.upsert({"old-doc": {"entity_names": ["Shared", "Exclusive"], "count": 2}})
+    await old.full_relations.upsert({"old-doc": {"relation_pairs": [], "count": 0}})
+    await backend.seal(old_claim, old, doc_id="old-doc")
+
+    other_claim = backend.claim("retirement-other")
+    other = await backend.open(other_claim, for_deletion=True)
+    await _merge(other, "Shared", ["description from retained document"], "other")
+    await other.text_chunks.upsert({"other:0": {"tokens": 4, "chunk_order_index": 0,
+        "full_doc_id": "other-doc", "content": "retained evidence", "file_path": "other",
+        "llm_cache_list": [] if failure == "no-cache" else ["retained-extraction"]}})
+    await other.llm_response_cache.upsert({"retained-extraction": {"cache_type": "extract",
+        "chunk_id": "other:0", "original_prompt": "fixture extraction", "return":
+        "entity<|#|>Shared<|#|>concept<|#|>description from retained document\n<|COMPLETE|>"}})
+    parent_receipt = await backend.seal(other_claim, other)
+
+    k = backend.repository
+    replacement_input = "input:retirement-replacement"
+    data = b"replacement evidence"
+    k.command("register_input", "retirement:input", {"unit_id": old_claim["unit_id"],
+        "consumed_input_revision": replacement_input, "manifest": {"metadata_revision": "2",
+        "artifacts": [{"artifact_id": hashlib.sha256(data).hexdigest(),
+                       "sha256": hashlib.sha256(data).hexdigest(), "byte_length": len(data)}],
+        "upstream_derivation_ids": []}})
+    requirement = k.get_requirement(old_claim["unit_id"], "acceptance")
+    k.command("set_requirement", "retirement:requirement", {"unit_id": old_claim["unit_id"],
+        "consumed_input_revision": replacement_input, "recipe_digest": old_claim["recipe_digest"],
+        "generation_id": "acceptance", "expected_revision": requirement["revision"],
+        "expected_record_revision": backend.catalog.get("retirement-old").revision})
+    job = k.command("enqueue", "retirement:enqueue", {"unit_id": old_claim["unit_id"],
+        "consumed_input_revision": replacement_input, "recipe_digest": old_claim["recipe_digest"],
+        "generation_id": "acceptance"})
+    claim = k.command("claim", "retirement:claim", {"job_id": job["job_id"],
+        "expected_revision": job["revision"], "authority_epoch": 1, "lease_seconds": 600})
+    backend.namespaces.append(claim["namespace"])
+    assert claim["retired_receipt_ids"] == ["receipt:" + old_claim["attempt_id"]]
+    delta = await backend.open(claim, for_deletion=True)
+    if failure == "entity":
+        async def reject_rebuild(*args, **kwargs):
+            raise OSError("disposable backend entity write rejected")
+        monkeypatch.setattr(delta.chunk_entity_relation_graph, "upsert_node", reject_rebuild)
+    if failure is not None:
+        from papervault.store.knowledge import RetirementFailure
+
+        with pytest.raises(RetirementFailure) as caught:
+            await CatalogLightRAGAdapter(k)._retire(delta, claim)
+        # The original deletion succeeded after its reducer swallowed the error;
+        # only operation history carries the failure, so no receipt may be sealed.
+        assert caught.value.status == "success"
+        assert k.get_submission(claim["submission_id"])["receipt_id"] is None
+        assert k.get_job(claim["job_id"])["state"] == "running"
+        assert caught.value.messages[0] == "Document old-doc successfully deleted"
+        assert any("Failed" in message or "cannot rebuild" in message for message in caught.value.messages)
+        return
+    await CatalogLightRAGAdapter(k)._retire(delta, claim)
+
+    shared = await delta.chunk_entity_relation_graph.get_node("Shared")
+    assert shared["description"] == "description from retained document"
+    assert shared["source_id"] == "other:0"
+    assert (await delta.entity_chunks.get_by_id("Shared"))["chunk_ids"] == ["other:0"]
+    assert not await delta.chunk_entity_relation_graph.has_node("Exclusive")
+    assert await delta.doc_status.get_by_id("old-doc") is None
+    assert await delta.text_chunks.get_by_id("old:0") is None
+    assert compute_mdhash_id("Exclusive", prefix="ent-") not in await delta.entities_vdb.get_vectors_by_ids(
+        [compute_mdhash_id("Exclusive", prefix="ent-")])
+    await backend.seal(claim, delta, publish=False)
+
+    parent = await backend.open({"namespace": other_claim["namespace"],
+        "aggregate_layers": parent_receipt["aggregate_layers"]}, read_only=True, for_deletion=True)
+    assert await parent.chunk_entity_relation_graph.has_node("Exclusive")
+    assert "retired document" in (await parent.chunk_entity_relation_graph.get_node("Shared"))["description"]
+    assert (await parent.doc_status.get_by_id("old-doc"))["status"] == "processed"
+    assert k.get_job(claim["job_id"])["state"] == "running"

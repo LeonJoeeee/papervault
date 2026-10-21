@@ -30,6 +30,18 @@ class KnownExecutionFailure(RuntimeError):
     """The adapter has definitive evidence this execution cannot succeed."""
 
 
+class RetirementFailure(RuntimeError):
+    """An inherited contribution could not be verifiably removed/rebuilt."""
+
+    def __init__(self, retired_receipt_id, doc_id, status, messages=(), evidence=None):
+        self.retired_receipt_id = retired_receipt_id
+        self.doc_id = doc_id
+        self.status = status
+        self.messages = tuple(messages)
+        self.evidence = evidence or {}
+        super().__init__("retirement rebuild unverified: " + str(status))
+
+
 # Token counts/sizes are execution identity; only credential token names are
 # secrets. Generic suffix `_token` covers provider names such as `hf_token`.
 _SECRET = re.compile(r"(^|_)(api_?key|password|passwd|secret|credentials?|authorization)(_|$)"
@@ -214,7 +226,7 @@ class KnowledgeRepository:
         audit = AuditEvent("knowledge", action, {"operation_id": operation_id})
         # Namespace first, writer second: a sealing caller may already own the
         # namespace guard across external IO. Reversing these locks deadlocks.
-        namespace = payload.get("claim", payload).get("namespace") if action in {"seal_namespace", "record_tombstone"} else None
+        namespace = payload.get("claim", payload).get("namespace") if action in {"seal_namespace", "record_tombstone", "defer_attempt"} else None
         guard = self._session_namespace_lock(namespace) if namespace else nullcontext()
         with guard, self.repository._write(audit):
             old = self._one("knowledge_operations", operation_id=operation_id)
@@ -383,6 +395,12 @@ class KnowledgeRepository:
 
     def get_selection(self, unit_id, generation_id):
         return self._one("selections", unit_id=unit_id, generation_id=generation_id)
+
+    def get_receipt_publications(self, receipt_id):
+        from psycopg import sql
+        return list(self.connection.execute(sql.SQL(
+            "SELECT p.* FROM {} p JOIN {} d USING(derivation_id) WHERE d.receipt_id=%s"
+        ).format(self.repository._table("publications"), self.repository._table("derivations")), (receipt_id,)))
 
     def get_derivation(self, derivation_id):
         from psycopg import sql

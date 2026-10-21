@@ -34,8 +34,9 @@ described below. Run:
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q
 ```
 
-Its three real-store cases exercise original merger summaries and shared-entity traversal,
-vector visibility before top-k, cache isolation, and sealed/stale graph/vector/cache writes.
+Its six real-store cases exercise original merger summaries and shared-entity traversal,
+vector visibility before top-k, cache isolation, sealed/stale graph/vector/cache writes,
+and retirement through the original deletion/rebuild reducer, including partial failures.
 Fixture embeddings and a fixture summary provider avoid GPU/LLM calls. The fixture prepares
 model-specific test tables additively and cleans only its generated namespaces and catalog
 schema; shared tables/indexes remain. Missing target variables skip these cases and provide
@@ -135,12 +136,13 @@ Check collection and the target refusal cases, then execute the actual backend c
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q -rs
 ```
 
-Expected results: **99 tests collected**, **72 passed, 27 deselected** for the refusal
-check, **96 passed, 3 deselected** for all target checks (no connections), and
-**99 passed**, exit **0**, for acceptance. Three skipped
+Expected results: **102 tests collected**, **72 passed, 30 deselected** for the refusal
+check, **96 passed, 6 deselected** for all target checks (no connections), and
+**102 passed**, exit **0**, for acceptance. Six skipped
 real-store tests mean missing explicit credentials and do not constitute acceptance.
-The three real-store test names identify original merge summaries/shared-entity traversal,
-latest-version vector visibility/top-k/tombstones, and cache/sealed/stale-write isolation.
+The real-store test names identify original merge summaries/shared-entity traversal,
+latest-version vector visibility/top-k/tombstones, cache/sealed/stale-write isolation,
+and retirement with clean rebuild, backend write failure and missing-cache variants.
 Any setup, assertion or cleanup error is a failed acceptance run.
 
 There is no operator namespace parameter: each fixture creates a random
@@ -175,7 +177,7 @@ This action opens a read-only transaction and installs no capture objects. Add e
 
 1. Initialize a dedicated catalog using `--action initialize-catalog --catalog-dsn ... --operation-id ...`. This installs the shared schema and importer explicitly; runtime startup performs no schema migration. Initialize exactly one active generation with `KnowledgeRepository.command('create_generation', stable_operation_id, {'generation_id': generation_id, 'candidate': False})`. No legacy output is selected automatically.
 2. On a dedicated source clone, `--action install-capture --source-dsn ... --source-id ...` installs durable inserts/updates/deletes capture and a transactionally ordered counter. `--action capture-snapshot` takes the aligned snapshot and C0 under a source-table lock. Retain source configuration and schema evidence. A rollback consumes no sequence number. TRUNCATE and capture-history edits are rejected.
-3. Use `--action apply --snapshot ... --catalog-dsn ... --operation-id ...` to import stable source-row/version identities. Reapply, interrupt and resume. When mappings or catalog units become resolved, reapply with a new operation ID even if source versions are unchanged: the importer refreshes guarded projections while retaining immutable source events. Handoff compares projections to the final report and current unit mappings and refuses unprojected resolutions. Verify that newer catalog-owned projections are not overwritten. Compare keyed matches, ledger-only and document-status-only units, duplicates, conflicts and provenance gaps; every item needs a disposition. Unknown legacy identities remain quarantined, non-executable and excluded from conforming coverage. Imported failure streaks and parking transfer once without replaying success/failure events or inventing historical attempts.
+3. Use `--action apply --snapshot ... --catalog-dsn ... --operation-id ...` to import stable source-row/version identities. Reapply, interrupt and resume. When mappings or catalog units become resolved, reapply with a new operation ID even if source versions are unchanged. The importer validates the entire plan before writing and appends accepted projection lineage separately from immutable source events. Equal-version updates must retain verified mappings and accepted disposition/observation evidence; conflicting verified mappings fail explicitly and preserve quarantine. Rehearse an interrupted unmapped plan, a committed enriched plan, and refusal of the older plan's resumption without changing jobs, heads, checkpoint or report. Identical replay remains idempotent, and genuinely newer source versions may change projections. Handoff compares projections to the final report and current unit mappings and refuses unprojected resolutions. Verify that newer catalog-owned projections are not overwritten. Compare keyed matches, ledger-only and document-status-only units, duplicates, conflicts and provenance gaps; every item needs a disposition. Unknown legacy identities remain quarantined, non-executable and excluded from conforming coverage. Imported failure streaks and parking transfer once without replaying success/failure events or inventing historical attempts.
 4. Shadow-compare compatible checkpoints with the catalog-only coverage and import reports. Comparison must not dispatch, repair, publish or change serving. The importer's audited migration writes are distinct from comparison. Preserve original attempt/counter checkpoints and independently inventory external work with uncertain outcomes.
 5. Stop dispatch and pipeline admission. Drain in-flight work, or fence both catalog completions and backend writes. Stop/isolate LightRAG internal workers that cannot honor attempt ownership. Record actual evidence for all five drain fields: `dispatch_stopped`, `pipeline_admission_stopped`, `inflight_drained`, `backend_writes_fenced`, `internal_workers_stopped`, plus a durable receipt. Setting fields true is an attestation, not a substitute for performing the operations.
 6. `--action freeze-source --legacy-role ... --evidence ...` takes the final writer lock, installs the durable DML fence, revokes table and column DML from named legacy roles and PUBLIC, and verifies effective privileges, including inherited grants. An inherited privilege or owner/superuser capability that remains writable prevents a successful fence. Capture final C1; `--action capture-delta --after C0` returns changes through the final checkpoint. Apply every change and prove the contiguous sequence, exact final row set and digest.
@@ -190,6 +192,8 @@ Routine ingestion advances active manifests. A forced operator rebuild creates a
 Candidate publication does not promote it. `promote_generation` requires exact candidate manifest/current-requirements revisions and positive compatible coverage. New registrations or input changes must be incorporated in a new explicit manifest or make promotion fail. Query serving pins the exact selected manifest and required namespaces; an ineligible contribution makes its aggregate unavailable. Durable reader/recovery pins and committed references protect outputs; this slice provides no garbage collection command.
 
 Inject crashes before/after external acceptance, after durable outputs but before catalog registration, after catalog commit but before its response, and before outbox acknowledgement. Recover by stable submission/operation IDs and persisted receipts. An ambiguous outcome retains conservative cost and pending work; delivery retries do not become attempts. A stale fence cannot register its outputs. Lost published material retains publication history and queues a deduplicated isolated repair, admitted only during the monthly maintenance window.
+
+Exercise peak-window and breaker pauses during an admitted build. A valid deferral settles and fences the attempt, acknowledges delivery and queues the job without a failure-streak event or parking change; the round stops further admission. Uncertain charges and recovery pins remain. Actual lease loss retains the abandoned-attempt behavior. For retirement, inject rebuild failures despite deletion success and verify that no receipt is sealed or publication selected, with a discrepancy and repair recorded. `not_found` is unverified retirement and cannot be accepted as proof that an inherited contribution is absent.
 
 Rollback after handoff keeps the catalog database, authority epoch, audit, outbox, accepted receipts and external-attempt accounting. Deploy only a catalog-compatible binary. Do not restore a frozen pre-cutover database or select the legacy flag. Returning authority to the ledger needs a separately designed and rehearsed reverse migration.
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -14,6 +15,7 @@ from functools import wraps
 
 from lightrag.kg.postgres_impl import namespace_to_table_name
 from lightrag.utils import compute_mdhash_id, sanitize_text_for_encoding
+from papervault.store.knowledge import RetirementFailure
 
 _IDENTITY = ("job_id", "attempt_id", "submission_id", "authority_epoch", "fencing_token",
              "unit_id", "consumed_input_revision", "recipe_digest", "generation_id", "namespace")
@@ -158,6 +160,8 @@ class CatalogLightRAGAdapter:
         return None
 
     async def _retire(self, rag, claim):
+        from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
+
         for retired_id in claim["retired_receipt_ids"]:
             retired = self.repository.get_receipt(retired_id)
             old_doc = (retired or {}).get("provider_observations", {}).get("doc_id")
@@ -166,8 +170,34 @@ class CatalogLightRAGAdapter:
                     continue
                 raise RuntimeError("retired contribution lacks verified document identity")
             result = await rag.adelete_by_doc_id(old_doc)
-            if result.status not in {"success", "not_found"}:
-                raise RuntimeError("original LightRAG deletion/rebuild did not complete")
+            messages = [result.message]
+            if result.status != "success":
+                # Missing document status does not prove the inherited graph,
+                # vectors or shared summaries no longer contain this document.
+                raise RetirementFailure(retired_id, old_doc, result.status, messages)
+            try:
+                if rag.workspace != claim["namespace"]:
+                    raise RuntimeError("deletion workspace differs from admitted namespace")
+                status = await get_namespace_data("pipeline_status", workspace=rag.workspace)
+                # Never retain this lock across the deletion: its reducers take
+                # the same lock when appending their operation evidence.
+                async with get_namespace_lock("pipeline_status", workspace=rag.workspace):
+                    history = list(status["history_messages"])
+                if not history or history[0] != f"Starting deletion for document: {old_doc}":
+                    raise RuntimeError("deletion history is not attributed to retired document")
+                if any(message.startswith("Starting deletion for document:") for message in history[1:]):
+                    raise RuntimeError("deletion history contains another operation")
+                messages.extend(history)
+            except Exception as exc:
+                raise RetirementFailure(retired_id, old_doc, result.status, messages,
+                                        {"history_error": str(exc)}) from exc
+            # LightRAG 1.5.4 catches individual rebuild/parse failures and can
+            # return success with a clean final result message. Its operation
+            # history is the reporting route for failed counts and no-cache exits.
+            if any(re.search(r"^Failed to\b|\bFailed:\s*\d+\s+entities\b|"
+                             r"^No cached extraction results found, cannot rebuild", message, re.IGNORECASE)
+                   for message in messages):
+                raise RetirementFailure(retired_id, old_doc, result.status, messages)
 
     @_admitted_recipe
     async def submit_metadata(self, claim, manifest, input_store):

@@ -1,5 +1,12 @@
 """Desired inputs are captured before admission and fallback creates a new job."""
 
+import json
+import os
+import subprocess
+import sys
+
+import pytest
+
 from papervault.store.repository import Record
 
 
@@ -107,6 +114,61 @@ def test_recipe_declares_every_tier_and_no_credentials(monkeypatch):
         assert not set(contract["required"]) & set(contract["not_applicable"])
     assert "graph" in actual["output_contract"]["metadata"]["not_applicable"]
     assert "secret-must-never-enter-recipe" not in canonical_json(actual)
+
+
+def test_recipe_changes_when_boot_time_llm_token_limit_changes():
+    # The wrapper reads this at import time. Test real process startup so the
+    # recipe cannot claim a fresh environment value the running wrapper ignores.
+    program = """
+import json
+from papervault.knowledge.scheduler.catalog_intake import effective_distill_recipe
+from papervault.knowledge.store.llm import _DEFAULT_MAX_TOKENS
+from papervault.store.knowledge import canonical_recipe
+recipe, digest = canonical_recipe(effective_distill_recipe())
+print(json.dumps({'digest': digest, 'recipe': recipe, 'actual': _DEFAULT_MAX_TOKENS}))
+"""
+    results = []
+    for limit in (4096, 8192):
+        result = subprocess.run([sys.executable, "-c", program], check=True,
+                                capture_output=True, text=True,
+                                env={**os.environ, "KS_LLM_MAX_TOKENS": str(limit)})
+        results.append(json.loads(result.stdout.splitlines()[-1]))
+    assert results[0]["digest"] != results[1]["digest"]
+    for result, expected in zip(results, (4096, 8192), strict=True):
+        assert result["actual"] == expected
+        assert result["recipe"]["execution_settings"]["llm_wrapper"]["max_tokens"] == expected
+
+
+@pytest.mark.parametrize(("setting", "changed"), [
+    ("_CLIENT_TIMEOUT", 301.0), ("_STREAM", False), ("_FIRST_CHUNK_S", 23.0),
+    ("_MAX_ROUNDS", 4), ("_BASE_BACKOFF", 3.0), ("_BACKOFF_JITTER", 0.25),
+    ("_GW_CONN_MAX_RETRIES", 3), ("_GW_CONN_BACKOFF_CAP", 11.0),
+    ("_GW_TRANSIENT_RETRIES", 5), ("_GW_TRANSIENT_BACKOFF_CAP", 12.0),
+    ("_GW_RETRY_BUDGET_S", 222.0),
+])
+def test_recipe_binds_effective_llm_transport_and_retry_settings(monkeypatch, setting, changed):
+    from papervault.knowledge.scheduler.catalog_intake import effective_distill_recipe
+    from papervault.knowledge.store import llm
+    from papervault.store.knowledge import canonical_recipe
+
+    before = canonical_recipe(effective_distill_recipe())[1]
+    monkeypatch.setattr(llm, setting, changed)
+    assert canonical_recipe(effective_distill_recipe())[1] != before
+
+
+def test_recipe_binds_gateway_mode_without_credentials(monkeypatch):
+    from papervault import config
+    from papervault.knowledge.scheduler.catalog_intake import effective_distill_recipe
+    from papervault.store.knowledge import canonical_recipe
+    from papervault.store.repository import canonical_json
+
+    monkeypatch.setattr(config, "USE_GATEWAY", False)
+    before = canonical_recipe(effective_distill_recipe())[1]
+    monkeypatch.setattr(config, "USE_GATEWAY", True)
+    monkeypatch.setattr(config, "GATEWAY_KEY", "private-test-gateway-key")
+    recipe = effective_distill_recipe()
+    assert canonical_recipe(recipe)[1] != before
+    assert "private-test-gateway-key" not in canonical_json(recipe)
 
 
 def test_unavailable_input_records_discrepancy_and_keeps_other_intake_moving(tmp_path):

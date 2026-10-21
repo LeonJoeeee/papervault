@@ -657,6 +657,23 @@ def dispatch(k, action, operation_id, p):
         job, attempt, _ = complete(k, p)
         return {"job_id": job["id"], "state": job["state"], "revision": job["revision"], "receipt_id": attempt["receipt_id"]}
 
+    if action == "defer_attempt":
+        job, attempt, _ = valid_claim(k, p, allow_sealed=False)
+        revision(job, p)
+        # A controlled pause is settled, but may follow partial external work.
+        # Retain its reservation and private output protection until accounting
+        # can be established; never invent a zero charge or a build failure.
+        k._update("knowledge_attempts", {"outcome": "deferred", "finished_at": now(k),
+            "cost_state": "unknown"}, attempt_id=attempt["attempt_id"])
+        event(k, attempt["attempt_id"], "deferred", {"reason": p.get("reason", {})})
+        pin = k._one("knowledge_pins", pin_id="attempt-pin:" + attempt["attempt_id"])
+        if pin:
+            k._update("knowledge_pins", {"kind": "recovery", "revision": pin["revision"]+1}, pin_id=pin["pin_id"])
+        k._update("knowledge_outbox", {"acknowledged_at": now(k)}, outbox_id="submit:" + attempt["submission_id"])
+        job = k._update("jobs", {"state": "queued", "lease_id": None, "started_at": None,
+            "finished_at": None, "revision": job["revision"]+1}, id=job["id"])
+        return {"job_id": job["id"], "state": job["state"], "revision": job["revision"]}
+
     if action in {"fail", "cancel"}:
         job, attempt, _ = valid_claim(k, p)
         revision(job, p)

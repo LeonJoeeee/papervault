@@ -18,6 +18,7 @@ import inspect
 import os
 import re
 import uuid
+from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from ipaddress import ip_address
@@ -239,7 +240,7 @@ class BackendAcceptance:
         self.repository, self.catalog, self.pg_connection = repository, catalog, pg_connection
         self.namespaces, self.resources, self.llm_calls = [], [], []
 
-    def claim(self, name):
+    def claim(self, name, *, input_store=None):
         from papervault.store.repository import AuditEvent, Record
 
         k, r = self.repository, self.catalog
@@ -250,15 +251,25 @@ class BackendAcceptance:
                   {"unit_id": unit, "kind": "paper", "record_key": name, "identity": name})
         data = ("fixture:" + name).encode()
         digest = hashlib.sha256(data).hexdigest()
+        artifact = {"artifact_id": digest, "sha256": digest, "byte_length": len(data)}
+        if input_store is not None:
+            artifact = input_store.capture(data, role="fulltext_evidence")
+        manifest = {"metadata_revision": "1", "artifacts": [artifact], "upstream_derivation_ids": []}
+        if input_store is not None:
+            manifest["tier"] = "fulltext"
         k.command("register_input", "input:" + name, {"unit_id": unit,
             "consumed_input_revision": "input:" + name,
-            "manifest": {"metadata_revision": "1", "artifacts": [{"artifact_id": digest,
-                "sha256": digest, "byte_length": len(data)}], "upstream_derivation_ids": []}})
-        recipe = k.command("register_recipe", "recipe:" + name, {"recipe": {
+            "manifest": manifest})
+        recipe_data = {
             "schema_version": 1, "code_version": "real-backend-acceptance",
             "embedding_contract": _embedding_contract(),
             "output_contract": {"fulltext": {"required": ["graph", "entities_vdb", "tombstones"],
-                                             "not_applicable": []}}}})["recipe_digest"]
+                                             "not_applicable": []}}}
+        if input_store is not None:
+            from lightrag.prompt import PROMPTS
+
+            recipe_data["prompts"] = dict(PROMPTS)
+        recipe = k.command("register_recipe", "recipe:" + name, {"recipe": recipe_data})["recipe_digest"]
         k.command("set_requirement", "requirement:" + name, {"unit_id": unit,
             "consumed_input_revision": "input:" + name, "recipe_digest": recipe,
             "generation_id": "acceptance", "expected_revision": 0,
@@ -347,7 +358,9 @@ class BackendAcceptance:
         return rag
 
     async def seal(self, claim, rag, *, publish=True, doc_id=None):
-        from papervault.knowledge.store.catalog_adapter import _graph_inventory, _inventory
+        from papervault.knowledge.store.catalog_adapter import (
+            _canonical_graph, _document_graph_contribution, _graph_inventory, _inventory,
+        )
         from papervault.store.repository import payload_hash
 
         await rag.entities_vdb.index_done_callback()
@@ -365,6 +378,22 @@ class BackendAcceptance:
                        [row["id"] for row in rows], stamp),
             self.repository.tombstone_inventory(claim["namespace"])]
         inventory[1]["verification"]["evidence"]["backend_table"] = table.lower()
+        if doc_id is not None:
+            from lightrag.kg.postgres_impl import namespace_to_table_name
+
+            membership = {}
+            for role in ("entity_chunks", "relation_chunks"):
+                store = getattr(rag, role)
+                table = getattr(store, "table_name", None) or namespace_to_table_name(store.namespace)
+                rows = await store.db.raw.query(
+                    f'SELECT * FROM "{table.lower()}" WHERE workspace=$1 ORDER BY id',
+                    [claim["namespace"]], multirows=True)
+                membership[role] = {row["id"]: dict(row) for row in rows}
+            status = await rag.doc_status.get_by_id(doc_id)
+            nodes, edges = _canonical_graph(nodes, edges)
+            contribution = await _document_graph_contribution(
+                rag, doc_id, status["chunks_list"], nodes, edges, membership)
+            inventory[0]["verification"]["evidence"]["document_contribution"] = contribution
         receipt_id = "receipt:" + claim["attempt_id"]
         selected = {**claim["base_selected_unit_receipts"], claim["unit_id"]: receipt_id}
         receipt = {**claim, "receipt_id": receipt_id, "achieved_tier": "fulltext",
@@ -754,3 +783,221 @@ async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggr
     assert "retired document" in (await parent.chunk_entity_relation_graph.get_node("Shared"))["description"]
     assert (await parent.doc_status.get_by_id("old-doc"))["status"] == "processed"
     assert k.get_job(claim["job_id"])["state"] == "running"
+
+
+async def _seed_indexed_document(rag, doc_id, prefix, text, track_id, *, exclusive=True):
+    """Write deterministic extraction through original reducers and actual stores."""
+    from lightrag.operate import _merge_edges_then_upsert
+
+    entities = ["Shared", "Neighbor"] + (["Exclusive"] if exclusive else [])
+    pairs = [["Shared", "Neighbor"]] + ([["Exclusive", "Neighbor"]] if exclusive else [])
+    for entity in entities:
+        await _merge(rag, entity, [f"{prefix} description for {entity}"], prefix)
+    for source, target in pairs:
+        await _merge_edges_then_upsert(source, target, [{
+            "weight": 1.0, "keywords": "related", "description": f"{prefix} relationship evidence",
+            "source_id": prefix + ":0", "file_path": prefix}], rag.chunk_entity_relation_graph,
+            rag.relationships_vdb, rag.entities_vdb, rag.config,
+            llm_response_cache=rag.llm_response_cache,
+            relation_chunks_storage=rag.relation_chunks, entity_chunks_storage=rag.entity_chunks)
+    stamp = datetime.now(timezone.utc).isoformat()
+    await rag.full_docs.upsert({doc_id: {"content": text, "file_path": prefix}})
+    await rag.doc_status.upsert({doc_id: {"status": "processed", "content_summary": text,
+        "content_length": len(text), "chunks_count": 1, "chunks_list": [prefix + ":0"],
+        "created_at": stamp, "updated_at": stamp, "file_path": prefix, "track_id": track_id}})
+    await rag.text_chunks.upsert({prefix + ":0": {"tokens": 4, "chunk_order_index": 0,
+        "full_doc_id": doc_id, "content": text, "file_path": prefix,
+        "llm_cache_list": [prefix + "-extraction"]}})
+    await rag.chunks_vdb.upsert({prefix + ":0": {"content": text,
+        "tokens": 4, "chunk_order_index": 0, "full_doc_id": doc_id, "file_path": prefix}})
+    extraction = [f"entity<|#|>{entity}<|#|>concept<|#|>{prefix} description for {entity}" for entity in entities]
+    extraction.extend(f"relation<|#|>{source}<|#|>{target}<|#|>related<|#|>{prefix} relationship evidence"
+                      for source, target in pairs)
+    await rag.llm_response_cache.upsert({prefix + "-extraction": {"cache_type": "extract",
+        "chunk_id": prefix + ":0", "original_prompt": "fixture extraction",
+        "return": "\n".join([*extraction, "<|COMPLETE|>"])}})
+    await rag.full_entities.upsert({doc_id: {"entity_names": entities, "count": len(entities)}})
+    await rag.full_relations.upsert({doc_id: {"relation_pairs": pairs, "count": len(pairs)}})
+    for store in rag._index_storages():
+        await store.index_done_callback()
+
+
+async def _damage_document_index(rag, doc_id, damage):
+    if damage is None:
+        return
+    if damage == "empty-status":
+        status = await rag.doc_status.get_by_id(doc_id)
+        await rag.doc_status.upsert({doc_id: {**status, "chunks_list": [], "chunks_count": 0}})
+        return
+    role, mode = damage
+    store = getattr(rag, role)
+    if mode == "missing":
+        await store.delete([doc_id])
+    else:
+        field = "entity_names" if role == "full_entities" else "relation_pairs"
+        row = await store.get_by_id(doc_id)
+        await store.upsert({doc_id: {**row, field: row[field][:1], "count": 1}})
+
+
+def _adapter_with_actual_stores(repository, rag, input_store):
+    from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
+
+    async def factory(*args, **kwargs):
+        async def finalize():
+            for store in rag._index_storages():
+                await store.finalize()
+        rag.finalize_storages = finalize
+        return rag
+
+    return CatalogLightRAGAdapter(repository, rag_factory=factory, input_store=input_store)
+
+
+_INDEX_DAMAGE = [None, ("full_entities", "missing"), ("full_entities", "partial"),
+                 ("full_relations", "missing"), ("full_relations", "partial")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", _INDEX_DAMAGE)
+async def test_real_document_indexes_gate_submission_sealing_and_publication(backend, monkeypatch, tmp_path, damage):
+    from papervault.knowledge.scheduler import catalog_intake
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+    from papervault.knowledge.scheduler.catalog_inputs import ImmutableInputStore
+
+    inputs = ImmutableInputStore(tmp_path / "indexed-inputs")
+    claim = backend.claim("indexed-build", input_store=inputs)
+    k = backend.repository
+    rag = await backend.open(claim, for_deletion=True)
+
+    async def insert(text, *, ids, file_paths, track_id):
+        await _seed_indexed_document(rag, ids, "build", text, track_id)
+        await _damage_document_index(rag, ids, damage)
+
+    rag.ainsert = insert
+    monkeypatch.setattr(catalog_intake, "effective_distill_recipe", lambda: k.get_recipe(claim["recipe_digest"]))
+    adapter = _adapter_with_actual_stores(k, rag, inputs)
+    before_manifest = k.get_manifest("acceptance")
+    scheduler = CatalogScheduler(k, adapter, inputs)
+    summary = defaultdict(int)
+    delivery = next(row for row in k.list_outbox(kind="submission")
+                    if row["submission_id"] == claim["submission_id"])
+
+    await scheduler._deliver(delivery, summary)
+
+    if damage is None:
+        receipt = k.get_submission(claim["submission_id"])["receipt"]
+        graph = next(row for row in receipt["output_inventory"] if row["role"] == "graph")
+        assert graph["verification"]["evidence"]["document_contribution"] == {
+            "doc_id": "doc-" + hashlib.sha256(claim["submission_id"].encode()).hexdigest(),
+            "chunk_ids": ["build:0"], "entity_ids": ["Exclusive", "Neighbor", "Shared"],
+            "relation_pairs": [["Exclusive", "Neighbor"], ["Neighbor", "Shared"]]}
+        assert summary["published"] == 1 and summary["discrepancies"] == 0
+        assert k.get_selection(claim["unit_id"], "acceptance") is not None
+        return
+    assert summary["discrepancies"] == 1 and summary["published"] == 0
+    assert k.get_submission(claim["submission_id"])["receipt_id"] is None
+    assert k.get_job(claim["job_id"])["state"] == "running"
+    assert k.get_selection(claim["unit_id"], "acceptance") is None
+    assert k.get_manifest("acceptance") == before_manifest
+    assert k.get_attempt(claim["attempt_id"])["sealed"] is False
+    discrepancy = backend.pg_connection.execute(
+        "SELECT reason,evidence FROM " + backend.catalog._table("knowledge_discrepancies").as_string(
+            backend.pg_connection)).fetchone()
+    assert discrepancy["reason"] == "submission_outcome_unknown"
+    assert discrepancy["evidence"]["error_type"] == "RuntimeError"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [*_INDEX_DAMAGE, "empty-status"])
+async def test_real_document_indexes_gate_metadata_retirement_and_preserve_selected_shared_material(
+        backend, monkeypatch, tmp_path, damage):
+    from copy import deepcopy
+    from lightrag.prompt import PROMPTS
+    from lightrag.utils import compute_mdhash_id
+    from papervault.knowledge.scheduler import catalog_intake
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+    from papervault.knowledge.scheduler.catalog_inputs import ImmutableInputStore
+
+    old_claim = backend.claim("indexed-old")
+    old = await backend.open(old_claim, for_deletion=True)
+    await _seed_indexed_document(old, "old-doc", "old", "retired document", old_claim["submission_id"])
+    old_receipt = await backend.seal(old_claim, old, doc_id="old-doc")
+    other_claim = backend.claim("indexed-other")
+    other = await backend.open(other_claim, for_deletion=True)
+    await _seed_indexed_document(other, "other-doc", "other", "retained document",
+                                 other_claim["submission_id"], exclusive=False)
+    parent_receipt = await backend.seal(other_claim, other, doc_id="other-doc")
+    inputs = ImmutableInputStore(tmp_path / "indexed-metadata")
+    manifest = {"metadata_revision": "2", "tier": "metadata",
+        "artifacts": [inputs.capture(b'{"title":"metadata downgrade"}', role="metadata")],
+        "upstream_derivation_ids": []}
+    k = backend.repository
+    recipe = deepcopy(k.get_recipe(old_claim["recipe_digest"]))
+    recipe["prompts"] = dict(PROMPTS)
+    recipe["output_contract"]["metadata"] = {"required": ["metadata", "graph", "tombstones"]}
+    recipe_digest = k.command("register_recipe", "indexed-metadata:recipe", {"recipe": recipe})["recipe_digest"]
+    monkeypatch.setattr(catalog_intake, "effective_distill_recipe", lambda: deepcopy(recipe))
+    desired = {"unit_id": old_claim["unit_id"], "consumed_input_revision": "indexed-metadata",
+               "generation_id": "acceptance", "recipe_digest": recipe_digest}
+    k.command("register_input", "indexed-metadata:input", {
+        "unit_id": old_claim["unit_id"], "consumed_input_revision": "indexed-metadata", "manifest": manifest})
+    requirement = k.get_requirement(old_claim["unit_id"], "acceptance")
+    k.command("set_requirement", "indexed-metadata:requirement", {**desired,
+        "expected_revision": requirement["revision"],
+        "expected_record_revision": backend.catalog.get("indexed-old").revision})
+    job = k.command("enqueue", "indexed-metadata:enqueue", desired)
+    claim = k.command("claim", "indexed-metadata:claim", {"job_id": job["job_id"],
+        "expected_revision": job["revision"], "authority_epoch": 1, "lease_seconds": 600})
+    backend.namespaces.append(claim["namespace"])
+    delta = await backend.open(claim, for_deletion=True)
+    await _damage_document_index(delta, "old-doc", damage)
+    before_manifest = k.get_manifest("acceptance")
+    before_selection = k.get_selection(old_claim["unit_id"], "acceptance")
+    adapter = _adapter_with_actual_stores(k, delta, inputs)
+    scheduler = CatalogScheduler(k, adapter, inputs)
+    summary = defaultdict(int)
+    delivery = next(row for row in k.list_outbox(kind="submission")
+                    if row["submission_id"] == claim["submission_id"])
+
+    await scheduler._deliver(delivery, summary)
+
+    if damage is None:
+        assert summary["published"] == 1 and summary["discrepancies"] == 0 and summary["repairs"] == 0
+        receipt = k.get_submission(claim["submission_id"])["receipt"]
+        assert receipt["achieved_tier"] == "metadata"
+        assert k.get_selection(old_claim["unit_id"], "acceptance") != before_selection
+        reader = await backend.open({"namespace": claim["namespace"],
+            "aggregate_layers": receipt["aggregate_layers"]}, read_only=True, for_deletion=True)
+        assert (await reader.chunk_entity_relation_graph.get_node("Shared"))["source_id"] == "other:0"
+        assert (await reader.chunk_entity_relation_graph.get_edge("Shared", "Neighbor"))["source_id"] == "other:0"
+        assert (await reader.entities_vdb.get_by_id(compute_mdhash_id("Shared", prefix="ent-")))["chunk_ids"] == ["other:0"]
+        assert not await reader.chunk_entity_relation_graph.has_node("Exclusive")
+        assert await reader.doc_status.get_by_id("old-doc") is None
+    else:
+        assert summary["discrepancies"] == summary["repairs"] == 1 and summary["published"] == 0
+        assert k.get_submission(claim["submission_id"])["receipt_id"] is None
+        assert k.get_job(claim["job_id"])["state"] == "running"
+        assert k.get_attempt(claim["attempt_id"])["sealed"] is False
+        assert k.get_manifest("acceptance") == before_manifest
+        assert k.get_selection(old_claim["unit_id"], "acceptance") == before_selection
+        repairs = [row for row in k.list_outbox(kind="repair")
+                   if row["payload"]["publication_id"] == k.get_receipt_publications(old_receipt["receipt_id"])[0]["publication_id"]]
+        assert len(repairs) == 1 and repairs[0]["payload"]["reason"] == "retirement_rebuild_unverified"
+        discrepancy = backend.pg_connection.execute(
+            "SELECT reason,evidence FROM " + backend.catalog._table("knowledge_discrepancies").as_string(
+                backend.pg_connection)).fetchone()
+        assert discrepancy["reason"] == "retirement_rebuild_unverified"
+        assert "index" in discrepancy["evidence"]["retirement_evidence"]["index_validation_error"]
+        reader = await backend.open(claim, for_deletion=True)
+        assert "old:0" in (await reader.chunk_entity_relation_graph.get_node("Shared"))["source_id"]
+        assert "old:0" in (await reader.chunk_entity_relation_graph.get_edge("Shared", "Neighbor"))["source_id"]
+        assert "old:0" in (await reader.entities_vdb.get_by_id(compute_mdhash_id("Shared", prefix="ent-")))["chunk_ids"]
+        assert "old:0" in (await reader.relationships_vdb.get_by_id(
+            compute_mdhash_id("NeighborShared", prefix="rel-")))["chunk_ids"]
+        assert await reader.chunk_entity_relation_graph.has_node("Exclusive")
+        assert await reader.doc_status.get_by_id("old-doc") is not None
+    parent = await backend.open({"namespace": other_claim["namespace"],
+        "aggregate_layers": parent_receipt["aggregate_layers"]}, read_only=True, for_deletion=True)
+    assert "old:0" in (await parent.chunk_entity_relation_graph.get_node("Shared"))["source_id"]
+    assert "old:0" in (await parent.chunk_entity_relation_graph.get_edge("Shared", "Neighbor"))["source_id"]
+    assert await parent.chunk_entity_relation_graph.has_node("Exclusive")
+    assert (await parent.doc_status.get_by_id("old-doc"))["status"] == "processed"

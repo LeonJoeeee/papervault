@@ -34,7 +34,7 @@ described below. Run:
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q
 ```
 
-Its six real-store cases exercise original merger summaries and shared-entity traversal,
+Its nineteen real-store cases exercise original merger summaries and shared-entity traversal,
 vector visibility before top-k, cache isolation, sealed/stale graph/vector/cache writes,
 and retirement through the original deletion/rebuild reducer, including partial failures.
 Fixture embeddings and a fixture summary provider avoid GPU/LLM calls. The fixture prepares
@@ -136,14 +136,15 @@ Check collection and the target refusal cases, then execute the actual backend c
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q -rs
 ```
 
-Expected results: **104 tests collected**, **72 passed, 32 deselected** for the refusal
-check, **96 passed, 8 deselected** for all target checks (no connections), and
-**104 passed**, exit **0**, for acceptance. Eight skipped
+Expected results: **115 tests collected**, **72 passed, 43 deselected** for the refusal
+check, **96 passed, 19 deselected** for all target checks (no connections), and
+**115 passed**, exit **0**, for acceptance. Nineteen skipped
 real-store tests mean missing explicit credentials and do not constitute acceptance.
 The real-store test names identify original merge summaries/shared-entity traversal,
 latest-version vector visibility/top-k/tombstones, cache/sealed/stale-write isolation,
 and retirement with clean rebuild, backend write failure, missing/partial-cache and
-unattributable-description variants.
+unattributable-description variants, plus document-index verification during build and
+metadata retirement (missing/partial entity or relationship indexes and empty status chunks).
 Any setup, assertion or cleanup error is a failed acceptance run.
 
 There is no operator namespace parameter: each fixture creates a random
@@ -197,6 +198,12 @@ Inject crashes before/after external acceptance, after durable outputs but befor
 Exercise peak-window and breaker pauses during an admitted build. A valid deferral settles and fences the attempt, acknowledges delivery and queues the job without a failure-streak event or parking change; the round stops further admission. Uncertain charges and recovery pins remain. Actual lease loss retains the abandoned-attempt behavior. For retirement, inject rebuild failures despite deletion success and verify that no receipt is sealed or publication selected, with a discrepancy and repair recorded. `not_found` is unverified retirement and cannot be accepted as proof that an inherited contribution is absent.
 
 Include partial extraction-cache loss, caches without descriptions for an affected entity or relationship, and empty normalized summaries from both callbacks and cache hits. All must refuse retirement before sealing, even when LightRAG reports successful deletion. Exercise typed peak/breaker pauses inside the original retirement summary callback: they must reach the catalog deferral command without a failure-streak event, discrepancy or repair. Also advance a migration checkpoint through another row, then attempt enrichment from the older checkpoint; it must leave all accepted projections and the newer report unchanged. Reissue enrichment against the current checkpoint before handoff.
+
+Inject absent and incomplete document-to-entity and document-to-relationship indexes after graph material exists. Build verification must refuse sealing; retirement must check immutable contribution evidence before the original deletion discovers targets, record a discrepancy/repair, and preserve production selection. Include source-limit cases with new chunk memberships but no private graph write, and an empty/partial document-status chunk list. A genuinely empty contribution remains valid. Historical receipts without recorded contribution evidence need an isolated rebuild before retirement can be verified.
+
+Replay physical receipts sealed before the document-index verification protocol, both before and after accepted execution completion. The shared catalog validator must reject further completion/publication, retain the historical receipt/job state, and record a discrepancy without moving selections. This includes metadata downgrades: recovery must not bypass the versioned retirement attestation. Do not backfill an attestation into an immutable historical receipt.
+
+Complete a receipt, advance its generation manifest with another publication, and run default single-slot scheduler rounds. Receipt recovery must leave capacity for a newly fenced rebase attempt, its publication against the current aggregate, and later queued jobs. For capture replay, import duplicate A/B at C0, delete B at C1, and prove C1 applies and permits validated handoff while retaining A's historical duplicate disposition and immutable C0 events.
 
 Rollback after handoff keeps the catalog database, authority epoch, audit, outbox, accepted receipts and external-attempt accounting. Deploy only a catalog-compatible binary. Do not restore a frozen pre-cutover database or select the legacy flag. Returning authority to the ledger needs a separately designed and rehearsed reverse migration.
 

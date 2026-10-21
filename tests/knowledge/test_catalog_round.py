@@ -5,6 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.store.conftest import catalog_test_dsn as catalog_test_dsn, repo as repo
+from tests.store.test_knowledge_postgres import knowledge as knowledge
+
 
 class EmptyCatalog:
     def __init__(self, authority="catalog"):
@@ -129,3 +132,87 @@ def test_backend_file_path_preserves_public_paper_and_operator_citation_keys():
         {"metadata": {"source_key": "textbook:plasma#s7"}}) == "textbook:plasma#s7"
     with pytest.raises(ValueError):
         citation_file_path({"unit_id": "unmapped-uuid", "kind": "section"}, {"metadata": {}})
+
+
+@pytest.mark.asyncio
+async def test_completed_receipt_rebases_without_starving_later_job_in_single_slot_rounds(knowledge, tmp_path):
+    from datetime import datetime, timezone
+
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+    from papervault.knowledge.scheduler.catalog_inputs import make_input_manifest
+    from papervault.store.knowledge import CLAIM_FIELDS
+    from tests.store.test_knowledge_postgres import (
+        _NoBackend, _OpenBuildGate, claim, prepare_fulltext, receipt, seal,
+    )
+
+    k = knowledge
+    store, first = prepare_fulltext(k, tmp_path)
+
+    def enqueue_unit(key):
+        unit_id = "operator:" + key
+        k.command("register_unit", "unit:" + key,
+            {"unit_id": unit_id, "kind": "operator_document", "identity": key})
+        artifact = store.capture(("Evidence for " + key).encode(), role="fulltext_evidence")
+        manifest, input_revision = make_input_manifest(unit_id, {"source_key": key}, [artifact], tier="fulltext")
+        k.command("register_input", "input:" + key,
+            {"unit_id": unit_id, "consumed_input_revision": input_revision, "manifest": manifest})
+        identity = {"unit_id": unit_id, "consumed_input_revision": input_revision,
+                    "recipe_digest": first["recipe_digest"], "generation_id": "g"}
+        k.command("set_requirement", "requirement:" + key, {**identity, "expected_revision": 0})
+        return k.command("enqueue", "job:" + key, identity)
+
+    advancing = enqueue_unit("B")
+    later = enqueue_unit("C")
+    original_claim = claim(k, first, "claim:A")
+    original_receipt = seal(k, original_claim)
+    k.command("complete", "complete:" + original_receipt["receipt_id"], {
+        **original_claim, "receipt": original_receipt, "expected_revision": original_claim["revision"]})
+
+    other_claim = claim(k, advancing, "claim:B")
+    other_receipt = seal(k, other_claim)
+    k.command("publish_derivation", "publish:" + other_receipt["receipt_id"], {
+        **other_claim, "receipt": other_receipt, "expected_revision": other_claim["revision"],
+        "expected_selection_revision": 0, "select": True})
+    current_base = k.get_generation("g")["manifest_revision"]
+    assert current_base > original_claim["aggregate_base_manifest_revision"]
+
+    class SealingBackend(_NoBackend):
+        async def submit(self, claim, text, file_path, *, achieved_tier):
+            k.command("accept_submission", "accept:" + claim["submission_id"], {"claim": claim})
+            rec = receipt(claim)
+            k.command("seal_namespace", "seal:" + claim["submission_id"], {"claim": claim, "receipt": rec})
+            return rec
+
+        async def collect_observations(self, rec):
+            return [{**{key: rec[key] for key in CLAIM_FIELDS}, "receipt_id": rec["receipt_id"],
+                **{key: output[key] for key in ("role", "store", "namespace", "output_id")},
+                "state": "present", "observed_at": datetime.now(timezone.utc).isoformat(), "detail": {}}
+                for output in rec["output_inventory"]]
+
+    scheduler = CatalogScheduler(k, SealingBackend(), store, breaker=_OpenBuildGate())
+    rebased = await scheduler.run_round()
+    assert rebased["claimed"] == rebased["delivered"] == rebased["published"] == 1
+    first_job = k.get_job(first["job_id"])
+    assert first_job["attempts"] == 2
+    attempt = k.get_attempt(first_job["current_attempt_id"])
+    assert attempt["attempt_id"] != original_claim["attempt_id"]
+    assert attempt["submission_id"] != original_claim["submission_id"]
+    assert attempt["fencing_token"] > original_claim["fencing_token"]
+    assert attempt["aggregate_base_manifest_revision"] == current_base
+    assert attempt["base_selected_unit_receipts"] == {"operator:B": other_receipt["receipt_id"]}
+    selected = k.get_selection("paper:A", "g")
+    assert selected["derivation_id"] == "derivation:" + attempt["receipt_id"]
+    assert k.get_operation("publish:" + attempt["receipt_id"]) is not None
+    assert k.get_job(later["job_id"])["attempts"] == 0
+
+    progressed = await scheduler.run_round()
+    assert progressed["claimed"] == progressed["delivered"] == progressed["published"] == 1
+    assert k.get_job(later["job_id"])["state"] == "succeeded"
+    assert k.get_selection("operator:C", "g") is not None
+    assert not k.list_outbox(kind="submission")
+    assert k.get_attempt(original_claim["attempt_id"])["cost_state"] == "unknown"
+    assert k.get_authority_state()["budget_reserved"] == 4
+    replay = await scheduler.run_round()
+    assert replay["claimed"] == replay["delivered"] == replay["published"] == 0
+    assert k.get_job(first["job_id"])["attempts"] == 2
+    assert k.get_job(later["job_id"])["attempts"] == 1

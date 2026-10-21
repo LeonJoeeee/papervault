@@ -51,8 +51,28 @@ def plan_legacy_import(snapshot, *, mappings=(), doc_status_rows=(), changes=(),
         if mapping.get("kind") not in {"paper", "operator_document", "section"} or not mapping.get("unit_id"):
             raise ValueError("mapping requires explicit typed unit_id")
         mappings_by_key[source_row_id(mapping)].append(deepcopy(mapping))
-    raw_events = [(start, "SNAPSHOT", row, False) for row in snapshot.get("rows", [])]
     current_rows = {source_row_id(row): row for row in snapshot.get("rows", [])}
+    mapping_units = {identity: {mapping["unit_id"] for mapping in choices}
+                     for identity, choices in mappings_by_key.items()}
+    unit_counts = Counter(unit for identity in current_rows for unit in mapping_units.get(identity, ()))
+    document_counts = Counter(_doc_identity(row) for row in current_rows.values())
+    raw_events = []
+
+    def index_row(row, increment):
+        document_counts[_doc_identity(row)] += increment
+        for unit in mapping_units.get(source_row_id(row), ()):
+            unit_counts[unit] += increment
+
+    def append_event(sequence, operation, row, deleted):
+        choices = mappings_by_key[source_row_id(row)]
+        duplicate_unit = len(choices) == 1 and unit_counts[choices[0]["unit_id"]] > 1
+        raw_events.append((sequence, operation, row, deleted, duplicate_unit,
+                           document_counts[_doc_identity(row)] > 1))
+
+    # All snapshot rows share one aligned source state; journal dispositions
+    # belong to the state after that atomic change, never the final row set.
+    for row in snapshot.get("rows", []):
+        append_event(start, "SNAPSHOT", row, False)
     expected = start + 1
     for change in changes:
         if not captured or change.get("sequence") != expected:
@@ -72,31 +92,27 @@ def plan_legacy_import(snapshot, *, mappings=(), doc_status_rows=(), changes=(),
             raise ValueError("capture insert already exists in snapshot/journal")
         if old:
             current_rows.pop(source_row_id(old), None)
+            index_row(old, -1)
         if new:
             current_rows[source_row_id(new)] = new
+            index_row(new, 1)
         if old and (new is None or source_row_id(old) != source_row_id(new)):
-            raw_events.append((change["sequence"], "DELETE", old, True))
+            append_event(change["sequence"], "DELETE", old, True)
         if new:
-            raw_events.append((change["sequence"], operation, new, False))
+            append_event(change["sequence"], operation, new, False)
     end = expected - 1
     if final_checkpoint is not None and (not captured or end != final_checkpoint):
         raise ValueError("capture changes must be contiguous through final checkpoint")
     latest = {}
-    for sequence, operation, raw, deleted in raw_events:
+    for sequence, operation, raw, deleted, _, _ in raw_events:
         latest[source_row_id(raw)] = (sequence, operation, raw, deleted)
-    by_unit = defaultdict(set)
-    for identity, (_, _, _, deleted) in latest.items():
-        if not deleted:
-            for mapping in mappings_by_key[identity]:
-                by_unit[mapping["unit_id"]].add(identity)
     status_by_doc = defaultdict(list)
     for status in doc_status_rows:
         status_by_doc[_doc_identity(status)].append(status)
     sets = {key: [] for key in ("matches", "ledger_only", "docstatus_only", "duplicates", "conflicts", "provenance_gaps")}
     events = []
     ledger_doc_ids = {_doc_identity(raw) for _, _, raw, deleted in latest.values() if not deleted}
-    ledger_doc_counts = Counter(_doc_identity(raw) for _, _, raw, deleted in latest.values() if not deleted)
-    for sequence, operation, raw, deleted in raw_events:
+    for sequence, operation, raw, deleted, duplicate_unit, duplicate_document in raw_events:
         identity = source_row_id(raw)
         choices = mappings_by_key[identity]
         compatible = len(choices) == 1
@@ -108,9 +124,9 @@ def plan_legacy_import(snapshot, *, mappings=(), doc_status_rows=(), changes=(),
             dispositions.append("conflicting_mapping")
         elif not choices:
             dispositions.append("unmatched_unit")
-        if mapped and len(by_unit[mapped["unit_id"]]) > 1:
+        if duplicate_unit:
             dispositions.append("duplicate_unit")
-        if ledger_doc_counts[_doc_identity(raw)] > 1:
+        if duplicate_document:
             dispositions.append("duplicate_document_identity")
         if len(status_by_doc.get(_doc_identity(raw), [])) > 1:
             dispositions.append("duplicate_docstatus")

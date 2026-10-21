@@ -194,7 +194,43 @@ def validate_receipt(receipt: dict, claim: dict, recipe: dict) -> None:
         seen[role] = state
     if any(seen.get(role) not in {"present", "verified_empty"} for role in required):
         raise ValueError("required output contract is incomplete")
+    outputs = {output["role"]: output for output in inventory}
+    if {"full_entities", "full_relations"} & outputs.keys():
+        _validate_document_index_verification(receipt, claim, outputs)
     canonical_json(receipt)
+
+
+def _validate_document_index_verification(receipt, claim, outputs):
+    """Keep pre-verification physical receipts from bypassing sealing on recovery."""
+    protocol = receipt.get("document_index_verification")
+    if (not isinstance(protocol, dict) or type(protocol.get("version")) is not int
+            or protocol != {"version": 1, "retired_receipt_ids": claim.get("retired_receipt_ids", [])}):
+        raise ValueError("document index verification protocol missing or incompatible; isolated rebuild required")
+    # Metadata deltas attest verified retirement but have no new graph-bearing
+    # document. Pure catalog metadata receipts do not contain backend indexes.
+    if receipt["achieved_tier"] == "metadata":
+        return
+    graph = outputs.get("graph", {})
+    proof = graph.get("verification", {}).get("evidence", {}).get("document_contribution")
+    if not isinstance(proof, dict):
+        raise ValueError("document index contribution evidence missing")
+    doc_id = proof.get("doc_id")
+    chunks = proof.get("chunk_ids")
+    if (not isinstance(doc_id, str) or not doc_id
+            or doc_id != receipt.get("provider_observations", {}).get("doc_id")
+            or not isinstance(chunks, list) or not chunks
+            or any(not isinstance(chunk, str) or not chunk for chunk in chunks)):
+        raise ValueError("document index contribution identity is invalid")
+    entities, pairs = proof.get("entity_ids"), proof.get("relation_pairs")
+    if (not isinstance(entities, list) or any(not isinstance(entity, str) or not entity for entity in entities)
+            or not isinstance(pairs, list) or any(not isinstance(pair, list) or len(pair) != 2
+                or any(not isinstance(part, str) or not part for part in pair) for pair in pairs)):
+        raise ValueError("document index contribution graph identities are invalid")
+    for role, expected in (("full_entities", entities), ("full_relations", pairs)):
+        index = outputs.get(role, {})
+        if expected and (doc_id not in index.get("backend_ids", [])
+                         or index.get("verification", {}).get("state") != "present"):
+            raise ValueError("document index inventory does not cover recorded contribution")
 
 
 def validate_test_dsn(dsn: str) -> None:

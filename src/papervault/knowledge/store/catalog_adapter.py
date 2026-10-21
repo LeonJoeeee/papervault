@@ -14,7 +14,9 @@ from pathlib import Path
 from functools import wraps
 
 from lightrag.kg.postgres_impl import namespace_to_table_name
-from lightrag.utils import compute_mdhash_id, sanitize_text_for_encoding
+from lightrag.utils import (
+    compute_mdhash_id, make_relation_chunk_key, parse_relation_chunk_key, sanitize_text_for_encoding,
+)
 from papervault.store.knowledge import RetirementFailure
 
 _IDENTITY = ("job_id", "attempt_id", "submission_id", "authority_epoch", "fencing_token",
@@ -288,7 +290,31 @@ class CatalogLightRAGAdapter:
             if not old_doc:
                 if retired and retired.get("achieved_tier") == "metadata":
                     continue
-                raise RuntimeError("retired contribution lacks verified document identity")
+                raise RetirementFailure(retired_id, old_doc, "unverified", evidence={
+                    "index_validation_error": "retired contribution lacks verified document identity; isolated rebuild required"})
+            try:
+                graph_output = next(output for output in retired.get("output_inventory", [])
+                                    if output["role"] == "graph")
+                contribution = graph_output["verification"]["evidence"]["document_contribution"]
+                if contribution["doc_id"] != old_doc:
+                    raise RuntimeError("document index contribution identity differs from receipt")
+                chunks = contribution["chunk_ids"]
+                if (not isinstance(chunks, list) or not chunks
+                        or any(not isinstance(chunk, str) or not chunk for chunk in chunks)):
+                    raise RuntimeError("document index contribution has invalid chunk identities")
+                status = await rag.doc_status.get_by_id(old_doc)
+                if not status or set(status.get("chunks_list") or []) != set(chunks):
+                    raise RuntimeError("document status index does not cover recorded contribution chunks")
+                # Discovery is part of verification, not evidence of absence.
+                # The upstream deletion returns success if both indexes are
+                # missing, without ever invoking its graph rebuild reducer.
+                _verify_document_indexes(contribution,
+                    await rag.full_entities.get_by_id(old_doc),
+                    await rag.full_relations.get_by_id(old_doc))
+            except Exception as exc:
+                raise RetirementFailure(retired_id, old_doc, "unverified", evidence={
+                    "index_validation_error": "document index contribution unverified; isolated rebuild required: "
+                                              + str(exc)}) from exc
             with _retirement_rebuild(rag) as rebuild:
                 result = await rag.adelete_by_doc_id(old_doc)
             if rebuild["pause"] is not None:
@@ -409,6 +435,7 @@ class CatalogLightRAGAdapter:
         receipt.update(receipt_id="receipt-" + hashlib.sha256(_bytes(receipt)).hexdigest(),
                        achieved_tier=achieved_tier, output_inventory=inventory,
                        sealed=True, durable=True, provider_observations=observations,
+                       document_index_verification={"version": 1, "retired_receipt_ids": claim["retired_receipt_ids"]},
                        origin_lineage={})
         selected = {**claim["base_selected_unit_receipts"], claim["unit_id"]: receipt["receipt_id"]}
         receipt.update(aggregate_layers=claim["base_aggregate_layers"] + [claim["namespace"]],
@@ -581,7 +608,7 @@ async def verify_outputs(rag, claim, doc_id, text):
     vectors = await rag.chunks_vdb.get_vectors_by_ids(chunk_ids)
     if set(vectors) != set(chunk_ids) or any(not value for value in vectors.values()):
         raise RuntimeError("chunk vector output readback is incomplete")
-    inventory, observed_at = await verify_delta_outputs(rag, claim)
+    inventory, observed_at = await verify_delta_outputs(rag, claim, document=(doc_id, chunk_ids))
     doc_output = next(item for item in inventory if item["role"] == "full_docs")
     content = expected.encode("utf-8")
     doc_output["verification"]["evidence"].update(
@@ -591,10 +618,11 @@ async def verify_outputs(rag, claim, doc_id, text):
                        "model": "unknown", "version": "unknown"}
 
 
-async def verify_delta_outputs(rag, claim):
+async def verify_delta_outputs(rag, claim, *, document=None):
     """Verify private physical rows plus effective vectors for rebuilt graph rows."""
     observed_at = datetime.now(timezone.utc).isoformat()
     inventory = []
+    index_rows = {}
     for name in _PG_STORES:
         store = getattr(rag, name)
         if store.workspace != claim["namespace"]:
@@ -608,6 +636,8 @@ async def verify_delta_outputs(rag, claim):
         if rows is None:
             raise RuntimeError(f"{name} output inventory unavailable")
         rows = [dict(row) for row in rows]
+        if name in {"full_entities", "full_relations", "entity_chunks", "relation_chunks"}:
+            index_rows[name] = {str(row["id"]): row for row in rows}
         inventory.append(_inventory(name, "postgres", claim["namespace"], rows,
                                     [str(row["id"]) for row in rows], observed_at))
         inventory[-1]["verification"]["evidence"]["backend_table"] = table.lower()
@@ -620,6 +650,12 @@ async def verify_delta_outputs(rag, claim):
     entry = _graph_inventory(claim["namespace"], nodes, edges, observed_at)
     inventory.append(entry)
     nodes, edges = _canonical_graph(nodes, edges)
+    if document is not None:
+        doc_id, chunk_ids = document
+        contribution = await _document_graph_contribution(rag, doc_id, chunk_ids, nodes, edges, index_rows)
+        _verify_document_indexes(contribution, index_rows["full_entities"].get(doc_id),
+                                 index_rows["full_relations"].get(doc_id))
+        entry["verification"]["evidence"]["document_contribution"] = contribution
     # Extraction can legitimately yield no entities, but nonempty graphs must
     # have all three kinds of vector materialization inventoried explicitly.
     expected_entities = {compute_mdhash_id(str(node.get("entity_id", node.get("id"))), prefix="ent-")
@@ -636,6 +672,80 @@ async def verify_delta_outputs(rag, claim):
                      & actual_relations) for edge in edges)):
         raise RuntimeError("graph vector output inventory incomplete")
     return inventory, observed_at
+
+
+async def _document_graph_contribution(rag, doc_id, chunk_ids, nodes, edges, private_rows):
+    """Derive ownership independently of the indexes used by deletion.
+
+    A replacement delta can also contain rows rebuilt while retiring the old
+    version. Only this document's chunks establish its contribution. Trackers
+    retain uncapped source IDs when the graph's display source list is limited.
+    """
+    from lightrag.utils import GRAPH_FIELD_SEP
+
+    chunks = set(chunk_ids)
+    entities, relations = set(), set()
+    for rows, store, key, selected in (
+        (nodes, rag.entity_chunks, lambda row: str(row.get("entity_id", row.get("id"))), entities),
+        (edges, rag.relation_chunks,
+         lambda row: make_relation_chunk_key(row["source"], row["target"]), relations),
+    ):
+        for row in rows:
+            sources = set(filter(None, str(row.get("source_id") or "").split(GRAPH_FIELD_SEP)))
+            tracker = await store.get_by_id(key(row))
+            if tracker:
+                sources.update(_index_list(tracker.get("chunk_ids", [])))
+            if not sources:
+                raise RuntimeError("document index contribution has no attributable graph sources")
+            if sources & chunks:
+                selected.add(key(row) if selected is entities else (row["source"], row["target"]))
+    # KEEP source limits can append uncapped memberships and return before any
+    # private graph write. Those contributions can become visible in a later
+    # rebuild, so a zero-row graph delta cannot prove an empty contribution.
+    for role, selected in (("entity_chunks", entities), ("relation_chunks", relations)):
+        for key, row in private_rows[role].items():
+            if not chunks.intersection(_index_list(row.get("chunk_ids", []))):
+                continue
+            identity = key if role == "entity_chunks" else parse_relation_chunk_key(key)
+            graph = rag.chunk_entity_relation_graph
+            material = await graph.get_node(identity) if role == "entity_chunks" else await graph.get_edge(*identity)
+            if not material:
+                raise RuntimeError("document index membership has no verified graph material")
+            selected.add(identity)
+    return {"doc_id": doc_id, "chunk_ids": sorted(chunks),
+            "entity_ids": sorted(entities), "relation_pairs": [list(pair) for pair in sorted(relations)]}
+
+
+def _index_list(values):
+    if isinstance(values, str):
+        values = json.loads(values)
+    if not isinstance(values, list):
+        raise RuntimeError("document index membership is malformed")
+    return values
+
+
+def _verify_document_indexes(contribution, entities, relations):
+    """Require target discovery to cover immutable, independently derived IDs."""
+    for role, row, field, expected_field in (
+        ("full_entities", entities, "entity_names", "entity_ids"),
+        ("full_relations", relations, "relation_pairs", "relation_pairs"),
+    ):
+        expected = contribution[expected_field]
+        values = row.get(field) if row else []
+        values = _index_list(values)
+        if not isinstance(values, list) or not isinstance(expected, list):
+            raise RuntimeError(f"{role} document index is malformed")
+        def identities(items):
+            if role == "full_entities":
+                if any(not isinstance(item, str) or not item for item in items):
+                    raise RuntimeError(f"{role} document index is malformed")
+                return set(items)
+            if any(not isinstance(item, (tuple, list)) or len(item) != 2
+                   or any(not isinstance(part, str) or not part for part in item) for item in items):
+                raise RuntimeError(f"{role} document index is malformed")
+            return {tuple(sorted(item)) for item in items}
+        if not identities(expected) <= identities(values):
+            raise RuntimeError(f"{role} document index does not cover recorded graph contribution")
 
 
 def _canonical_graph(nodes, edges):

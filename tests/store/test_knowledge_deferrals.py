@@ -308,7 +308,7 @@ async def test_metadata_retirement_llm_pause_preserves_failure_budget(knowledge,
     from papervault.knowledge.scheduler.catalog import CatalogScheduler
     from papervault.knowledge.scheduler.catalog_inputs import make_input_manifest
     from papervault.knowledge.store.build_breaker import BuildBreaker, BuildPausedError, BuildSchedule
-    from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
+    from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter, _graph_inventory, _inventory
     from papervault.store.knowledge import ClaimRejected
     from tests.knowledge.test_catalog_retirement import memory_rag_for_retirement
     from tests.store.test_knowledge_postgres import receipt
@@ -319,6 +319,16 @@ async def test_metadata_retirement_llm_pause_preserves_failure_budget(knowledge,
     old_claim = claim(k, old_job, "published-fulltext-claim")
     old_receipt = receipt(old_claim)
     old_receipt["provider_observations"]["doc_id"] = "old-doc"
+    # The prior publication must carry verified discovery evidence so this test
+    # reaches the reducer's pause instead of failing retirement admission.
+    stamp = old_receipt["output_inventory"][0]["verified_at"]
+    graph = _graph_inventory(old_claim["namespace"], [{"entity_id": "Shared", "source_id": "old:0"}], [], stamp)
+    graph["verification"]["evidence"]["document_contribution"] = {
+        "doc_id": "old-doc", "chunk_ids": ["old:0"], "entity_ids": ["Shared"], "relation_pairs": []}
+    old_receipt["output_inventory"] = [graph, _inventory("full_entities", "postgres", old_claim["namespace"],
+        [{"id": "old-doc", "entity_names": ["Shared"]}], ["old-doc"], stamp),
+        _inventory("full_relations", "postgres", old_claim["namespace"], [], [], stamp)]
+    old_receipt["document_index_verification"] = {"version": 1, "retired_receipt_ids": []}
     k.command("seal_namespace", "published-fulltext-seal", {"claim": old_claim, "receipt": old_receipt})
     k.command("publish_derivation", "published-fulltext", {**old_claim, "receipt": old_receipt,
         "expected_revision": old_claim["revision"], "expected_selection_revision": 0, "select": True})

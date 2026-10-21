@@ -35,7 +35,11 @@ class Repository:
         return {"receipt": self.receipt} if self.accepted else None
 
     def get_receipt(self, receipt_id):
-        return {"provider_observations": {"doc_id": "old-doc"}}
+        return {"provider_observations": {"doc_id": "old-doc"}, "output_inventory": [{
+            "role": "graph", "verification": {"evidence": {"document_contribution": {
+                "doc_id": "old-doc", "chunk_ids": ["chunk"],
+                "entity_ids": ["Earth"], "relation_pairs": [],
+            }}}}]}
 
     def list_tombstones(self, namespaces, role=None):
         return []
@@ -146,6 +150,10 @@ def verified_rag(*, wrong_entity_vector=False):
                 return [{"id": "other" if wrong_entity_vector else compute_mdhash_id("Earth", prefix="ent-")}]
             if '"chunk_vectors"' in sql:
                 return [{"id": "chunk"}]
+            if '"full_entities"' in sql:
+                import hashlib
+                return [{"id": key, "entity_names": ["Earth"], "count": 1} for key in (
+                    "doc", "old-doc", "doc-" + hashlib.sha256(CLAIM["submission_id"].encode()).hexdigest())]
             return []
 
     class Store:
@@ -154,7 +162,16 @@ def verified_rag(*, wrong_entity_vector=False):
         table_name = "records"
         db = DB()
 
+        def __init__(self, role):
+            self.role = role
+            if role in {"full_entities", "full_relations"}:
+                self.table_name = role
+
         async def get_by_id(self, key):
+            if self.role == "full_entities":
+                return {"entity_names": ["Earth"], "count": 1}
+            if self.role == "full_relations":
+                return {"relation_pairs": [], "count": 0}
             return {"content": "actual content", "status": "processed", "track_id": "submission",
                     "chunks_list": ["chunk"]}
 
@@ -169,12 +186,12 @@ def verified_rag(*, wrong_entity_vector=False):
         workspace = "pv_private"
 
         async def get_all_nodes(self):
-            return [{"entity_id": "Earth", "id": "Earth"}]
+            return [{"entity_id": "Earth", "id": "Earth", "source_id": "chunk"}]
 
         async def get_all_edges(self):
             return []
 
-    stores = {name: Store() for name in (
+    stores = {name: Store(name) for name in (
         "full_docs", "text_chunks", "full_entities", "full_relations", "entity_chunks",
         "relation_chunks", "llm_response_cache", "doc_status", "chunks_vdb", "entities_vdb",
         "relationships_vdb")}

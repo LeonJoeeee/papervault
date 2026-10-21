@@ -302,6 +302,7 @@ class CatalogScheduler:
             receipt = submission.get("receipt") if submission else None
             if not receipt:
                 receipt = await self.adapter.lookup_submission(claim["submission_id"])
+            recovered = bool(receipt)
             attempt = self.repository.get_attempt(claim["attempt_id"])
             if attempt["outcome"] == "deferred" or (job["state"] in {"failed", "cancelled"} and attempt["outcome"] is not None):
                 self._command_once("acknowledge_outbox", "ack:"+row["outbox_id"], {"outbox_id": row["outbox_id"]})
@@ -352,7 +353,10 @@ class CatalogScheduler:
             await self._collect(receipt, summary)
             if await self._finish(receipt, summary):
                 self._command_once("acknowledge_outbox", "ack:" + row["outbox_id"], {"outbox_id": row["outbox_id"]})
-            return True
+            # Recovering a sealed receipt does not execute new work. In
+            # particular, a stale aggregate base must leave room to admit its
+            # rebased attempt instead of consuming the only delivery slot.
+            return not recovered
         except BuildPausedError:
             latest = self.repository.get_job(claim["job_id"])
             current = self._current_claim(latest)

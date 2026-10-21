@@ -308,6 +308,14 @@ async def memory_rag_for_retirement(claim, *, pause=None, kind="entity", cache_c
     rag.full_entities.rows["old-doc"] = {"entity_names": ["Shared"] if kind == "entity" else [], "count": 1}
     rag.full_relations.rows["old-doc"] = {"relation_pairs": [["Shared", "Neighbor"]]
         if kind == "relationship" else [], "count": 1}
+    # This fixture starts with an already verified publication. Preserve its
+    # contribution independently of later mutations to the discovery indexes.
+    rag.retired_receipt = {"provider_observations": {"doc_id": "old-doc"}, "output_inventory": [{
+        "role": "graph", "verification": {"evidence": {"document_contribution": {
+            "doc_id": "old-doc", "chunk_ids": ["old:0"],
+            "entity_ids": ["Shared"] if kind == "entity" else [],
+            "relation_pairs": [["Neighbor", "Shared"]] if kind == "relationship" else [],
+        }}}}]}
     for chunk in ("old:0", "remain:1", "remain:2"):
         rag.text_chunks.rows[chunk] = {"id": chunk, "content": "remaining evidence", "file_path": "other",
             "llm_cache_list": [] if chunk == "old:0" else ["cache:" + chunk]}
@@ -354,6 +362,12 @@ async def memory_rag_for_retirement(claim, *, pause=None, kind="entity", cache_c
     return rag
 
 
+def retirement_repository(rag):
+    repo = Repository()
+    repo.get_receipt = lambda receipt_id: deepcopy(rag.retired_receipt)
+    return repo
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["entity", "relationship"])
 @pytest.mark.parametrize("wrapped", [False, True])
@@ -375,7 +389,7 @@ async def test_real_rebuild_summary_pause_reaches_metadata_delivery_as_typed_def
     rag = await memory_rag_for_retirement(claim, pause=pause, kind=kind, wrap_pause=wrapped)
     store = ImmutableInputStore(tmp_path / "inputs")
     artifact = store.capture(b'{"title":"metadata"}', role="metadata")
-    repo = Repository()
+    repo = retirement_repository(rag)
     repo.manifest = manifest = {"tier": "metadata", "artifacts": [artifact]}
 
     async def factory(*args, **kwargs):
@@ -417,7 +431,7 @@ async def test_retirement_rebuild_observer_is_scoped_to_its_graph_and_task(mode)
 
     async def retire():
         with pytest.raises(BuildPausedError) as caught:
-            await CatalogLightRAGAdapter(Repository())._retire(paused, claim)
+            await CatalogLightRAGAdapter(retirement_repository(paused))._retire(paused, claim)
         assert caught.value is pause
 
     if mode == "parallel":
@@ -442,7 +456,7 @@ async def test_retirement_requires_attributable_cached_descriptions_after_source
              "retired_receipt_ids": ["retired"]}
     rag = await memory_rag_for_retirement(claim, kind=kind, cache_case=cache_case)
     with pytest.raises(RetirementFailure) as caught:
-        await CatalogLightRAGAdapter(Repository())._retire(rag, claim)
+        await CatalogLightRAGAdapter(retirement_repository(rag))._retire(rag, claim)
     assert "isolated rebuild required" in caught.value.evidence["rebuild_validation_error"]
     assert await rag.doc_status.get_by_id("old-doc") is not None
     assert rag.llm_calls == []
@@ -462,7 +476,7 @@ async def test_real_retirement_rejects_empty_normalized_or_cached_rebuild_summar
     rag = await memory_rag_for_retirement(claim, kind="relationship",
         summary_result=result, summary_cache=result if cached else None)
     with pytest.raises(RetirementFailure) as caught:
-        await CatalogLightRAGAdapter(Repository())._retire(rag, claim)
+        await CatalogLightRAGAdapter(retirement_repository(rag))._retire(rag, claim)
     assert "empty" in caught.value.evidence["rebuild_validation_error"]
     assert "isolated rebuild required" in caught.value.evidence["rebuild_validation_error"]
     assert len(rag.llm_calls) == (0 if cached else 1)
@@ -478,7 +492,7 @@ async def test_retirement_rejects_normalized_empty_single_description_without_ll
     claim = {**CLAIM, "namespace": "source_summary_" + uuid4().hex, "retired_receipt_ids": ["retired"]}
     rag = await memory_rag_for_retirement(claim, kind="relationship", cache_case="normalized-source")
     with pytest.raises(RetirementFailure) as caught:
-        await CatalogLightRAGAdapter(Repository())._retire(rag, claim)
+        await CatalogLightRAGAdapter(retirement_repository(rag))._retire(rag, claim)
     assert "empty summary" in caught.value.evidence["rebuild_validation_error"]
     assert rag.llm_calls == []
     assert await rag.doc_status.get_by_id("old-doc") is not None
@@ -504,6 +518,6 @@ async def test_retirement_summary_validation_ignores_other_config_inside_observe
 
     rag = await memory_rag_for_retirement(claim, pause=pause, on_summary=nested)
     with pytest.raises(BuildPausedError) as caught:
-        await CatalogLightRAGAdapter(Repository())._retire(rag, claim)
+        await CatalogLightRAGAdapter(retirement_repository(rag))._retire(rag, claim)
     assert caught.value is pause
     assert unrelated == [""]

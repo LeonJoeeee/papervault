@@ -523,3 +523,122 @@ def test_older_checkpoint_cannot_enrich_projection_outside_accepted_report(repo)
     k.command("create_generation", "generation", {"generation_id": "g", "candidate": False})
     assert CutoverRepository(repo).commit_handoff(handoff_evidence(current_enriched), expected_epoch=1,
                                                 operation_id="handoff")["authority_epoch"] == 2
+
+
+@pytest.mark.parametrize("duplicate_kind", ["document", "unit"])
+def test_history_retains_snapshot_duplicates_when_another_source_is_deleted(duplicate_kind):
+    from papervault.store.knowledge_import import plan_legacy_import
+    from papervault.store.repository import payload_hash
+
+    reason = "duplicate_document_identity" if duplicate_kind == "document" else "duplicate_unit"
+    other = source("B", doc_id="doc:A" if duplicate_kind == "document" else "doc:B")
+    mappings = [mapping(), mapping("B", "paper:A" if duplicate_kind == "unit" else "paper:B")]
+    raw = snapshot([source(), other])
+    before = copy.deepcopy(raw)
+    initial = plan_legacy_import(raw, mappings=mappings)
+    final = plan_legacy_import(raw, mappings=mappings, changes=[{
+        "sequence": 11, "operation": "DELETE", "old": other, "new": None}], final_checkpoint=11)
+
+    assert all(reason in event["dispositions"] for event in initial["events"])
+    assert final["events"][:2] == initial["events"]
+    tombstone = final["events"][-1]
+    assert tombstone["deleted"] and "source_deleted" in tombstone["dispositions"]
+    assert reason not in tombstone["dispositions"]
+    assert [(row["source_identity"]["source_id"], row["source_version"])
+            for row in final["sets"]["duplicates"]] == [("A", 10)]
+    assert final["counts"] == {"matches": 0, "ledger_only": 2, "docstatus_only": 0,
+                              "duplicates": 1, "conflicts": 0, "provenance_gaps": 2}
+    assert final["checkpoint"]["final_row_count"] == 1
+    assert final["checkpoint"]["final_rows_digest"] == payload_hash([source()])
+    assert raw == before
+
+
+@pytest.mark.parametrize("duplicate_kind", ["document", "unit"])
+def test_history_records_duplicate_introduction_and_removal_at_their_source_sequences(duplicate_kind):
+    from papervault.store.knowledge_import import plan_legacy_import
+
+    reason = "duplicate_document_identity" if duplicate_kind == "document" else "duplicate_unit"
+    other = source("B", doc_id="doc:A" if duplicate_kind == "document" else "doc:B")
+    mappings = [mapping(), mapping("B", "paper:A" if duplicate_kind == "unit" else "paper:B")]
+    changes = [{"sequence": 11, "operation": "INSERT", "old": None, "new": other},
+               {"sequence": 12, "operation": "DELETE", "old": other, "new": None}]
+    introduced = plan_legacy_import(snapshot(), mappings=mappings, changes=changes[:1], final_checkpoint=11)
+    final = plan_legacy_import(snapshot(), mappings=mappings, changes=changes, final_checkpoint=12)
+
+    assert reason not in introduced["events"][0]["dispositions"]
+    assert reason in introduced["events"][1]["dispositions"]
+    assert final["events"][:2] == introduced["events"]
+    assert reason not in final["events"][2]["dispositions"]
+    assert "source_deleted" in final["events"][2]["dispositions"]
+    assert final["sets"]["duplicates"] == []
+
+
+def test_history_key_changing_update_classifies_both_images_after_the_atomic_change():
+    from papervault.store.knowledge_import import plan_legacy_import
+    from papervault.store.repository import payload_hash
+
+    renamed = source("B", doc_id="doc:A")
+    plan = plan_legacy_import(snapshot(), mappings=[mapping(), mapping("B")], changes=[{
+        "sequence": 11, "operation": "UPDATE", "old": source(), "new": renamed}], final_checkpoint=11)
+
+    assert [(event["source_identity"]["source_id"], event["operation"], event["deleted"])
+            for event in plan["events"]] == [("A", "SNAPSHOT", False), ("A", "DELETE", True), ("B", "UPDATE", False)]
+    assert all("duplicate_unit" not in event["dispositions"]
+               and "duplicate_document_identity" not in event["dispositions"] for event in plan["events"])
+    assert plan["sets"]["duplicates"] == []
+    assert plan["checkpoint"]["final_row_count"] == 1
+    assert plan["checkpoint"]["final_rows_digest"] == payload_hash([renamed])
+
+
+@pytest.mark.parametrize("duplicate_kind", ["document", "unit"])
+def test_history_duplicate_deletion_applies_without_rewriting_evidence_and_allows_handoff(repo, duplicate_kind):
+    from papervault.store.knowledge import OperationConflict
+    from papervault.store.knowledge_cutover import CutoverRepository
+    from papervault.store.knowledge_import import plan_legacy_import
+    from papervault.store.repository import payload_hash
+
+    importer = parked_importer(repo)
+    k = importer.knowledge
+    reason = "duplicate_document_identity" if duplicate_kind == "document" else "duplicate_unit"
+    other = source("B", doc_id="doc:A" if duplicate_kind == "document" else "doc:B")
+    mappings = [mapping(), {**mapping("B", "paper:A" if duplicate_kind == "unit" else "paper:B"),
+                            "record_key": "A" if duplicate_kind == "unit" else "B"}]
+    raw = snapshot([source(), other])
+    initial = plan_legacy_import(raw, mappings=mappings)
+    importer.apply(initial, operation_id="history-C0")
+    original_events = importer.source_versions("ledger-test")
+    original_head = next(head for head in k._rows("knowledge_import_heads")
+                         if head["source_row_id"] == initial["events"][0]["source_row_id"])
+    original_job = k._one("jobs", id=original_head["job_id"])
+    original_lineage = k._rows("knowledge_import_projections", source_row_id=original_head["source_row_id"])
+    final = plan_legacy_import(raw, mappings=mappings, changes=[{
+        "sequence": 11, "operation": "DELETE", "old": other, "new": None}], final_checkpoint=11)
+
+    result = importer.apply(final, operation_id="history-C1")
+
+    assert result["inserted"] == 1 and result["projected"] == 1
+    assert k._one("knowledge_import_heads", source_row_id=original_head["source_row_id"]) == original_head
+    assert k._one("jobs", id=original_head["job_id"]) == original_job
+    assert k._rows("knowledge_import_projections", source_row_id=original_head["source_row_id"]) == original_lineage
+    assert reason in original_job["detail"]["evidence"]["dispositions"]
+    assert [event for event in importer.source_versions("ledger-test") if event["source_version"] == 10] == original_events
+    assert k._one("knowledge_import_reports", plan_digest=payload_hash(initial))["report"] == initial
+    checkpoint = k._rows("knowledge_import_checkpoints")[0]
+    assert checkpoint["checkpoint"] == final["checkpoint"]
+    assert checkpoint["plan_digest"] == payload_hash(final)
+    assert k._one("knowledge_import_reports", plan_digest=checkpoint["plan_digest"])["report"] == final
+    assert [(row["source_identity"]["source_id"], row["source_version"])
+            for row in final["sets"]["duplicates"]] == [("A", 10)]
+    assert all(job["quarantine"] and job["detail"]["excluded"] and not job["detail"]["executable"]
+               for job in k._rows("jobs", kind="distill_legacy_unverified"))
+    before = schema_rows(repo)
+    assert importer.apply(final, operation_id="history-C1") == result
+    assert schema_rows(repo) == before
+    losing = copy.deepcopy(final)
+    losing["events"][0]["dispositions"].remove(reason)
+    with pytest.raises(OperationConflict, match="disposition.*regression"):
+        importer.apply(losing, operation_id="history-regression")
+    assert schema_rows(repo) == before
+    k.command("create_generation", "generation", {"generation_id": "g", "candidate": False})
+    assert CutoverRepository(repo).commit_handoff(handoff_evidence(final), expected_epoch=1,
+                                                operation_id="history-handoff")["authority_epoch"] == 2

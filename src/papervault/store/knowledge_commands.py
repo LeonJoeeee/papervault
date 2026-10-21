@@ -626,6 +626,14 @@ def dispatch(k, action, operation_id, p):
         job = k._update("jobs", {"revision": job["revision"] + 1}, id=job["id"])
         return claim_result(job, attempt)
 
+    if action == "begin_retirement":
+        job, attempt, _ = valid_claim(k, p["claim"], allow_sealed=False)
+        require(isinstance(p.get("delivery_id"), str) and p["delivery_id"], "retirement delivery identity required")
+        require(not k._rows("knowledge_attempt_events", attempt_id=attempt["attempt_id"], event="retirement_started"),
+                "retirement already started; isolated rebuild required")
+        event(k, attempt["attempt_id"], "retirement_started", {"delivery_id": p["delivery_id"]})
+        return {"delivery_id": p["delivery_id"], "attempt_id": attempt["attempt_id"]}
+
     if action == "seal_namespace":
         payload = p.get("claim", p)
         namespace = payload["namespace"]
@@ -674,10 +682,10 @@ def dispatch(k, action, operation_id, p):
             "finished_at": None, "revision": job["revision"]+1}, id=job["id"])
         return {"job_id": job["id"], "state": job["state"], "revision": job["revision"]}
 
-    if action in {"fail", "cancel"}:
-        job, attempt, _ = valid_claim(k, p)
+    if action in {"fail", "cancel", "fail_retirement"}:
+        job, attempt, _ = valid_claim(k, p, allow_sealed=action != "fail_retirement")
         revision(job, p)
-        outcome = "failed" if action == "fail" else "cancelled"
+        outcome = "cancelled" if action == "cancel" else "failed"
         k._update("knowledge_attempts", {"outcome": outcome, "finished_at": now(k),
             "error": p.get("error", {}), "cost_state": "unknown"}, attempt_id=attempt["attempt_id"])
         event(k, attempt["attempt_id"], outcome, {"error": p.get("error", {})})
@@ -685,7 +693,9 @@ def dispatch(k, action, operation_id, p):
         if pin:
             k._update("knowledge_pins", {"kind": "recovery", "revision": pin["revision"]+1}, pin_id=pin["pin_id"])
         job = k._update("jobs", {"state": outcome, "finished_at": now(k), "revision": job["revision"] + 1}, id=job["id"])
-        checkpoint = reduce_outcome(k, job, outcome) if action == "fail" else None
+        checkpoint = reduce_outcome(k, job, outcome) if outcome == "failed" else None
+        if action == "fail_retirement":
+            k._update("knowledge_outbox", {"acknowledged_at": now(k)}, outbox_id="submit:" + attempt["submission_id"])
         return {"job_id": job["id"], "state": job["state"], "revision": job["revision"], "reducer": checkpoint}
 
     if action == "claim_publication":
@@ -806,7 +816,8 @@ def dispatch(k, action, operation_id, p):
         if old:
             return {"repair_id": old["repair_id"]}
         row = k._insert("knowledge_repairs", {"repair_id": identifier("repair"), **key})
-        outbox(k, "repair", {"repair_id": row["repair_id"], **key})
+        requirement = {"isolated_rebuild_required": True} if key["reason"] == "retirement_rebuild_unverified" else {}
+        outbox(k, "repair", {"repair_id": row["repair_id"], **key, **requirement})
         return {"repair_id": row["repair_id"]}
 
     if action == "record_discrepancy":

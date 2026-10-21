@@ -403,6 +403,15 @@ class BackendAcceptance:
             "selected_unit_receipts": selected, "selected_unit_receipts_digest": payload_hash(selected)}
         if doc_id is not None:
             receipt["provider_observations"]["doc_id"] = doc_id
+        if claim["retired_receipt_ids"]:
+            from papervault.knowledge.store.catalog_adapter import verify_delta_outputs
+
+            verified, _ = await verify_delta_outputs(rag, claim)
+            verified_graph = next(row for row in verified if row["role"] == "graph")
+            assert verified_graph["sha256"] == inventory[0]["sha256"]
+            receipt["retirement_verification"] = {"version": 1,
+                "retired_receipt_ids": claim["retired_receipt_ids"],
+                "graph_sha256": verified_graph["sha256"]}
         async with self.repository.namespace_access(claim, seal=True):
             self.repository.command("seal_namespace", "seal:" + claim["attempt_id"],
                                     {"claim": claim, "receipt": receipt})
@@ -545,6 +554,41 @@ async def test_real_original_merge_summary_and_cross_document_traversal(backend)
     assert await graph.node_degree("Shared") == 2
     assert not await graph.has_node("Secret")
     assert (await reader.entity_chunks.get_by_id("Shared"))["count"] == 8
+
+
+@pytest.mark.asyncio
+async def test_real_original_relationship_source_append_accepts_full_entity_vector_content(backend):
+    from lightrag.operate import _merge_edges_then_upsert
+    from lightrag.utils import compute_mdhash_id
+    from papervault.knowledge.store.catalog_adapter import verify_delta_outputs
+
+    claim = backend.claim("relationship-entity-content")
+    rag = await backend.open(claim, for_deletion=True)
+    rag.config["embedding_token_limit"] = 8192
+    await _merge(rag, "Shared", ["d" * 9000], "A")
+    for store in rag._index_storages():
+        await store.index_done_callback()
+    vector_id = compute_mdhash_id("Shared", prefix="ent-")
+    initial = await rag.entities_vdb.get_by_id(vector_id)
+    # The character tokenizer leaves 7936 characters after the reducer's
+    # 256-token reserve; the seven-character entity prefix uses that budget.
+    assert initial["content"] == "Shared\n" + "d" * 7929
+    await verify_delta_outputs(rag, claim)
+
+    await _merge_edges_then_upsert("Shared", "Neighbor", [{
+        "description": "relationship evidence", "keywords": "related",
+        "source_id": "B:0", "file_path": "B", "weight": 1.0}],
+        rag.chunk_entity_relation_graph, rag.relationships_vdb, rag.entities_vdb, rag.config,
+        entity_chunks_storage=rag.entity_chunks, relation_chunks_storage=rag.relation_chunks,
+        llm_response_cache=rag.llm_response_cache)
+    for store in rag._index_storages():
+        await store.index_done_callback()
+    updated = await rag.entities_vdb.get_by_id(vector_id)
+    assert updated["content"] == "Shared\n" + "d" * 9000
+    assert set(updated["chunk_ids"]) == {"A:0", "B:0"}
+    assert (await rag.chunk_entity_relation_graph.get_node("Shared"))["description"] == "d" * 9000
+    assert backend.llm_calls == []
+    await verify_delta_outputs(rag, claim)
 
 
 @pytest.mark.asyncio
@@ -785,6 +829,256 @@ async def test_real_retirement_rebuild_preserves_shared_evidence_and_parent_aggr
     assert k.get_job(claim["job_id"])["state"] == "running"
 
 
+class _RetirementProcessDeath(BaseException):
+    """Interrupt outside Exception handlers, as a killed worker would."""
+
+
+def _retirement_vector(rag, kind):
+    from lightrag.utils import compute_mdhash_id
+
+    if kind == "entity":
+        return rag.entities_vdb, compute_mdhash_id("Shared", prefix="ent-")
+    return rag.relationships_vdb, compute_mdhash_id("NeighborShared", prefix="rel-")
+
+
+async def _seed_private_ranking_probe(rag):
+    """Give a failed namespace a distinguishable nearest-neighbor result."""
+    from lightrag.utils import compute_mdhash_id
+
+    await _merge(rag, "PrivateRetirementOnly", ["unpublished ranking evidence"], "private")
+    await rag.relationships_vdb.upsert({compute_mdhash_id("PrivateRetirementOnlyShared", prefix="rel-"): {
+        "src_id": "PrivateRetirementOnly", "tgt_id": "Shared", "source_id": "private:0",
+        "content": "vector:old"}})
+    await rag.entities_vdb.index_done_callback()
+    await rag.relationships_vdb.index_done_callback()
+
+
+async def _crash_before_retirement_vector(context, monkeypatch, kind, vector_state):
+    await _seed_private_ranking_probe(context.delta)
+    store, vector_id = _retirement_vector(context.delta, kind)
+    original_upsert, original_delete = store.upsert, store.delete
+
+    async def interrupt(data):
+        if vector_id in data:
+            if vector_state == "absent":
+                await original_delete([vector_id])
+            raise _RetirementProcessDeath("graph committed before replacement vector")
+        return await original_upsert(data)
+
+    async def preserve_stale(ids):
+        return await original_delete([item for item in ids if item != vector_id])
+
+    # The original relationship reducer deletes both orientations before its
+    # replacement upsert. Preserve that inherited row only for the stale case.
+    if kind == "relation" and vector_state == "stale":
+        monkeypatch.setattr(store, "delete", preserve_stale)
+    monkeypatch.setattr(store, "upsert", interrupt)
+    adapter = _adapter_with_actual_stores(context.k, context.delta, context.inputs)
+    with pytest.raises(_RetirementProcessDeath):
+        await adapter.submit_metadata(context.claim, context.manifest, context.inputs)
+    monkeypatch.setattr(store, "upsert", original_upsert)
+    monkeypatch.setattr(store, "delete", original_delete)
+
+
+async def _assert_selected_retirement_parent(backend, context):
+    """A failed private graph and vector must never enter selected retrieval."""
+    k, claim = context.k, context.claim
+    manifest = k.get_manifest("acceptance")["manifest"]
+    assert claim["namespace"] not in manifest["aggregate_layers"]
+    reader = await backend.open({"namespace": context.other_claim["namespace"],
+        "aggregate_layers": manifest["aggregate_layers"]}, read_only=True, for_deletion=True)
+    assert "old:0" in (await reader.chunk_entity_relation_graph.get_node("Shared"))["source_id"]
+    assert "old:0" in (await reader.chunk_entity_relation_graph.get_edge("Shared", "Neighbor"))["source_id"]
+    assert not await reader.chunk_entity_relation_graph.has_node("PrivateRetirementOnly")
+    for kind in ("entity", "relation"):
+        store, vector_id = _retirement_vector(reader, kind)
+        assert "old:0" in (await store.get_by_id(vector_id))["chunk_ids"]
+        ranked = await store.query("unused", 100, [1.0, 0.0, 0.0])
+        if kind == "entity":
+            assert "Shared" in {row["entity_name"] for row in ranked}
+            assert "PrivateRetirementOnly" not in {row["entity_name"] for row in ranked}
+        else:
+            assert ("Neighbor", "Shared") in {(row["src_id"], row["tgt_id"]) for row in ranked}
+            assert all("PrivateRetirementOnly" not in (row["src_id"], row["tgt_id"]) for row in ranked)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["entity", "relation"])
+@pytest.mark.parametrize("vector_state", ["stale", "absent"])
+async def test_real_interrupted_retirement_requires_isolated_rebuild_on_same_lease(
+        backend, monkeypatch, tmp_path, kind, vector_state):
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+    from papervault.store.knowledge import ClaimRejected, RetirementFailure
+
+    context = await _metadata_retirement_context(backend, monkeypatch, tmp_path)
+    k, claim = context.k, context.claim
+    before_manifest = k.get_manifest("acceptance")
+    before_selection = k.get_selection(claim["unit_id"], "acceptance")
+    await _crash_before_retirement_vector(context, monkeypatch, kind, vector_state)
+    residual = await backend.open(claim, for_deletion=True)
+    if kind == "entity":
+        row = await residual.chunk_entity_relation_graph.get_node("Shared")
+        tracker = await residual.entity_chunks.get_by_id("Shared")
+        assert row["description"] == "other description for Shared"
+    else:
+        from lightrag.utils import make_relation_chunk_key
+
+        row = await residual.chunk_entity_relation_graph.get_edge("Shared", "Neighbor")
+        tracker = await residual.relation_chunks.get_by_id(make_relation_chunk_key("Shared", "Neighbor"))
+        assert row["description"] == "other relationship evidence"
+    assert row["source_id"] == "other:0"
+    assert tracker["chunk_ids"] == ["other:0"]
+    store, vector_id = _retirement_vector(residual, kind)
+    vector = await store.get_by_id(vector_id)
+    if vector_state == "stale":
+        assert "old:0" in vector["chunk_ids"]
+    else:
+        assert vector is None
+
+    adapter = _adapter_with_actual_stores(k, residual, context.inputs)
+    scheduler = CatalogScheduler(k, adapter, context.inputs)
+    delivery = next(row for row in k.list_outbox(kind="submission")
+                    if row["submission_id"] == claim["submission_id"])
+    summary = defaultdict(int)
+    await scheduler._deliver(delivery, summary)
+
+    assert summary["published"] == 0 and summary["repairs"] == summary["discrepancies"] == 1
+    assert k.get_submission(claim["submission_id"])["receipt_id"] is None
+    assert k.get_attempt(claim["attempt_id"])["sealed"] is False
+    assert k.get_job(claim["job_id"])["state"] == "failed"
+    assert k.get_attempt(claim["attempt_id"])["outcome"] == "failed"
+    assert k.get_manifest("acceptance") == before_manifest
+    assert k.get_selection(claim["unit_id"], "acceptance") == before_selection
+    discrepancy = backend.pg_connection.execute(
+        "SELECT reason,evidence FROM " + backend.catalog._table("knowledge_discrepancies").as_string(
+            backend.pg_connection)).fetchone()
+    assert discrepancy["reason"] == "retirement_rebuild_unverified"
+    assert "isolated rebuild" in str(discrepancy["evidence"]).lower()
+    repairs = k.list_outbox(kind="repair")
+    assert len(repairs) == 1
+    assert repairs[0]["payload"]["isolated_rebuild_required"] is True
+    with pytest.raises((ClaimRejected, RetirementFailure)):
+        await adapter.submit_metadata(claim, context.manifest, context.inputs)
+    with pytest.raises(ClaimRejected):
+        await backend.open(claim, for_deletion=True)
+    with pytest.raises(ClaimRejected):
+        await residual.chunk_entity_relation_graph.upsert_node("Poison", {"entity_id": "Poison"})
+    with pytest.raises(ClaimRejected):
+        async with k.namespace_access(claim, seal=True):
+            pytest.fail("failed retirement namespace entered the sealing gate")
+    again = defaultdict(int)
+    await scheduler._deliver(delivery, again)
+    assert again["published"] == 0
+    assert k.get_submission(claim["submission_id"])["receipt_id"] is None
+    await _assert_selected_retirement_parent(backend, context)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["entity", "relation"])
+async def test_real_interrupted_retirement_lease_expiry_rebuilds_in_new_namespace(
+        backend, monkeypatch, tmp_path, kind):
+    from psycopg import sql
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+    from papervault.store.knowledge import ClaimRejected
+
+    context = await _metadata_retirement_context(backend, monkeypatch, tmp_path)
+    k, old = context.k, context.claim
+    await _crash_before_retirement_vector(context, monkeypatch, kind, "stale")
+    backend.pg_connection.execute(sql.SQL(
+        "UPDATE {} SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE attempt_id=%s"
+    ).format(backend.catalog._table("knowledge_attempts")), (old["attempt_id"],))
+    job = k.get_job(old["job_id"])
+    claim = k.command("claim", "retirement:after-death", {"job_id": job["job_id"],
+        "expected_revision": job["revision"], "authority_epoch": 1, "lease_seconds": 600})
+    backend.namespaces.append(claim["namespace"])
+    assert claim["attempt_id"] != old["attempt_id"]
+    assert claim["submission_id"] != old["submission_id"]
+    assert claim["namespace"] != old["namespace"]
+    assert claim["fencing_token"] > old["fencing_token"]
+    assert old["namespace"] not in claim["base_aggregate_layers"]
+    with pytest.raises(ClaimRejected):
+        await context.delta.chunk_entity_relation_graph.upsert_node("Stale", {"entity_id": "Stale"})
+    delta = await backend.open(claim, for_deletion=True)
+    scheduler = CatalogScheduler(k, _adapter_with_actual_stores(k, delta, context.inputs), context.inputs)
+    delivery = next(row for row in k.list_outbox(kind="submission")
+                    if row["submission_id"] == claim["submission_id"])
+    summary = defaultdict(int)
+    await scheduler._deliver(delivery, summary)
+    assert summary["published"] == 1 and summary["discrepancies"] == 0
+    receipt = k.get_submission(claim["submission_id"])["receipt"]
+    assert old["namespace"] not in receipt["aggregate_layers"]
+    reader = await backend.open({"namespace": claim["namespace"],
+        "aggregate_layers": receipt["aggregate_layers"]}, read_only=True, for_deletion=True)
+    assert (await reader.chunk_entity_relation_graph.get_node("Shared"))["description"] == "other description for Shared"
+    assert (await reader.chunk_entity_relation_graph.get_edge("Shared", "Neighbor"))["description"] == "other relationship evidence"
+    for role in ("entity", "relation"):
+        store, vector_id = _retirement_vector(reader, role)
+        row = await store.get_by_id(vector_id)
+        assert row["chunk_ids"] == ["other:0"]
+        assert "old" not in row["content"]
+    assert await reader.doc_status.get_by_id("old-doc") is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,damage", [
+    (kind, damage) for damage in (None, "content", "identity", "source")
+    for kind in ("entity", "relation")
+] + [("relation", "stale-reverse")])
+async def test_real_retirement_graph_vector_agreement_gates_sealing(
+        backend, monkeypatch, tmp_path, kind, damage):
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+
+    context = await _metadata_retirement_context(backend, monkeypatch, tmp_path)
+    k, claim, delta = context.k, context.claim, context.delta
+    if damage is not None:
+        await _seed_private_ranking_probe(delta)
+    store, vector_id = _retirement_vector(delta, kind)
+    original_upsert = store.upsert
+
+    async def corrupt_replacement(data):
+        if vector_id in data and damage is not None:
+            data = {key: dict(value) for key, value in data.items()}
+            if damage == "content":
+                data[vector_id]["content"] = "retired evidence survives only in embedding input"
+            elif damage == "identity":
+                data[vector_id]["entity_name" if kind == "entity" else "tgt_id"] = "WrongIdentity"
+            elif damage == "source":
+                data[vector_id]["source_id"] = "old:0<SEP>other:0"
+        await original_upsert(data)
+        if vector_id in data and damage == "stale-reverse":
+            from lightrag.utils import compute_mdhash_id
+
+            await original_upsert({compute_mdhash_id("SharedNeighbor", prefix="rel-"): {
+                **data[vector_id], "src_id": "Shared", "tgt_id": "Neighbor",
+                "source_id": "old:0<SEP>other:0",
+                "content": "related\tShared\nNeighbor\nretired relationship evidence"}})
+
+    monkeypatch.setattr(store, "upsert", corrupt_replacement)
+    before_manifest = k.get_manifest("acceptance")
+    scheduler = CatalogScheduler(k, _adapter_with_actual_stores(k, delta, context.inputs), context.inputs)
+    delivery = next(row for row in k.list_outbox(kind="submission")
+                    if row["submission_id"] == claim["submission_id"])
+    summary = defaultdict(int)
+    await scheduler._deliver(delivery, summary)
+    if damage is None:
+        assert summary["published"] == 1 and summary["discrepancies"] == 0
+        assert k.get_attempt(claim["attempt_id"])["sealed"] is True
+        receipt = k.get_submission(claim["submission_id"])["receipt"]
+        reader = await backend.open({"namespace": claim["namespace"],
+            "aggregate_layers": receipt["aggregate_layers"]}, read_only=True, for_deletion=True)
+        vectors, vector_id = _retirement_vector(reader, kind)
+        row = await vectors.get_by_id(vector_id)
+        assert row["content"] == ("Shared\nother description for Shared" if kind == "entity"
+            else "related\tNeighbor\nShared\nother relationship evidence")
+        assert row["chunk_ids"] == ["other:0"]
+        return
+    assert summary["published"] == 0 and summary["discrepancies"] == 1
+    assert k.get_submission(claim["submission_id"])["receipt_id"] is None
+    assert k.get_attempt(claim["attempt_id"])["sealed"] is False
+    assert k.get_manifest("acceptance") == before_manifest
+    await _assert_selected_retirement_parent(backend, context)
+
+
 async def _seed_indexed_document(rag, doc_id, prefix, text, track_id, *, exclusive=True):
     """Write deterministic extraction through original reducers and actual stores."""
     from lightrag.operate import _merge_edges_then_upsert
@@ -906,15 +1200,10 @@ async def test_real_document_indexes_gate_submission_sealing_and_publication(bac
     assert discrepancy["evidence"]["error_type"] == "RuntimeError"
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("damage", [*_INDEX_DAMAGE, "empty-status"])
-async def test_real_document_indexes_gate_metadata_retirement_and_preserve_selected_shared_material(
-        backend, monkeypatch, tmp_path, damage):
+async def _metadata_retirement_context(backend, monkeypatch, tmp_path):
     from copy import deepcopy
     from lightrag.prompt import PROMPTS
-    from lightrag.utils import compute_mdhash_id
     from papervault.knowledge.scheduler import catalog_intake
-    from papervault.knowledge.scheduler.catalog import CatalogScheduler
     from papervault.knowledge.scheduler.catalog_inputs import ImmutableInputStore
 
     old_claim = backend.claim("indexed-old")
@@ -949,6 +1238,22 @@ async def test_real_document_indexes_gate_metadata_retirement_and_preserve_selec
         "expected_revision": job["revision"], "authority_epoch": 1, "lease_seconds": 600})
     backend.namespaces.append(claim["namespace"])
     delta = await backend.open(claim, for_deletion=True)
+    return SimpleNamespace(k=k, old_claim=old_claim, old_receipt=old_receipt,
+        other_claim=other_claim, parent_receipt=parent_receipt, inputs=inputs,
+        manifest=manifest, claim=claim, delta=delta)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("damage", [*_INDEX_DAMAGE, "empty-status"])
+async def test_real_document_indexes_gate_metadata_retirement_and_preserve_selected_shared_material(
+        backend, monkeypatch, tmp_path, damage):
+    from lightrag.utils import compute_mdhash_id
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+
+    context = await _metadata_retirement_context(backend, monkeypatch, tmp_path)
+    k, claim, delta, inputs = context.k, context.claim, context.delta, context.inputs
+    old_claim, old_receipt = context.old_claim, context.old_receipt
+    other_claim, parent_receipt = context.other_claim, context.parent_receipt
     await _damage_document_index(delta, "old-doc", damage)
     before_manifest = k.get_manifest("acceptance")
     before_selection = k.get_selection(old_claim["unit_id"], "acceptance")
@@ -975,7 +1280,7 @@ async def test_real_document_indexes_gate_metadata_retirement_and_preserve_selec
     else:
         assert summary["discrepancies"] == summary["repairs"] == 1 and summary["published"] == 0
         assert k.get_submission(claim["submission_id"])["receipt_id"] is None
-        assert k.get_job(claim["job_id"])["state"] == "running"
+        assert k.get_job(claim["job_id"])["state"] == "failed"
         assert k.get_attempt(claim["attempt_id"])["sealed"] is False
         assert k.get_manifest("acceptance") == before_manifest
         assert k.get_selection(old_claim["unit_id"], "acceptance") == before_selection
@@ -987,7 +1292,9 @@ async def test_real_document_indexes_gate_metadata_retirement_and_preserve_selec
                 backend.pg_connection)).fetchone()
         assert discrepancy["reason"] == "retirement_rebuild_unverified"
         assert "index" in discrepancy["evidence"]["retirement_evidence"]["index_validation_error"]
-        reader = await backend.open(claim, for_deletion=True)
+        reader = await backend.open({**claim,
+            "aggregate_layers": claim["base_aggregate_layers"] + [claim["namespace"]]},
+            read_only=True, for_deletion=True)
         assert "old:0" in (await reader.chunk_entity_relation_graph.get_node("Shared"))["source_id"]
         assert "old:0" in (await reader.chunk_entity_relation_graph.get_edge("Shared", "Neighbor"))["source_id"]
         assert "old:0" in (await reader.entities_vdb.get_by_id(compute_mdhash_id("Shared", prefix="ent-")))["chunk_ids"]

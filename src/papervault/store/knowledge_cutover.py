@@ -12,7 +12,10 @@ from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 
 from .knowledge import KnowledgeRepository, OperationConflict
-from .knowledge_import import _json, source_row_id, validate_projection_unchanged
+from .knowledge_import import (
+    _json, align_source_event, canonical_import_checkpoint, canonical_source_row,
+    source_row_id, validate_projection_unchanged,
+)
 from .repository import AuditEvent, payload_hash
 
 DRAIN_FIELDS = ("dispatch_stopped", "pipeline_admission_stopped", "inflight_drained",
@@ -65,6 +68,8 @@ def validate_legacy_projection(head, job, event, *, expected_evidence=None):
     validate_projection_unchanged(head, job)
     source_evidence = event["evidence"] if event else {}
     expected = expected_evidence if expected_evidence is not None else source_evidence
+    if event:
+        expected = align_source_event(event, expected)
     if (not job or not event or job["kind"] != "distill_legacy_unverified" or job["state"] != "quarantined"
             or not job["quarantine"] or job["detail"].get("source_version") != head["source_version"]
             or not job["detail"].get("excluded") or job.get("achieved_tier") is not None
@@ -180,7 +185,7 @@ class SourceCapture:
             state = self._state()
             rows = list(self.connection.execute(sql.SQL("SELECT * FROM {} ORDER BY workspace,ingest_source,source_id").format(self.ledger)))
             return {"source": self.source, "capture_id": state["capture_id"], "checkpoint": state["sequence"],
-                    "rows": _json(rows), "configuration": state["configuration"],
+                    "rows": [canonical_source_row(row) for row in rows], "configuration": state["configuration"],
                     "schema": self._schema(), "external_attempts": "unknown"}
 
     def _schema(self):
@@ -193,7 +198,8 @@ class SourceCapture:
         with self.connection.transaction():
             self.connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             rows = list(self.connection.execute(sql.SQL("SELECT * FROM {} ORDER BY workspace,ingest_source,source_id").format(self.ledger)))
-            return {"source": self.source, "capture_id": None, "checkpoint": None, "rows": _json(rows),
+            return {"source": self.source, "capture_id": None, "checkpoint": None,
+                    "rows": [canonical_source_row(row) for row in rows],
                     "configuration": self.configuration, "schema": self._schema(), "external_attempts": "unknown"}
 
     def delta(self, after):
@@ -207,7 +213,8 @@ class SourceCapture:
             if [row["sequence"] for row in rows] != list(range(after + 1, state["sequence"] + 1)):
                 raise ValueError("capture journal is not contiguous")
             return {"capture_id": state["capture_id"], "final_checkpoint": state["sequence"], "changes": [
-                {"sequence": row["sequence"], "operation": row["operation"], "old": row["old_row"], "new": row["new_row"]} for row in rows]}
+                {"sequence": row["sequence"], "operation": row["operation"],
+                 "old": canonical_source_row(row["old_row"]), "new": canonical_source_row(row["new_row"])} for row in rows]}
 
     def freeze(self, *, legacy_roles, drain):
         """Explicit final source fence; no running work is inferred from process flags."""
@@ -239,7 +246,7 @@ class SourceCapture:
                 self._table("papervault_ledger_capture_state")), (fence_id,))
             state = self._state()
             rows = list(self.connection.execute(sql.SQL("SELECT * FROM {}").format(self.ledger)))
-            rows = sorted(_json(rows), key=source_row_id)
+            rows = sorted((canonical_source_row(row) for row in rows), key=source_row_id)
             return {"capture_id": state["capture_id"], "final_sequence": state["sequence"], "fenced": True,
                     "final_row_count": len(rows), "final_rows_digest": payload_hash(rows),
                     "legacy_dml_revoked": True, "fence_id": state["fence_id"],
@@ -272,16 +279,21 @@ class CutoverRepository:
             checkpoint = k._one("knowledge_import_checkpoints", source=evidence["source"], capture_id=evidence["capture_id"])
             if not checkpoint:
                 raise ValueError("no imported final capture checkpoint")
-            validate_handoff_evidence(checkpoint["checkpoint"], evidence)
             report = k._one("knowledge_import_reports", plan_digest=checkpoint["plan_digest"])
             if not report or report["source"] != evidence["source"] or report["capture_id"] != evidence["capture_id"]:
                 raise ValueError("final keyed disposition report missing")
+            if payload_hash(report["report"]) != checkpoint["plan_digest"] or report["report"]["checkpoint"] != checkpoint["checkpoint"]:
+                raise ValueError("final source checkpoint/report has conflicting evidence")
+            final_checkpoint = canonical_import_checkpoint(report["report"])
+            validate_handoff_evidence(final_checkpoint, evidence)
             expected_events = {}
             for event in report["report"]["events"]:
                 previous = expected_events.get(event["source_row_id"])
                 if previous is None or event["source_version"] > previous["source_version"]:
                     expected_events[event["source_row_id"]] = event
             imported = k._rows("knowledge_import_events", source=evidence["source"], capture_id=evidence["capture_id"])
+            for event in imported:
+                align_source_event(event, event["evidence"])
             first, last = checkpoint["checkpoint"]["snapshot_sequence"], evidence["final_sequence"]
             versions = {event["source_version"] for event in imported if event["source_version"] > first}
             if versions != set(range(first + 1, last + 1)):
@@ -305,9 +317,9 @@ class CutoverRepository:
                             "verified" if compatible else "missing_or_conflicting_catalog_unit")):
                     raise ValueError("legacy projection mapping is not resolved against current catalog units")
                 if not head["deleted"]:
-                    current_rows.append(event["evidence"]["raw"])
-            if (expected_events or len(current_rows) != checkpoint["checkpoint"]["final_row_count"]
-                    or payload_hash(sorted(current_rows, key=source_row_id)) != checkpoint["checkpoint"]["final_rows_digest"]):
+                    current_rows.append(canonical_source_row(event["evidence"]["raw"]))
+            if (expected_events or len(current_rows) != final_checkpoint["final_row_count"]
+                    or payload_hash(sorted(current_rows, key=source_row_id)) != final_checkpoint["final_rows_digest"]):
                 raise ValueError("final source row set differs from imported projection")
             if any(not event["evidence"].get("quarantine") or not event["evidence"].get("excluded")
                    or not event["evidence"].get("dispositions") for event in imported):
@@ -317,7 +329,7 @@ class CutoverRepository:
             registered = {"evidence_id": "handoff:" + operation_id, "source": evidence["source"],
                           "capture_id": evidence["capture_id"], "final_sequence": last, "evidence": evidence, "digest": digest}
             k._insert("knowledge_cutover_evidence", registered)
-            checkpoint_value = {"migration": checkpoint["checkpoint"], "evidence_id": registered["evidence_id"],
+            checkpoint_value = {"migration": final_checkpoint, "evidence_id": registered["evidence_id"],
                                 "evidence_digest": digest, "validation": evidence["validation"]}
             result = k._update("knowledge_runtime", {"authority": "catalog", "authority_epoch": expected_epoch + 1,
                                                        "checkpoint": checkpoint_value}, singleton=True)

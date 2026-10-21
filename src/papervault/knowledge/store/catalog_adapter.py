@@ -12,6 +12,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from functools import wraps
+from uuid import uuid4
 
 from lightrag.kg.postgres_impl import namespace_to_table_name
 from lightrag.utils import (
@@ -259,6 +260,8 @@ class CatalogLightRAGAdapter:
                 inventory, observations = await verify_outputs(rag, claim, doc_id, text)
                 receipt = self._seal(claim, achieved_tier, inventory, observations)
             return receipt
+        except Exception as exc:
+            self._replacement_failure(claim, exc)
         finally:
             await rag.finalize_storages()
 
@@ -283,6 +286,22 @@ class CatalogLightRAGAdapter:
 
     async def _retire(self, rag, claim):
         from lightrag.kg.shared_storage import get_namespace_data, get_namespace_lock
+        from papervault.store.knowledge import ClaimRejected, OperationConflict
+
+        if claim["retired_receipt_ids"]:
+            # Commit before the first external mutation. A crash may leave any
+            # subset of graph/tracker/vector writes durable. A new invocation
+            # must never ask the deletion reducer to resume that partial view.
+            stable = {key: claim[key] for key in _IDENTITY + _COW_IDENTITY + ("lease_id",)}
+            try:
+                self.repository.command("begin_retirement", "begin-retirement:" + claim["submission_id"],
+                                        {"claim": stable, "delivery_id": uuid4().hex})
+            except (OperationConflict, ClaimRejected) as exc:
+                retired_id = claim["retired_receipt_ids"][0]
+                retired = self.repository.get_receipt(retired_id) or {}
+                raise RetirementFailure(retired_id, retired.get("provider_observations", {}).get("doc_id"),
+                    "unverified", evidence={"recovery_error":
+                        "retirement attempt cannot be resumed; isolated rebuild required"}) from exc
 
         for retired_id in claim["retired_receipt_ids"]:
             retired = self.repository.get_receipt(retired_id)
@@ -351,6 +370,29 @@ class CatalogLightRAGAdapter:
                              r"^No cached extraction results found, cannot rebuild", message, re.IGNORECASE)
                    for message in messages):
                 raise RetirementFailure(retired_id, old_doc, result.status, messages)
+            try:
+                for storage in rag._index_storages():
+                    await storage.index_done_callback()
+                await _verify_retired_vectors(rag, contribution)
+            except Exception as exc:
+                raise RetirementFailure(retired_id, old_doc, "unverified", messages, {
+                    "vector_validation_error": str(exc) + "; isolated rebuild required"}) from exc
+
+    def _replacement_failure(self, claim, exc):
+        from papervault.knowledge.store.build_breaker import BuildPausedError
+
+        if claim["retired_receipt_ids"] and not isinstance(exc, (BuildPausedError, RetirementFailure)):
+            # A lost seal response is an ambiguous delivery, not a failed
+            # retirement. Never discard accepted work or its completion path.
+            try:
+                submission = self.repository.get_submission(claim["submission_id"])
+            except Exception:
+                raise exc
+            if submission and (submission.get("receipt") or submission.get("receipt_id")):
+                raise exc
+            raise RetirementFailure(claim["retired_receipt_ids"][0], None, "unverified", evidence={
+                "replacement_validation_error": str(exc) + "; isolated rebuild required"}) from exc
+        raise exc
 
     @_admitted_recipe
     async def submit_metadata(self, claim, manifest, input_store):
@@ -383,6 +425,8 @@ class CatalogLightRAGAdapter:
                 return self._seal(claim, "metadata", inventory,
                                   {"metadata_only": True, "observed_at": stamp,
                                    "provider": "unknown", "model": "unknown", "version": "unknown"})
+        except Exception as exc:
+            self._replacement_failure(claim, exc)
         finally:
             await rag.finalize_storages()
 
@@ -437,6 +481,10 @@ class CatalogLightRAGAdapter:
                        sealed=True, durable=True, provider_observations=observations,
                        document_index_verification={"version": 1, "retired_receipt_ids": claim["retired_receipt_ids"]},
                        origin_lineage={})
+        if claim["retired_receipt_ids"]:
+            graph = next(output for output in inventory if output["role"] == "graph")
+            receipt["retirement_verification"] = {"version": 1,
+                "retired_receipt_ids": claim["retired_receipt_ids"], "graph_sha256": graph["sha256"]}
         selected = {**claim["base_selected_unit_receipts"], claim["unit_id"]: receipt["receipt_id"]}
         receipt.update(aggregate_layers=claim["base_aggregate_layers"] + [claim["namespace"]],
                        selected_unit_receipts=selected,
@@ -656,22 +704,77 @@ async def verify_delta_outputs(rag, claim, *, document=None):
         _verify_document_indexes(contribution, index_rows["full_entities"].get(doc_id),
                                  index_rows["full_relations"].get(doc_id))
         entry["verification"]["evidence"]["document_contribution"] = contribution
-    # Extraction can legitimately yield no entities, but nonempty graphs must
-    # have all three kinds of vector materialization inventoried explicitly.
-    expected_entities = {compute_mdhash_id(str(node.get("entity_id", node.get("id"))), prefix="ent-")
-                         for node in nodes}
-    entity_vectors = await rag.entities_vdb.get_vectors_by_ids(list(expected_entities))
-    expected_relations = {value for edge in edges for value in (
-        compute_mdhash_id(edge["source"] + edge["target"], prefix="rel-"),
-        compute_mdhash_id(edge["target"] + edge["source"], prefix="rel-"))}
-    relation_vectors = await rag.relationships_vdb.get_vectors_by_ids(list(expected_relations))
-    actual_relations = {key for key, value in relation_vectors.items() if value}
-    if (not expected_entities <= {key for key, value in entity_vectors.items() if value} or
-            any(not ({compute_mdhash_id(edge["source"] + edge["target"], prefix="rel-"),
-                      compute_mdhash_id(edge["target"] + edge["source"], prefix="rel-")}
-                     & actual_relations) for edge in edges)):
-        raise RuntimeError("graph vector output inventory incomplete")
+    await _verify_graph_vectors(rag, nodes, edges)
     return inventory, observed_at
+
+
+async def _verify_graph_vectors(rag, nodes, edges):
+    """Bind effective vector payloads to graph content, even when inherited.
+
+    The pinned reducers embed these canonical strings. Physical PostgreSQL rows
+    retain endpoint identities and source chunks alongside the vector; presence
+    of a vector with the right key alone cannot prove a rebuild completed.
+    """
+    from lightrag.operate import _truncate_vdb_content
+    from lightrag.utils import GRAPH_FIELD_SEP
+
+    config = rag._build_global_config()
+
+    async def verify(store, key, row, content, identity, label):
+        vector = await store.get_by_id(key)
+        embedding = await store.get_vectors_by_ids([key])
+        # Pinned ingestion reducers can truncate the string, while entity
+        # source-appends and relationship rebuilds write it in full.
+        expected_content = {content, _truncate_vdb_content(content, config, label)}
+        sources = set(filter(None, str(row.get("source_id") or "").split(GRAPH_FIELD_SEP)))
+        if (not vector or not embedding.get(key) or vector.get("id") != key
+                or vector.get("content") not in expected_content
+                or any(vector.get(field) != value for field, value in identity.items())
+                or set(_index_list(vector.get("chunk_ids", []))) != sources):
+            raise RuntimeError(f"graph vector content/identity mismatch or absent: {label}")
+
+    for node in nodes:
+        name = str(node.get("entity_id", node.get("id")))
+        if not isinstance(node.get("description"), str):
+            raise RuntimeError(f"graph vector description unavailable: {name}")
+        await verify(rag.entities_vdb, compute_mdhash_id(name, prefix="ent-"), node,
+                     f"{name}\n{node['description']}", {"entity_name": name}, f"entity:{name}")
+    for edge in edges:
+        source, target = edge["source"], edge["target"]
+        if not all(isinstance(edge.get(field), str) for field in ("description", "keywords")):
+            raise RuntimeError(f"graph vector description/keywords unavailable: {source}-{target}")
+        found = False
+        for src, tgt in {(source, target), (target, source)}:
+            key = compute_mdhash_id(src + tgt, prefix="rel-")
+            if await rag.relationships_vdb.get_by_id(key) is None:
+                continue
+            found = True
+            await verify(rag.relationships_vdb, key, edge,
+                         f"{edge['keywords']}\t{src}\n{tgt}\n{edge['description']}",
+                         {"source_id": src, "target_id": tgt}, f"relationship:{src}-{tgt}")
+        if not found:
+            raise RuntimeError(f"graph vector output absent: relationship:{source}-{target}")
+
+
+async def _verify_retired_vectors(rag, contribution):
+    """Check all affected identities, including deletions and untouched rows."""
+    graph = rag.chunk_entity_relation_graph
+    nodes, edges = [], []
+    for name in contribution["entity_ids"]:
+        node = await graph.get_node(name)
+        if node is not None:
+            nodes.append({**node, "entity_id": name})
+        elif await rag.entities_vdb.get_by_id(compute_mdhash_id(name, prefix="ent-")) is not None:
+            raise RuntimeError(f"retired graph vector survives deleted entity: {name}")
+    for source, target in contribution["relation_pairs"]:
+        edge = await graph.get_edge(source, target)
+        if edge is not None:
+            edges.append({**edge, "source": source, "target": target})
+        else:
+            for src, tgt in {(source, target), (target, source)}:
+                if await rag.relationships_vdb.get_by_id(compute_mdhash_id(src + tgt, prefix="rel-")) is not None:
+                    raise RuntimeError(f"retired graph vector survives deleted relationship: {src}-{tgt}")
+    await _verify_graph_vectors(rag, nodes, edges)
 
 
 async def _document_graph_contribution(rag, doc_id, chunk_ids, nodes, edges, private_rows):

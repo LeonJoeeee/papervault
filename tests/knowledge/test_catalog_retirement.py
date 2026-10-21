@@ -521,3 +521,25 @@ async def test_retirement_summary_validation_ignores_other_config_inside_observe
         await CatalogLightRAGAdapter(retirement_repository(rag))._retire(rag, claim)
     assert caught.value is pause
     assert unrelated == [""]
+
+
+@pytest.mark.asyncio
+async def test_retirement_seal_response_loss_recovers_committed_receipt(tmp_path):
+    async def delete(pipeline):
+        return _result()
+
+    adapter, repo, claim, _ = await _delivery(tmp_path, delete)
+    original = repo.command
+
+    def lose_response(action, operation_id, payload):
+        result = original(action, operation_id, payload)
+        if action == "seal_namespace":
+            raise OSError("receipt committed before connection loss")
+        return result
+
+    repo.command = lose_response
+    with pytest.raises(OSError, match="committed"):
+        await adapter.submit(claim, "actual content", "one")
+    assert repo.sealed and repo.receipt is not None
+    # Receipt recovery must precede the single-use retirement gate.
+    assert await adapter.submit(claim, "actual content", "one") == repo.receipt

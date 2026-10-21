@@ -30,6 +30,7 @@ class Repository:
         self.receipt = None
         self.accepted = False
         self.sealed = False
+        self.retirement_started = False
 
     def get_submission(self, submission):
         return {"receipt": self.receipt} if self.accepted else None
@@ -57,6 +58,12 @@ class Repository:
         if action == "accept_submission":
             self.accepted = True
             return {"accepted": True}
+        if action == "begin_retirement":
+            from papervault.store.knowledge import OperationConflict
+            if self.retirement_started:
+                raise OperationConflict("retirement already started")
+            self.retirement_started = True
+            return {"delivery_id": payload["delivery_id"]}
         assert action == "seal_namespace"
         self.receipt = payload["receipt"]
         self.sealed = True
@@ -168,6 +175,12 @@ def verified_rag(*, wrong_entity_vector=False):
                 self.table_name = role
 
         async def get_by_id(self, key):
+            if self.role == "entities_vdb":
+                if key != compute_mdhash_id("Earth", prefix="ent-") or wrong_entity_vector:
+                    return None
+                return {"id": key, "entity_name": "Earth", "content": "Earth\nactual content", "chunk_ids": ["chunk"]}
+            if self.role == "relationships_vdb":
+                return None
             if self.role == "full_entities":
                 return {"entity_names": ["Earth"], "count": 1}
             if self.role == "full_relations":
@@ -186,7 +199,10 @@ def verified_rag(*, wrong_entity_vector=False):
         workspace = "pv_private"
 
         async def get_all_nodes(self):
-            return [{"entity_id": "Earth", "id": "Earth", "source_id": "chunk"}]
+            return [{"entity_id": "Earth", "id": "Earth", "description": "actual content", "source_id": "chunk"}]
+
+        async def get_node(self, key):
+            return {"entity_id": "Earth", "description": "actual content", "source_id": "chunk"}
 
         async def get_all_edges(self):
             return []
@@ -197,7 +213,7 @@ def verified_rag(*, wrong_entity_vector=False):
         "relationships_vdb")}
     stores["entities_vdb"].table_name = "entity_vectors"
     stores["chunks_vdb"].table_name = "chunk_vectors"
-    return SimpleNamespace(**stores, chunk_entity_relation_graph=Graph())
+    return SimpleNamespace(**stores, chunk_entity_relation_graph=Graph(), _build_global_config=lambda: {})
 
 
 @pytest.mark.asyncio
@@ -575,3 +591,56 @@ async def test_recipe_drift_during_execution_prevents_sealing(monkeypatch, tmp_p
     with pytest.raises(RuntimeError, match="recipe"):
         await adapter.submit(claim, "actual content", "one")
     assert repo.receipt is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,damage", [(kind, damage) for kind in ("entity", "relationship")
+    for damage in ("content", "identity", "sources", "missing")] + [("relationship", "stale-reverse")])
+async def test_graph_vectors_must_match_rebuilt_content_identity_and_sources(kind, damage):
+    from lightrag.utils import compute_mdhash_id
+    from papervault.knowledge.store.catalog_adapter import verify_delta_outputs
+
+    rag = verified_rag()
+
+    async def nodes():
+        return [{"entity_id": "Earth", "description": "retained evidence", "source_id": "kept"}]
+
+    async def edges():
+        return ([{"source": "Earth", "target": "Sun", "description": "retained relation",
+                  "keywords": "orbits", "source_id": "kept"}] if kind == "relationship" else [])
+
+    rag.chunk_entity_relation_graph.get_all_nodes = nodes
+    rag.chunk_entity_relation_graph.get_all_edges = edges
+    entity_id = compute_mdhash_id("Earth", prefix="ent-")
+    relation_id = compute_mdhash_id("EarthSun", prefix="rel-")
+    reverse_id = compute_mdhash_id("SunEarth", prefix="rel-")
+    entity_rows = {entity_id: {"id": entity_id, "entity_name": "Earth",
+        "content": "Earth\nretained evidence", "chunk_ids": ["kept"]}}
+    relation_rows = {relation_id: {"id": relation_id, "source_id": "Earth", "target_id": "Sun",
+        "content": "orbits\tEarth\nSun\nretained relation", "chunk_ids": ["kept"]}}
+    rows = entity_rows if kind == "entity" else relation_rows
+    key = entity_id if kind == "entity" else relation_id
+    if damage == "content":
+        rows[key]["content"] += " with retired contribution"
+    elif damage == "identity":
+        rows[key]["entity_name" if kind == "entity" else "source_id"] = "Wrong"
+    elif damage == "sources":
+        rows[key]["chunk_ids"].append("retired")
+    elif damage == "missing":
+        rows.pop(key)
+    else:
+        relation_rows[reverse_id] = {"id": reverse_id, "source_id": "Sun", "target_id": "Earth",
+            "content": "orbits\tSun\nEarth\nretained AND retired relation", "chunk_ids": ["kept", "retired"]}
+
+    def bind(store, values):
+        async def get_by_id(key):
+            return values.get(key)
+        async def get_vectors_by_ids(keys):
+            return {key: [0.5, 0.2] for key in keys if key in values}
+        store.get_by_id = get_by_id
+        store.get_vectors_by_ids = get_vectors_by_ids
+
+    bind(rag.entities_vdb, entity_rows)
+    bind(rag.relationships_vdb, relation_rows)
+    with pytest.raises(RuntimeError, match="vector"):
+        await verify_delta_outputs(rag, CLAIM)

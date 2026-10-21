@@ -136,15 +136,19 @@ Check collection and the target refusal cases, then execute the actual backend c
 .venv/bin/pytest -m integration tests/knowledge/test_catalog_backend_integration.py -q -rs
 ```
 
-Expected results: **115 tests collected**, **72 passed, 43 deselected** for the refusal
-check, **96 passed, 19 deselected** for all target checks (no connections), and
-**115 passed**, exit **0**, for acceptance. Nineteen skipped
+Expected results: **131 tests collected**, **72 passed, 59 deselected** for the refusal
+check, **96 passed, 35 deselected** for all target checks (no connections), and
+**131 passed**, exit **0**, for acceptance. Thirty-five skipped
 real-store tests mean missing explicit credentials and do not constitute acceptance.
 The real-store test names identify original merge summaries/shared-entity traversal,
 latest-version vector visibility/top-k/tombstones, cache/sealed/stale-write isolation,
 and retirement with clean rebuild, backend write failure, missing/partial-cache and
 unattributable-description variants, plus document-index verification during build and
-metadata retirement (missing/partial entity or relationship indexes and empty status chunks).
+metadata retirement (missing/partial entity or relationship indexes and empty status chunks),
+interruption between graph and vector writes, same-lease refusal, fresh-namespace lease recovery,
+and entity/relationship vector content, identity, source and reverse-orientation mismatches.
+The original relationship reducer's full entity-vector content after source appends
+must also verify alongside the original truncated form.
 Any setup, assertion or cleanup error is a failed acceptance run.
 
 There is no operator namespace parameter: each fixture creates a random
@@ -195,13 +199,19 @@ Candidate publication does not promote it. `promote_generation` requires exact c
 
 Inject crashes before/after external acceptance, after durable outputs but before catalog registration, after catalog commit but before its response, and before outbox acknowledgement. Recover by stable submission/operation IDs and persisted receipts. An ambiguous outcome retains conservative cost and pending work; delivery retries do not become attempts. A stale fence cannot register its outputs. Lost published material retains publication history and queues a deduplicated isolated repair, admitted only during the monthly maintenance window.
 
-Exercise peak-window and breaker pauses during an admitted build. A valid deferral settles and fences the attempt, acknowledges delivery and queues the job without a failure-streak event or parking change; the round stops further admission. Uncertain charges and recovery pins remain. Actual lease loss retains the abandoned-attempt behavior. For retirement, inject rebuild failures despite deletion success and verify that no receipt is sealed or publication selected, with a discrepancy and repair recorded. `not_found` is unverified retirement and cannot be accepted as proof that an inherited contribution is absent.
+Exercise peak-window and breaker pauses during an admitted build. A valid deferral settles and fences the attempt, acknowledges delivery and queues the job without a failure-streak event or parking change; the round stops further admission. Uncertain charges and recovery pins remain. Actual lease loss retains the abandoned-attempt behavior. For retirement, inject rebuild failures despite deletion success and verify that no receipt is sealed or publication selected, with a discrepancy and repair recorded. A failed retirement settles and fences its attempt, acknowledges delivery, preserves uncertain charges/recovery pins and requires an isolated rebuild; delivery retries do not spend another failure event. `not_found` is unverified retirement and cannot be accepted as proof that an inherited contribution is absent.
 
 Include partial extraction-cache loss, caches without descriptions for an affected entity or relationship, and empty normalized summaries from both callbacks and cache hits. All must refuse retirement before sealing, even when LightRAG reports successful deletion. Exercise typed peak/breaker pauses inside the original retirement summary callback: they must reach the catalog deferral command without a failure-streak event, discrepancy or repair. Also advance a migration checkpoint through another row, then attempt enrichment from the older checkpoint; it must leave all accepted projections and the newer report unchanged. Reissue enrichment against the current checkpoint before handoff.
 
 Inject absent and incomplete document-to-entity and document-to-relationship indexes after graph material exists. Build verification must refuse sealing; retirement must check immutable contribution evidence before the original deletion discovers targets, record a discrepancy/repair, and preserve production selection. Include source-limit cases with new chunk memberships but no private graph write, and an empty/partial document-status chunk list. A genuinely empty contribution remains valid. Historical receipts without recorded contribution evidence need an isolated rebuild before retirement can be verified.
 
 Replay physical receipts sealed before the document-index verification protocol, both before and after accepted execution completion. The shared catalog validator must reject further completion/publication, retain the historical receipt/job state, and record a discrepancy without moving selections. This includes metadata downgrades: recovery must not bypass the versioned retirement attestation. Do not backfill an attestation into an immutable historical receipt.
+
+Interrupt retirement after a shared graph/tracker has been rebuilt but before its entity or relationship vector is replaced. Exercise both stale and absent vectors, then redeliver within the same lease: the durable retirement-start record must refuse reuse and request an isolated rebuild. Expire/reclaim the attempt and prove the fresh namespace rebuilds from the selected parent and can publish matching graph/vector content. Inject content, endpoint, source-chunk and stale reverse-orientation vector mismatches; none may seal. Confirm failed private graph/vector rows never enter selected traversal or ranking. Replay an earlier retirement receipt without graph/vector attestation and retain its history while refusing new completion/publication. Lose the seal response after commit and prove the persisted receipt is recovered without treating it as failed execution.
+
+Capture timestamp-bearing INSERT, UPDATE and DELETE operations through C1 with trailing-zero and nonzero fractional seconds and different session timezones. Snapshot, exported old/new images, final import row count/digest and freeze must agree semantically. Changed timestamp instants, source identities, fingerprints, counters or extra fields must still fail strict old-image alignment. Never rewrite the immutable capture journal to obtain agreement.
+
+Resume a C0 import accepted before timestamp normalization, including same-checkpoint replay/enrichment and C1 INSERT/UPDATE/DELETE. Retain an unchanged C0 row through the new final freeze and handoff. Verify that original source events, hashes and reports remain byte-for-byte unchanged; canonical report/checkpoint digests must agree with the final freeze. Invalid literal hashes, changed instants or counters, independent projection edits and enrichment from an older checkpoint must still fail.
 
 Complete a receipt, advance its generation manifest with another publication, and run default single-slot scheduler rounds. Receipt recovery must leave capacity for a newly fenced rebase attempt, its publication against the current aggregate, and later queued jobs. For capture replay, import duplicate A/B at C0, delete B at C1, and prove C1 applies and permits validated handoff while retaining A's historical duplicate disposition and immutable C0 events.
 

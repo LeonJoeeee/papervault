@@ -195,6 +195,12 @@ def validate_receipt(receipt: dict, claim: dict, recipe: dict) -> None:
     if any(seen.get(role) not in {"present", "verified_empty"} for role in required):
         raise ValueError("required output contract is incomplete")
     outputs = {output["role"]: output for output in inventory}
+    if claim.get("retired_receipt_ids") and outputs.get("graph", {}).get("store") == "neo4j":
+        expected = {"version": 1, "retired_receipt_ids": claim["retired_receipt_ids"],
+                    "graph_sha256": outputs["graph"].get("sha256")}
+        protocol = receipt.get("retirement_verification")
+        if not isinstance(protocol, dict) or type(protocol.get("version")) is not int or protocol != expected:
+            raise ValueError("retirement graph/vector verification missing or incompatible; isolated rebuild required")
     if {"full_entities", "full_relations"} & outputs.keys():
         _validate_document_index_verification(receipt, claim, outputs)
     canonical_json(receipt)
@@ -262,7 +268,8 @@ class KnowledgeRepository:
         audit = AuditEvent("knowledge", action, {"operation_id": operation_id})
         # Namespace first, writer second: a sealing caller may already own the
         # namespace guard across external IO. Reversing these locks deadlocks.
-        namespace = payload.get("claim", payload).get("namespace") if action in {"seal_namespace", "record_tombstone", "defer_attempt"} else None
+        namespace = payload.get("claim", payload).get("namespace") if action in {
+            "seal_namespace", "record_tombstone", "defer_attempt", "begin_retirement", "fail_retirement"} else None
         guard = self._session_namespace_lock(namespace) if namespace else nullcontext()
         with guard, self.repository._write(audit):
             old = self._one("knowledge_operations", operation_id=operation_id)

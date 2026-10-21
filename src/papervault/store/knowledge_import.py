@@ -3,18 +3,45 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from copy import deepcopy
+from datetime import datetime, timezone
 from importlib.resources import files
 import json
+import re
 
 from .knowledge import KnowledgeRepository, OperationConflict
 from .repository import AuditEvent, payload_hash, render_catalog_ddl
 
 SOURCE_FIELDS = ("workspace", "ingest_source", "source_id")
+SOURCE_EVENT_FIELDS = ("source", "capture_id", "source_row_id", "source_version", "operation", "raw", "deleted")
 TIERS = {"done": "fulltext", "done_abstract": "abstract", "done_meta": "metadata"}
 
 
 def _json(value):
     return json.loads(json.dumps(value, default=lambda item: item.isoformat()))
+
+
+def canonical_source_row(row):
+    """Give the ledger's timestamptz one lossless spelling; keep text exact.
+
+    Python snapshots and PostgreSQL JSON journal images differ in fractional
+    precision and session timezone. Only last_processed_at is a timestamp in the
+    legacy ledger schema; timestamp-looking identities and fingerprints are text.
+    Unrecognized values stay unchanged rather than losing evidence or precision.
+    """
+    if row is None:
+        return None
+    row = _json(row)
+    value = row.get("last_processed_at")
+    if isinstance(value, str) and re.fullmatch(
+            r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?"
+            r"(?:Z|[+-]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?)", value):
+        try:
+            timestamp = datetime.fromisoformat(value).astimezone(timezone.utc)
+        except ValueError:
+            return row
+        row["last_processed_at"] = (timestamp.replace(tzinfo=None).isoformat(timespec="microseconds")
+                                    .rstrip("0").rstrip(".") + "Z")
+    return row
 
 
 def source_identity(row):
@@ -25,6 +52,44 @@ def source_identity(row):
 
 def source_row_id(row):
     return payload_hash(source_identity(row))
+
+
+def validate_source_event(event):
+    """Validate the literal evidence before comparing timestamp representations."""
+    payload = {field: event[field] for field in SOURCE_EVENT_FIELDS}
+    if payload_hash(payload) != event["event_digest"] or source_row_id(event["raw"]) != event["source_row_id"]:
+        raise OperationConflict("source event has conflicting identity/evidence")
+    return payload
+
+
+def align_source_event(stored, proposed):
+    """Keep accepted raw encoding/hash when only timestamp spelling differs."""
+    previous = stored["evidence"]
+    old_payload, new_payload = validate_source_event(previous), validate_source_event(proposed)
+    if any(stored[field] != previous[field] for field in (
+            "source", "capture_id", "source_row_id", "source_version", "event_digest")):
+        raise OperationConflict("stored source event has conflicting identity/evidence")
+    old_payload["raw"], new_payload["raw"] = canonical_source_row(previous["raw"]), canonical_source_row(proposed["raw"])
+    if payload_hash(old_payload) != payload_hash(new_payload):
+        raise OperationConflict("source row/version has conflicting evidence")
+    return {**proposed, "raw": deepcopy(previous["raw"]), "event_digest": previous["event_digest"]}
+
+
+def canonical_import_checkpoint(plan):
+    """Derive the row digest without rewriting a pre-normalization report."""
+    latest = {}
+    for event in plan["events"]:
+        validate_source_event(event)
+        previous = latest.get(event["source_row_id"])
+        if previous is None or previous["source_version"] < event["source_version"]:
+            latest[event["source_row_id"]] = event
+    rows = [latest[key]["raw"] for key in sorted(latest) if not latest[key]["deleted"]]
+    digest = payload_hash([canonical_source_row(row) for row in rows])
+    checkpoint = plan["checkpoint"]
+    if (checkpoint["final_row_count"] != len(rows)
+            or checkpoint["final_rows_digest"] not in {payload_hash(rows), digest}):
+        raise OperationConflict("source checkpoint has conflicting final row evidence")
+    return {**checkpoint, "final_rows_digest": digest}
 
 
 def _doc_identity(row):
@@ -39,6 +104,7 @@ def plan_legacy_import(snapshot, *, mappings=(), doc_status_rows=(), changes=(),
     A plan is side-effect free; apply is a separate audited administrative action.
     """
     snapshot = _json(deepcopy(snapshot))
+    snapshot["rows"] = [canonical_source_row(row) for row in snapshot.get("rows", [])]
     if not isinstance(snapshot.get("source"), str) or not snapshot["source"]:
         raise ValueError("explicit source identity required")
     captured = bool(snapshot.get("capture_id")) and type(snapshot.get("checkpoint")) is int
@@ -79,7 +145,7 @@ def plan_legacy_import(snapshot, *, mappings=(), doc_status_rows=(), changes=(),
             raise ValueError("capture changes must be contiguous after snapshot checkpoint")
         expected += 1
         operation = change.get("operation")
-        old, new = change.get("old"), change.get("new")
+        old, new = canonical_source_row(change.get("old")), canonical_source_row(change.get("new"))
         if operation not in {"INSERT", "UPDATE", "DELETE"}:
             raise ValueError("unknown source change operation")
         if operation in {"UPDATE", "DELETE"} and not old:
@@ -259,16 +325,15 @@ class LegacyImportRepository:
                 raise OperationConflict("source event does not belong to the proposed plan")
             identity = {**checkpoint_id, "source_row_id": event["source_row_id"]}
             version = {**identity, "source_version": event["source_version"]}
-            event_digest = payload_hash({key: event[key] for key in (
-                "source", "capture_id", "source_row_id", "source_version", "operation", "raw", "deleted")})
-            if event_digest != event["event_digest"] or source_row_id(event["raw"]) != event["source_row_id"]:
-                raise OperationConflict("source event has conflicting identity/evidence")
+            validate_source_event(event)
+            event_digest = event["event_digest"]
             stored = k._one("knowledge_import_events", **version)
             version_key = (event["source_row_id"], event["source_version"])
-            if ((stored and stored["event_digest"] != event_digest)
-                    or (version_key in seen and seen[version_key] != event_digest)):
+            if version_key in seen and seen[version_key] != event_digest:
                 raise OperationConflict("source row/version has conflicting evidence")
             seen[version_key] = event_digest
+            if stored:
+                event = align_source_event(stored, event)
             old = latest.get(event["source_row_id"])
             if old is None or old["source_version"] < event["source_version"]:
                 latest[event["source_row_id"]] = event
@@ -277,14 +342,16 @@ class LegacyImportRepository:
         last = plan["checkpoint"].get("last_sequence")
         previous_last = checkpoint["checkpoint"].get("last_sequence") if checkpoint else None
         advance = checkpoint is None or previous_last is None or (last is not None and last >= previous_last)
+        proposed_checkpoint = canonical_import_checkpoint(plan)
         if checkpoint and last == previous_last:
-            previous_checkpoint = deepcopy(checkpoint["checkpoint"])
-            proposed_checkpoint = deepcopy(plan["checkpoint"])
+            previous_report = k._one("knowledge_import_reports", plan_digest=checkpoint["plan_digest"])["report"]
+            if payload_hash(previous_report) != checkpoint["plan_digest"] or previous_report["checkpoint"] != checkpoint["checkpoint"]:
+                raise OperationConflict("accepted source checkpoint/report has conflicting evidence")
+            previous_checkpoint = canonical_import_checkpoint(previous_report)
             if previous_checkpoint.get("external_attempts") == "unknown":
                 previous_checkpoint.pop("external_attempts", None)
             if not _retains_evidence(previous_checkpoint, proposed_checkpoint):
                 raise OperationConflict("same-checkpoint evidence regression; enrichment required")
-            previous_report = k._one("knowledge_import_reports", plan_digest=checkpoint["plan_digest"])["report"]
             for key in ("docstatus_only", "duplicates"):
                 # Ledger-row dispositions are checked against their accepted projections below.
                 previous_orphans = [row for row in previous_report["sets"][key] if "source_row_id" not in row]

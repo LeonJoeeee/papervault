@@ -379,8 +379,19 @@ class CatalogScheduler:
                           "reason": "retirement_rebuild_unverified"}
                 self._command_once("request_repair", "repair:" + payload_hash(repair), repair)
                 summary["repairs"] += 1
-            # Private retirement output is unverified. Preserve this delivery's
-            # identity and charge for recovery, without completing or publishing.
+            latest = self.repository.get_job(claim["job_id"])
+            current = self._current_claim(latest)
+            if current and current["attempt_id"] == claim["attempt_id"]:
+                try:
+                    self._command_once("fail_retirement", "fail-retirement:" + claim["attempt_id"], {
+                        **current, "expected_revision": latest["revision"], "error": {
+                            "kind": "RetirementFailure", "isolated_rebuild_required": True,
+                            "retired_receipt_id": exc.retired_receipt_id}})
+                except ClaimRejected:
+                    self._discrepancy("retirement_failure_claim_rejected", claim)
+                    summary["discrepancies"] += 1
+            # Preserve unknown charges and recovery pins, but fence the private
+            # delta. Only a fresh admitted attempt can execute the replacement.
             return True
         except KnownExecutionFailure as exc:
             latest = self.repository.get_job(claim["job_id"])

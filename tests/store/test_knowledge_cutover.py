@@ -88,6 +88,269 @@ def test_durable_capture_has_transactional_sequences_and_aligned_snapshot_final_
         repo.connection.execute(sql.SQL("TRUNCATE {}").format(repo._table("ks_ledger")))
 
 
+@pytest.mark.parametrize("operation,final_count", [("INSERT", 2), ("UPDATE", 1), ("DELETE", 0)])
+@pytest.mark.parametrize("timestamp,canonical_time", [
+    ("2026-10-19T17:30:00.123000+05:30", "2026-10-19T12:00:00.123Z"),
+    ("2026-10-19T08:00:00.123456-04:00", "2026-10-19T12:00:00.123456Z"),
+    ("2026-10-20T01:30:00+05:30", "2026-10-19T20:00:00Z"),
+])
+def test_timestamped_capture_delta_freeze_and_import_agree_across_timezones(
+        repo, operation, final_count, timestamp, canonical_time):
+    from papervault.store.knowledge import KnowledgeRepository
+    from papervault.store.knowledge_cutover import CutoverRepository
+    from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
+    from papervault.store.repository import AuditEvent
+
+    capture = source_capture(repo)
+    table = repo._table("ks_ledger")
+    repo.connection.execute(sql.SQL("ALTER TABLE {} ADD COLUMN last_processed_at timestamptz").format(table))
+    repo.connection.execute("SET TIME ZONE 'Asia/Kolkata'")
+    insert = sql.SQL("INSERT INTO {} VALUES ('probe','paper',%s,'done',0,%s,%s::timestamptz)").format(table)
+    repo.connection.execute(insert, ("A", "doc:A", timestamp))
+    snap = capture.snapshot()
+    readonly = capture.readonly_snapshot()
+    repo.connection.execute("SET TIME ZONE 'America/New_York'")
+    if operation == "INSERT":
+        repo.connection.execute(insert, ("B", "doc:B", timestamp))
+    elif operation == "UPDATE":
+        repo.connection.execute(sql.SQL("UPDATE {} SET status='error',attempts=1 WHERE source_id='A'").format(table))
+    else:
+        repo.connection.execute(sql.SQL("DELETE FROM {} WHERE source_id='A'").format(table))
+    delta = capture.delta(snap["checkpoint"])
+    assert [change["operation"] for change in delta["changes"]] == [operation]
+    plan = plan_legacy_import(snap, changes=delta["changes"], final_checkpoint=delta["final_checkpoint"])
+    assert snap["rows"][0]["last_processed_at"] == canonical_time
+    assert readonly["rows"] == snap["rows"]
+    assert all(event["raw"]["last_processed_at"] == canonical_time for event in plan["events"])
+    assert all(row["last_processed_at"] == canonical_time
+               for change in delta["changes"] for row in (change["old"], change["new"]) if row)
+
+    repo.connection.execute("SET TIME ZONE 'UTC'")
+    frozen = capture.freeze(legacy_roles=["pg_monitor"], drain=evidence()["drain"])
+    assert plan["checkpoint"]["final_row_count"] == frozen["final_row_count"] == final_count
+    assert plan["checkpoint"]["final_rows_digest"] == frozen["final_rows_digest"]
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    imports = LegacyImportRepository(repo)
+    imports.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    assert imports.apply(plan, operation_id="timestamp-import")["inserted"] == 2
+    checkpoint = imports.knowledge._rows("knowledge_import_checkpoints")[0]["checkpoint"]
+    assert checkpoint["final_row_count"] == frozen["final_row_count"]
+    assert checkpoint["final_rows_digest"] == frozen["final_rows_digest"]
+    assert all(event["evidence"]["raw"]["last_processed_at"] == canonical_time
+               for event in imports.source_versions("ledger-test"))
+    KnowledgeRepository(repo).command("create_generation", "timestamp-active", {
+        "generation_id": "active1", "candidate": False})
+    handoff = {**evidence(), "capture_id": snap["capture_id"],
+               "final_sequence": delta["final_checkpoint"], "source_fence": frozen}
+    assert CutoverRepository(repo).commit_handoff(handoff, expected_epoch=1,
+                                                operation_id="timestamp-handoff")["authority"] == "catalog"
+
+
+def pre_normalization_c0_plan(snapshot):
+    """Reproduce the old planner's literal Python timestamp encoding and hashes."""
+    from papervault.store.knowledge_import import plan_legacy_import, source_row_id
+    from papervault.store.repository import payload_hash
+
+    plan = plan_legacy_import(snapshot)
+    original = {source_row_id(row): row for row in snapshot["rows"]}
+    for event in plan["events"]:
+        event["raw"] = copy.deepcopy(original[event["source_row_id"]])
+        event["event_digest"] = payload_hash({key: event[key] for key in (
+            "source", "capture_id", "source_row_id", "source_version", "operation", "raw", "deleted")})
+    plan["checkpoint"]["final_rows_digest"] = payload_hash([
+        original[key] for key in sorted(original)])
+    return plan
+
+
+@pytest.mark.parametrize("resume", ["replay", "enrichment", "INSERT", "UPDATE", "DELETE"])
+def test_pre_normalization_c0_resumes_without_rewriting_history_and_handoff_keeps_unchanged_row(repo, resume):
+    from papervault.store.knowledge import KnowledgeRepository, OperationConflict
+    from papervault.store.knowledge_cutover import CutoverRepository
+    from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
+    from papervault.store.repository import AuditEvent, payload_hash
+
+    capture = source_capture(repo)
+    table = repo._table("ks_ledger")
+    repo.connection.execute(sql.SQL("ALTER TABLE {} ADD COLUMN last_processed_at timestamptz").format(table))
+    repo.connection.execute("SET TIME ZONE 'UTC'")
+    insert = sql.SQL("INSERT INTO {} VALUES ('probe','paper',%s,'done',0,%s,%s::timestamptz)").format(table)
+    for key in ("A", "B"):
+        repo.connection.execute(insert, (key, "doc:" + key, "2026-10-19T12:00:00.123000+00:00"))
+    snap = capture.snapshot()
+    old_snapshot = copy.deepcopy(snap)
+    for row in old_snapshot["rows"]:
+        row["last_processed_at"] = "2026-10-19T12:00:00.123000+00:00"
+    accepted = pre_normalization_c0_plan(old_snapshot)
+    assert accepted["checkpoint"]["final_rows_digest"] != plan_legacy_import(snap)["checkpoint"]["final_rows_digest"]
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    imports = LegacyImportRepository(repo)
+    imports.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    imports.apply(accepted, operation_id="old-C0")
+    k = imports.knowledge
+    original_events = imports.source_versions("ledger-test")
+    original_report = k._one("knowledge_import_reports", plan_digest=payload_hash(accepted))
+    original_head = next(head for head in k._rows("knowledge_import_heads")
+                         if head["source_row_id"] == accepted["events"][0]["source_row_id"])
+    original_job = k._one("jobs", id=original_head["job_id"])
+    assert original_job["detail"]["evidence"]["raw"]["last_processed_at"] == "2026-10-19T12:00:00.123000+00:00"
+
+    repo.connection.execute("SET TIME ZONE 'America/New_York'")
+    if resume == "INSERT":
+        repo.connection.execute(insert, ("C", "doc:C", "2026-10-19T08:00:00.123456-04:00"))
+    elif resume == "UPDATE":
+        repo.connection.execute(sql.SQL("UPDATE {} SET status='error',attempts=1,"
+            "last_processed_at='2026-10-19T08:00:00.123456-04:00' WHERE source_id='B'").format(table))
+    elif resume == "DELETE":
+        repo.connection.execute(sql.SQL("DELETE FROM {} WHERE source_id='B'").format(table))
+    delta = capture.delta(snap["checkpoint"])
+    statuses = [{"workspace": "probe", "doc_id": "doc:A", "status": "processed"}] if resume == "enrichment" else []
+    proposed = plan_legacy_import(old_snapshot, changes=delta["changes"],
+        final_checkpoint=delta["final_checkpoint"], doc_status_rows=statuses)
+    before = copy.deepcopy(proposed)
+    # Source capture changes its timezone; catalog projection hashes stay exact.
+    repo.connection.execute("SET TIME ZONE 'UTC'")
+    result = imports.apply(proposed, operation_id="resume")
+    assert proposed == before
+    assert result["inserted"] == (1 if resume in {"INSERT", "UPDATE", "DELETE"} else 0)
+    assert imports.apply(proposed, operation_id="resume") == result
+    assert [event for event in imports.source_versions("ledger-test")
+            if event["source_version"] == snap["checkpoint"]] == original_events
+    assert k._one("knowledge_import_reports", plan_digest=payload_hash(accepted)) == original_report
+    assert k._one("knowledge_import_reports", plan_digest=payload_hash(proposed))["report"] == proposed
+    unchanged = k._one("jobs", id=original_head["job_id"])
+    assert unchanged["detail"]["evidence"]["raw"]["last_processed_at"] == "2026-10-19T12:00:00.123000+00:00"
+    if resume != "enrichment":
+        assert k._one("knowledge_import_heads", source_row_id=original_head["source_row_id"]) == original_head
+        assert unchanged == original_job
+    else:
+        assert unchanged["detail"]["evidence"]["dispositions"] == ["matched", "unmatched_unit", "provenance_gap"]
+    if resume in {"INSERT", "UPDATE", "DELETE"}:
+        checkpoint_before = k._rows("knowledge_import_checkpoints")
+        older = plan_legacy_import(old_snapshot, doc_status_rows=[{
+            "workspace": "probe", "doc_id": "doc:A", "status": "processed"}])
+        with pytest.raises(OperationConflict, match="older source checkpoint"):
+            imports.apply(older, operation_id="older-enrichment")
+        assert k._rows("knowledge_import_checkpoints") == checkpoint_before
+        assert k._one("jobs", id=original_head["job_id"]) == unchanged
+
+    repo.connection.execute("SET TIME ZONE 'Asia/Kolkata'")
+    frozen = capture.freeze(legacy_roles=["pg_monitor"], drain=evidence()["drain"])
+    checkpoint = k._rows("knowledge_import_checkpoints")[0]["checkpoint"]
+    assert checkpoint["final_row_count"] == frozen["final_row_count"]
+    assert checkpoint["final_rows_digest"] == frozen["final_rows_digest"]
+    repo.connection.execute("SET TIME ZONE 'UTC'")
+    KnowledgeRepository(repo).command("create_generation", "resumed-active", {
+        "generation_id": "active1", "candidate": False})
+    handoff = {**evidence(), "capture_id": snap["capture_id"],
+               "final_sequence": delta["final_checkpoint"], "source_fence": frozen}
+    assert CutoverRepository(repo).commit_handoff(handoff, expected_epoch=1,
+                                                operation_id="resumed-handoff")["authority"] == "catalog"
+
+
+@pytest.mark.parametrize("tampering", ["instant", "counter", "text", "invalid_digest", "counter_evidence"])
+def test_old_timestamp_compatibility_rejects_conflicting_or_unhashed_source_evidence(repo, tampering):
+    from papervault.store.knowledge import OperationConflict
+    from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
+    from papervault.store.repository import AuditEvent
+
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    imports = LegacyImportRepository(repo)
+    imports.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    raw = {"source": "ledger-test", "capture_id": "capture1", "checkpoint": 1, "rows": [{
+        "workspace": "probe", "ingest_source": "paper", "source_id": "A", "status": "done", "attempts": 0,
+        "fingerprint": "2026-10-19T12:00:00.123000+00:00", "last_processed_at": "2026-10-19T12:00:00.123000+00:00"}]}
+    accepted = pre_normalization_c0_plan(raw)
+    imports.apply(accepted, operation_id="old-C0")
+    changed = copy.deepcopy(raw)
+    if tampering == "instant":
+        changed["rows"][0]["last_processed_at"] = "2026-10-19T12:00:00.123001Z"
+    elif tampering == "counter":
+        changed["rows"][0]["attempts"] = 1
+    elif tampering == "text":
+        changed["rows"][0]["fingerprint"] = "2026-10-19T12:00:00.123Z"
+    proposed = plan_legacy_import(changed)
+    if tampering == "invalid_digest":
+        proposed["events"][0]["event_digest"] = accepted["events"][0]["event_digest"]
+    elif tampering == "counter_evidence":
+        proposed["events"][0]["legacy_consecutive_failures"] = 1
+    before_jobs = imports.knowledge._rows("jobs")
+    before_reports = imports.knowledge._rows("knowledge_import_reports")
+    with pytest.raises(OperationConflict, match="evidence|regression"):
+        imports.apply(proposed, operation_id="tampering")
+    assert imports.knowledge._rows("jobs") == before_jobs
+    assert imports.knowledge._rows("knowledge_import_reports") == before_reports
+
+
+@pytest.mark.parametrize("corruption", ["literal", "digest_column"])
+def test_timestamp_compatibility_requires_valid_literal_hash_for_stored_events(repo, corruption):
+    from papervault.store.knowledge import OperationConflict
+    from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
+    from papervault.store.repository import AuditEvent
+
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    imports = LegacyImportRepository(repo)
+    imports.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    raw = {"source": "ledger-test", "capture_id": "capture1", "checkpoint": 1, "rows": [{
+        "workspace": "probe", "ingest_source": "paper", "source_id": "A", "status": "done", "attempts": 0,
+        "last_processed_at": "2026-10-19T12:00:00.123000+00:00"}]}
+    old_event = pre_normalization_c0_plan(raw)["events"][0]
+    stored = {field: old_event[field] for field in (
+        "source", "capture_id", "source_row_id", "source_version", "event_digest")}
+    stored["evidence"] = copy.deepcopy(old_event)
+    if corruption == "literal":
+        stored["evidence"]["raw"]["last_processed_at"] = "2026-10-19T12:00:00.123Z"
+    else:
+        stored["event_digest"] = "incorrect"
+    audit = AuditEvent("test", "corrupt-source-fixture")
+    with repo._write(audit):
+        imports.knowledge._insert("knowledge_import_events", stored)
+        repo._finish(None, audit)
+    before = imports.source_versions("ledger-test")
+    with pytest.raises(OperationConflict, match="evidence"):
+        imports.apply(plan_legacy_import(raw), operation_id="invalid-history")
+    assert imports.source_versions("ledger-test") == before
+    assert imports.knowledge._rows("knowledge_import_reports") == []
+    assert imports.knowledge._rows("jobs") == []
+
+
+def test_timestamp_compatibility_preserves_exact_projection_hash_guard(repo):
+    from papervault.store.knowledge import KnowledgeRepository, OperationConflict
+    from papervault.store.knowledge_cutover import CutoverRepository
+    from papervault.store.knowledge_import import LegacyImportRepository, plan_legacy_import
+    from papervault.store.repository import AuditEvent
+
+    repo.ensure_knowledge_schema(audit=AuditEvent("test", "knowledge-schema"))
+    imports = LegacyImportRepository(repo)
+    imports.ensure_schema(audit=AuditEvent("test", "migration-schema"))
+    raw = {"source": "ledger-test", "capture_id": "capture1", "checkpoint": 10, "rows": [{
+        "workspace": "probe", "ingest_source": "paper", "source_id": "A", "status": "done", "attempts": 0,
+        "last_processed_at": "2026-10-19T12:00:00.123000+00:00"}]}
+    imports.apply(pre_normalization_c0_plan(raw), operation_id="old-C0")
+    k = imports.knowledge
+    head = k._rows("knowledge_import_heads")[0]
+    job = k._one("jobs", id=head["job_id"])
+    detail = copy.deepcopy(job["detail"])
+    detail["evidence"]["raw"]["last_processed_at"] = "2026-10-19T12:00:00.123Z"
+    audit = AuditEvent("test", "independent-projection-edit")
+    with repo._write(audit):
+        k._update("jobs", {"detail": detail}, id=job["id"])
+        repo._finish(None, audit)
+    changed_job = k._one("jobs", id=job["id"])
+    proposed = plan_legacy_import(raw)
+    with pytest.raises(OperationConflict, match="independently"):
+        imports.apply(proposed, operation_id="overwrite")
+    KnowledgeRepository(repo).command("create_generation", "guard-active", {
+        "generation_id": "active1", "candidate": False})
+    handoff = {**evidence(), "final_sequence": 10, "source_fence": {
+        **evidence()["source_fence"], "final_sequence": 10,
+        "final_row_count": 1, "final_rows_digest": proposed["checkpoint"]["final_rows_digest"]}}
+    with pytest.raises(OperationConflict, match="independently"):
+        CutoverRepository(repo).commit_handoff(handoff, expected_epoch=1, operation_id="tampered-handoff")
+    assert k._one("jobs", id=job["id"]) == changed_job
+    assert k._rows("knowledge_import_heads")[0] == head
+    assert k.get_authority_state()["authority"] == "legacy"
+
+
 def test_handoff_commits_epoch_once_and_rollback_cannot_restore_legacy(repo):
     from papervault.store.knowledge import KnowledgeRepository
     from papervault.store.knowledge_cutover import CutoverRepository
@@ -153,10 +416,15 @@ def test_capture_statement_lock_blocks_other_writer_before_row_changes_and_reser
 
 def test_final_projection_validation_rejects_changed_raw_evidence_failure_counter_or_catalog_identity():
     from papervault.store.knowledge_cutover import validate_legacy_projection
+    from papervault.store.knowledge_import import plan_legacy_import
 
-    event = {"source_row_id": "a", "source_version": 1, "event_digest": "digest", "evidence": {
-        "raw": {"attempts": 3, "status": "error_parked"}, "event_digest": "digest"}}
-    head = {"source_row_id": "a", "source_version": 1, "event_digest": "digest", "deleted": False}
+    evidence = plan_legacy_import({"source": "ledger-test", "capture_id": "capture1", "checkpoint": 1,
+        "rows": [{"workspace": "probe", "ingest_source": "paper", "source_id": "A",
+                  "attempts": 3, "status": "error_parked"}]})["events"][0]
+    event = {**{field: evidence[field] for field in (
+        "source", "capture_id", "source_row_id", "source_version", "event_digest")}, "evidence": evidence}
+    head = {"source_row_id": evidence["source_row_id"], "source_version": 1,
+            "event_digest": evidence["event_digest"], "deleted": False}
     job = {"kind": "distill_legacy_unverified", "state": "quarantined", "quarantine": True,
         "attempts": 0, "achieved_tier": None, "consumed_input_revision": None, "recipe_digest": None,
         "target_generation": None, "detail": {"source_version": 1, "legacy_consecutive_failures": 3,

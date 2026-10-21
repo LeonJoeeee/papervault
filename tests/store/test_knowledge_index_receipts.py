@@ -92,3 +92,19 @@ async def test_recovered_old_receipt_cannot_complete_or_publish_and_retains_hist
     assert k.get_serving_manifest() == before
     assert k.get_selection(c["unit_id"], c["generation_id"]) is None
     assert k.get_receipt(rec["receipt_id"]) == rec
+
+
+@pytest.mark.parametrize("tier", ["fulltext", "abstract", "metadata"])
+def test_retirement_receipt_requires_graph_vector_verification_before_recovery(tier):
+    from papervault.store.knowledge import validate_receipt
+    from tests.knowledge.test_catalog_adapter import CLAIM
+
+    c = {**CLAIM, "retired_receipt_ids": ["prior-receipt"]}
+    rec = backend_receipt(c, tier)
+    rec["document_index_verification"] = {"version": 1, "retired_receipt_ids": c["retired_receipt_ids"]}
+    rec["provider_observations"]["doc_id"] = "doc"
+    rec["output_inventory"][0]["verification"]["evidence"]["document_contribution"] = {
+        "doc_id": "doc", "chunk_ids": ["chunk"], "entity_ids": [], "relation_pairs": []}
+    # These were valid under the prior index-only protocol, including metadata.
+    with pytest.raises(ValueError, match="retirement|vector"):
+        validate_receipt(rec, c, {"output_contract": {tier: {"required": ["graph"]}}})

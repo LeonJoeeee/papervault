@@ -18,12 +18,26 @@ def effective_recipe(monkeypatch):
 
 
 def indexed_rag(doc_id, *, empty=False):
+    from lightrag.utils import compute_mdhash_id
+
     rag = verified_rag()
     nodes = [] if empty else [
-        {"entity_id": name, "id": name, "source_id": "chunk"} for name in ("Earth", "Moon")]
-    edges = [] if empty else [{"source": "Earth", "target": "Moon", "source_id": "chunk"}]
+        {"entity_id": name, "id": name, "description": "description", "source_id": "chunk"}
+        for name in ("Earth", "Moon")]
+    edges = [] if empty else [{"source": "Earth", "target": "Moon", "source_id": "chunk",
+                              "description": "description", "keywords": "related"}]
     rag.chunk_entity_relation_graph.get_all_nodes = AsyncMock(return_value=nodes)
     rag.chunk_entity_relation_graph.get_all_edges = AsyncMock(return_value=edges)
+    vector_rows = {compute_mdhash_id(name, prefix="ent-"): {
+        "id": compute_mdhash_id(name, prefix="ent-"), "entity_name": name,
+        "content": name + "\ndescription", "chunk_ids": ["another-document-chunk" if name == "Other" else "chunk"]}
+        for name in ("Earth", "Moon", "Other")}
+    relation_key = compute_mdhash_id("EarthMoon", prefix="rel-")
+    vector_rows[relation_key] = {"id": relation_key, "source_id": "Earth", "target_id": "Moon",
+        "content": "related\tEarth\nMoon\ndescription", "chunk_ids": ["chunk"]}
+    async def vector(key):
+        return deepcopy(vector_rows.get(key))
+    rag.entities_vdb.get_by_id = rag.relationships_vdb.get_by_id = vector
     for role, field, values in (
         ("full_entities", "entity_names", [row["id"] for row in nodes]),
         ("full_relations", "relation_pairs", [["Earth", "Moon"]] if edges else []),
@@ -119,7 +133,7 @@ async def test_rebuilt_other_document_rows_do_not_become_successor_contributions
 
     rag = indexed_rag("doc", empty=True)
     rag.chunk_entity_relation_graph.get_all_nodes.return_value = [
-        {"entity_id": "Other", "id": "Other", "source_id": "another-document-chunk"}]
+        {"entity_id": "Other", "id": "Other", "description": "description", "source_id": "another-document-chunk"}]
     inventory, _ = await verify_outputs(rag, CLAIM, "doc", "actual content")
     proof = next(row for row in inventory if row["role"] == "graph")["verification"]["evidence"]["document_contribution"]
     assert proof["entity_ids"] == proof["relation_pairs"] == []

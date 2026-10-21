@@ -194,7 +194,7 @@ async def test_unknown_delivery_retries_stay_one_attempt_and_real_expiry_still_p
 
 
 @pytest.mark.asyncio
-async def test_retirement_failure_keeps_delivery_recoverable_and_requests_published_graph_repair(knowledge, tmp_path):
+async def test_retirement_failure_fences_delivery_and_requests_isolated_published_graph_repair(knowledge, tmp_path):
     from papervault.knowledge.scheduler.catalog import CatalogScheduler
     from papervault.store.knowledge import RetirementFailure
 
@@ -213,7 +213,6 @@ async def test_retirement_failure_keeps_delivery_recoverable_and_requests_publis
     replacement = k.command("enqueue", "replacement-job", {"unit_id": job["unit_id"], "generation_id": "g",
         "consumed_input_revision": job["consumed_input_revision"], "recipe_digest": recipe})
     admitted = claim(k, replacement, "replacement-claim")
-    before = k.get_reducer(job["unit_id"], job["consumed_input_revision"])
     pin = k.get_pin("attempt-pin:" + admitted["attempt_id"])
 
     class UnverifiedRetirementBackend(_NoBackend):
@@ -237,13 +236,22 @@ async def test_retirement_failure_keeps_delivery_recoverable_and_requests_publis
     assert len(repairs) == 1
     assert repairs[0]["publication_id"] == published["publication_id"]
     assert repairs[0]["role"] == "graph" and repairs[0]["reason"] == "retirement_rebuild_unverified"
-    assert k.get_job(replacement["job_id"])["state"] == "running"
+    assert k.get_job(replacement["job_id"])["state"] == "failed"
     assert k.get_job(replacement["job_id"])["attempts"] == 1
-    assert k.get_attempt(admitted["attempt_id"])["outcome"] is None
+    attempt = k.get_attempt(admitted["attempt_id"])
+    assert attempt["outcome"] == "failed" and attempt["cost_state"] == "unknown"
     assert k.get_submission(admitted["submission_id"])["receipt"] is None
-    assert k.get_pin(pin["pin_id"]) == pin
-    assert k.get_reducer(job["unit_id"], job["consumed_input_revision"]) == before
-    assert len(k.list_outbox(kind="submission")) >= 1
+    assert k.get_pin(pin["pin_id"])["kind"] == "recovery"
+    assert admitted["namespace"] in k.protected_namespaces()
+    assert k.get_reducer(job["unit_id"], job["consumed_input_revision"])["failure_streak"] == 1
+    assert not any(row["submission_id"] == admitted["submission_id"] for row in k.list_outbox(kind="submission"))
+    from papervault.store.knowledge import ClaimRejected
+    with pytest.raises(ClaimRejected):
+        async with k.namespace_access(admitted):
+            raise AssertionError("failed retirement must not write")
+    fresh = claim(k, k.get_job(replacement["job_id"]), "isolated-retry")
+    assert fresh["namespace"] != admitted["namespace"]
+    assert fresh["fencing_token"] > admitted["fencing_token"]
     assert len(k._rows("publications")) == 1
 
 
@@ -394,3 +402,17 @@ async def test_metadata_retirement_llm_pause_preserves_failure_budget(knowledge,
         "expected_revision": resumed["revision"], "error": {"kind": "verified_failure"}})
     reducer = k.get_reducer("paper:A", input_revision)
     assert reducer["failure_streak"] == 2 and reducer["parked"] is True
+
+
+def test_retirement_failure_cannot_discard_already_sealed_work(knowledge):
+    from papervault.store.knowledge import ClaimRejected
+
+    k = knowledge
+    admitted = claim(k, prepare(k))
+    rec = seal(k, admitted)
+    before = k.get_job(admitted["job_id"])
+    with pytest.raises(ClaimRejected):
+        k.command("fail_retirement", "ambiguous-retirement-failure", {**admitted,
+            "expected_revision": before["revision"], "error": {"kind": "RetirementFailure"}})
+    assert k.get_job(admitted["job_id"]) == before
+    assert k.get_receipt(rec["receipt_id"]) == rec

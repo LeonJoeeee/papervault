@@ -143,6 +143,52 @@ def test_capture_rejects_journal_old_image_that_disagrees_with_aligned_snapshot(
             "old": source(status="error"), "new": source(status="done_meta")}])
 
 
+@pytest.mark.parametrize("snapshot_time,journal_time,canonical_time", [
+    ("2026-10-19T12:00:00.123000+00:00", "2026-10-19T12:00:00.123+00:00", "2026-10-19T12:00:00.123Z"),
+    ("2026-10-19T17:30:00.123456+05:30", "2026-10-19T08:00:00.123456-04:00", "2026-10-19T12:00:00.123456Z"),
+    ("2026-10-20T01:30:00+05:30", "2026-10-19T16:00:00-04:00", "2026-10-19T20:00:00Z"),
+])
+def test_planner_aligns_equivalent_source_timestamps_without_changing_text(snapshot_time, journal_time, canonical_time):
+    from datetime import datetime
+
+    from papervault.store.knowledge_import import plan_legacy_import
+    from papervault.store.repository import payload_hash
+
+    # A timestamp-looking fingerprint is still exact source text.
+    fingerprint = "2026-10-19T17:30:00.123000+05:30"
+    original = source(last_processed_at=datetime.fromisoformat(snapshot_time), fingerprint=fingerprint)
+    old = source(last_processed_at=journal_time, fingerprint=fingerprint)
+    new = {**old, "status": "error", "attempts": 4}
+    plan = plan_legacy_import(snapshot([original]), changes=[{
+        "sequence": 11, "operation": "UPDATE", "old": old, "new": new}], final_checkpoint=11)
+    expected = {**new, "last_processed_at": canonical_time}
+    assert plan["events"][0]["raw"]["last_processed_at"] == canonical_time
+    assert plan["events"][1]["raw"] == expected
+    assert plan["checkpoint"]["final_rows_digest"] == payload_hash([expected])
+    assert original["last_processed_at"] == datetime.fromisoformat(snapshot_time)
+    equivalent = plan_legacy_import(snapshot([source(last_processed_at=canonical_time, fingerprint=fingerprint)]))
+    assert plan["events"][0]["event_digest"] == equivalent["events"][0]["event_digest"]
+
+
+@pytest.mark.parametrize("changed", [
+    {"last_processed_at": "2026-10-19T08:00:00.123001-04:00"},
+    {"last_processed_at": "2026-10-19T08:00:00.1230001-04:00"},
+    {"last_processed_at": "2026-10-19T12:00:00.123"},
+    {"fingerprint": "2026-10-19T08:00:00.123-04:00"},
+    {"attempts": 4},
+    {"unexpected": None},
+])
+def test_timestamp_canonicalization_keeps_strict_old_image_alignment(changed):
+    from papervault.store.knowledge_import import plan_legacy_import
+
+    original = source(last_processed_at="2026-10-19T12:00:00.123000+00:00",
+                      fingerprint="2026-10-19T12:00:00.123000+00:00")
+    old = {**original, "last_processed_at": "2026-10-19T08:00:00.123-04:00", **changed}
+    with pytest.raises(ValueError, match="old image"):
+        plan_legacy_import(snapshot([original]), changes=[{
+            "sequence": 11, "operation": "UPDATE", "old": old, "new": {**old, "status": "error"}}])
+
+
 def test_two_ledger_rows_claiming_same_backend_document_are_duplicate_even_without_mapping():
     from papervault.store.knowledge_import import plan_legacy_import
 

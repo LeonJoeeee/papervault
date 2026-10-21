@@ -466,7 +466,8 @@ def _mapping_compatible(inventory, member, parent_row, members, unit_id, parent_
 
 
 def _group_ids(rows):
-    root_records = {row["unit"].get("unit_id"): row["unit"].get("record_key") for row in rows}
+    root_records = {row["unit"].get("unit_id"): row["unit"].get("record_key") for row in rows
+                    if row["unit"].get("unit_id") is not None}
     parents = {}
     for row in rows:
         unit = row["unit"]

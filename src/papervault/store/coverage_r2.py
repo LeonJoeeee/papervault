@@ -90,7 +90,9 @@ def coverage_r2(pools, coverage, *, frozen_snapshot, current_legacy_records=None
         raise ValueError("R2 requires the frozen 12 pools and 111 entries")
     records = [record for record in coverage["records"] if record.get("kind", "paper") == "paper"]
     by_key = {record["key"]: record for record in records}
-    units = {unit["unit_id"]: unit for unit in coverage["units"]}
+    # Missing knowledge identities retain record-local evidence without inventing unit IDs.
+    units = {unit["unit_id"] if unit["unit_id"] is not None else ("record", unit["record_key"]): unit
+             for unit in coverage["units"]}
     legacy_by_key = {record["key"]: record for record in (current_legacy_records or [])}
     current = {"metadata": 0, "readable": 0, "indexed": 0,
                "lower_tiers": {"abstract": 0, "metadata": 0}, "per_pool": []}
@@ -108,7 +110,9 @@ def coverage_r2(pools, coverage, *, frozen_snapshot, current_legacy_records=None
         for index, (entry, key, old_key) in enumerate(zip(entries, keys, old_keys, strict=True)):
             record = by_key.get(key) or {}
             old_record = legacy_by_key.get(old_key) or {}
-            evidence = [deepcopy(units[unit_id]) for unit_id in record.get("unit_ids", []) if unit_id in units]
+            evidence_keys = [unit_id if unit_id is not None else ("record", key)
+                             for unit_id in record.get("unit_ids", [])]
+            evidence = [deepcopy(units[unit_key]) for unit_key in evidence_keys if unit_key in units]
             new = {"metadata": bool(key and record.get("registered")),
                    "readable": bool(key and record.get("readable")), "indexed": bool(key and record.get("indexed"))}
             old = {"metadata": bool(old_key), "readable": old_record.get("readable") if old_key else False,

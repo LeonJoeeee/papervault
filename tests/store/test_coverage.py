@@ -407,6 +407,28 @@ def test_standalone_operator_documents_remain_distinct_registered_units_and_scop
     assert len(query([first, second], scope="operator:A")["units"]) == 1
 
 
+@pytest.mark.parametrize("scope, expected_keys", [(None, ["A", "B"]), ("A", ["A"]), ("B", ["B"])])
+def test_records_without_knowledge_units_keep_distinct_metadata_and_scope(scope, expected_keys):
+    rows = [{"unit": {"unit_id": None, "kind": "paper", "record_key": key},
+             "record": {"key": key, "title": title, "doi": doi},
+             "requirement": None, "selection": None, "selected_derivation": None,
+             "receipt": None, "receipt_validated": False, "input_manifest": None,
+             "observations": [], "aggregate_observations": [], "aggregate_receipts": [],
+             "inventories": [], "section_mappings": [], "jobs": [], "publication_history": [],
+             "recipe": None, "generation": None, "generation_manifest": None, "serving_manifest": None}
+            for key, title, doi in (("A", "First paper", "10.1/a"), ("B", "Second paper", "10.1/b"))]
+
+    result = query(rows, scope=scope)
+
+    assert [record["key"] for record in result["records"]] == expected_keys
+    assert {record["key"]: (record["title"], record["doi"]) for record in result["records"]} == {
+        key: {"A": ("First paper", "10.1/a"), "B": ("Second paper", "10.1/b")}[key]
+        for key in expected_keys}
+    assert result["totals"] == {"registered": len(expected_keys), "readable": 0, "published": 0, "indexed": 0}
+    assert [unit["record_key"] for unit in result["units"]] == expected_keys
+    assert all(unit["unit_id"] is None for unit in result["units"])
+
+
 def test_receipt_requires_explicit_catalog_validation_and_matching_achieved_tier():
     source = row()
     source.pop("receipt_validated", None)

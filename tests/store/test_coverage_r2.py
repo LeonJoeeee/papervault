@@ -4,6 +4,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[2]
 POOLS = ROOT / "src/papervault/eval/gold_search_pools.jsonl"
 FROZEN = ROOT / "docs/baselines/f0-snapshot-2026-10-18.json"
@@ -84,6 +86,32 @@ def test_matcher_preserves_doi_precedence_and_exact_ascii_title_rule():
                {"key": "last", "doi": "10.1/x", "title": "TITLE"}]
     assert match_entries(records, [{"doi": "10.1/X", "title": "different"},
                                    {"title": "Tí-tle"}, {"title": "title"}]) == ["last", None, "first"]
+
+
+@pytest.mark.parametrize("match_by", ["doi", "title"])
+def test_unitless_pool_matches_and_differences_keep_each_records_own_evidence(match_by):
+    from papervault.store.coverage_r2 import coverage_r2
+
+    pools, coverage, frozen = inputs()
+    coverage["records"] = [{"key": key, "title": entry["title"] if match_by == "title" else "Unrelated " + key,
+                            "doi": entry["doi"] if match_by == "doi" else None,
+                            "registered": True, "readable": False, "indexed": False, "unit_ids": [None]}
+                           for key, entry in zip(("A", "B"), pools[0]["pool"][:2], strict=True)]
+    coverage["units"] = [{"unit_id": None, "record_key": "A", "reasons": ["selected_unit_id_mismatch"]},
+                         {"unit_id": None, "record_key": "B", "reasons": ["selected_unit_id_mismatch"]}]
+    legacy = [{**record, "readable": True, "indexed": True} for record in coverage["records"]]
+
+    report = coverage_r2(pools, coverage, frozen_snapshot=frozen, current_legacy_records=legacy)
+
+    for field in ("entries", "current_differences"):
+        matches = [item for item in report[field] if item["qid"] == pools[0]["qid"] and item["entry_index"] < 2]
+        assert [item["current_key"] for item in matches] == ["A", "B"]
+        assert [item["legacy_key"] for item in matches] == ["A", "B"]
+        assert [item["units"][0]["record_key"] for item in matches] == ["A", "B"]
+        assert all(item["version_qualified"] == {"metadata": True, "readable": False, "indexed": False}
+                   for item in matches)
+    assert all(item["differences"]["indexed"] == {"legacy": True, "version_qualified": False}
+               for item in report["current_differences"])
 
 
 def test_report_script_only_reads_explicit_inputs_and_writes_explicit_output(tmp_path):

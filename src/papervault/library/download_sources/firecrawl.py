@@ -55,7 +55,12 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
         # Cloud requires a key; self-hosted doesn't.
         return False
 
+    from ..services.extraction_registration import begin_extraction, finish_extraction, recover_completions
+    recover_completions(library, key=paper.key)
+
     if library.has_extract(paper.key, "md"):
+        from ..services.extraction_registration import require_selected_registration
+        require_selected_registration(library, paper)
         # Idempotent re-entry on an md already on disk. If it's firecrawl-
         # sourced, the paper is in text-only state — but D5 says firecrawl md
         # must PASS the completeness gate to be served as full text, with no
@@ -155,7 +160,8 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
                       "url": target_url, "error": str(body.get("error"))[:200]})
         return False
 
-    md = ((body.get("data") or {}).get("markdown") or "").strip()
+    raw_markdown = ((body.get("data") or {}).get("markdown") or "")
+    md = raw_markdown.strip()
     if len(md) < 1000:
         library.log({"event": "firecrawl_too_short", "key": paper.key,
                       "url": target_url, "len": len(md)})
@@ -214,7 +220,7 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
     # keeps a good rendering serveable through API flakiness.
     #
     # Gate the in-memory body BEFORE touching disk — mirrors the extract_md
-    # spine (gate final_md in memory, _save_md only after PASS). This closes
+    # spine (gate final_md in memory, finalize only after PASS). This closes
     # the transient "md on disk ⟺ gated" window: the old order wrote the md to
     # disk and only THEN gated, so a daemon crash between the write and the gate
     # decision left an UNGATED firecrawl stub on disk that serve-safety would
@@ -248,20 +254,20 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
                          "title": (paper.title or "")[:80]})
             return False
 
+    extraction_request = begin_extraction(paper, library, raw_markdown.encode(),
+        engine="firecrawl", source_role="provider_markdown", request={"url": target_url,
+            "endpoint": api_url + "/v1/scrape", "formats": ["markdown"], "timeout": 90000})
+    success_fields = ("download_status", "download_source", "firecrawl_pdf_hunt_exhausted")
+    before = {field: getattr(paper, field) for field in success_fields}
     if not _gate_firecrawl_md(paper, library, md, target_url=target_url):
         return False
-
-    # PASS: persist the rendering. _gate_firecrawl_md already stamped status
-    # ok + source firecrawl + firecrawl_pdf_hunt_exhausted; record the md path.
-    md_path = library.md_path(paper.key)
-    md_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = md_path.with_suffix(md_path.suffix + ".tmp")
-    tmp.write_text(frontmatter + md)
-    tmp.replace(md_path)
-
-    paper.md_path = str(md_path.relative_to(library.root))
-    paper.md_engine = "firecrawl"
-    paper.md_engine_version = "v1"
+    # The historical gate also handles existing files. Fresh completion cannot
+    # expose its optimistic status stamps until durable registration succeeds.
+    for field, value in before.items():
+        setattr(paper, field, value)
+    finish_extraction(paper, library, extraction_request, frontmatter + md,
+        provider_observations={"actual_model": "unknown", "engine_version": "unknown",
+                               "source_bytes": "not_disclosed", "input_boundary": "provider_markdown"})
 
     # ✦ Phase 12.3 (#94): pre-curator quality gate (Phase 28 route B
     # reframe — the gate originally protected the 5-Q insight worker

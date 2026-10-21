@@ -50,12 +50,14 @@ newer attempts or reopen settled attempts. Staged publication takes file lock th
 lock, checks revision and lease before touching artifacts, and retains its stage on a
 failed/unknown publication commit for forward recovery. Artifact bytes precede their
 catalog references; a failed catalog commit may leave unpublished bytes and must not
-be treated as successful publication. This does not implement P5 versioned derivatives.
+be treated as successful publication. P5a now adds immutable extraction bundles and
+atomic derivation/receipt/outbox registration to this guarded completion transaction;
+see [knowledge publication](DRAFT-catalog-knowledge-publication.md#extraction-registration-p5a).
 
 In PG mode, purge and DOI-resolution collision merges refuse before changing the
 working set or unlinking files, including before dispatch to the V2 merge path.
 Missing keys in a save also refuse.
-Retention, tombstones and record deletion await P5.
+Coordinated snapshots/restore and GC/retirement remain deferred to P5b/P5c; record deletion remains refused.
 
 JSON load/save/rotation/BibTeX behavior stays in its existing path. PG save never writes
 `index.json` or its backup. `scripts/export_catalog.py --output <path> --verify` reads

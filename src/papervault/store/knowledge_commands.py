@@ -718,6 +718,9 @@ def dispatch(k, action, operation_id, p):
         return {**claim_result(job, attempt), "publication_claim_id": token}
 
     if action == "publish_derivation":
+        if p.get("kind") == "extraction":
+            from .extraction_commands import publish_extraction
+            return publish_extraction(k, operation_id, p)
         job, attempt, claim = complete(k, p, publish=True)
         rec = p["receipt"]
         generation_contract(k, job, tier=rec["achieved_tier"])

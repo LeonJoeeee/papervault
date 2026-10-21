@@ -151,6 +151,11 @@ def _gate_firecrawl_md(paper: Paper, library: Library, body: str,
         # first; on OSError fall back to truncate-to-empty; only if BOTH fail
         # does the stub remain (logged for audit).
         md_p = library.md_path(paper.key)
+        if md_p.resolve().is_relative_to((library.root / "extracts" / "versions").resolve()):
+            # Selected source versions survive rejection and merge adoption.
+            # Clearing md_path below removes their serveable selection; only
+            # the disposable conventional projection may be unlinked.
+            md_p = library.md_dir / (paper.key + ".md")
         try:
             md_p.unlink()
         except FileNotFoundError:

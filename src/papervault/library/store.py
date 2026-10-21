@@ -1170,7 +1170,7 @@ class Library:
             existing.terminal_state = retain_observed_restrictions(current_state, observed)
         for field, value in incoming.items():
             if field in {"inspire_record_id", "inspire_document_urls", "source_identities", "terminal_state",
-                         "reopen_claim", "merge_intent", "merge_budget"}:
+                         "reopen_claim", "merge_intent", "merge_budget", "extraction_completion_id"}:
                 continue  # source identity and links are merged together above
             if field == "key" or field not in Paper.model_fields:
                 continue                       # never reassign the cite key

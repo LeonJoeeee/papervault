@@ -96,7 +96,22 @@ class CatalogIntake:
                 "identity": {"record_id": identity},
                 "legacy_keys": [{"source": "catalog_record", "legacy_key": record.key},
                                 {"source": "lightrag_doc", "legacy_key": "paper:" + record.key}]})
-        captured = capture_paper_input(record, unit["unit_id"], self.input_store, self.vault)
+        extraction_receipt = extraction_origin = None
+        completion_id = record.payload.get("extraction_completion_id")
+        if completion_id and record.payload.get("md_path"):
+            from papervault.store.extraction import ExtractionStore, register_completion
+            from papervault.store.knowledge import ClaimRejected
+            try:
+                extraction_receipt = self.repository.get_extraction_receipt(completion_id)
+                if extraction_receipt is None:
+                    completion = ExtractionStore(self.vault).completion(completion_id)
+                    register_completion(self.repository, self.vault, completion)
+                    extraction_receipt = self.repository.get_extraction_receipt(completion_id)
+                extraction_origin = self.repository.extraction_origin(record.key, extraction_receipt)
+            except (OSError, ValueError, ClaimRejected) as exc:
+                raise InputUnavailable("extraction registration pending or refused") from exc
+        captured = capture_paper_input(record, unit["unit_id"], self.input_store, self.vault,
+                                       extraction_receipt=extraction_receipt, extraction_origin=extraction_origin)
         manifest, input_revision = captured["manifest"], captured["consumed_input_revision"]
         self._command("register_input", {"unit_id": unit["unit_id"],
                       "consumed_input_revision": input_revision, "manifest": manifest})

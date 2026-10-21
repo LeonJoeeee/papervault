@@ -228,7 +228,8 @@ class MergeStore:
         owned = {"key", "reopen_claim", "merge_intent", "merge_budget"}
         values = {k: v for k, v in metadata.items() if k not in owned and v is not None}
         identities = {"doi", "arxiv_id", "paper_id", "url", "inspire_record_id", "inspire_document_urls",
-                      "title", "authors", "year", "download_status", "pdf_path", "md_path", "txt_path"}
+                      "title", "authors", "year", "download_status", "pdf_path", "md_path", "txt_path",
+                      "extraction_completion_id", "md_engine", "md_engine_version"}
         self.library._merge(paper, {k: v for k, v in values.items() if k not in identities})
         if "domain_status" in values:
             observed = project_domain_policy(TerminalState(policy=Policy.CLEAR), values)
@@ -346,12 +347,15 @@ class MergeStore:
             if not self._drain_ready(intent):
                 return None
             left, right = self._pair(intent)
+            md_fields = ("md_path", "extraction_completion_id", "md_engine", "md_engine_version")
+            selected_md = {field: getattr(left, field) for field in md_fields}
             artifacts = {}
             for kind in ("pdf", "md", "txt"):
                 source = getattr(self.library, kind + "_path")(right.key)
                 target = getattr(self.library, kind + "_path")(left.key)
                 if not target.is_file() and source.is_file() and source.stat().st_size:
-                    artifacts[kind] = str(source.relative_to(self.library.root))
+                    artifacts[kind] = (right.md_path if kind == "md" and right.extraction_completion_id
+                                       else str(source.relative_to(self.library.root)))
             state = retain_observed_restrictions(
                 replace(left.unquiesced_state, quarantine=left.unquiesced_state.quarantine or intent.canonical_quarantine),
                 replace(right.unquiesced_state, quarantine=right.unquiesced_state.quarantine or intent.absorbed_quarantine))
@@ -362,6 +366,10 @@ class MergeStore:
             self.library._merge(left, right.model_dump())
             if intent.metadata:
                 self.library._merge(left, intent.metadata)
+            if "md" in artifacts:
+                selected_md = {field: getattr(right, field) for field in md_fields}
+            for field, value in selected_md.items():
+                setattr(left, field, value)
             for kind, path in artifacts.items():
                 setattr(left, kind + "_path", path)
             rank = {Retrieval.ACQUIRED: 1, Retrieval.VERIFIED: 2}

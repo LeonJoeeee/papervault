@@ -134,6 +134,10 @@ class ExtractQueue:
         """
         if self._started:
             return
+        from .extraction_registration import recover_completions
+        recovered = await asyncio.to_thread(recover_completions, self.library)
+        if recovered["recovered"]:
+            self.library.save(force=True, durable=True)
         self._started = True
 
         from ..extract import pdf_probe
@@ -313,6 +317,10 @@ class ExtractQueue:
         if paper is None:
             log.warning("extract queue: %s not in library, dropping", key)
             return
+        from .extraction_registration import recover_completions
+        recovered = await asyncio.to_thread(recover_completions, self.library, key=key)
+        if recovered["recovered"]:
+            self.library.save(force=True, durable=True)
         if not self.library.has_pdf(key):
             log.warning(
                 "extract queue: %s has no PDF, dropping (download chain bug?)",
@@ -323,6 +331,8 @@ class ExtractQueue:
         # run, firecrawl text-only path, etc.). Skip extract; forward
         # to on_success if present (no-op in post-route-B production).
         if self.library.has_extract(key, "md"):
+            from .extraction_registration import require_selected_registration
+            require_selected_registration(self.library, paper)
             log.debug(
                 "extract queue: %s already has md, skipping extract", key
             )
@@ -346,8 +356,10 @@ class ExtractQueue:
         # OCR-slot admission now lives INSIDE extract_md, bracketing ONLY the
         # MinerU call and released before the LLM gates — so the (off-loop) gate
         # phase never pins a GPU slot. Here we just run extract_md + log a crash.
+        completed = False
         try:
             await extract_md(paper, self.library)
+            completed = True
         except Exception:
             log.exception("extract queue: extract_md failed for %s", key)
 
@@ -360,7 +372,7 @@ class ExtractQueue:
         # insight queue; post-route-B production wiring sets on_success
         # to None (extract is the terminal pipeline stage). The branch
         # remains for test fixtures and future Librarian-side hooks.
-        if self.library.has_extract(key, "md") and self._on_success is not None:
+        if completed and self.library.has_extract(key, "md") and self._on_success is not None:
             log.info("extract queue: %s OK → on_success", key)
             try:
                 self._on_success(key, priority=priority)

@@ -1,6 +1,6 @@
 # Catalog-owned knowledge publication and coverage
 
-Status: implementation of the accepted [P4 design, issue #278](https://github.com/LeonJoeeee/papervault/issues/278); activation requires the evidence and writer handoff below.
+Status: implementation of the accepted [P4 design, issue #278](https://github.com/LeonJoeeee/papervault/issues/278) and [P5a extraction registration, issue #282](https://github.com/LeonJoeeee/papervault/issues/282); activation requires the evidence and writer handoff below.
 
 ## Context
 
@@ -41,6 +41,22 @@ Backend collectors record nonauthoritative, identity-qualified observations. A p
 The catalog-only coverage read performs no refresh or repair. A complete result needs the exact selected publication, compatible input/recipe/inventory and fresh positive verification for every required output. The default observation age is 300 seconds, based on backend observation time. Verified empty graphs require explicit evidence and applicable byte proofs. Unknown provenance, missing identity and stale observations receive no completeness credit.
 
 ## Consequences and activation
+
+### Extraction registration (P5a)
+
+Extraction uses the artifact branch of `publish_derivation`. A completion captures the exact input bytes, metadata and typed record identity before local transformation, together with a canonical recipe containing code hashes, package/configured model identity, loaded transport/retry and gate settings. Firecrawl's observed raw markdown is the input boundary; undisclosed source-page bytes, remote engine version and actual serving model remain explicitly unknown. Existing outputs without execution evidence remain `legacy_unknown`; recovery never manufactures their recipes.
+
+Inputs are installed without replacement at `extracts/inputs/<sha256>`. A completion directory contains `output.md` and `completion.json`; file readback, file fsync, directory fsync and atomic directory rename precede registration. Its generation is `extraction:<completion_id>`, independent of graph generations. The receipt binds hashes, byte lengths, exact immutable locators, tier, input and recipe digests, original catalog revision/authority epoch and predecessor guard. Receipt validation checks these identities against the retained bundle. Later extraction preserves older versions. Conventional `extracts/md/<key>.md` files remain disposable compatibility projections, and rejection never deletes an immutable version.
+
+The [orchestrator ruling](https://github.com/LeonJoeeee/papervault/issues/282#issuecomment-6309623189) permits legacy and standalone JSON extraction to succeed with this durable pending bundle. Pending is a retained evidence disposition, not catalog publication or conforming coverage. Under committed catalog authority the shared writer transaction adds an append-only extraction receipt and derivation, an extraction registration audit, a predecessor/revision fence and one distillation outbox item before reporting success. It creates no distillation attempt, graph publication or graph selection. The additive schema migration is version 5 and remains an explicit administrative operation.
+
+`registration-request.json` retains the exact operation payload for unknown-commit replay. Queue startup, per-key extraction recovery and catalog intake deliver retained evidence without repeating transformations, success/failure events or execution attempts. Stale revisions/epochs, changed inputs, conflicting predecessors and invalid evidence retain the bundle without credit. Recovery reports blocked completions without stopping unrelated queue work; catalog success shortcuts still require registration for selected new outputs. A crash after alias replacement but before record save recovers the same verified version.
+
+Staged reopen execution records its original claim and live unit identity separately from verified metadata fills. Guarded writeback shares the existing record/claim transaction with registration. Refused and byte-identical staged outputs survive cleanup; ordinary queue recovery cannot publish a dispatched or expired staged result. Merge adoption moves the selected markdown path and provenance together. Intake authorizes an adopted receipt through the committed alias chain and keeps its original unit/derivation identity. A selected legacy pending origin may register through that chain only when the canonical record is eligible and selects that exact output. No historical catalog revision is invented.
+
+Catalog distillation reads the verified immutable output and records its extraction derivation as upstream input. Outbox retries are delivery, not attempts; the consumer waits for committed record selection and acknowledges superseded inputs without admitting stale work. These changes do not activate catalog authority, implement coordinated backup/restore, garbage collection or research-asset deletion.
+
+### Authority handoff
 
 `PAPERVAULT_KNOWLEDGE_JOBS` defaults to `legacy`. Selecting `postgres` requires an already committed catalog authority epoch and Postgres library authority. The configuration flag cannot transfer authority. Legacy ledger methods remain readable for historical comparison; their writers and direct legacy backend mutation entry points fail after handoff.
 

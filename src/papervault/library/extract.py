@@ -12,7 +12,7 @@ decoupled from GPU count; vLLM batches the per-page sub-requests server-side.
 **Pipeline** (SDD §2.1): ``pdf_probe`` (isolated subprocess guard) → acquire a
 concurrency slot + a round-robin endpoint → ``mineru_client.extract_mineru``
 (one whole-PDF call) → doc-level ``review_extract`` clarity check → whole-doc
-``completeness_gate`` → ``_save_md(engine="mineru2.5-pro")``.
+``completeness_gate`` → durable extraction completion registration.
 
 **Failure model (C1, SDD §2.2)**: ``mineru_client`` raises two typed
 exceptions. ``MineruTransportError`` (server unreachable / connection death /
@@ -37,7 +37,6 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 from papervault.llm_routing import route
@@ -105,23 +104,6 @@ _EXTRACT_WORKERS = int(
 # keyed off ``pdf_probe(...).n_pages``.
 _LONG_PAPER_PAGE_THRESHOLD = int(
     os.environ.get("PAPER_LIBRARY_LONG_PAPER_PAGE_THRESHOLD", "90"))
-
-
-def _atomic_write(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    tmp.replace(path)
-
-
-def _pkg_version(name: str) -> str:
-    if not name:
-        return ""
-    try:
-        from importlib.metadata import version
-        return version(name)
-    except Exception:
-        return ""
 
 
 # ----------------------------- pdf_probe -----------------------------------
@@ -532,35 +514,6 @@ def confirmed_completeness_gate(full_text: str, *, llm=None) -> dict:
                       f"| {second.get('reason', '')}"}
 
 
-# ------------------------- save helper -------------------------------------
-
-
-def _save_md(paper: Paper, library: Library, engine: str, text: str) -> None:
-    """Write the md body RAW (NO YAML frontmatter — OCR md has never carried
-    any; serve / reconcile-abstract-feed / consistency all read the file head
-    raw and would mis-parse a YAML block) and stamp provenance in
-    ``md_engine`` / ``md_engine_version`` (index.json).
-
-    ``md_engine_version`` for the current engine ``mineru2.5-pro`` is the
-    HARDCODED model id (SDD §3.3 item 4c): do NOT route mineru through
-    ``_pkg_version`` (``importlib.metadata.version`` returns ``""`` if mineru
-    is absent from the daemon import path, and the model id is the meaningful
-    provenance anyway — consumed by ``extract_quality_tier``, audits, the
-    backfill resume marker). The dots/chandra/marker pkg-map is kept
-    read-frozen for back-compat (no new rows are produced by them).
-    """
-    md_path = library.md_path(paper.key)
-    _atomic_write(md_path, text)
-    paper.md_path = str(md_path.relative_to(library.root))
-    paper.md_engine = engine
-    if engine == "mineru2.5-pro":
-        paper.md_engine_version = "MinerU2.5-Pro-2605-1.2B"
-        return
-    pkg = {"chandra": "chandra-ocr", "dots": "dots_mocr",
-           "marker": "marker-pdf"}.get(engine, "")
-    paper.md_engine_version = _pkg_version(pkg)
-
-
 # ------------------------- main entry point --------------------------------
 
 
@@ -585,7 +538,7 @@ async def extract_md(paper: Paper, library: Library, *,
       4. Doc-level ``review_extract`` clarity sanity (belt-and-suspenders for a
          200-OK-but-thin body; ``extract_mineru`` already raises on thin/empty).
       5. Whole-doc ``completeness_gate`` (the write-time chokepoint).
-      6. ``_save_md(engine="mineru2.5-pro")`` + ``download_status = ok``.
+      6. durable extraction completion registration + ``download_status = ok``.
 
     C1 terminalization rule (SDD §2.2/§2.4):
       - ``MineruTransportError`` → NO md, leave status ``ok``/``pending``, do
@@ -610,7 +563,12 @@ async def extract_md(paper: Paper, library: Library, *,
     # re-hunt. classify() routes such a paper to rule-2 TERMINAL (has_pdf ∧
     # has_md) and serve-safety keeps surfacing the firecrawl md via text_path;
     # nothing forces a re-OCR.
+    if not force:
+        from .services.extraction_registration import recover_completions
+        recover_completions(library, key=paper.key)
     if not force and library.has_extract(paper.key, "md"):
+        from .services.extraction_registration import require_selected_registration
+        require_selected_registration(library, paper)
         return md_path.read_text()
     if not library.has_pdf(paper.key):
         return None
@@ -666,6 +624,9 @@ async def extract_md(paper: Paper, library: Library, *,
     wall_clock_deadline = t_pinned_start + _CEILING_SECONDS
 
     pdf_bytes = pdf_path.read_bytes()
+    from .services.extraction_registration import begin_extraction, finish_extraction
+    extraction_request = begin_extraction(paper, library, pdf_bytes,
+        request={"endpoints": [e.url for e in endpoints]}, llm=llm)
 
     # ---- 3. ONE whole-PDF MinerU call (no chunking, no page cap) ----
     library.log({"event": "extract_md_start", "key": paper.key,
@@ -777,7 +738,7 @@ async def extract_md(paper: Paper, library: Library, *,
         return None
 
     # ---- 6. Save (label → mineru2.5-pro) ----
-    _save_md(paper, library, "mineru2.5-pro", mineru_md)
+    finish_extraction(paper, library, extraction_request, mineru_md)
     paper.download_status = DOWNLOAD_STATUS_OK
     # Issue #43: a successful extraction proves the backend is producing output —
     # advance the process-global success epoch so any papers deferred during the

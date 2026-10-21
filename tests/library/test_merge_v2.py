@@ -887,6 +887,31 @@ async def test_canonical_adopts_only_absorbed_artifacts_without_deleting_them(pa
     assert restarted.pdf_path(right.key).read_bytes() == b"verified PDF"
 
 
+@pytest.mark.parametrize("existing", [False, True])
+async def test_merge_keeps_selected_extraction_provenance_together(pair, existing):
+    from papervault.library.services.extraction_registration import begin_extraction, finish_extraction
+    from papervault.store.extraction import ExtractionStore
+
+    lib, left, right, _, _ = pair
+    if existing:
+        lib.md_path(left.key).write_text("Canonical legacy output")
+    request = begin_extraction(right, lib, b"observed response",
+        engine="firecrawl", source_role="provider_markdown")
+    completion = finish_extraction(right, lib, request, "# Immutable absorbed output")
+    assert await coordinator(pair).merge_records(left.key, right.key) is left
+    restarted = Library(lib.root)
+    selected = restarted.get(left.key)
+    if existing:
+        assert selected.extraction_completion_id is None
+        assert selected.md_path is None
+        assert restarted.md_path(left.key).read_text() == "Canonical legacy output"
+    else:
+        assert selected.extraction_completion_id == completion["completion_id"]
+        assert selected.md_path == completion["output_inventory"][0]["path"]
+        assert restarted.md_path(left.key).read_text() == "# Immutable absorbed output"
+    assert ExtractionStore(lib.root).completion(completion["completion_id"]) == completion
+
+
 async def test_new_doi_cannot_bypass_an_existing_intent(pair):
     lib, left, right, _, _ = pair
     await coordinator(pair).quiesce(left.key, right.key)

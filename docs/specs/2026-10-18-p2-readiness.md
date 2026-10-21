@@ -49,6 +49,13 @@ conflicts, the twin-creation defect tracked in
 replication under the F1 backup ADR. The local dump schedule does not close that
 off-host recovery item.
 
+P5b adds the separate [coordinated recovery procedure](../../README.md#coordinated-recovery)
+and [isolated drill evidence](../baselines.md). Its weekly sets include source and
+derivative stores under `/data/p5b-recovery`; the orchestrator owns operational
+activation after merge. The nightly catalog-only timer above remains unchanged and
+does not establish recovery-set completeness. Same-host P5b evidence does not close
+the off-host recovery item.
+
 ## Historical rehearsal evidence
 
 Preparation first imported a read-only JSON/ledger copy into isolated

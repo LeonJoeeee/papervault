@@ -1,0 +1,24 @@
+Reviewer: Codex native subagent, gpt-6-astra at max, read-only.
+Reviewed continuation working-tree diff against 6a8070d1ecdfec4f86e660af1a4996a069f13cc1.
+Binding: the implementation/test files recorded in validation.json; the final test-only amendment is assessed in the supplement below.
+
+No remaining correctness findings in the final continuation diff against 6a8070d1ecdfec4f86e660af1a4996a069f13cc1.
+
+Two P2 findings raised during review are now addressed:
+
+- Pre-candidate resume could adopt unexpected rows. Resume now requires exact original row multisets and table inventory before candidate creation; afterward, the atomically recorded digest covers added rows. The interruption regression exercises the original gap.
+- Bundled unique indexes could reject valid captured rows before reconciliation. Mismatching nonconstraint defaults are now removed before loading rows. Captured definitions are installed afterward and compared exactly, within the transaction. New regressions distinguish the changed uniqueness semantics.
+
+The reviewed code captures all installed catalog index names and definitions, binds them to the checkpoint, preserves quoted names and predicate literals when rebinding the indexed relation, and verifies the exact inventory on restore and resume. The importer round-trip regression checks rejection of duplicate DOI and arXiv values. Neo4j added-object rejection and recorded isolated replay quarantine disposition are consistent with the stated continuation.
+
+This was read-only source and assertion review: I ran no tests, changed no files or git state, and contacted no remote service. The new 100-parent drill evidence and final validation results were not yet available and are not assessed here.
+
+Arbitrary custom catalog schema migrations, existing PostgreSQL derivative-store rebinding behavior, and live/P5c/GC operations remain outside this scope. This is a task-local assessment, not merge readiness or the orchestrator's independent integration verdict.
+
+Supplemental scoped verdict from the same reviewer: the deadline test change is sound; no new finding.
+
+The assertion in tests/store/test_recovery.py directly verifies interruption before the 0.1-second delay finishes, while retaining the real 0.02-second deadline, expected exception, and registration/retention guards. It removes the unrelated whole-operation timing threshold.
+
+The supplied mutation log shows export_finished=True fails when the timer is disabled, even with the post-export elapsed check retained. Thus the test still distinguishes interruption from eventual timeout detection.
+
+My prior code assessment remains unchanged. I reviewed source and supplied logs only; I ran no tests or mutations. This is not an integration verdict.

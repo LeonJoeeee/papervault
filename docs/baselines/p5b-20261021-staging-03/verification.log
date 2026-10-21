@@ -1,0 +1,4 @@
+snapshot: exact catalog checkpoint and all seven component inventories/hash closures verified
+restore: 100 parents; verified bytes, backend readback, original history, new fenced receipt
+replay: 100 original metadata inputs/recipes, 100 new normal claims/sealed receipts, no source serving change
+sample generation cannot promote; production-window drill remains with orchestrator

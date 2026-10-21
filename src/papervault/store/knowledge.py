@@ -136,6 +136,8 @@ OBSERVATION_IDENTITY_FIELDS = ("unit_id", "consumed_input_revision", "recipe_dig
 
 
 def validate_receipt(receipt: dict, claim: dict, recipe: dict) -> None:
+    if receipt.get("acceptance_scope") == "isolated_recovery":
+        raise ValueError("isolated recovery requires a new current live acceptance receipt")
     for key in CLAIM_FIELDS:
         if receipt.get(key) != claim.get(key) or receipt.get(key) is None:
             raise ValueError(f"receipt identity mismatch: {key}")
@@ -735,6 +737,22 @@ class KnowledgeRepository:
             valid_claim(self, claim, allow_sealed=False)
             yield self
             return
+        recovery_key = "papervault:" + self.repository.schema + ":recovery"
+        acquired = self.connection.execute(
+            "SELECT pg_try_advisory_lock_shared(hashtextextended(%s,0)) AS locked",
+            (recovery_key,)).fetchone()["locked"]
+        if not acquired:
+            raise ClaimRejected("recovery barrier fences backend writes")
+        try:
+            async with self._locked_namespace(claim, task):
+                yield self
+        finally:
+            self.connection.execute("SELECT pg_advisory_unlock_shared(hashtextextended(%s,0))", (recovery_key,))
+
+    @asynccontextmanager
+    async def _locked_namespace(self, claim, task):
+        from .knowledge_commands import valid_claim
+        namespace = claim["namespace"]
         lock = self._namespace_locks.setdefault(namespace, asyncio.Lock())
         async with lock:
             lock_key = "papervault:" + self.repository.schema + ":namespace:" + namespace

@@ -254,7 +254,8 @@ class PostgresCatalogRepository:
                         self._table("knowledge_runtime")))
             changed = self.connection.execute(sql.SQL(
                 "INSERT INTO {}(version,name) VALUES(4,'P4 catalog knowledge commands'),"
-                "(5,'P5a extraction derivation registration') "
+                "(5,'P5a extraction derivation registration'),"
+                "(6,'P5b isolated recovery generations') "
                 "ON CONFLICT(version) DO NOTHING RETURNING version"
             ).format(self._table("schema_version"))).fetchone()
             if changed:

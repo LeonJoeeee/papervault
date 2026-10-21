@@ -1,0 +1,717 @@
+Presentation: trailing whitespace removed from the captured pytest output.
+Representative test-first evidence. Red runs precede their fixes; the final focused run covers the implemented recovery modules. Historical fixture/setup failures are not represented as product passes.
+
+--- snapshot-red.log ---
+command: .venv/bin/pytest -q tests/store/test_recovery.py
+exit_code: 1
+FFFFFFFFFFFFFFFFFFF                                                      [100%]
+=================================== FAILURES ===================================
+_________ test_snapshot_dry_run_has_no_files_barrier_or_catalog_effect _________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_snapshot_dry_run_has_no_f0')
+
+    def test_snapshot_dry_run_has_no_files_barrier_or_catalog_effect(tmp_path):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:68:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+__________ test_same_day_snapshots_have_distinct_verified_identities ___________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_same_day_snapshots_have_d0')
+
+    def test_same_day_snapshots_have_distinct_verified_identities(tmp_path):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:79:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+____________ test_omitted_store_cannot_publish_or_register[catalog] ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_omitted_store_cannot_publ0')
+store = 'catalog'
+
+    @pytest.mark.parametrize("store", STORES)
+    def test_omitted_store_cannot_publish_or_register(tmp_path, store):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:100:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+____________ test_omitted_store_cannot_publish_or_register[sources] ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_omitted_store_cannot_publ1')
+store = 'sources'
+
+    @pytest.mark.parametrize("store", STORES)
+    def test_omitted_store_cannot_publish_or_register(tmp_path, store):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:100:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+___________ test_omitted_store_cannot_publish_or_register[extracts] ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_omitted_store_cannot_publ2')
+store = 'extracts'
+
+    @pytest.mark.parametrize("store", STORES)
+    def test_omitted_store_cannot_publish_or_register(tmp_path, store):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:100:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+____________ test_omitted_store_cannot_publish_or_register[inputs] _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_omitted_store_cannot_publ3')
+store = 'inputs'
+
+    @pytest.mark.parametrize("store", STORES)
+    def test_omitted_store_cannot_publish_or_register(tmp_path, store):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:100:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+____________ test_omitted_store_cannot_publish_or_register[recipes] ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_omitted_store_cannot_publ4')
+store = 'recipes'
+
+    @pytest.mark.parametrize("store", STORES)
+    def test_omitted_store_cannot_publish_or_register(tmp_path, store):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:100:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+___________ test_omitted_store_cannot_publish_or_register[postgres] ____________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_omitted_store_cannot_publ5')
+store = 'postgres'
+
+    @pytest.mark.parametrize("store", STORES)
+    def test_omitted_store_cannot_publish_or_register(tmp_path, store):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:100:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+_____________ test_omitted_store_cannot_publish_or_register[neo4j] _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_omitted_store_cannot_publ6')
+store = 'neo4j'
+
+    @pytest.mark.parametrize("store", STORES)
+    def test_omitted_store_cannot_publish_or_register(tmp_path, store):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:100:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+_____________________ test_mixed_checkpoint_cannot_publish _____________________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_mixed_checkpoint_cannot_p0')
+
+    def test_mixed_checkpoint_cannot_publish(tmp_path):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:110:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+________ test_verifier_refuses_damaged_or_incomplete_packages[corrupt] _________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_verifier_refuses_damaged_0')
+fault = 'corrupt'
+
+    @pytest.mark.parametrize("fault", ["corrupt", "missing", "extra", "symlink", "incomplete", "manifest"])
+    def test_verifier_refuses_damaged_or_incomplete_packages(tmp_path, fault):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:120:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+________ test_verifier_refuses_damaged_or_incomplete_packages[missing] _________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_verifier_refuses_damaged_1')
+fault = 'missing'
+
+    @pytest.mark.parametrize("fault", ["corrupt", "missing", "extra", "symlink", "incomplete", "manifest"])
+    def test_verifier_refuses_damaged_or_incomplete_packages(tmp_path, fault):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:120:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+_________ test_verifier_refuses_damaged_or_incomplete_packages[extra] __________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_verifier_refuses_damaged_2')
+fault = 'extra'
+
+    @pytest.mark.parametrize("fault", ["corrupt", "missing", "extra", "symlink", "incomplete", "manifest"])
+    def test_verifier_refuses_damaged_or_incomplete_packages(tmp_path, fault):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:120:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+________ test_verifier_refuses_damaged_or_incomplete_packages[symlink] _________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_verifier_refuses_damaged_3')
+fault = 'symlink'
+
+    @pytest.mark.parametrize("fault", ["corrupt", "missing", "extra", "symlink", "incomplete", "manifest"])
+    def test_verifier_refuses_damaged_or_incomplete_packages(tmp_path, fault):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:120:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+_______ test_verifier_refuses_damaged_or_incomplete_packages[incomplete] _______
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_verifier_refuses_damaged_4')
+fault = 'incomplete'
+
+    @pytest.mark.parametrize("fault", ["corrupt", "missing", "extra", "symlink", "incomplete", "manifest"])
+    def test_verifier_refuses_damaged_or_incomplete_packages(tmp_path, fault):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:120:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+________ test_verifier_refuses_damaged_or_incomplete_packages[manifest] ________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_verifier_refuses_damaged_5')
+fault = 'manifest'
+
+    @pytest.mark.parametrize("fault", ["corrupt", "missing", "extra", "symlink", "incomplete", "manifest"])
+    def test_verifier_refuses_damaged_or_incomplete_packages(tmp_path, fault):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:120:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+______ test_failed_and_sample_exports_do_not_displace_four_complete_sets _______
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_failed_and_sample_exports0')
+
+    def test_failed_and_sample_exports_do_not_displace_four_complete_sets(tmp_path):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:144:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+_____________ test_capacity_exhaustion_preserves_existing_packages _____________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_capacity_exhaustion_prese0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x792f8222e350>
+
+    def test_capacity_exhaustion_preserves_existing_packages(tmp_path, monkeypatch):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:164:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+______________ test_snapshot_refuses_symlink_root_before_writing _______________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-553/test_snapshot_refuses_symlink_0')
+
+    def test_snapshot_refuses_symlink_root_before_writing(tmp_path):
+>       module = recovery()
+                 ^^^^^^^^^^
+
+tests/store/test_recovery.py:174:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+    def recovery():
+        # A missing implementation is an assertion failure in the initial red run.
+        import importlib.util
+>       assert importlib.util.find_spec("papervault.store.recovery") is not None
+E       AssertionError: assert None is not None
+E        +  where None = <function find_spec at 0x792f86660360>('papervault.store.recovery')
+E        +    where <function find_spec at 0x792f86660360> = <module 'importlib.util' (frozen)>.find_spec
+E        +      where <module 'importlib.util' (frozen)> = <module 'importlib' from '/home/leon/.local/share/uv/python/cpython-3.13.12-linux-x86_64-gnu/lib/python3.13/importlib/__init__.py'>.util
+
+tests/store/test_recovery.py:58: AssertionError
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery.py::test_snapshot_dry_run_has_no_files_barrier_or_catalog_effect
+FAILED tests/store/test_recovery.py::test_same_day_snapshots_have_distinct_verified_identities
+FAILED tests/store/test_recovery.py::test_omitted_store_cannot_publish_or_register[catalog]
+FAILED tests/store/test_recovery.py::test_omitted_store_cannot_publish_or_register[sources]
+FAILED tests/store/test_recovery.py::test_omitted_store_cannot_publish_or_register[extracts]
+FAILED tests/store/test_recovery.py::test_omitted_store_cannot_publish_or_register[inputs]
+FAILED tests/store/test_recovery.py::test_omitted_store_cannot_publish_or_register[recipes]
+FAILED tests/store/test_recovery.py::test_omitted_store_cannot_publish_or_register[postgres]
+FAILED tests/store/test_recovery.py::test_omitted_store_cannot_publish_or_register[neo4j]
+FAILED tests/store/test_recovery.py::test_mixed_checkpoint_cannot_publish - A...
+FAILED tests/store/test_recovery.py::test_verifier_refuses_damaged_or_incomplete_packages[corrupt]
+FAILED tests/store/test_recovery.py::test_verifier_refuses_damaged_or_incomplete_packages[missing]
+FAILED tests/store/test_recovery.py::test_verifier_refuses_damaged_or_incomplete_packages[extra]
+FAILED tests/store/test_recovery.py::test_verifier_refuses_damaged_or_incomplete_packages[symlink]
+FAILED tests/store/test_recovery.py::test_verifier_refuses_damaged_or_incomplete_packages[incomplete]
+FAILED tests/store/test_recovery.py::test_verifier_refuses_damaged_or_incomplete_packages[manifest]
+FAILED tests/store/test_recovery.py::test_failed_and_sample_exports_do_not_displace_four_complete_sets
+FAILED tests/store/test_recovery.py::test_capacity_exhaustion_preserves_existing_packages
+FAILED tests/store/test_recovery.py::test_snapshot_refuses_symlink_root_before_writing
+19 failed in 0.23s
+
+--- snapshot-green.log ---
+command: .venv/bin/pytest -q tests/store/test_recovery.py
+exit_code: 0
+...................                                                      [100%]
+19 passed in 6.40s
+
+--- exact-restore-red.log ---
+command: .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest -q tests/store/test_recovery_receipts.py tests/store/test_recovery_postgres.py -k 'runtime_receipt or checkpoint_must'
+exit_code: 1
+F....FF                                                                  [100%]
+=================================== FAILURES ===================================
+______ test_exported_materializations_match_runtime_receipt_hashes[None] _______
+
+backend_tables = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x754581866e40>, 'recovery_bac...: 'lightrag_text_chunks', 'full_entities': 'lightrag_full_entities', 'full_relations': 'lightrag_full_relations', ...})
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-600/test_exported_materializations0')
+fault = None
+
+    @pytest.mark.parametrize("fault", [None, "empty_stores", "changed_row", "missing_graph", "ancestor"])
+    async def test_exported_materializations_match_runtime_receipt_hashes(backend_tables, tmp_path, fault):
+        from papervault.knowledge.store.catalog_adapter import _inventory, _graph_inventory
+        from papervault.store.recovery_backends import PostgresStore
+        from papervault.store.repository import payload_hash
+        connection, schema, roles = backend_tables
+        # Include the representations that differ between jsonb export and asyncpg:
+        # JSON null versus SQL NULL, JSON whitespace, vector float32, timestamp and
+        # exact numeric scale. Runtime's original encoder supplies the reference.
+        vector = sql.Identifier(schema, roles["chunks_vdb"])
+        connection.execute(sql.SQL("DROP TABLE {}").format(vector))
+        connection.execute(sql.SQL("CREATE TABLE {} (workspace text,id text,content_vector vector(3),"
+            "nullable jsonb,literal_null jsonb,original_json json,n numeric(20,5),r real,stamp timestamp(6),"
+            "zoned timestamptz,labels varchar[],PRIMARY KEY(workspace,id))").format(vector))
+        connection.execute(sql.SQL("INSERT INTO {} VALUES('retained','vector','[0.1,0.2,0.3]',NULL,'null',"
+            "'{{ \"spaced\": 1 }}',12.12000,0.1,'2026-01-01 01:00:00.120000',"
+            "'2026-01-01 01:00:00+08',ARRAY['first',NULL])").format(vector))
+        runtime = await asyncpg.connect(host=connection.info.host, port=connection.info.port,
+            database=connection.info.dbname, user=connection.info.user, password=connection.info.password)
+        try:
+            await register_vector(runtime)
+            outputs = []
+            for role, table in roles.items():
+                rows = [dict(row) for row in await runtime.fetch(f'SELECT * FROM "{schema}"."{table}" ORDER BY workspace,id')]
+                output = _inventory(role, "postgres", "retained", rows, [row["id"] for row in rows], "2026-10-21T00:00:00+00:00")
+                output["verification"]["evidence"]["backend_table"] = table
+                outputs.append(output)
+        finally:
+            await runtime.close()
+        node = {"id": "source-node", "labels": ["PaperVaultCatalogEntity"],
+                "properties": {"_pv_namespace": "retained", "entity_id": "Earth", "description": "retained graph"}}
+        outputs.append(_graph_inventory("retained", [{**node["properties"], "id": "Earth"}], [], "2026-10-21T00:00:00+00:00"))
+        receipt = {"receipt_id": "retained-receipt", "namespace": "retained", "sealed": True, "durable": True,
+                   "aggregate_layers": ["retained"], "output_inventory": outputs}
+        catalog = {"tables": {"knowledge_receipts": [{"receipt_id": receipt["receipt_id"], "receipt": receipt,
+            "digest": payload_hash(receipt)}], "input_manifests": [], "knowledge_output_tombstones": [],
+            "generation_manifests": [], "derivations": [], "selections": []}}
+        store = PostgresStore(connection, schema=schema, roles=roles)
+        with store.barrier():
+            exported = store.export()
+        graph = {"nodes": [node], "relationships": []}
+        if fault == "empty_stores":
+            for table in exported["tables"].values():
+                table.update(rows=[], rows_json=[], json_text_columns=[])
+        elif fault == "changed_row":
+            table = exported["tables"][roles["full_docs"]]
+            table["rows_json"][0] = table["rows_json"][0].replace("retained evidence", "changed evidence")
+            import json
+            table["rows"] = [json.loads(row) for row in table["rows_json"]]
+        elif fault == "missing_graph":
+            graph["nodes"] = []
+        elif fault == "ancestor":
+            receipt["aggregate_layers"].insert(0, "missing-ancestor")
+            catalog["tables"]["knowledge_receipts"][0]["digest"] = payload_hash(receipt)
+        assert importlib.util.find_spec("papervault.store.recovery_receipts") is not None
+        from papervault.store.recovery_receipts import verify_receipt_closure
+        if fault:
+            with pytest.raises(ValueError, match="receipt|material|ancestor"):
+                verify_receipt_closure(tmp_path, copy.deepcopy(catalog), exported, graph)
+        else:
+            verify_receipt_closure(tmp_path, catalog, exported, graph)
+            from papervault.store.recovery_backends import restore_postgres_store
+            target = "recovery_backend_target_" + uuid4().hex
+            runtime = await asyncpg.connect(host=connection.info.host, port=connection.info.port,
+                database=connection.info.dbname, user=connection.info.user, password=connection.info.password)
+            try:
+                await register_vector(runtime)
+                restore_postgres_store(connection, target, exported, operation_id="typed-restore")
+                for expected in outputs:
+                    if expected["store"] != "postgres":
+                        continue
+                    table = roles[expected["role"]]
+                    values = [dict(row) for row in await runtime.fetch(f'SELECT * FROM "{target}"."{table}" ORDER BY workspace,id')]
+                    actual = _inventory(expected["role"], "postgres", "retained", values, [row["id"] for row in values], "restored")
+>                   assert actual["sha256"] == expected["sha256"]
+E                   AssertionError: assert 'dc947ab2f61b...c23b4f6f1be7c' == '7a2e628bf44f...e89cb395cebd9'
+E
+E                     - 7a2e628bf44f457a85ce01159525e399b1db50a31a8493a9c7ce89cb395cebd9
+E                     + dc947ab2f61b65ea1d6bea53a49478d74f9d2e6a5162f460e44c23b4f6f1be7c
+
+tests/store/test_recovery_receipts.py:88: AssertionError
+____ test_checkpoint_must_match_the_captured_catalog_state[authority_epoch] ____
+
+repo = <papervault.store.repository.PostgresCatalogRepository object at 0x75454009e330>
+field = 'authority_epoch'
+
+    @pytest.mark.parametrize("field", ["authority_epoch", "audit_head"])
+    def test_checkpoint_must_match_the_captured_catalog_state(repo, field):
+        module = recovery_pg()
+        seed(repo)
+        with module.catalog_barrier(repo, "checkpoint-consistency") as checkpoint:
+            exported = module.export_catalog_state(repo, checkpoint)
+        exported["checkpoint"][field] += 1
+>       with pytest.raises(ValueError, match="checkpoint"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_postgres.py:123: Failed
+______ test_checkpoint_must_match_the_captured_catalog_state[audit_head] _______
+
+repo = <papervault.store.repository.PostgresCatalogRepository object at 0x75453ff585a0>
+field = 'audit_head'
+
+    @pytest.mark.parametrize("field", ["authority_epoch", "audit_head"])
+    def test_checkpoint_must_match_the_captured_catalog_state(repo, field):
+        module = recovery_pg()
+        seed(repo)
+        with module.catalog_barrier(repo, "checkpoint-consistency") as checkpoint:
+            exported = module.export_catalog_state(repo, checkpoint)
+        exported["checkpoint"][field] += 1
+>       with pytest.raises(ValueError, match="checkpoint"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_postgres.py:123: Failed
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery_receipts.py::test_exported_materializations_match_runtime_receipt_hashes[None]
+FAILED tests/store/test_recovery_postgres.py::test_checkpoint_must_match_the_captured_catalog_state[authority_epoch]
+FAILED tests/store/test_recovery_postgres.py::test_checkpoint_must_match_the_captured_catalog_state[audit_head]
+3 failed, 4 passed, 19 deselected in 1.47s
+
+--- timezone-restore-red.log ---
+command: .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest -q tests/store/test_recovery_receipts.py -k None
+exit_code: 1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+______ test_exported_materializations_match_runtime_receipt_hashes[None] _______
+
+backend_tables = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x71a422531fd0>, 'recovery_bac...: 'lightrag_text_chunks', 'full_entities': 'lightrag_full_entities', 'full_relations': 'lightrag_full_relations', ...})
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-602/test_exported_materializations0')
+fault = None
+
+    @pytest.mark.parametrize("fault", [None, "empty_stores", "changed_row", "missing_graph", "ancestor"])
+    async def test_exported_materializations_match_runtime_receipt_hashes(backend_tables, tmp_path, fault):
+        from papervault.knowledge.store.catalog_adapter import _inventory, _graph_inventory
+        from papervault.store.recovery_backends import PostgresStore
+        from papervault.store.repository import payload_hash
+        connection, schema, roles = backend_tables
+        # Include the representations that differ between jsonb export and asyncpg:
+        # JSON null versus SQL NULL, JSON whitespace, vector float32, timestamp and
+        # exact numeric scale. Runtime's original encoder supplies the reference.
+        vector = sql.Identifier(schema, roles["chunks_vdb"])
+        connection.execute(sql.SQL("DROP TABLE {}").format(vector))
+        connection.execute(sql.SQL("CREATE TABLE {} (workspace text,id text,content_vector vector(3),"
+            "nullable jsonb,literal_null jsonb,original_json json,n numeric(20,5),r real,stamp timestamp(6),"
+            "zoned timestamptz,labels varchar[],PRIMARY KEY(workspace,id))").format(vector))
+        connection.execute(sql.SQL("INSERT INTO {} VALUES('retained','vector','[0.1,0.2,0.3]',NULL,'null',"
+            "'{{ \"spaced\": 1 }}',12.12000,0.1,'2026-01-01 01:00:00.120000',"
+            "'2026-01-01 01:00:00+08',ARRAY['first',NULL])").format(vector))
+        runtime = await asyncpg.connect(host=connection.info.host, port=connection.info.port,
+            database=connection.info.dbname, user=connection.info.user, password=connection.info.password)
+        try:
+            await register_vector(runtime)
+            outputs = []
+            for role, table in roles.items():
+                rows = [dict(row) for row in await runtime.fetch(f'SELECT * FROM "{schema}"."{table}" ORDER BY workspace,id')]
+                output = _inventory(role, "postgres", "retained", rows, [row["id"] for row in rows], "2026-10-21T00:00:00+00:00")
+                output["verification"]["evidence"]["backend_table"] = table
+                outputs.append(output)
+        finally:
+            await runtime.close()
+        node = {"id": "source-node", "labels": ["PaperVaultCatalogEntity"],
+                "properties": {"_pv_namespace": "retained", "entity_id": "Earth", "description": "retained graph"}}
+        outputs.append(_graph_inventory("retained", [{**node["properties"], "id": "Earth"}], [], "2026-10-21T00:00:00+00:00"))
+        receipt = {"receipt_id": "retained-receipt", "namespace": "retained", "sealed": True, "durable": True,
+                   "aggregate_layers": ["retained"], "output_inventory": outputs}
+        catalog = {"tables": {"knowledge_receipts": [{"receipt_id": receipt["receipt_id"], "receipt": receipt,
+            "digest": payload_hash(receipt)}], "input_manifests": [], "knowledge_output_tombstones": [],
+            "generation_manifests": [], "derivations": [], "selections": []}}
+        store = PostgresStore(connection, schema=schema, roles=roles)
+        with store.barrier():
+            exported = store.export()
+        graph = {"nodes": [node], "relationships": []}
+        if fault == "empty_stores":
+            for table in exported["tables"].values():
+                table.update(rows=[], rows_json=[], json_text_columns=[])
+        elif fault == "changed_row":
+            table = exported["tables"][roles["full_docs"]]
+            table["rows_json"][0] = table["rows_json"][0].replace("retained evidence", "changed evidence")
+            import json
+            table["rows"] = [json.loads(row) for row in table["rows_json"]]
+        elif fault == "missing_graph":
+            graph["nodes"] = []
+        elif fault == "ancestor":
+            receipt["aggregate_layers"].insert(0, "missing-ancestor")
+            catalog["tables"]["knowledge_receipts"][0]["digest"] = payload_hash(receipt)
+        assert importlib.util.find_spec("papervault.store.recovery_receipts") is not None
+        from papervault.store.recovery_receipts import verify_receipt_closure
+        if fault:
+            with pytest.raises(ValueError, match="receipt|material|ancestor"):
+                verify_receipt_closure(tmp_path, copy.deepcopy(catalog), exported, graph)
+        else:
+            verify_receipt_closure(tmp_path, catalog, exported, graph)
+            from papervault.store.recovery_backends import restore_postgres_store
+            target = "recovery_backend_target_" + uuid4().hex
+            runtime = await asyncpg.connect(host=connection.info.host, port=connection.info.port,
+                database=connection.info.dbname, user=connection.info.user, password=connection.info.password)
+            try:
+                await register_vector(runtime)
+                restore_postgres_store(connection, target, exported, operation_id="typed-restore")
+                for expected in outputs:
+                    if expected["store"] != "postgres":
+                        continue
+                    table = roles[expected["role"]]
+                    values = [dict(row) for row in await runtime.fetch(f'SELECT * FROM "{target}"."{table}" ORDER BY workspace,id')]
+                    actual = _inventory(expected["role"], "postgres", "retained", values, [row["id"] for row in values], "restored")
+                    assert actual["sha256"] == expected["sha256"]
+                connection.execute("SET TIME ZONE 'Asia/Shanghai'")
+>               restore_postgres_store(connection, target, exported, operation_id="typed-restore")
+
+tests/store/test_recovery_receipts.py:90:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src/papervault/store/recovery_backends.py:185: in restore_postgres_store
+    _verify_postgres_rows(connection, schema, exported)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+connection = <psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x71a422531fd0>
+schema = 'recovery_backend_target_23712c408ca34784b3f6eb311ad23f01'
+exported = {'schema_version': 1, 'source_schema': 'recovery_backend_source_60577b9ad7f143a3ab0635a2e4f0dc38', 'roles': {'full_doc...s': [], 'rows': [{'id': 'doc', 'content': {'content': 'retained evidence'}, 'workspace': 'retained'}], ...}, ...}, ...}
+
+    def _verify_postgres_rows(connection, schema, exported):
+        names = {row["tablename"] for row in connection.execute(
+            "SELECT tablename FROM pg_tables WHERE schemaname=%s", (schema,))}
+        if names - {"_papervault_recovery"} != set(exported["tables"]):
+            raise ValueError("restored backend table inventory changed")
+        for name, table in exported["tables"].items():
+            rows = list(connection.execute(sql.SQL("SELECT to_jsonb(t)::text AS value,{} AS json_text FROM {} t").format(
+                _json_projection(table["columns"]), sql.Identifier(schema, name))))
+            expected_rows = [{"value": value, "json_text": raw} for value, raw in
+                             zip(table["rows_json"], table["json_text_columns"], strict=True)]
+            if sorted(map(canonical_json, rows)) != sorted(map(canonical_json, expected_rows)):
+>               raise ValueError("restored backend rows changed or checksum differs: " + name)
+E               ValueError: restored backend rows changed or checksum differs: lightrag_chunks_vdb
+
+src/papervault/store/recovery_backends.py:148: ValueError
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery_receipts.py::test_exported_materializations_match_runtime_receipt_hashes[None]
+1 failed, 4 deselected in 0.79s
+
+--- recovery-final-focus.log ---
+command: .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest -q tests/store/test_recovery_receipts.py tests/store/test_recovery_postgres.py tests/store/test_recovery_backends.py tests/store/test_recovery_replay.py tests/store/test_recovery_restore.py
+exit_code: 0
+....................................................................     [100%]
+68 passed in 44.49s

@@ -350,14 +350,18 @@ async def test_catalog_factory_initializes_its_own_pipeline_status(monkeypatch, 
         async def initialize_storages(self):
             pass
 
+        async def finalize_storages(self):
+            pass
+
     class Repository(Gate):
         def list_tombstones(self, namespaces):
             return []
 
     monkeypatch.setattr(graph, "LightRAG", Rag)
     monkeypatch.setattr(shared_storage, "initialize_pipeline_status", status)
-    await graph.build_catalog_graph(Repository(), {"namespace": "private_attempt",
-                                    "base_aggregate_layers": []}, working_dir=tmp_path)
+    rag = await graph.build_catalog_graph(Repository(), {"namespace": "private_attempt",
+                                          "base_aggregate_layers": []}, working_dir=tmp_path)
+    await rag.finalize_storages()
     assert initialized == ["private_attempt"]
 
 

@@ -1,0 +1,543 @@
+Test-first evidence. Dedicated test DSN passwords in pytest fixture headers are redacted; trailing horizontal whitespace is normalized.
+
+Deadline mutation probe source:
+"""Evidence probe: a post-export timeout cannot satisfy interruption coverage."""
+from contextlib import nullcontext
+import pytest
+from papervault.store import recovery
+
+recovery.maintenance_deadline = lambda seconds: nullcontext()
+raise SystemExit(pytest.main(['--tb=short', '-q',
+    'tests/store/test_recovery.py::test_snapshot_stops_at_maintenance_deadline_and_cannot_rotate_retention']))
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest -q tests/store/test_recovery_postgres.py tests/store/test_recovery_restore.py -k 'imported_identity_indexes or catalog_index_inventory or installed_catalog_indexes'
+exit_code=1
+FFFFFFF                                                                  [100%]
+=================================== FAILURES ===================================
+__________ test_imported_identity_indexes_survive_coordinated_restore __________
+
+repo = <papervault.store.repository.PostgresCatalogRepository object at 0x7e302f9b34d0>
+catalog_test_dsn = 'host=127.0.0.1 port=5432 dbname=p5b_catalog_test user=p5b_test password=[REDACTED]'
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-612/test_imported_identity_indexes0')
+
+    def test_imported_identity_indexes_survive_coordinated_restore(repo, catalog_test_dsn, tmp_path):
+        from papervault.store.adapter import LibraryAdapter
+        from papervault.store.importer import import_catalog
+        from papervault.store.recovery import snapshot, verify_recovery_set
+        from papervault.store.recovery_restore import restore_recovery_set
+        from papervault.store.recovery_source import CoordinatedSource
+
+        vault, knowledge = tmp_path / "vault", tmp_path / "knowledge"
+        vault.mkdir()
+        knowledge.mkdir()
+        source = vault / "index.json"
+        source.write_text(json.dumps({"papers": {"A": {"key": "A", "title": "Imported identity",
+            "doi": "10.1234/recovery", "arxiv_id": "2501.12345"}}}))
+        report = import_catalog(LibraryAdapter.from_snapshot(source), repo)
+        assert report["target_identity_indexes"]["doi"]["state"] == "created"
+        assert report["target_identity_indexes"]["arxiv_id"]["state"] == "created"
+        repo.ensure_knowledge_schema(audit=AuditEvent("test", "recovery_schema"))
+        # A non-bundled expression/partial index, including a schema-looking literal,
+        # catches index allowlists and unsafe global schema-name replacements.
+        literal = " ON " + sql.Identifier(repo.schema, "records").as_string() + " "
+        repo.connection.execute(sql.SQL("CREATE INDEX {} ON {} (lower(title)) WHERE source <> {}").format(
+            sql.Identifier('extra "title" index'), repo._table("records"), sql.Literal(literal)))
+        manifest = snapshot(CoordinatedSource(repo, vault=vault, knowledge_root=knowledge, metadata_sample=True),
+                            tmp_path / "sets", sample=True, apply=True)
+        package = tmp_path / "sets" / manifest["snapshot_id"]
+        assert verify_recovery_set(package) == manifest
+        target = "catalog_recovery_" + uuid4().hex
+        with psycopg.connect(catalog_test_dsn, autocommit=True) as connection:
+            try:
+                restore_recovery_set(package, tmp_path / "restored", target_generation="restored",
+                    catalog_connection=connection, catalog_schema=target, apply=True)
+                indexes = {row["indexname"] for row in connection.execute(
+                    "SELECT indexname FROM pg_indexes WHERE schemaname=%s", (target,))}
+>               assert {"records_doi_unique", "records_arxiv_id_unique", 'extra "title" index'} <= indexes
+E               assert {'extra "titl...s_doi_unique'} <= {'aliases_pke...ns_pkey', ...}
+E
+E                 Extra items in the left set:
+E                 'extra "title" index'
+E                 'records_arxiv_id_unique'
+E                 'records_doi_unique'
+
+tests/store/test_recovery_postgres.py:339: AssertionError
+_________ test_catalog_index_inventory_is_bound_to_checkpoint[missing] _________
+
+repo = <papervault.store.repository.PostgresCatalogRepository object at 0x7e302f9c6fd0>
+damage = 'missing'
+
+    @pytest.mark.parametrize("damage", ["missing", "omitted", "changed"])
+    def test_catalog_index_inventory_is_bound_to_checkpoint(repo, damage):
+        module = recovery_pg()
+        seed(repo)
+        with module.catalog_barrier(repo, "indexes") as checkpoint:
+            exported = module.export_catalog_state(repo, checkpoint)
+        # Default {} lets the old exporter reach the fail-closed assertion too.
+        indexes = exported.setdefault("indexes", {})
+        if damage == "missing":
+            exported.pop("indexes")
+        elif damage == "omitted":
+            indexes.pop("records_status_idx", None)
+        else:
+            indexes["records_status_idx"] = {"table": "records", "definition": "corrupt"}
+>       with pytest.raises(ValueError, match="index"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_postgres.py:368: Failed
+_________ test_catalog_index_inventory_is_bound_to_checkpoint[omitted] _________
+
+repo = <papervault.store.repository.PostgresCatalogRepository object at 0x7e2fed56bd10>
+damage = 'omitted'
+
+    @pytest.mark.parametrize("damage", ["missing", "omitted", "changed"])
+    def test_catalog_index_inventory_is_bound_to_checkpoint(repo, damage):
+        module = recovery_pg()
+        seed(repo)
+        with module.catalog_barrier(repo, "indexes") as checkpoint:
+            exported = module.export_catalog_state(repo, checkpoint)
+        # Default {} lets the old exporter reach the fail-closed assertion too.
+        indexes = exported.setdefault("indexes", {})
+        if damage == "missing":
+            exported.pop("indexes")
+        elif damage == "omitted":
+            indexes.pop("records_status_idx", None)
+        else:
+            indexes["records_status_idx"] = {"table": "records", "definition": "corrupt"}
+>       with pytest.raises(ValueError, match="index"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_postgres.py:368: Failed
+_________ test_catalog_index_inventory_is_bound_to_checkpoint[changed] _________
+
+repo = <papervault.store.repository.PostgresCatalogRepository object at 0x7e2fed55f790>
+damage = 'changed'
+
+    @pytest.mark.parametrize("damage", ["missing", "omitted", "changed"])
+    def test_catalog_index_inventory_is_bound_to_checkpoint(repo, damage):
+        module = recovery_pg()
+        seed(repo)
+        with module.catalog_barrier(repo, "indexes") as checkpoint:
+            exported = module.export_catalog_state(repo, checkpoint)
+        # Default {} lets the old exporter reach the fail-closed assertion too.
+        indexes = exported.setdefault("indexes", {})
+        if damage == "missing":
+            exported.pop("indexes")
+        elif damage == "omitted":
+            indexes.pop("records_status_idx", None)
+        else:
+            indexes["records_status_idx"] = {"table": "records", "definition": "corrupt"}
+>       with pytest.raises(ValueError, match="index"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_postgres.py:368: Failed
+____ test_completed_restore_revalidates_installed_catalog_indexes[missing] _____
+
+package = (PosixPath('/tmp/pytest-of-leon/pytest-612/test_completed_restore_revalid0/packages/recovery-20261021T112515299554Z-d8fec38be6df421889ddcde4e23c1de2'), <papervault.store.knowledge.KnowledgeRepository object at 0x7e2fed5ab6f0>)
+target_catalog = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x7e2fec5639b0>, 'catalog_recovery_3174b78f699c4335b468bb2fdf7bed1c')
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-612/test_completed_restore_revalid0')
+damage = 'missing'
+
+    @pytest.mark.parametrize("damage", ["missing", "added", "definition"])
+    def test_completed_restore_revalidates_installed_catalog_indexes(package, target_catalog, tmp_path, damage):
+        module = restore_module()
+        path, _ = package
+        connection, schema = target_catalog
+        options = {"target_generation": "restored", "catalog_connection": connection,
+                   "catalog_schema": schema, "apply": True}
+        target = tmp_path / "target"
+        receipt = module.restore_recovery_set(path, target, **options)
+        assert module.restore_recovery_set(path, target, **options) == receipt
+        if damage in {"missing", "definition"}:
+            connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(schema, "records_status_idx")))
+        if damage in {"added", "definition"}:
+            name = "extra_index" if damage == "added" else "records_status_idx"
+            connection.execute(sql.SQL("CREATE INDEX {} ON {} (title)").format(
+                sql.Identifier(name), sql.Identifier(schema, "records")))
+>       with pytest.raises(ValueError, match="catalog index"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_restore.py:239: Failed
+_____ test_completed_restore_revalidates_installed_catalog_indexes[added] ______
+
+package = (PosixPath('/tmp/pytest-of-leon/pytest-612/test_completed_restore_revalid1/packages/recovery-20261021T112516352568Z-384ff850b3034aa98e8977eb5258cf63'), <papervault.store.knowledge.KnowledgeRepository object at 0x7e2fec533050>)
+target_catalog = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x7e2fec60cd50>, 'catalog_recovery_76bc18b7c23d411daffac6541928f909')
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-612/test_completed_restore_revalid1')
+damage = 'added'
+
+    @pytest.mark.parametrize("damage", ["missing", "added", "definition"])
+    def test_completed_restore_revalidates_installed_catalog_indexes(package, target_catalog, tmp_path, damage):
+        module = restore_module()
+        path, _ = package
+        connection, schema = target_catalog
+        options = {"target_generation": "restored", "catalog_connection": connection,
+                   "catalog_schema": schema, "apply": True}
+        target = tmp_path / "target"
+        receipt = module.restore_recovery_set(path, target, **options)
+        assert module.restore_recovery_set(path, target, **options) == receipt
+        if damage in {"missing", "definition"}:
+            connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(schema, "records_status_idx")))
+        if damage in {"added", "definition"}:
+            name = "extra_index" if damage == "added" else "records_status_idx"
+            connection.execute(sql.SQL("CREATE INDEX {} ON {} (title)").format(
+                sql.Identifier(name), sql.Identifier(schema, "records")))
+>       with pytest.raises(ValueError, match="catalog index"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_restore.py:239: Failed
+___ test_completed_restore_revalidates_installed_catalog_indexes[definition] ___
+
+package = (PosixPath('/tmp/pytest-of-leon/pytest-612/test_completed_restore_revalid2/packages/recovery-20261021T112517707840Z-6e8c7ca904aa4586a8eaee7e478b8fad'), <papervault.store.knowledge.KnowledgeRepository object at 0x7e2fec5cb850>)
+target_catalog = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x7e2fec5525d0>, 'catalog_recovery_6359f5c3b9a04a1186bf40f13419b286')
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-612/test_completed_restore_revalid2')
+damage = 'definition'
+
+    @pytest.mark.parametrize("damage", ["missing", "added", "definition"])
+    def test_completed_restore_revalidates_installed_catalog_indexes(package, target_catalog, tmp_path, damage):
+        module = restore_module()
+        path, _ = package
+        connection, schema = target_catalog
+        options = {"target_generation": "restored", "catalog_connection": connection,
+                   "catalog_schema": schema, "apply": True}
+        target = tmp_path / "target"
+        receipt = module.restore_recovery_set(path, target, **options)
+        assert module.restore_recovery_set(path, target, **options) == receipt
+        if damage in {"missing", "definition"}:
+            connection.execute(sql.SQL("DROP INDEX {}").format(sql.Identifier(schema, "records_status_idx")))
+        if damage in {"added", "definition"}:
+            name = "extra_index" if damage == "added" else "records_status_idx"
+            connection.execute(sql.SQL("CREATE INDEX {} ON {} (title)").format(
+                sql.Identifier(name), sql.Identifier(schema, "records")))
+>       with pytest.raises(ValueError, match="catalog index"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_restore.py:239: Failed
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery_postgres.py::test_imported_identity_indexes_survive_coordinated_restore
+FAILED tests/store/test_recovery_postgres.py::test_catalog_index_inventory_is_bound_to_checkpoint[missing]
+FAILED tests/store/test_recovery_postgres.py::test_catalog_index_inventory_is_bound_to_checkpoint[omitted]
+FAILED tests/store/test_recovery_postgres.py::test_catalog_index_inventory_is_bound_to_checkpoint[changed]
+FAILED tests/store/test_recovery_restore.py::test_completed_restore_revalidates_installed_catalog_indexes[missing]
+FAILED tests/store/test_recovery_restore.py::test_completed_restore_revalidates_installed_catalog_indexes[added]
+FAILED tests/store/test_recovery_restore.py::test_completed_restore_revalidates_installed_catalog_indexes[definition]
+7 failed, 32 deselected in 6.94s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest -q tests/store/test_recovery_postgres.py tests/store/test_recovery_restore.py
+exit_code=0
+.......................................                                  [100%]
+39 passed in 19.86s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest -q tests/store/test_recovery_restore.py tests/store/test_recovery_replay.py -k 'new_catalog_rows or quarantine_reset'
+exit_code=1
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+________ test_completed_restore_revalidates_new_catalog_rows[candidate] ________
+
+package = (PosixPath('/tmp/pytest-of-leon/pytest-614/test_completed_restore_revalid0/packages/recovery-20261021T112752102603Z-63f8cc3369ce43e7a26af627b8cdc419'), <papervault.store.knowledge.KnowledgeRepository object at 0x7c6cec7cb8c0>)
+target_catalog = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x7c6ca96c4cd0>, 'catalog_recovery_8fbe55892a744167b4a275dfdaa6911e')
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-614/test_completed_restore_revalid0')
+damage = 'candidate'
+
+    @pytest.mark.parametrize("damage", ["candidate", "new_manifest", "new_record"])
+    def test_completed_restore_revalidates_new_catalog_rows(package, target_catalog, tmp_path, damage):
+        module = restore_module()
+        path, _ = package
+        connection, schema = target_catalog
+        options = {"target_generation": "restored", "catalog_connection": connection,
+                   "catalog_schema": schema, "apply": True}
+        target = tmp_path / "target"
+        module.restore_recovery_set(path, target, **options)
+        if damage == "candidate":
+            connection.execute(sql.SQL("UPDATE {} SET state='retired' WHERE generation_id='restored'").format(
+                sql.Identifier(schema, "generations")))
+        elif damage == "new_manifest":
+            table = sql.Identifier(schema, "generation_manifests")
+            connection.execute(sql.SQL("INSERT INTO {} SELECT generation_id,manifest_revision+1,"
+                "requirements_revision,manifest,created_at FROM {} WHERE generation_id='restored'").format(table, table))
+        else:
+            connection.execute(sql.SQL("INSERT INTO {} (key,download_status,payload_version,payload) "
+                "VALUES ('unaccounted','pending',1,'{{\"key\":\"unaccounted\"}}')").format(sql.Identifier(schema, "records")))
+>       with pytest.raises(ValueError, match="catalog"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_restore.py:262: Failed
+______ test_completed_restore_revalidates_new_catalog_rows[new_manifest] _______
+
+package = (PosixPath('/tmp/pytest-of-leon/pytest-614/test_completed_restore_revalid1/packages/recovery-20261021T112754252208Z-909c566f6b7a46708d15a801ef95ce0f'), <papervault.store.knowledge.KnowledgeRepository object at 0x7c6cec7b23f0>)
+target_catalog = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x7c6cec35eb10>, 'catalog_recovery_ea4cc9f4da7744fcaed17842db2974a6')
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-614/test_completed_restore_revalid1')
+damage = 'new_manifest'
+
+    @pytest.mark.parametrize("damage", ["candidate", "new_manifest", "new_record"])
+    def test_completed_restore_revalidates_new_catalog_rows(package, target_catalog, tmp_path, damage):
+        module = restore_module()
+        path, _ = package
+        connection, schema = target_catalog
+        options = {"target_generation": "restored", "catalog_connection": connection,
+                   "catalog_schema": schema, "apply": True}
+        target = tmp_path / "target"
+        module.restore_recovery_set(path, target, **options)
+        if damage == "candidate":
+            connection.execute(sql.SQL("UPDATE {} SET state='retired' WHERE generation_id='restored'").format(
+                sql.Identifier(schema, "generations")))
+        elif damage == "new_manifest":
+            table = sql.Identifier(schema, "generation_manifests")
+            connection.execute(sql.SQL("INSERT INTO {} SELECT generation_id,manifest_revision+1,"
+                "requirements_revision,manifest,created_at FROM {} WHERE generation_id='restored'").format(table, table))
+        else:
+            connection.execute(sql.SQL("INSERT INTO {} (key,download_status,payload_version,payload) "
+                "VALUES ('unaccounted','pending',1,'{{\"key\":\"unaccounted\"}}')").format(sql.Identifier(schema, "records")))
+>       with pytest.raises(ValueError, match="catalog"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_restore.py:262: Failed
+_______ test_completed_restore_revalidates_new_catalog_rows[new_record] ________
+
+package = (PosixPath('/tmp/pytest-of-leon/pytest-614/test_completed_restore_revalid2/packages/recovery-20261021T112757657446Z-a66780513b1945869f181e41019f5cc9'), <papervault.store.knowledge.KnowledgeRepository object at 0x7c6ca9397b50>)
+target_catalog = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x7c6ca9345490>, 'catalog_recovery_e3e2c07240b6481aae0aba9fea15d855')
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-614/test_completed_restore_revalid2')
+damage = 'new_record'
+
+    @pytest.mark.parametrize("damage", ["candidate", "new_manifest", "new_record"])
+    def test_completed_restore_revalidates_new_catalog_rows(package, target_catalog, tmp_path, damage):
+        module = restore_module()
+        path, _ = package
+        connection, schema = target_catalog
+        options = {"target_generation": "restored", "catalog_connection": connection,
+                   "catalog_schema": schema, "apply": True}
+        target = tmp_path / "target"
+        module.restore_recovery_set(path, target, **options)
+        if damage == "candidate":
+            connection.execute(sql.SQL("UPDATE {} SET state='retired' WHERE generation_id='restored'").format(
+                sql.Identifier(schema, "generations")))
+        elif damage == "new_manifest":
+            table = sql.Identifier(schema, "generation_manifests")
+            connection.execute(sql.SQL("INSERT INTO {} SELECT generation_id,manifest_revision+1,"
+                "requirements_revision,manifest,created_at FROM {} WHERE generation_id='restored'").format(table, table))
+        else:
+            connection.execute(sql.SQL("INSERT INTO {} (key,download_status,payload_version,payload) "
+                "VALUES ('unaccounted','pending',1,'{{\"key\":\"unaccounted\"}}')").format(sql.Identifier(schema, "records")))
+>       with pytest.raises(ValueError, match="catalog"):
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_restore.py:262: Failed
+______________ test_isolated_replay_records_unit_quarantine_reset ______________
+
+package = (PosixPath('/tmp/pytest-of-leon/pytest-614/test_isolated_replay_records_u0/packages/recovery-20261021T112801064608Z-925834d959684f079ee46dcc6989d3a8'), <papervault.store.knowledge.KnowledgeRepository object at 0x7c6ca937e350>)
+target_catalog = (<psycopg.Connection [IDLE] (host=127.0.0.1 user=p5b_test database=p5b_catalog_test) at 0x7c6ca9248050>, 'catalog_recovery_53ebbdcee02a4da18b0f14d32d3f02bd')
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-614/test_isolated_replay_records_u0')
+
+    async def test_isolated_replay_records_unit_quarantine_reset(package, target_catalog, tmp_path):
+        from papervault.store.recovery import snapshot
+        from papervault.store.recovery_source import CoordinatedSource
+        from papervault.store.knowledge import KnowledgeRepository
+        from papervault.store.repository import PostgresCatalogRepository
+
+        _, source = package
+        unit = source._rows("units")[0]
+        reason = {"reason": "source execution uncertain", "scope": "unit", "origin": "test"}
+        source.command("set_quarantine", "quarantine-before-snapshot", {"unit_id": unit["unit_id"],
+            "expected_revision": unit["revision"], "quarantine": True, "reason": reason})
+        captured = snapshot(CoordinatedSource(source.repository, vault=tmp_path / "vault",
+            knowledge_root=tmp_path / "knowledge", metadata_sample=True), tmp_path / "quarantined-sets",
+            apply=True, sample=True)
+        path = tmp_path / "quarantined-sets" / captured["snapshot_id"]
+        connection, schema = target_catalog
+        result = await replay_module().replay_recovery_set(path, tmp_path / "replay", source_generation="source",
+            target_generation="replayed", catalog_connection=connection, catalog_schema=schema, apply=True)
+        assert len(result["receipts"]) == 2
+        disposition = result.get("unit_quarantine_disposition")
+>       assert disposition == {"policy": "reset_in_isolated_replay", "reset_units": [
+            {"unit_id": unit["unit_id"], "source_revision": unit["revision"] + 1, "source_reason": reason}]}
+E       AssertionError: assert None == {'policy': 'reset_in_isolated_replay', 'reset_units': [{'unit_id': 'paper:9f1341c8-83e2-5857-9745-7c9a022a2a51', 'source_revision': 2, 'source_reason': {'reason': 'source execution uncertain', 'scope': 'unit', 'origin': 'test'}}]}
+
+tests/store/test_recovery_replay.py:214: AssertionError
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery_restore.py::test_completed_restore_revalidates_new_catalog_rows[candidate]
+FAILED tests/store/test_recovery_restore.py::test_completed_restore_revalidates_new_catalog_rows[new_manifest]
+FAILED tests/store/test_recovery_restore.py::test_completed_restore_revalidates_new_catalog_rows[new_record]
+FAILED tests/store/test_recovery_replay.py::test_isolated_replay_records_unit_quarantine_reset
+4 failed, 24 deselected in 12.20s
+
+$ RECOVERY_TEST_NEO4J_SOURCE=bolt://127.0.0.1:32782 RECOVERY_TEST_NEO4J_TARGET=bolt://127.0.0.1:32783 .venv/bin/pytest -q tests/store/test_recovery_neo4j.py -k added_schema_objects
+exit_code=1
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+____________ test_graph_resume_refuses_added_schema_objects[INDEX] _____________
+
+isolated_graphs = ((<neo4j._sync.driver.BoltDriver object at 0x7e9915e4d400>, 'bolt://127.0.0.1:32782'), (<neo4j._sync.driver.BoltDriver object at 0x7e9915e64050>, 'bolt://127.0.0.1:32783'))
+kind = 'INDEX'
+
+    @pytest.mark.parametrize("kind", ["INDEX", "CONSTRAINT"])
+    def test_graph_resume_refuses_added_schema_objects(isolated_graphs, kind):
+        from papervault.store.recovery_backends import Neo4jStore, restore_neo4j_store
+        (source, source_uri), (target, target_uri) = isolated_graphs
+        token = uuid4().hex
+        name = "extra_" + token
+        with source.session() as session:
+            session.run("CREATE (:PaperVaultCatalogEntity {_pv_namespace:$ns,entity_id:'Earth'})", ns=token).consume()
+        try:
+            store = Neo4jStore(source, database="neo4j", uri=source_uri)
+            with store.barrier():
+                exported = store.export()
+            options = {"database": "neo4j", "uri": target_uri, "disposable": True, "operation_id": token}
+            restore_neo4j_store(target, exported, **options)
+            with target.session() as session:
+                statement = (f"CREATE INDEX {name} FOR (n:PaperVaultCatalogEntity) ON (n.entity_id)" if kind == "INDEX"
+                             else f"CREATE CONSTRAINT {name} FOR (n:PaperVaultCatalogEntity) REQUIRE n.entity_id IS UNIQUE")
+                session.run(statement).consume()
+>           with pytest.raises(ValueError, match="schema"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_neo4j.py:103: Failed
+------------------------------ Captured log call -------------------------------
+WARNING  neo4j.notifications:result.py:345 Received notification from DBMS server: <GqlStatusObject gql_status='01N50', status_description='warn: label does not exist. The label `_PapervaultRecovery` does not exist. Verify that the spelling is correct.', position=<SummaryInputPosition line=1, column=10, offset=9>, raw_classification='UNRECOGNIZED', classification=<NotificationClassification.UNRECOGNIZED: 'UNRECOGNIZED'>, raw_severity='WARNING', severity=<NotificationSeverity.WARNING: 'WARNING'>, diagnostic_record={'_classification': 'UNRECOGNIZED', '_severity': 'WARNING', '_position': {'offset': 9, 'line': 1, 'column': 10}, 'OPERATION': '', 'OPERATION_CODE': '0', 'CURRENT_SCHEMA': '/'}> for query: 'MATCH (n:_PapervaultRecovery) RETURN properties(n) AS marker'
+__________ test_graph_resume_refuses_added_schema_objects[CONSTRAINT] __________
+
+isolated_graphs = ((<neo4j._sync.driver.BoltDriver object at 0x7e9915e66850>, 'bolt://127.0.0.1:32782'), (<neo4j._sync.driver.BoltDriver object at 0x7e9915ec0510>, 'bolt://127.0.0.1:32783'))
+kind = 'CONSTRAINT'
+
+    @pytest.mark.parametrize("kind", ["INDEX", "CONSTRAINT"])
+    def test_graph_resume_refuses_added_schema_objects(isolated_graphs, kind):
+        from papervault.store.recovery_backends import Neo4jStore, restore_neo4j_store
+        (source, source_uri), (target, target_uri) = isolated_graphs
+        token = uuid4().hex
+        name = "extra_" + token
+        with source.session() as session:
+            session.run("CREATE (:PaperVaultCatalogEntity {_pv_namespace:$ns,entity_id:'Earth'})", ns=token).consume()
+        try:
+            store = Neo4jStore(source, database="neo4j", uri=source_uri)
+            with store.barrier():
+                exported = store.export()
+            options = {"database": "neo4j", "uri": target_uri, "disposable": True, "operation_id": token}
+            restore_neo4j_store(target, exported, **options)
+            with target.session() as session:
+                statement = (f"CREATE INDEX {name} FOR (n:PaperVaultCatalogEntity) ON (n.entity_id)" if kind == "INDEX"
+                             else f"CREATE CONSTRAINT {name} FOR (n:PaperVaultCatalogEntity) REQUIRE n.entity_id IS UNIQUE")
+                session.run(statement).consume()
+>           with pytest.raises(ValueError, match="schema"):
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E           Failed: DID NOT RAISE ValueError
+
+tests/store/test_recovery_neo4j.py:103: Failed
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery_neo4j.py::test_graph_resume_refuses_added_schema_objects[INDEX]
+FAILED tests/store/test_recovery_neo4j.py::test_graph_resume_refuses_added_schema_objects[CONSTRAINT]
+2 failed, 2 deselected in 2.49s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest --tb=short -q tests/store/test_recovery_postgres.py tests/store/test_recovery_restore.py tests/store/test_recovery_replay.py
+exit_code=0
+.....................................................                    [100%]
+53 passed in 84.64s (0:01:24)
+
+$ RECOVERY_TEST_NEO4J_SOURCE=bolt://127.0.0.1:32782 RECOVERY_TEST_NEO4J_TARGET=bolt://127.0.0.1:32783 .venv/bin/pytest --tb=short -q tests/store/test_recovery_neo4j.py
+exit_code=0
+....                                                                     [100%]
+4 passed in 0.93s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest --tb=short -q tests/store/test_recovery_postgres.py -k nonconstraint_index_changes
+exit_code=1
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+______ test_restore_matches_installed_nonconstraint_index_changes[False] _______
+tests/store/test_recovery_postgres.py:384: in test_restore_matches_installed_nonconstraint_index_changes
+    module.restore_catalog_state(connection, target, exported, recovery_id="changed-index")
+src/papervault/store/recovery_postgres.py:253: in restore_catalog_state
+    verify_catalog_indexes(repository, state)
+src/papervault/store/recovery_postgres.py:59: in verify_catalog_indexes
+    raise ValueError("restored catalog index inventory/definitions differ")
+E   ValueError: restored catalog index inventory/definitions differ
+_______ test_restore_matches_installed_nonconstraint_index_changes[True] _______
+tests/store/test_recovery_postgres.py:384: in test_restore_matches_installed_nonconstraint_index_changes
+    module.restore_catalog_state(connection, target, exported, recovery_id="changed-index")
+src/papervault/store/recovery_postgres.py:253: in restore_catalog_state
+    verify_catalog_indexes(repository, state)
+src/papervault/store/recovery_postgres.py:59: in verify_catalog_indexes
+    raise ValueError("restored catalog index inventory/definitions differ")
+E   ValueError: restored catalog index inventory/definitions differ
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery_postgres.py::test_restore_matches_installed_nonconstraint_index_changes[False]
+FAILED tests/store/test_recovery_postgres.py::test_restore_matches_installed_nonconstraint_index_changes[True]
+2 failed, 25 deselected in 1.62s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest --tb=short -q tests/store/test_recovery_postgres.py -k index
+exit_code=0
+......                                                                   [100%]
+6 passed, 21 deselected in 1.52s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest --tb=short -q tests/store/test_recovery_restore.py -k before_candidate
+exit_code=1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+_________ test_interrupted_restore_rejects_rows_added_before_candidate _________
+tests/store/test_recovery_restore.py:283: in test_interrupted_restore_rejects_rows_added_before_candidate
+    with pytest.raises(ValueError, match="catalog"):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ValueError
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery_restore.py::test_interrupted_restore_rejects_rows_added_before_candidate
+1 failed, 17 deselected in 4.49s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest --tb=short -q tests/store/test_recovery_restore.py
+exit_code=0
+..................                                                       [100%]
+18 passed in 29.09s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest --tb=short -q tests/store/test_recovery_postgres.py -k stronger_default
+exit_code=1
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+_____ test_restore_reconciles_stronger_default_index_before_loading[False] _____
+tests/store/test_recovery_postgres.py:412: in test_restore_reconciles_stronger_default_index_before_loading
+    module.restore_catalog_state(connection, target, exported, recovery_id="changed-unique-index")
+src/papervault/store/recovery_postgres.py:233: in restore_catalog_state
+    connection.execute(sql.SQL("INSERT INTO {} SELECT * FROM json_populate_recordset(NULL::{}, %s::json)").format(
+.venv/lib/python3.13/site-packages/psycopg/connection.py:300: in execute
+    raise ex.with_traceback(None)
+E   psycopg.errors.UniqueViolation: duplicate key value violates unique constraint "generations_one_active"
+E   DETAIL:  Key (state)=(active) already exists.
+_____ test_restore_reconciles_stronger_default_index_before_loading[True] ______
+tests/store/test_recovery_postgres.py:412: in test_restore_reconciles_stronger_default_index_before_loading
+    module.restore_catalog_state(connection, target, exported, recovery_id="changed-unique-index")
+src/papervault/store/recovery_postgres.py:233: in restore_catalog_state
+    connection.execute(sql.SQL("INSERT INTO {} SELECT * FROM json_populate_recordset(NULL::{}, %s::json)").format(
+.venv/lib/python3.13/site-packages/psycopg/connection.py:300: in execute
+    raise ex.with_traceback(None)
+E   psycopg.errors.UniqueViolation: duplicate key value violates unique constraint "generations_one_active"
+E   DETAIL:  Key (state)=(active) already exists.
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery_postgres.py::test_restore_reconciles_stronger_default_index_before_loading[False]
+FAILED tests/store/test_recovery_postgres.py::test_restore_reconciles_stronger_default_index_before_loading[True]
+2 failed, 27 deselected in 1.77s
+
+$ .venv/bin/python /tmp/p5b-test-env.py .venv/bin/pytest --tb=short -q tests/store/test_recovery_postgres.py -k index
+exit_code=0
+........                                                                 [100%]
+8 passed, 21 deselected in 4.17s
+
+$ .venv/bin/python /tmp/papervault-p5b-cont.arVV5T/deadline-mutation.py
+exit_code=1
+F                                                                        [100%]
+=================================== FAILURES ===================================
+___ test_snapshot_stops_at_maintenance_deadline_and_cannot_rotate_retention ____
+tests/store/test_recovery.py:121: in test_snapshot_stops_at_maintenance_deadline_and_cannot_rotate_retention
+    assert not export_finished
+E   assert not True
+=========================== short test summary info ============================
+FAILED tests/store/test_recovery.py::test_snapshot_stops_at_maintenance_deadline_and_cannot_rotate_retention
+1 failed in 0.14s
+
+$ .venv/bin/pytest --tb=short -q tests/store/test_recovery.py::test_snapshot_stops_at_maintenance_deadline_and_cannot_rotate_retention
+exit_code=0
+.                                                                        [100%]
+1 passed in 0.15s

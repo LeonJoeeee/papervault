@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS catalog.generations (
  created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
 );
 ALTER TABLE catalog.generations ADD COLUMN IF NOT EXISTS retrieval_contract JSONB;
+ALTER TABLE catalog.generations ADD COLUMN IF NOT EXISTS sample BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE UNIQUE INDEX IF NOT EXISTS generations_one_active ON catalog.generations(state) WHERE state='active';
 CREATE TABLE IF NOT EXISTS catalog.current_inventories (
  parent_unit_id TEXT NOT NULL REFERENCES catalog.units,
@@ -379,6 +380,9 @@ END $$;
 
 CREATE OR REPLACE FUNCTION catalog.guard_generation_retrieval_contract() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
+ IF OLD.sample AND NOT NEW.sample THEN
+  RAISE EXCEPTION 'recovery sample marker is permanent';
+ END IF;
  IF OLD.retrieval_contract IS NOT NULL AND NEW.retrieval_contract IS DISTINCT FROM OLD.retrieval_contract THEN
   RAISE EXCEPTION 'generation retrieval contract is immutable once bound';
  END IF;

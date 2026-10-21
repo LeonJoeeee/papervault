@@ -431,6 +431,150 @@ The [readiness checklist and rehearsal runbook](docs/specs/2026-10-18-p2-readine
 cover the copy-only cutover/rollback tools and remaining owner gates. Live activation
 is not authorized by this release.
 
+## Coordinated recovery
+
+P5b provides `scripts/snapshot_derivatives.py` and `scripts/rebuild_derivatives.py`.
+Both require explicit roots and connection identities and default to dry-run. They
+disable dotenv discovery. `PAPERVAULT_KNOWLEDGE_JOBS=legacy` remains the default;
+these tools do not activate catalog scheduling, change the serving generation,
+promote a rebuild, or delete research assets.
+
+The operational roots approved in [#283](https://github.com/LeonJoeeee/papervault/issues/283)
+are `/data/p5b-recovery` and `/data/p5b-drills/<drill-id>` on the owner's RAID.
+The worker's staging runs use explicit isolated `/tmp` roots, recorded in
+[the baseline evidence](docs/baselines.md). The orchestrator owns deployment,
+weekly operational snapshots and production drills in the monthly reboot window
+(at most two hours). No timer or live backup configuration is activated by this PR.
+
+A complete set contains the catalog schema, installed index definitions (including
+importer-installed DOI/arXiv uniqueness), exact row encodings, sequence state,
+checkpoint/epoch/audit boundary; the entire vault including source bytes, extraction
+inputs/versions and operational ledgers; knowledge inputs/local state; recipes and
+receipts; all PostgreSQL KV/cache/doc-status/vector tables including retained extra
+tables and indexes; and Neo4j nodes, relationships, properties, indexes and
+constraints. Every component binds the same checkpoint and has file lengths and
+SHA-256 hashes. Verification also checks sealed receipt ancestry and recomputes
+the hashes of retained PostgreSQL/graph materializations; empty tables cannot stand
+in for missing outputs. Pending extraction completions must retain their source,
+input, recipe and artifact dependency closure even before catalog registration.
+Catalog registration happens after the exported checkpoint and
+cannot appear in its own dump. The existing nightly catalog-only dump and hourly
+JSON export remain separate operations; neither alone covers these dependencies.
+
+Drain all library and graph clients before capture. The coordinator holds exclusive
+vault/knowledge-root leases, catalog writer/backend-access advisory locks, and
+PostgreSQL table locks through export, verification and registration. Graph clients
+hold their root lease through successful storage finalization; failed flushes fail
+closed. Neo4j's transaction relies on this drained application boundary, so direct
+administrative/backend writers must also be stopped by the operator. A busy barrier
+refuses capture. An independently timed collection of database dumps is not accepted
+as a coordinated set.
+
+The source JSON configuration has this shape (credentials are named environment
+variables, never values in a committed configuration):
+
+```json
+{
+  "vault": "/data/paper-vault",
+  "knowledge_root": "<explicit existing knowledge working directory>",
+  "catalog": {"dsn_env": "RECOVERY_CATALOG_DSN", "schema": "<catalog schema>"},
+  "postgres": {
+    "dsn_env": "RECOVERY_BACKEND_DSN", "schema": "<backend schema>",
+    "roles": {
+      "full_docs": "lightrag_doc_full", "text_chunks": "lightrag_doc_chunks",
+      "full_entities": "lightrag_full_entities", "full_relations": "lightrag_full_relations",
+      "entity_chunks": "lightrag_entity_chunks", "relation_chunks": "lightrag_relation_chunks",
+      "llm_response_cache": "lightrag_llm_cache", "doc_status": "lightrag_doc_status",
+      "chunks_vdb": "lightrag_vdb_chunks", "entities_vdb": "lightrag_vdb_entity",
+      "relationships_vdb": "lightrag_vdb_relation"
+    }
+  },
+  "neo4j": {"uri": "<explicit source URI>", "database": "neo4j",
+    "user": "neo4j", "password_env": "RECOVERY_NEO4J_PASSWORD"}
+}
+```
+
+Use the actual installed table names, including any embedding-model suffixes. A
+missing role or incompatible schema refuses capture. The source catalog must have
+the explicit P5b knowledge-schema migration (version 6); capture does not migrate
+the source. Run the preview first; the
+orchestrator can schedule the applied `--due` command weekly after arranging drain:
+
+```bash
+.venv/bin/python scripts/snapshot_derivatives.py --config source.json --root /data/p5b-recovery
+.venv/bin/python scripts/snapshot_derivatives.py --config source.json --root /data/p5b-recovery --due --apply
+.venv/bin/python scripts/snapshot_derivatives.py --verify /data/p5b-recovery/<snapshot-id>
+```
+
+`--due` requires a new complete set when the newest verified retained set is at
+least seven days old. UTC microseconds plus a UUID distinguish same-day snapshots.
+Four verified complete sets roll; failed and sample exports cannot replace them.
+Older packages remain protected if they still hold the only retained copy of
+research/input bytes, so an unresolved protection can temporarily exceed four.
+Mutable projections and ledgers are included in every set without pinning each
+historical revision indefinitely. Removal is limited to verified owned recovery
+package copies; no source tree or live backend is pruned.
+
+The operational derivative soft cap is **2 TB (2,000,000,000,000 bytes)**, with an
+**80% alert (1.6 TB)**. Plans account for derivatives, retained sets, a staged export
+and a held capacity reservation. Insufficient filesystem headroom refuses the run;
+crossing the soft cap emits alert evidence and never triggers asset deletion.
+Blocking snapshot/restore work has a two-hour deadline. Logical exports use memory
+proportional to the exported database data; full-corpus resource qualification is
+still required before operational scheduling.
+
+Restore and replay use separate target configurations. Catalog targets must be
+absent `catalog_recovery_*` schemas in an explicitly named `test`/`rehearsal`
+database; PostgreSQL derivative targets use absent `recovery_backend_*` schemas
+with matching extensions. Neo4j requires a distinct empty endpoint/database and
+`"disposable": true`; source aliases and populated unowned targets are rejected.
+Reruns resume only a target bound to the same operation and package. The packaged
+DDL is trusted operator material, not an import format for untrusted third parties.
+Catalog export format 2 binds the full installed index inventory to the checkpoint.
+Restore recreates additional indexes and compares every definition with the source,
+including on resume; invalid/unready indexes and older packages without index state
+are refused. An index definition incompatible with the bundled table constraints
+rolls back the empty catalog target rather than silently weakening its integrity.
+
+```bash
+.venv/bin/python scripts/rebuild_derivatives.py --mode restore --package <set> --root <empty-target> --generation restored
+.venv/bin/python scripts/rebuild_derivatives.py --mode restore --package <set> --root <empty-target> --generation restored --config target.json --apply
+.venv/bin/python scripts/rebuild_derivatives.py --mode replay --package <set> --root <other-empty-target> --generation replayed --source-generation <source-generation> --config replay-target.json --apply
+```
+
+Restore preserves historical content recipes/receipts, installs a new durable writer
+fence and epoch, and records a separate materialization receipt. Copied dispatch
+remains disabled; that receipt cannot supply fresh live acceptance. Replay imports
+only selected original inputs/recipes into a fresh candidate catalog and runs the
+normal admission, execution, readback, sealing and publication path, producing new
+attempts and receipts. Isolated replay explicitly resets unit-level execution
+quarantine on fresh units; its plan and receipt record each affected unit's original
+revision and reason under `unit_quarantine_disposition`. Record-level policy and
+quarantine remain enforced, and the source is unchanged. This reset is scoped to
+non-promotable sample execution, not a live quarantine release. It never imports
+historical runnable jobs. Physical replay
+requires `"physical_replay": true`, explicit isolated PostgreSQL/Neo4j targets, the
+exact supported recipe, and its installed models/providers. It does not substitute
+a different transform when the original recipe is unavailable. Metadata replay
+needs no graph/model calls. Physical replay's PostgreSQL DSN must name one IP
+address (with the same `hostaddr`, if present); DNS, multi-host and alternate
+address routing are rejected. Runtime tables must resolve to the owned target
+schema, including on resume, before any backend write.
+
+Both paths recheck completed materializations on resume. Restore verifies its added
+candidate/catalog rows against an atomically recorded digest and rejects extra
+Neo4j indexes or constraints. Replay preserves completed
+admissions, stops on errors or deadline, and may resume in a later permitted monthly
+window; it cannot extend a consumed window in the same month. All drill/replay
+candidate generations are permanently marked sample and cannot promote. This
+release contains no promotion or disposable-extract GC tool.
+
+Weekly cadence is a scheduling policy, not a committed RPO; acceptable loss and
+full-system recovery time remain unqualified. Sample elapsed time is not full RTO,
+especially where source strata or rebuild work were unavailable. RAID and these
+local copies share the host failure domain. Off-host replication and host-loss/
+disaster recovery remain outside P5b and are not satisfied by this evidence.
+
 ## Releases
 
 papervault is consumed **by pin** (ADR-0001): deployments track an annotated git tag

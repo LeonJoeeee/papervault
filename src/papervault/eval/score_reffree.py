@@ -18,6 +18,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from papervault.eval._paths import eval_path
 
 EVAL = Path(__file__).resolve().parent
 if str(EVAL) not in sys.path:
@@ -37,7 +38,7 @@ def _load_jsonl(path: Path) -> dict:
 
 def _served_counts(tag: str) -> dict[str, int]:
     """#chunks the run actually served per qid (from results/<tag>.jsonl), for coverage check."""
-    p = EVAL / "results" / f"{tag}.jsonl"
+    p = eval_path(f"{tag}.jsonl")
     if not p.exists():
         return {}
     return {qid: len((rec.get("data") or {}).get("chunks") or []) for qid, rec in _load_jsonl(p).items()}
@@ -47,7 +48,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Aggregate reference-free precision judge outputs.")
     ap.add_argument("tag", help="run tag (judge/<tag>/ + results/<tag>.jsonl)")
     ap.add_argument("--intents", default=str(EVAL / "intents_v1.jsonl"))
-    ap.add_argument("--judge-dir", default=str(EVAL / "judge"))
+    ap.add_argument("--judge-dir", default=str(eval_path("judge")))
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 

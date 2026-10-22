@@ -33,7 +33,8 @@ def _try_mdpi_scrapling(paper: Paper) -> Optional[bytes]:
     if StealthyFetcher is None:
         return None
     import tempfile, os as _os, os.path as _osp
-    save_path = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False).name
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as temporary:
+        save_path = temporary.name
     state = {"pdf_path": None}
 
     def _action(page):
@@ -55,19 +56,24 @@ def _try_mdpi_scrapling(paper: Paper) -> Optional[bytes]:
         return page
 
     try:
-        browser_fetch(StealthyFetcher,
-            f"https://doi.org/{doi}",
-            solve_cloudflare=True, network_idle=True, timeout=60000,
-            humanize=False, geoip=False, page_action=_action)
-    except Exception:
-        return None
-    if state["pdf_path"] and _osp.exists(state["pdf_path"]):
         try:
-            with open(state["pdf_path"], "rb") as f:
-                data = f.read()
-            _os.unlink(state["pdf_path"])
-            if _is_pdf_bytes(data):
-                return data
+            browser_fetch(StealthyFetcher,
+                f"https://doi.org/{doi}",
+                solve_cloudflare=True, network_idle=True, timeout=60000,
+                humanize=False, geoip=False, page_action=_action)
         except Exception:
             return None
-    return None
+        if state["pdf_path"] and _osp.exists(state["pdf_path"]):
+            try:
+                with open(state["pdf_path"], "rb") as f:
+                    data = f.read()
+                if _is_pdf_bytes(data):
+                    return data
+            except Exception:
+                return None
+        return None
+    finally:
+        try:
+            _os.unlink(save_path)
+        except FileNotFoundError:
+            pass

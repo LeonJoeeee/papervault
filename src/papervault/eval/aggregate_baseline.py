@@ -15,6 +15,7 @@ from pathlib import Path
 
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))  # repo root → `from papervault.eval import ...`
+from papervault.eval._paths import eval_path
 from papervault.eval import headline as HL  # noqa: E402
 from papervault.eval import judge_aggregate as JA  # noqa: E402
 from papervault.eval import stats as ST  # noqa: E402
@@ -51,19 +52,19 @@ def main() -> None:
     for r in res:
         tag, qid, j = r["tag"], r["qid"], _recompute(dict(r["judge"]))
         j.setdefault("qid", qid)
-        d = EVAL / "judge" / tag
+        d = eval_path("judge", tag)
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"{qid}.seed0.json").write_text(json.dumps(j, ensure_ascii=False))
+        eval_path("judge", tag, f"{qid}.seed0.json").write_text(json.dumps(j, ensure_ascii=False))
         wrote += 1
     print(f"wrote {wrote} judge seed files")
 
     gold_path = EVAL / "gold.jsonl"
     per_run = {}
     for tag in TAGS:
-        bbq = ST.per_question_scalars(EVAL / "results" / f"{tag}.jsonl", gold_path)
-        jq = JA.per_question_scalars(EVAL / "judge", gold_path, tag=tag, n_seeds=1)
+        bbq = ST.per_question_scalars(eval_path(f"{tag}.jsonl"), gold_path)
+        jq = JA.per_question_scalars(eval_path("judge"), gold_path, tag=tag, n_seeds=1)
         summ = HL.run_summary(bbq, jq)
-        trap = JA.trap_correct_refusal_rate(EVAL / "judge", gold_path, tag=tag, n_seeds=1)
+        trap = JA.trap_correct_refusal_rate(eval_path("judge"), gold_path, tag=tag, n_seeds=1)
         per_run[tag] = {"summary": summ, "trap": trap, "hl_table": HL.headline_table(bbq, jq)}
 
     headlines = [per_run[t]["summary"]["headline"] for t in TAGS]

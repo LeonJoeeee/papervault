@@ -36,10 +36,10 @@ from openai import AsyncOpenAI
 
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))  # repo root, for `papervault.eval`
+from papervault.eval._paths import eval_path
 from papervault.eval import judge_aggregate as JA  # noqa: E402
 from papervault.llm_routing import gateway_model, route  # noqa: E402
 
-JUDGE = EVAL / "judge"
 GOLD = EVAL / os.getenv("JUDGE_GOLD", "gold_v2.jsonl")  # env-override for new gold frames (gold_v4 / gold_newq)
 ALL_TAGS = ["fullcorpus_baseline", "fullcorpus_r2", "fullcorpus_r3",
             "vmq_r1", "vmq_r2", "vmq_r3", "vsr_r1", "vsr_r2", "vsr_r3"]
@@ -171,7 +171,7 @@ def _load_gold() -> dict:
 
 # ---------------------------------------------------------------- per-question judging
 async def _judge_one(client, sem, tag, qid, gold_entry, force, counters):
-    out = JUDGE / tag / f"{qid}.seed0.json"
+    out = eval_path("judge", tag, f"{qid}.seed0.json")
     n_gold = (len(gold_entry.get("nuggets") or []) or None)
     is_trap = not (gold_entry.get("gold_keys") or [])
     if out.exists() and not force:
@@ -181,7 +181,7 @@ async def _judge_one(client, sem, tag, qid, gold_entry, force, counters):
             return (tag, qid, "skip", "")
         except Exception:
             pass  # invalid existing seed -> rejudge
-    prompt = (JUDGE / tag / f"{qid}.prompt.txt").read_text()
+    prompt = eval_path("judge", tag, f"{qid}.prompt.txt").read_text()
     last_err = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -248,7 +248,7 @@ def main():
     tags = ALL_TAGS if a.all else a.tags
     if not tags:
         raise SystemExit("give tags or --all")
-    bad = [t for t in tags if not (JUDGE / t).is_dir()]
+    bad = [t for t in tags if not eval_path("judge", t).is_dir()]
     if bad:
         raise SystemExit(f"unknown tag dirs: {bad}")
     asyncio.run(_run(tags, a.concurrency, a.force))

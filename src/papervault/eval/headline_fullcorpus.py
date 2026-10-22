@@ -13,6 +13,7 @@ from pathlib import Path
 
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))
+from papervault.eval._paths import eval_path
 from papervault.eval import headline as HL  # noqa: E402
 from papervault.eval import judge_aggregate as JA  # noqa: E402
 from papervault.eval import stats as ST  # noqa: E402
@@ -28,10 +29,10 @@ def _hl(rec_table: dict, nug_table: dict) -> float:
 
 
 def main() -> None:
-    bbq = ST.per_question_scalars(EVAL / "results" / f"{TAG}.jsonl", GOLD)
-    jq = JA.per_question_scalars(EVAL / "judge", GOLD, tag=TAG, n_seeds=NSEEDS)
+    bbq = ST.per_question_scalars(eval_path(f"{TAG}.jsonl"), GOLD)
+    jq = JA.per_question_scalars(eval_path("judge"), GOLD, tag=TAG, n_seeds=NSEEDS)
     summ = HL.run_summary(bbq, jq)
-    trap = JA.trap_correct_refusal_rate(EVAL / "judge", GOLD, tag=TAG, n_seeds=NSEEDS)
+    trap = JA.trap_correct_refusal_rate(eval_path("judge"), GOLD, tag=TAG, n_seeds=NSEEDS)
     nug = jq.get("nugget_recall", {})
     hl_distinct = _hl(bbq.get("paper_recall_at_12_distinct", {}), nug)
     hl_chunk = _hl(bbq.get("paper_recall_at_12", {}), nug)

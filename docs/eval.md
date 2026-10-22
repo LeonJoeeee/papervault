@@ -48,10 +48,39 @@ if the recall delta clears the measured noise floor. This is how the reranker fp
 build-model switch were decided upstream.
 
 **Evidence convention.** Eval result files stay **local and untracked** — they embed verbatim
-paper chunks, which the repo's no-paper-data gate forbids (PRD DoD #7), so the results dir
-(`src/papervault/eval/results/`, plus the judge scratch dir) is gitignored by design. Arbitration
-verdicts therefore live on GitHub: quote the summary numbers on the relevant issue thread — never
-commit the raw results file.
+paper chunks, which the repo's no-paper-data gate forbids (PRD DoD #7). Generated artifacts live
+under `PAPERVAULT_EVAL_DIR`, defaulting to `/data/paper-vault/eval-results/`: result JSONL files
+are `<root>/<tag>.jsonl`, and filled prompts/judge seeds are `<root>/judge/<tag>/`. This matches
+the existing external archive. Bundled gold sets and prompt templates remain in
+`src/papervault/eval/`. The shared path resolver rejects artifact paths inside any `src/`
+directory, including symlink targets, and paths escaping the configured artifact root.
+Set `PAPERVAULT_EVAL_DIR` in the process environment before running the harness to select another
+external location; resolution alone creates no directories. Arbitration verdicts live on GitHub:
+quote the summary numbers on the relevant issue thread — never commit the raw results file.
+
+## Operator hygiene
+
+Keep environment backups outside the checkout in `/home/leon/backups/papervault-env/`, with
+directory mode `700` and file mode `600`. `papervault doctor` warns when `.env.bak*` entries
+remain at the repository root, without opening or printing their contents. Retain backups until
+their owner decides their disposition; do not put credentials in issues or PRs.
+
+`python scripts/sweep_worktrees.py --repo /path/to/papervault` reports eligible worktrees without
+changing anything. After the workers have stopped and their disposable worktrees have been
+reviewed, add `--execute` to remove clean, registered direct children of the primary checkout's
+`.claude/worktrees/` and `.agents/worktrees/`. The sweeper checks tracked, untracked, and ignored
+files, skips locked/current/detached/unknown paths, and requires ancestry in the locally fetched
+`origin/main` or a merged PR targeting `main` for the exact current branch head in the same
+repository. Fetch `origin/main` before the audit; unavailable PR evidence preserves the worktree.
+It uses non-forced `git worktree remove` and `git worktree prune`, retaining all local and remote
+branch refs. A removed clean worktree can be recreated with `git worktree add <path> <branch>`.
+
+`python scripts/snapshot_catalog.py --output /path/to/catalog-snapshot.json` selects the snapshot
+destination explicitly. The default is `/data/paper-vault/snapshots/catalog-snapshot.json`, outside
+agent job scratch and the checkout; repeated runs replace that snapshot, so choose a dated
+`--output` when retaining multiple baselines. Snapshot collection still reads the catalog directly
+and opens database connections read-only. MDPI browser downloads remove their temporary PDF on
+every exit, and test-owned temporary vaults use pytest's cleanup lifecycle.
 
 ## Retrieval tuning knobs (benchmark-arbitrated)
 

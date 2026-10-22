@@ -20,7 +20,7 @@ Run:
   NEO4J_WORKSPACE=l0_probe POSTGRES_WORKSPACE=l0_probe \
     python -m papervault.eval.run_eval --gold src/papervault/eval/gold.sample.jsonl --tag smoke --limit 3
 
-Output: src/papervault/eval/results/<tag>.jsonl — one JSON object per gold question, in the
+Output: $PAPERVAULT_EVAL_DIR/<tag>.jsonl (default /data/paper-vault/eval-results/) — one JSON object per gold question, in the
 EXACT shape backbone.py + judge_prompt.md consume (see backbone.py module docstring):
   {
     "qid": "...",
@@ -52,8 +52,9 @@ import time
 from pathlib import Path
 from typing import Any
 
+from papervault.eval._paths import eval_path
+
 EVAL_DIR = Path(__file__).resolve().parent
-RESULTS_DIR = EVAL_DIR / "results"
 REPO_ROOT = EVAL_DIR.parent.parent  # so `from papervault.eval import backbone` resolves
 
 # Reuse the backbone's exact 'paper/<key>' -> '<key>' rule for the judge's bare paper_key, so
@@ -268,8 +269,8 @@ async def main_async(args: argparse.Namespace) -> None:
     if args.limit:
         gold = gold[: args.limit]
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    out_path = RESULTS_DIR / f"{args.tag}.jsonl"
+    out_path = eval_path(f"{args.tag}.jsonl")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Self-describing dump: stamp the RESOLVED query-path knobs (not just top_k/chunk_top_k) so a
     # stale-default A/B is caught at read time — the fcap/diversity/refusal knobs default-ON in code,

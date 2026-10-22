@@ -1,5 +1,6 @@
 """A selected manifest is applied before backend retrieval and cache access."""
 from copy import deepcopy
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -31,6 +32,34 @@ class Repository:
 
     def get_serving_manifest(self, **kwargs):
         return deepcopy(self.current)
+
+    def coverage_rows(self, scope=None):
+        from tests.store.test_coverage import row
+        rows = []
+        for entry in self.current["entries"]:
+            value = row()
+            uid, receipt = entry["unit_id"], entry["receipt"]
+            value["unit"].update(unit_id=uid, record_key=uid)
+            value["record"]["key"] = uid
+            value["unit"]["quarantine"] = not entry["eligible"]
+            for item in (value["requirement"], value["selected_derivation"], value["receipt"], *value["observations"]):
+                item.update(unit_id=uid, generation_id="active")
+                if "receipt_id" in item:
+                    item["receipt_id"] = receipt["receipt_id"]
+                if "namespace" in item:
+                    item["namespace"] = receipt["namespace"]
+            value["receipt"]["output_inventory"][0]["namespace"] = receipt["namespace"]
+            value["receipt"].update(receipt)
+            for obs in value["observations"]:
+                obs["observed_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+            value["inventories"][0]["required_units"] = [uid]
+            rows.append(value)
+        receipts = [{"receipt": value["receipt"], "recipe": value["recipe"]} for value in rows]
+        observations = [obs for value in rows for obs in value["observations"]]
+        for value in rows:
+            value["aggregate_receipts"] = receipts
+            value["aggregate_observations"] = observations
+        return rows
 
 
 @pytest.mark.asyncio
@@ -184,14 +213,26 @@ async def test_policy_change_fails_before_next_facet_reads_pinned_namespace():
 
 
 @pytest.mark.asyncio
-async def test_generation_promotion_does_not_mix_manifest_across_facets():
+async def test_generation_promotion_keeps_the_original_manifest_across_facets():
     from papervault.knowledge.store.catalog_serving import CatalogServingFacade
 
     repo = Repository()
-    facade = await CatalogServingFacade.pin(repo)
+    async def factory(repository, claim, **kwargs):
+        assert claim["aggregate_layers"] == ["pv_selected"]
+        class Rag:
+            async def aquery_data(self, query, param):
+                return {"status": "success", "data": {"chunks": [{"content": "original view"}]}}
+            async def finalize_storages(self):
+                pass
+        return Rag()
+    facade = await CatalogServingFacade.pin(repo, rag_factory=factory)
     repo.current["manifest_revision"] = 8
-    with pytest.raises(RuntimeError, match="manifest"):
-        await facade.aquery_data("facet", None)
+    try:
+        result = await facade.aquery_data("facet", None)
+        assert result["data"]["chunks"] == [{"content": "original view"}]
+        assert facade.snapshot["manifest_revision"] == 7
+    finally:
+        await facade.close()
 
 
 @pytest.mark.asyncio

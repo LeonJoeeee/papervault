@@ -1,6 +1,5 @@
 """V-MQ: multi-query + RRF (RAG-Fusion) retrieval variants for the KS query path — EXPERIMENTAL,
-reached only via `run_eval.py --variant multiquery|standard` (the shipped query() in aquery.py is
-untouched).
+used by production query() and by `run_eval.py --variant multiquery|standard`.
 
 WHY: the 49-Q baseline's weak arm is multi-paper recall (recall@12-distinct 0.816; the hard
 synthesis Qs sit at 0.2-0.85 because one mix-mode retrieval can't surface all 4-6 gold papers that
@@ -46,6 +45,7 @@ from lightrag import QueryParam
 from papervault import config as _pv_config
 from papervault.domain import get_domain
 from papervault.knowledge.query import aquery as aq
+from papervault.knowledge.query.synth import SOURCE_TIER_RANK, _source_label, annotate_sources, source_tier
 from papervault.knowledge.store.llm import mimo_complete
 from papervault.llm_routing import route
 
@@ -106,7 +106,7 @@ _STD_MAX_TERMS = 6
 # near-adjacent 'thin' traps also fuse, so the ruler's trap gate adjudicates the refusal risk. Set
 # KS_MQ_MIN_COVERAGE=strong to restrict fusion to strong-coverage Qs (trap path then byte-identical).
 # NOTE: this gate applies to V-MQ (retrieve_fused) ONLY. The STANDARD pipeline removes the gate.
-_COV_RANK = {"empty": 0, "thin": 1, "strong": 2}
+_COV_RANK = {"empty": 0, "weak": 1, "thin": 2, "strong": 3}
 _MIN_COV = os.environ.get("KS_MQ_MIN_COVERAGE", "thin").strip().lower()
 
 _DECOMPOSE_SYSTEM = """You decompose a researcher's information need into focused retrieval facets \
@@ -394,36 +394,31 @@ def _citation_rerank(ranked_chunks: list[dict]) -> list[dict]:
 async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[str, Any] | None, bool]:
     """Multi-query+RRF retrieval. Returns (data, base_metadata, fused_applied).
 
-    data: the fused data dict when base coverage=='strong' AND decomposition succeeded, else the
-          UNCHANGED baseline single-query data (so non-strong / failed = baseline path exactly).
+    data: fused evidence when the anchor passes the coverage gate and decomposition
+          succeeds; otherwise the unchanged anchor evidence.
     base_metadata: ALWAYS the original single-intent retrieval's metadata (kb_coverage source).
     fused_applied: whether multi-query fusion actually ran (for run logging)."""
     params = QueryParam(mode=aq._QUERY_MODE, top_k=aq._TOP_K, chunk_top_k=aq._CHUNK_TOP_K, enable_rerank=aq._ENABLE_RERANK, max_total_tokens=_MAX_TOTAL_TOKENS)
-    base = await rag.aquery_data(intent, params)
-    base_ok = isinstance(base, dict) and base.get("status") == "success" and base.get("data")
-    base_data = base["data"] if base_ok else _empty_data()
-    base_meta = base.get("metadata") if isinstance(base, dict) else None
-
-    # Gate: fuse only when base coverage rank >= KS_MQ_MIN_COVERAGE (default 'thin'). 'empty' never
-    # fuses → that path is byte-identical to baseline (clean refuse). The fused set always carries
-    # the original intent's results as one input, so fusion can only ADD recall, never lose the
-    # baseline's own top chunks.
-    cov = aq._assess_coverage(base_meta, base_data)
-    if _COV_RANK.get(cov, 0) < _COV_RANK.get(_MIN_COV, 1):
-        return base_data, base_meta, False
-
-    # fcap v2: LLM-driven CONTINUOUS fanout budget (KS_MQ_FANOUT, DEFAULT ON 2026-06-18 — validated
-    # +0.0324 headline, passes noise floor + jackknife; set KS_MQ_FANOUT=0 to disable). The headline's
-    # @served bottleneck is broad/high-fanout questions (corr(gold_size,
-    # recall)=-0.61) whose fixed 60-chunk budget can't surface their 8-14 answerers past the global RRF
-    # 60-cut. _estimate_n_sources (a cheap separate call, concurrent with decompose) sizes how many
-    # distinct library papers a thorough answer needs; the served + sub-pool budget then scales
-    # CONTINUOUSLY = clamp(n_sources*SLOPE, _CHUNK_TOP_K, MAX). Off-domain/trap Qs estimate ~1 -> floor
-    # budget -> no trap leak (a per-task LLM judgment, not a word-count proxy). user 2026-06-18.
-    if os.getenv("KS_MQ_FANOUT", "1") == "1":
-        facets, _n_src = await asyncio.gather(_decompose(intent), _estimate_n_sources(intent))
-    else:
-        facets, _n_src = await _decompose(intent), 0
+    # Speculate only on decomposition. If the anchor rejects fusion (or fails),
+    # cancel and drain it so a cheap refusal cannot leave a detached LLM call.
+    decomposition = asyncio.create_task(_decompose(intent))
+    try:
+        base = await rag.aquery_data(intent, params)
+        base_ok = isinstance(base, dict) and base.get("status") == "success" and base.get("data")
+        base_data = base["data"] if base_ok else _empty_data()
+        base_meta = base.get("metadata") if isinstance(base, dict) else None
+        cov = aq._assess_coverage(base_meta, base_data)
+        if cov == "empty" or _COV_RANK.get(cov, 0) < _COV_RANK.get(_MIN_COV, 2):
+            return base_data, base_meta, False
+        # Fanout estimation is admitted only after the anchor passes the gate.
+        if os.getenv("KS_MQ_FANOUT", "1") == "1":
+            facets, _n_src = await asyncio.gather(decomposition, _estimate_n_sources(intent))
+        else:
+            facets, _n_src = await decomposition, 0
+    finally:
+        if not decomposition.done():
+            decomposition.cancel()
+        await asyncio.gather(decomposition, return_exceptions=True)
     if not facets:
         return base_data, base_meta, False
 
@@ -476,22 +471,23 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
         )
 
     _ranked_chunks = _rrf(
-        [d.get("chunks") or [] for d in datas],
-        key_fn=lambda c: ((c.get("content") or "")[:200]) or c.get("file_path"),
-        # need the FULL fused pool (not pre-cut) when diversity-cap OR citation-prior will reorder it.
-        top=None if (_MQ_MAX_CHUNKS_PER_PAPER or _CITATION_PRIOR) else _served_cap,
+        [annotate_sources(d)["chunks"] for d in datas],
+        key_fn=lambda c: (_source_label(c.get("file_path") or "")[0], c.get("content") or c.get("chunk_id")),
+        # Tier priority must apply before any served-window cut.
+        top=None,
     )
     if _CITATION_PRIOR:
         # Path 1: authority rerank the full pool BEFORE the served cut / diversity step, so a
         # foundational paper crowded out of the top-60 by its descendants gets lifted into the window.
         _ranked_chunks = _citation_rerank(_ranked_chunks)
+    _ranked_chunks.sort(key=lambda c: SOURCE_TIER_RANK[source_tier(c)])
     if _MQ_MAX_CHUNKS_PER_PAPER:
         # L2 diversification: greedily fill chunk_top_k from the RRF order, skipping a chunk once its
         # paper already holds _MQ_MAX_CHUNKS_PER_PAPER chunks → frees served slots for distinct papers.
         chunks = []
         _per_paper: dict = {}
         for c in _ranked_chunks:
-            fp = c.get("file_path") or ""
+            fp = _source_label(c.get("file_path") or "")[0]
             if _per_paper.get(fp, 0) >= _MQ_MAX_CHUNKS_PER_PAPER:
                 continue
             chunks.append(c)
@@ -499,7 +495,7 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
             if len(chunks) >= _served_cap:
                 break
     else:
-        chunks = _ranked_chunks[:_served_cap]  # no-op when neither flag set (_rrf already cut to cap)
+        chunks = _ranked_chunks[:_served_cap]
     entities = _rrf([d.get("entities") or [] for d in datas], key_fn=lambda e: e.get("entity_name"), top=aq._TOP_K)
     rels = _rrf([d.get("relationships") or [] for d in datas], key_fn=lambda r: (r.get("src_id"), r.get("tgt_id")), top=aq._TOP_K)
 
@@ -509,7 +505,7 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
         fp = c.get("file_path")
         if fp and fp not in seen:
             seen.add(fp)
-            refs.append({"file_path": fp, "reference_id": c.get("reference_id")})
+            refs.append({"file_path": fp, "reference_id": c.get("reference_id"), "source_tier": source_tier(c)})
 
     fused = {"chunks": chunks, "references": refs, "entities": entities, "relationships": rels}
     return fused, base_meta, True
@@ -725,7 +721,7 @@ async def retrieve_standard(intent: str, rag: Any) -> tuple[dict[str, Any], dict
         fp = c.get("file_path")
         if fp and fp not in seen:
             seen.add(fp)
-            refs.append({"file_path": fp, "reference_id": c.get("reference_id")})
+            refs.append({"file_path": fp, "reference_id": c.get("reference_id"), "source_tier": source_tier(c)})
 
     data = {"chunks": chunks, "references": refs, "entities": entities, "relationships": rels}
     return data, anchor_meta

@@ -4,12 +4,8 @@ KS-written exit-LLM stage. Takes the structured `data` dict from `aquery_data`
 (entities / relationships / chunks — NOT pre-LLM'd) + the NL intent, and emits
 prose with inline [paper_key] cites (operator sources cite as [textbook:Key], issue #122).
 
-DECOUPLED from the out-feed's source-of-truth: this module only produces the
-PROSE. `cited_papers` is aggregated separately in aquery.py from
-`data.references[].file_path` (the chunk-level, untruncated, deduped reference
-list — SDD §4.3 F12), NEVER regex-scraped from this prose (the v2
-_extract_cited_papers mistake: an LLM that forgets to tag a key would drop it,
-and a key-format regex silently misses legit keys).
+The shared out-feed verifies inline keys against the retrieved evidence. Retrieval
+candidates remain available separately when synthesis cites only part of the pool.
 
 credibility (SDD §12): derived from the file_path ingest_source prefix
 (textbook→established, paper→empirical/interpretive, web→preliminary). web and
@@ -45,7 +41,7 @@ SYNTH_FAILED_PREFIX = "(synthesis LLM failed"
 # Retrieval still succeeded, so point the caller at cited_papers to pull the sources directly.
 _SYNTH_FAILED_MSG = (
     f"{SYNTH_FAILED_PREFIX}; the knowledge base did return relevant sources — "
-    "see cited_papers and pull them via get_paper.)"
+    "see retrieved_papers and pull them via get_paper.)"
 )
 
 # MiMo is a REASONING model: it spends a large chain-of-thought budget BEFORE the visible
@@ -195,7 +191,40 @@ def _source_label(file_path: str) -> tuple[str, str]:
     return (f"{source}:{sid}", cred)
 
 
-def _build_prompt(data: dict[str, Any], intent: str) -> str:
+# Used by retrieval, out-feed, and synthesis so one evidence classification governs all three.
+SOURCE_TIER_RANK = {"canon": 0, "fulltext": 1, "abstract_only": 2}
+
+
+def source_tier(item: dict[str, Any]) -> str:
+    """Classify retained evidence; abstract-only evidence never gains full-text authority.
+
+    Textbooks are the current canon. Ingested classic papers may carry an explicit
+    canon annotation; citation counts and model judgments never manufacture that status.
+    """
+    if item.get("source_tier") == "abstract_only" or is_abstract_text(item.get("content")):
+        return "abstract_only"
+    if (item.get("file_path") or "").startswith("textbook:") or item.get("source_tier") == "canon":
+        return "canon"
+    return "fulltext"
+
+
+def annotate_sources(data: dict[str, Any]) -> dict[str, Any]:
+    """Return annotated chunk/reference copies without altering the retrieval snapshot."""
+    chunks = [dict(c, source_tier=source_tier(c)) for c in data.get("chunks") or []]
+    tiers: dict[str, str] = {}
+    for chunk in chunks:
+        key, _ = _source_label(chunk.get("file_path") or "")
+        tier = chunk["source_tier"]
+        if key not in tiers or SOURCE_TIER_RANK[tier] < SOURCE_TIER_RANK[tiers[key]]:
+            tiers[key] = tier
+    refs = []
+    for ref in data.get("references") or []:
+        key, _ = _source_label(ref.get("file_path") or "")
+        refs.append(dict(ref, source_tier=tiers.get(key, source_tier(ref))))
+    return {**data, "chunks": chunks, "references": refs}
+
+
+def _build_prompt(data: dict[str, Any], intent: str, kb_coverage: str | None = None) -> str:
     """Assemble the synth prompt from aquery_data's structured `data` dict.
 
     Sends entities (typed nodes), relationships (edges), and source chunks — each
@@ -230,7 +259,7 @@ def _build_prompt(data: dict[str, Any], intent: str) -> str:
         for c in chunks:
             label, cred = _source_label(c.get("file_path") or "")
             content = (c.get("content") or "").strip()
-            if label != "unknown" and cred == _CRED_BY_SOURCE["paper"] and is_abstract_text(content):
+            if label != "unknown" and cred == _CRED_BY_SOURCE["paper"] and source_tier(c) == "abstract_only":
                 # #144: the label carries the class; the header line (square brackets) is dropped so
                 # it never reads as a citation lookalike next to the one bracketed-key rule (#122).
                 cred = ABSTRACT_ONLY_CRED
@@ -239,7 +268,7 @@ def _build_prompt(data: dict[str, Any], intent: str) -> str:
                 header = f"(no citeable source key; do not invent a citation | credibility: {cred})"
             else:
                 header = f"(source key: {label} | credibility: {cred})"
-            chunk_blocks.append(f"{header}\n{content}")
+            chunk_blocks.append(f"{header}\n(source tier: {source_tier(c)})\n{content}")
         blocks.append(
             "Source chunks (each chunk below has a source key or an explicit no-citation marker; to "
             "cite it, wrap ONLY the key, unchanged, in square brackets, e.g. [Reames2023] for a "
@@ -247,6 +276,10 @@ def _build_prompt(data: dict[str, Any], intent: str) -> str:
             "colon) — never write the word paper_key or the credibility tag inside the brackets):\n"
             + "\n\n---\n\n".join(chunk_blocks)
         )
+
+    if kb_coverage == "weak":
+        blocks.insert(0, "Coverage: weak. Evidence is limited to abstracts; explicitly state this "
+                      "limitation and do not infer full-text methods or results.")
 
     context = "\n\n====\n\n".join(blocks) if blocks else "(no material retrieved)"
 
@@ -321,13 +354,15 @@ async def synth_answer(
     data: dict[str, Any],
     intent: str,
     timeout_s: float = _SYNTH_TIMEOUT_S,
+    *,
+    kb_coverage: str | None = None,
 ) -> str:
     """Exit LLM → prose answer string (NO cited_papers here; aquery.py owns that).
 
     On LLM failure, returns a clean honesty fallback string rather than raising —
     the out-feed must still return a well-formed {answer, cited_papers, kb_coverage}.
     """
-    prompt = _build_prompt(data, intent)
+    prompt = _build_prompt(data, intent, kb_coverage)
     level = route("synth")
     # Bounded retry (issue #70): retry ONLY transient hiccups (see _is_transient_synth_error);
     # fail fast on deterministic ones; fall back to _SYNTH_FAILED_MSG once retries are exhausted.
@@ -386,6 +421,8 @@ async def synth_answer(
         logger.info(
             "synth done in %.0fs (prompt_chars=%d, attempt %d/%d)",
             time.monotonic() - t0, len(prompt), attempt + 1, attempts)
+        if kb_coverage == "weak":
+            answer = "Evidence is limited to abstracts; full text was not available for this answer.\n\n" + answer
         return answer
 
     # Unreachable: the final loop iteration always returns. Defensive fallback for total safety.

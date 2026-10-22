@@ -1,7 +1,7 @@
 """Pure unit tests for S3 query out-feed parsing (SDD §6.4). No LightRAG / no DB / no LLM.
 
 Covers the two load-bearing pure functions over a canned aquery_data dict:
-  _cited_papers   — strip 'paper/' from references[].file_path, dedupe, sort; ignore
+  _cited_papers   — strip 'paper/' from references[].file_path, dedupe, retain rank; ignore
                     textbook//web//unknown (F12: chunk-level refs, not entity-level).
   _assess_coverage — graph-signal kb_coverage from metadata.processing_info, None-safe
                      (failure/empty → empty, processing_info absent).
@@ -43,7 +43,7 @@ def test_cited_papers_strips_paper_prefix_only():
         {"reference_id": "3", "file_path": "web/https://nasa.gov/x"},
         {"reference_id": "4", "file_path": "paper/Jokipii1966"},
     ]
-    assert _cited_papers({"references": refs}) == ["Jokipii1966", "Reames2023"]  # sorted, paper/ only
+    assert _cited_papers({"references": refs}) == ["Reames2023", "Jokipii1966"]  # retrieval rank, paper/ only
 
 
 def test_cited_papers_accepts_15_era_basenames():
@@ -56,16 +56,16 @@ def test_cited_papers_accepts_15_era_basenames():
         {"reference_id": "4", "file_path": ""},                   # blank
         {"reference_id": "5", "file_path": "web/https://x/y"},    # defensive exclusion holds
     ]
-    assert _cited_papers({"references": refs}) == ["Bonomi2020", "Xu2025e"]
+    assert _cited_papers({"references": refs}) == ["Xu2025e", "Bonomi2020"]
 
 
-def test_cited_papers_dedup_and_sort():
+def test_cited_papers_dedup_and_preserve_retrieval_rank():
     refs = [
         {"reference_id": "1", "file_path": "paper/Bbb2020"},
         {"reference_id": "2", "file_path": "paper/Aaa2019"},
         {"reference_id": "3", "file_path": "paper/Bbb2020"},  # dup
     ]
-    assert _cited_papers({"references": refs}) == ["Aaa2019", "Bbb2020"]
+    assert _cited_papers({"references": refs}) == ["Bbb2020", "Aaa2019"]
 
 
 def test_cited_papers_empty_when_no_paper_refs():
@@ -95,7 +95,7 @@ def test_cited_sources_separated_from_cited_papers():
         {"file_path": "Bonomi2020"},           # 1.5-era bare paper key
     ]
     data = {"references": refs}
-    assert _cited_papers(data) == ["Bonomi2020", "Reames2023"]
+    assert _cited_papers(data) == ["Reames2023", "Bonomi2020"]
     assert _cited_sources(data) == ["notebook:idea23-c12", "textbook:Schlickeiser2002"]
 
 
@@ -147,7 +147,7 @@ def test_legacy_paper_slash_and_bare_keys_never_leak_into_cited_sources():
         {"file_path": "unknown_source"},     # LightRAG sentinel
     ]
     data = {"references": refs}
-    assert _cited_papers(data) == ["Bonomi2020", "Reames2023"]
+    assert _cited_papers(data) == ["Reames2023", "Bonomi2020"]
     assert _cited_sources(data) == []
 
 
@@ -195,8 +195,11 @@ def test_query_failure_status_returns_empty(monkeypatch):
     monkeypatch.setattr(aq, "_QUERY_VARIANT", "single")  # exercise the aquery_data branch directly
     res = {"status": "failure", "message": "no results", "data": {}, "metadata": {"failure_reason": "no_results"}}
     out = _run(query("anything", rag=_StubRag(res)))
-    assert out == {"answer": "(KB 无相关知识)", "cited_papers": [], "cited_sources": [],
-                   "abstract_only_papers": [], "kb_coverage": "empty"}
+    assert out["answer"] == "(KB 无相关知识)"
+    assert out["cited_papers"] == out["cited_sources"] == out["abstract_only_papers"] == []
+    assert out["retrieved_papers"] == [] and out["kb_coverage"] == "empty"
+    assert out["query_receipt"]["retrieved_chunk_count"] == 0
+    assert out["query_receipt"]["synthesis_model"] is None
 
 
 def test_query_returns_cited_sources_field(monkeypatch):
@@ -205,8 +208,8 @@ def test_query_returns_cited_sources_field(monkeypatch):
 
     monkeypatch.setattr(aq, "_QUERY_VARIANT", "single")
 
-    async def _synth(data, intent):  # no LLM
-        return "synthesized answer"
+    async def _synth(data, intent, **kwargs):  # no LLM
+        return "synthesized answer [R2023] [textbook:A2020]"
 
     monkeypatch.setattr(aq, "synth_answer", _synth)
     res = {

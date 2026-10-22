@@ -29,8 +29,9 @@ EXACT shape backbone.py + judge_prompt.md consume (see backbone.py module docstr
              "entities":[...], "relationships":[...]},   # the raw aquery_data 'data' block
                                                            # (paper_key = bare cite key for the judge)
     "metadata": {"processing_info": {"total_entities_found": N}},   # graph signal
-    "cited_papers": [...],                        # aquery._cited_papers output
-    "kb_coverage": "empty"|"thin"|"strong",
+    "cited_papers": [...],                        # verified inline cites (retrieval fallback in FAST)
+    "retrieved_papers": [...], "query_receipt": {...},
+    "kb_coverage": "empty"|"weak"|"thin"|"strong",
     "answer": "<synth prose>"|"(KB 无相关知识)"|"(synthesis LLM failed...)",
     "meta": {tag, workspace, ts, query_mode, top_k, chunk_top_k, gold_file, error?}
   }
@@ -57,11 +58,9 @@ from papervault.eval._paths import eval_path
 EVAL_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EVAL_DIR.parent.parent  # so `from papervault.eval import backbone` resolves
 
-# Reuse the backbone's exact 'paper/<key>' -> '<key>' rule for the judge's bare paper_key, so
-# the chunk's paper_key matches the prose's inline [<bare key>] cites (drill 2026-06-02e, tail 8).
+# The flat eval modules cross-import by bare module name.
 if str(EVAL_DIR) not in sys.path:
     sys.path.insert(0, str(EVAL_DIR))
-from backbone import strip_paper_key  # noqa: E402  (sibling module, EVAL_DIR on path)
 
 
 def _rerank_fail_count() -> int:
@@ -149,43 +148,38 @@ def load_gold(path: Path) -> list[dict[str, Any]]:
 def _slim_chunk(c: dict[str, Any]) -> dict[str, Any]:
     """Keep only what backbone scoring + the judge need from an aquery_data chunk.
 
-    Emits BOTH the raw 'file_path' ('paper/<key>', what the backbone strips) AND a bare
+    Emits BOTH the raw 'file_path' (legacy paper/<key> or current bare key) AND a bare
     'paper_key' ('<key>', None for non-paper chunks). The judge harness fills the prompt's
     {{paper_key}} from THIS field so it matches the prose's inline [<bare key>] cites — never
     from the raw file_path, which would carry the 'paper/' prefix and make every citation check
     a spurious missing_chunk (SDD §6.10 B, tail 8).
     """
+    from papervault.knowledge.query.aquery import _cited_papers
+
+    keys = _cited_papers({"chunks": [c]})
     return {
         "file_path": c.get("file_path"),
-        "paper_key": strip_paper_key(c.get("file_path")),
+        "paper_key": keys[0] if keys else None,
         "content": c.get("content"),
         "reference_id": c.get("reference_id"),
+        "source_tier": c.get("source_tier"),
     }
 
 
 def _slim_ref(r: dict[str, Any]) -> dict[str, Any]:
-    return {"file_path": r.get("file_path"), "reference_id": r.get("reference_id")}
+    return {"file_path": r.get("file_path"), "reference_id": r.get("reference_id"),
+            "source_tier": r.get("source_tier")}
 
 
 async def run_one(rag: Any, g: dict[str, Any], base_meta: dict[str, Any], variant: str = "baseline",
                   no_synth: bool = False) -> dict[str, Any]:
-    """Query ONE gold question via the real path and capture the backbone result shape.
+    """Capture one retrieval and use production's synthesis/out-feed contract.
 
-    SINGLE retrieval (SDD §6.10 D, drill 2026-06-02d): call rag.aquery_data() ONCE with the
-    exact QueryParam aquery pins in its module constants, then run KS's three pure out-feed
-    functions — synth_answer(data, intent) / aquery._cited_papers(data) /
-    aquery._assess_coverage(metadata, data) — on THAT one captured data dict. This is what
-    aquery.query() does internally, but inlining it guarantees the answer/cited_papers/
-    kb_coverage AND the raw data.chunks the backbone scores all come from the SAME retrieval —
-    so the 'allowed' set the backbone uses for hallucinated_rate is exactly what synth saw.
-    (The old code double-queried: aquery.query() re-retrieved, then a second aquery_data
-    re-retrieved again, leaving a soundness seam if retrieval were ever non-deterministic.)
-    On failure aquery.query()'s own guards are reproduced: a non-success / empty response
-    yields the empty out-feed. Any raised exception is caught → meta.error.
+    FAST no-synthesis mode keeps retrieval-ranked paper candidates for recall scoring.
+    Raw evidence remains available even when coverage is empty or prose cites a subset.
     """
     from lightrag import QueryParam
     from papervault.knowledge.query import aquery as aq
-    from papervault.knowledge.query.synth import synth_answer
 
     intent = g["intent"]
     rec: dict[str, Any] = {
@@ -218,30 +212,27 @@ async def run_one(rag: Any, g: dict[str, Any], base_meta: dict[str, Any], varian
                 QueryParam(
                     mode=aq._QUERY_MODE, top_k=aq._TOP_K,
                     chunk_top_k=aq._CHUNK_TOP_K, enable_rerank=aq._ENABLE_RERANK,
+                    max_total_tokens=int(os.getenv("KS_MAX_TOTAL_TOKENS", "300000")),
                 ),
             )
             ok_res = isinstance(res, dict) and res.get("status") == "success" and res.get("data")
             data = res["data"] if ok_res else {"chunks": [], "references": [], "entities": [], "relationships": []}
             metadata = res.get("metadata") if isinstance(res, dict) else None
 
-        # Reproduce aquery.query()'s guards: empty data → empty out-feed sentinel.
-        if not (data.get("entities") or data.get("relationships") or data.get("chunks")):
-            rec["answer"] = aq._EMPTY["answer"]
-            rec["cited_papers"] = list(aq._EMPTY["cited_papers"])
-            rec["kb_coverage"] = aq._EMPTY["kb_coverage"]
-            rec["meta"]["rerank_degraded"] = _rerank_fail_count() > _rr0
-            return rec
+        if hasattr(rag, "validate"):
+            await asyncio.to_thread(rag.validate)
+        out = await aq.synthesize_outfeed(
+            data, metadata, intent, no_synth=no_synth, variant=variant,
+            generation_id=getattr(rag, "snapshot", {}).get("generation_id"),
+            rerank_degraded=_rerank_fail_count() > _rr0,
+        )
+        if hasattr(rag, "validate"):
+            await asyncio.to_thread(rag.validate)
+        rec.update(out)
+        rec["meta"]["query_receipt"] = out["query_receipt"]
 
-        # The three pure out-feed functions, all over the SAME captured data dict.
-        # --no-synth (FAST tier): skip ONLY the synth LLM round-trip (the ~60-chunk MiMo call that
-        # dominates wall-clock). cited_papers + kb_coverage are pure functions over the retrieval
-        # data (no answer text), so they + the deterministic backbone (@served / gold_citation_recall
-        # / hallucinated_rate, all from data.chunks + cited_papers vs gold) stay fully intact — only
-        # the judge-dependent metrics (nugget/cit_sp/faith/trap) are unavailable without an answer.
-        rec["answer"] = None if no_synth else await synth_answer(data, intent)
-        rec["cited_papers"] = aq._cited_papers(data)
-        rec["kb_coverage"] = aq._assess_coverage(metadata, data)
-
+        from papervault.knowledge.query.synth import annotate_sources
+        data = annotate_sources(data)
         rec["data"] = {
             "chunks": [_slim_chunk(c) for c in (data.get("chunks") or [])],
             "references": [_slim_ref(r) for r in (data.get("references") or [])],

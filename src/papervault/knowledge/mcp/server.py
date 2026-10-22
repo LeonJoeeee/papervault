@@ -419,11 +419,13 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
       {
         "answer":        "<prose answer with [paper_key] inline cites>",
         "cited_papers":  ["Reames2023", ...],   # feed these to get_paper
-        "cited_sources": ["textbook:Schlickeiser2002", ...],  # operator sources (not papers)
+        "cited_sources": ["textbook:Schlickeiser2002", ...],  # cited operator sources
+        "retrieved_papers": ["Reames2023", ...],  # all retrieval candidates
+        "query_receipt": {"generation_id": "...", ...},  # read counts and synthesis timing
         "abstract_only_papers": ["Schwartz2022", ...],  # cited, but only the abstract is known
-        "kb_coverage":   "strong" | "thin" | "empty",   # honesty signal
+        "kb_coverage":   "strong" | "thin" | "weak" | "empty",   # honesty signal
       }
-    kb_coverage="empty"/"thin" → rephrase more specifically, or fall back to
+    kb_coverage="empty"/"weak"/"thin" → rephrase more specifically, or fall back to
     paper-library `search_papers` for fresher external literature.
 
     Latency: minutes, not seconds — p50 ~4 min under load (p90 ~7 min); plan other
@@ -442,7 +444,11 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     heartbeat = asyncio.create_task(_progress_heartbeat(ctx, stop)) if ctx else None
     try:
         await _ensure_knowledge_authority()
-        return await _query(intent=intent)
+        result = await _query(intent=intent)
+        receipt = result.get("query_receipt")
+        if receipt is not None:
+            log.info("query_receipt %s", receipt, extra={"query_receipt": receipt})
+        return result
     finally:
         if heartbeat is not None:
             stop.set()

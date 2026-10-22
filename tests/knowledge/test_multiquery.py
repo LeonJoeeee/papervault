@@ -134,3 +134,106 @@ def test_estimate_n_sources_real_estimate_passes_through(monkeypatch):
 
     monkeypatch.setattr(mq, "mimo_complete", _twelve)
     assert _run(mq._estimate_n_sources("broad synthesis")) == 12
+
+
+def test_anchor_and_decomposition_overlap(monkeypatch):
+    async def scenario():
+        started = asyncio.Event()
+        async def decompose(*args):
+            started.set()
+            return [{"query": "facet", "hl": [], "ll": []}]
+        class Rag:
+            async def aquery_data(self, query, param):
+                if query == "anchor":
+                    await asyncio.wait_for(started.wait(), 0.2)
+                    return _strong_base()
+                return _ok_facet("Facet")
+        monkeypatch.setattr(mq, "_decompose", decompose)
+        monkeypatch.setenv("KS_MQ_FANOUT", "0")
+        data, _, fused = await mq.retrieve_fused("anchor", Rag())
+        assert fused and any(c["file_path"] == "paper/Facet" for c in data["chunks"])
+    _run(scenario())
+
+
+def test_rejected_anchor_cancels_and_drains_speculative_decomposition(monkeypatch):
+    async def scenario():
+        started, stopped = asyncio.Event(), asyncio.Event()
+        async def decompose(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        class Rag:
+            async def aquery_data(self, query, param):
+                assert query == "anchor", "gated anchor must not run facets"
+                await asyncio.wait_for(started.wait(), 0.2)
+                return {"status": "success", "data": {}, "metadata": {}}
+        monkeypatch.setattr(mq, "_decompose", decompose)
+        data, _, fused = await mq.retrieve_fused("anchor", Rag())
+        assert not fused and not data.get("chunks")
+        assert stopped.is_set()
+    _run(scenario())
+
+
+def test_fulltext_and_canon_survive_rrf_cut_and_per_paper_cap(monkeypatch):
+    from papervault.knowledge.ingest.abstract_doc import ABSTRACT_HEADER
+    _patch_decompose(monkeypatch, 1)
+    monkeypatch.setattr(mq.aq, "_CHUNK_TOP_K", 3)
+    monkeypatch.setattr(mq, "_MQ_MAX_CHUNKS_PER_PAPER", 1)
+    base = _strong_base()
+    base["data"]["chunks"] = [
+        {"file_path": "paper/A", "content": ABSTRACT_HEADER + "\nA abstract"},
+        {"file_path": "paper/Stub", "content": ABSTRACT_HEADER + "\nOther stub"},
+        {"file_path": "A", "content": "Fulltext A"},
+        {"file_path": "textbook:Book#s1", "content": "Textbook evidence"},
+    ]
+    data, _, fused = _run(mq.retrieve_fused("anchor", _StubRag(base, [_ok_facet("Facet")])))
+    assert fused
+    assert [c["file_path"] for c in data["chunks"]] == ["textbook:Book#s1", "paper/Facet", "A"]
+    assert [c["source_tier"] for c in data["chunks"]] == ["canon", "fulltext", "fulltext"]
+    assert [r["source_tier"] for r in data["references"]] == ["canon", "fulltext", "fulltext"]
+
+
+def test_anchor_failure_drains_decomposition_without_swallowing_error(monkeypatch):
+    import pytest
+    async def scenario():
+        started, stopped = asyncio.Event(), asyncio.Event()
+        async def decompose(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        class Rag:
+            async def aquery_data(self, query, param):
+                await started.wait()
+                raise RuntimeError("backend unavailable")
+        monkeypatch.setattr(mq, "_decompose", decompose)
+        with pytest.raises(RuntimeError, match="backend unavailable"):
+            await mq.retrieve_fused("anchor", Rag())
+        assert stopped.is_set()
+    _run(scenario())
+
+
+def test_query_cancellation_drains_decomposition(monkeypatch):
+    import pytest
+    async def scenario():
+        started, stopped = asyncio.Event(), asyncio.Event()
+        async def decompose(*args):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+        class Rag:
+            async def aquery_data(self, query, param):
+                await asyncio.Event().wait()
+        monkeypatch.setattr(mq, "_decompose", decompose)
+        query = asyncio.create_task(mq.retrieve_fused("anchor", Rag()))
+        await started.wait()
+        query.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await query
+        assert stopped.is_set()
+    _run(scenario())

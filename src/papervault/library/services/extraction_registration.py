@@ -47,7 +47,7 @@ def effective_recipe(engine: str, *, request=None, llm=None) -> dict:
     from papervault.llm_routing import route
 
     packages = {}
-    for name in ("papervault", "mineru", "pypdf"):
+    for name in ("papervault", "httpx", "pypdf"):
         try:
             packages[name] = version(name)
         except PackageNotFoundError:
@@ -56,15 +56,18 @@ def effective_recipe(engine: str, *, request=None, llm=None) -> dict:
     sources = (("extract.py", "mineru_client.py") if engine == "mineru2.5-pro" else (
         "download_sources/firecrawl.py", "download_sources/_shared.py", "extract.py")) + ("llm.py",)
     return {"schema_version": 1, "name": "papervault-extraction", "engine": engine,
+            "transport": "mineru-api-tasks" if engine == "mineru2.5-pro" else "firecrawl",
+            "remote_engine_version": "unknown",
             "configured_model": "MinerU2.5-Pro-2605-1.2B" if engine == "mineru2.5-pro" else "unknown",
             "packages": packages,
             "code_sha256": {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in sources},
-            "settings": {"whole_document": True, "formula_enable": True, "table_enable": True,
+            "settings": {"whole_document": True,
+                         **({"backend": "vlm-engine"} if engine == "mineru2.5-pro" else {}),
+                         "formula_enable": True, "table_enable": True,
                          "image_analysis": False, "blank_floor": extract._BLANK_CHUNK_FLOOR,
                          "ceiling_seconds": extract._CEILING_SECONDS,
                          "http_timeout": mineru_client._MINERU_HTTP_TIMEOUT,
-                         "native_retries": mineru_client._MINERU_INLINE_NATIVE_RETRIES,
-                         "native_backoff_factor": mineru_client._MINERU_NATIVE_BACKOFF_FACTOR,
+                         "task_poll_interval": mineru_client._TASK_POLL_INTERVAL,
                          "inline_retries": mineru_client._INLINE_RETRIES,
                          "backoff_base": mineru_client._BACKOFF_BASE,
                          "backoff_cap": mineru_client._BACKOFF_CAP,

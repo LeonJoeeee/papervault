@@ -429,10 +429,23 @@ def test_loaded_transport_settings_change_recipe_identity(monkeypatch):
     from papervault.store.knowledge import canonical_recipe
 
     before = canonical_recipe(effective_recipe("mineru2.5-pro"))[1]
-    monkeypatch.setattr(mineru_client, "_MINERU_INLINE_NATIVE_RETRIES", 71)
+    monkeypatch.setattr(mineru_client, "_INLINE_RETRIES", 71)
     after = effective_recipe("mineru2.5-pro")
     assert canonical_recipe(after)[1] != before
-    assert after["settings"]["native_retries"] == 71
+    assert after["settings"]["inline_retries"] == 71
+
+
+def test_http_task_recipe_identifies_client_and_unknown_remote_engine():
+    from papervault.library.services.extraction_registration import effective_recipe
+
+    recipe = effective_recipe("mineru2.5-pro")
+    assert recipe["transport"] == "mineru-api-tasks"
+    assert recipe["settings"]["backend"] == "vlm-engine"
+    assert recipe["remote_engine_version"] == "unknown"
+    assert "httpx" in recipe["packages"]
+    assert "mineru" not in recipe["packages"]
+    assert "native_retries" not in recipe["settings"]
+    assert "native_backoff_factor" not in recipe["settings"]
 
 
 def test_rejection_never_deletes_an_immutable_adopted_version(extraction, monkeypatch):

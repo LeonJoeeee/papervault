@@ -40,10 +40,18 @@ cp .env.example .env          # then fill in your LLM endpoint + key + data dir
 docker volume create ks-pgdata      # external volumes hold the production data (create once)
 docker volume create ks-neo4jdata
 docker compose --env-file .env -f deploy/docker-compose.yml up -d   # Neo4j + Postgres
-uv venv && uv pip install -e ".[mineru,grey]"       # beta standard: + local OCR + grey download tiers
+uv venv && uv pip install -e ".[mineru,grey]"       # HTTP OCR client + grey download tiers
 papervault doctor             # verify GPU, databases, LLM config
 papervault-mcp                # start the MCP server (== papervault serve)
 ```
+
+Provision the standalone `mineru-service` separately at `http://127.0.0.1:30000`
+(override with `MINERU_URL`). papervault submits PDFs to its official `mineru-api`
+task API over HTTP, waits in the shared FIFO queue, and reads the completed markdown.
+The service owns model preload and GPU unloading after 20 idle minutes. papervault's
+`mineru` extra is retained as an empty compatibility extra: `uv sync --extra mineru`
+remains valid without installing `mineru` or `torchvision` in the caller's environment.
+`papervault doctor` checks the configured endpoint's `/health`.
 
 Then register the server with your agent (Claude Code: install the bundled plugin; other
 clients: point them at the MCP endpoint — see `docs/INSTALL.md`).

@@ -1,40 +1,12 @@
-"""In-process async client for the independent MinerU2.5-Pro OCR service.
+"""HTTP task client for the independently managed MinerU OCR service.
 
-The daemon talks through the service gate via mineru's own in-process VLM
-http-client (``aio_do_parse`` with ``backend="vlm-http-client"`` + ``server_url``).
-The service owns backend stop/start; this module sends one whole-PDF parse per
-call and reads back the markdown that mineru writes to ``<out_dir>/<stem>/vlm/<stem>.md``.
+Submit a whole PDF to official ``mineru-api``, poll its FIFO task queue, then
+read the completed markdown. No MinerU libraries, page rendering, model state
+or service lifecycle belong in this process.
 
-**The transport-vs-extraction error split (C1, §2.2).** The single failure
-bucket of the old cascade is split into TWO typed exceptions so the caller
-(``extract.extract_md``) branches on ``type``, never on string-sniffing:
-
-  - ``MineruTransportError`` — the server is unreachable / a connection died /
-    the request never produced a usable response, OR an AMBIGUOUS bare-500 we
-    choose not to charge (§2.3), OR a 400 ``Failed to load image`` (the server
-    cannot decode the PNGs the client itself rendered — issue #134). The PAPER
-    is fine; the SERVER (or net) is the problem. The caller MUST NOT charge an
-    ``extract_attempt`` and MUST NOT terminalize — non-mutation lets classify
-    re-route the paper next sweep.
-  - ``MineruExtractionError`` — the server WAS reached and RESPONDED with a
-    DISCRIMINABLE per-doc error verdict (400/422/structured-500/truncation),
-    OR produced output the client judges unusable (thin/missing md). The PAPER
-    is the problem. The caller charges an attempt; terminal at budget only.
-
-These wrap what the mineru http-client actually raises —
-``mineru_vl_utils.vlm_client.base_client.ServerError`` (a ``RuntimeError``)
-and ``RequestError`` (a ``ValueError``) — plus the daemon wall-clock cap.
-
-**Inline retry / failover (§2.3).** mineru's http-client already wraps a
-native ``httpx_retries.RetryTransport`` (``Retry`` total=``max_retries``,
-``backoff_factor=retry_backoff_factor``) that absorbs brief blips before any
-exception escapes — that is wired via the ``max_retries`` /
-``retry_backoff_factor`` kwargs, NOT hand-rolled. The loop in
-``extract_mineru`` is the OUTER, endpoint-failover layer ON TOP of that: a
-transport error on endpoint A retries on B (round-robin across the
-comma-separated ``MINERU_URL`` list), with capped exponential backoff,
-bounded by the daemon wall-clock deadline. An extraction-class error raises
-immediately (no retry — a retry hits the same wall).
+C1 keeps service/connection failures and queue-wait timeouts uncharged through
+``MineruTransportError``. Per-document verdicts and read/wall-clock timeouts
+observed during active processing raise ``MineruExtractionError``.
 """
 
 from __future__ import annotations
@@ -42,53 +14,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import re
 import resource
-import sys
-import tempfile
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
+
+import httpx
 
 log = logging.getLogger(__name__)
 
 
-# --------------------------- typed exceptions (C1) -------------------------
-
-
 class MineruTransportError(Exception):
-    """Server unreachable / connection-level failure / request never produced a
-    usable response, OR an AMBIGUOUS bare-500 we choose not to charge (§2.3).
-
-    The PAPER is fine; the SERVER (or net) is the problem. The caller MUST NOT
-    charge an attempt, MUST NOT terminalize — non-mutation is the C1 mechanism
-    that lets classify re-route the paper to EXTRACT on the next sweep.
-    """
+    """Service unavailable or transport failed; the caller must not charge an attempt."""
 
 
 class MineruImageDecodeError(MineruTransportError):
-    """The server answered HTTP 400 ``Failed to load image`` (issue #134).
-
-    The client renders every page PNG itself, so a server that cannot decode them
-    is broken, never the paper. The observed cause was a vLLM server process left
-    running on a deleted venv: Pillow loads its format plugins lazily, the import
-    failed, and every ``Image.open`` from then on raised. A ``MineruTransportError``
-    subclass so ``extract_md``'s C1 transport arm parks the paper with NO attempt
-    charged. Recovery belongs to the independent MinerU service.
-    """
+    """HTTP 400 says the service could not decode an image; preserve uncharged deferral."""
 
 
 class MineruExtractionError(Exception):
-    """Server WAS reached and RESPONDED with a DISCRIMINABLE per-doc error
-    verdict, OR produced output the client/gate judges unusable.
-
-    The PAPER is the problem. Charges an ``extract_attempt``; terminal at the
-    retry budget only.
-    """
-
-
-# ------------------------------- endpoints ---------------------------------
+    """A per-document failure or unusable output; the caller charges its attempt budget."""
 
 
 @dataclass(frozen=True)
@@ -121,30 +67,16 @@ def endpoints_from_env() -> list[Endpoint]:
     return out
 
 
-# ------------------------------- tunables ----------------------------------
+# Per-request read/write timeout; the caller's absolute deadline also bounds
+# the complete submit/poll/result flow and every retry/backoff.
+_MINERU_HTTP_TIMEOUT = float(os.environ.get("PAPER_LIBRARY_MINERU_HTTP_TIMEOUT", "600"))
 
-# Per-request HTTP read+write cap, threaded into the mineru http-client as
-# ``http_timeout`` (§4.2 D10-part-1). Bounds ONE HTTP call; a zero-byte read
-# timeout classifies as transport (§2.2).
-_MINERU_HTTP_TIMEOUT = float(
-    os.environ.get("PAPER_LIBRARY_MINERU_HTTP_TIMEOUT", "600"))
+# Compatibility names for consumers of the former in-process MinerU client.
+# HTTP task requests use the endpoint retry budget below; there is no nested
+# MinerU parser or native retry transport in this process anymore.
+_MINERU_INLINE_NATIVE_RETRIES = int(os.environ.get("PAPER_LIBRARY_MINERU_NATIVE_RETRIES", "3"))
+_MINERU_NATIVE_BACKOFF_FACTOR = float(os.environ.get("PAPER_LIBRARY_MINERU_NATIVE_BACKOFF", "0.5"))
 
-# Native httpx_retries.Retry total inside the mineru http-client — absorbs
-# brief blips WITHIN a single call before any exception escapes.
-_MINERU_INLINE_NATIVE_RETRIES = int(
-    os.environ.get("PAPER_LIBRARY_MINERU_NATIVE_RETRIES", "3"))
-_MINERU_NATIVE_BACKOFF_FACTOR = float(
-    os.environ.get("PAPER_LIBRARY_MINERU_NATIVE_BACKOFF", "0.5"))
-
-# ── Request fan-out + socket ceiling (issue #96) ────────────────────────────
-# mineru's http-client defaults to max_concurrency=100 requests in flight PER
-# PARSE and an UNCAPPED httpx pool, so 8 concurrent OCR slots reached ~800
-# sockets to the server (747 observed). ``max_concurrency`` bounds the requests
-# one parse keeps in flight; the default 32 equals the ``--max-num-seqs 32``
-# the deployed MinerU server runs with — it never serves more at once, so more
-# only queue there. ``max_connections`` caps the per-event-loop pool that ALL
-# concurrent parses against one endpoint share; httpx queues requests beyond it
-# (no error). Read at call time so an env override needs no reload.
 _DEFAULT_MAX_CONCURRENCY = 32
 _DEFAULT_MAX_CONNECTIONS = 64
 
@@ -158,7 +90,7 @@ def _positive_int_env(name: str, default: int) -> int:
 
 
 def client_limits() -> tuple[int, int]:
-    """``(max_concurrency, max_connections)`` for the mineru http-client, from
+    """``(max_concurrency, max_connections)`` for the HTTP task client, from
     ``PAPER_LIBRARY_MINERU_MAX_CONCURRENCY`` (default 32) and
     ``PAPER_LIBRARY_MINERU_MAX_CONNECTIONS`` (default 64). A missing, invalid or
     non-positive value falls back to the default."""
@@ -170,8 +102,6 @@ def client_limits() -> tuple[int, int]:
     )
 
 
-# OUTER endpoint-failover retry budget (in-MEMORY loop counter, NOT
-# extract_attempts). Each iteration may switch endpoints round-robin.
 _INLINE_RETRIES = int(
     os.environ.get("PAPER_LIBRARY_MINERU_INLINE_RETRIES", "3"))
 _BACKOFF_BASE = float(
@@ -179,68 +109,7 @@ _BACKOFF_BASE = float(
 _BACKOFF_CAP = float(
     os.environ.get("PAPER_LIBRARY_MINERU_BACKOFF_CAP", "30.0"))
 
-# ------------------------- ServerError discriminator -----------------------
-
-
-def _status_of(exc: Exception) -> Optional[int]:
-    """Best-effort parse of the HTTP status code off a ``ServerError`` message.
-
-    The mineru http-client embeds the code in two shapes:
-      - ``"Unexpected status code: [{code}], response body: ..."`` (parse loop)
-      - ``"... Status code: {code}, response body: ..."`` (model-name probe)
-    Returns the int code, or ``None`` if the message carries no parseable code.
-    """
-    msg = str(exc)
-    m = re.search(r"status code:\s*\[(\d{3})\]", msg, re.I)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"status code:\s*(\d{3})\b", msg, re.I)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-def _is_connect_fail(exc: Exception) -> bool:
-    """A ``ServerError("Failed to connect to server ...")`` — the server unit is
-    down / starting (a service restart window, the case that motivates
-    C1). Also catches generic connect/refused wording."""
-    msg = str(exc).lower()
-    return ("failed to connect to server" in msg
-            or "connection refused" in msg
-            or "name or service not known" in msg
-            or "failed to establish a new connection" in msg)
-
-
-def _is_zero_byte_timeout(exc: Exception) -> bool:
-    """A read/connect timeout with no usable response — transport (§2.2). The
-    mineru client surfaces these as ``ServerError`` (non-200/parse-fail) or the
-    httpx timeout types leak through; treat any timeout wording as transport
-    UNLESS the daemon wall-clock cap fired (that is handled separately as
-    extraction-class while the server is alive)."""
-    msg = str(exc).lower()
-    return ("timeout" in msg or "timed out" in msg
-            or "read timed out" in msg)
-
-
-def _is_server_image_decode_fail(exc: Exception) -> bool:
-    """A 400 whose body says the SERVER could not decode an image (issue #134).
-
-    vLLM's ``load_bytes`` answers ``400 Failed to load image: cannot identify image
-    file`` when its Pillow cannot open a PNG. The client generated that PNG, so the
-    fault is server-side: transport-class, not a per-doc 400 verdict."""
-    return _status_of(exc) == 400 and "failed to load image" in str(exc).lower()
-
-
-def _is_structured_500(exc: Exception) -> bool:
-    """A 500-ish error that carries a STRUCTURED per-doc error verdict — the
-    ``ServerError("Error from server: {object:error ...}")`` case (a
-    discriminable "server responds with a real error on THIS file"). This is
-    EXTRACTION-class (§2.2), distinct from a bare 500 (transport by default)."""
-    msg = str(exc).lower()
-    return ("error from server:" in msg
-            or "'object': 'error'" in msg
-            or '"object": "error"' in msg
-            or "object': 'error" in msg)
+_TASK_POLL_INTERVAL = 1.0
 
 
 def alternate(endpoints: list[Endpoint], i: int) -> Endpoint:
@@ -249,201 +118,6 @@ def alternate(endpoints: list[Endpoint], i: int) -> Endpoint:
     one endpoint this degenerates to retrying the same URL (steady state)."""
     return endpoints[i % len(endpoints)]
 
-
-# ------------------------------- md read-back ------------------------------
-
-
-def _read_md_from_outdir(outdir: Path, stem: str) -> str:
-    """Read the markdown mineru wrote at ``<outdir>/<stem>/vlm/<stem>.md``.
-
-    ``_async_process_vlm`` hardcodes ``parse_method="vlm"`` and ``prepare_env``
-    builds ``<output_dir>/<pdf_file_name>/<parse_method>/`` then writes
-    ``f"{pdf_file_name}.md"`` (verified common.py:180,309-310,437). A missing
-    or thin file means the server produced nothing usable → EXTRACTION-class.
-    """
-    md_path = outdir / stem / "vlm" / f"{stem}.md"
-    if not md_path.exists():
-        raise MineruExtractionError(
-            f"thin_or_missing_md: expected {md_path} not written by server")
-    text = md_path.read_text()
-    if not text or not text.strip():
-        raise MineruExtractionError("thin_or_missing_md: empty md body")
-    return text
-
-
-# ---------------- transport lifecycle: shared MinerU client (#93) ----------
-#
-# The OCR path delegates the actual HTTP to mineru's ``aio_do_parse``, which
-# drives a PROCESS-GLOBAL singleton ``HttpVlmClient``
-# (``mineru.backend.vlm.vlm_analyze.ModelSingleton``). That client caches ONE
-# ``httpx.AsyncClient`` PER EVENT LOOP and, on every loop switch, DROPS the
-# other loop's client WITHOUT ``aclose()``
-# (``mineru_vl_utils/vlm_client/http_client.py`` ``_aio_client`` ->
-# ``self._aio_client_cache.clear()``). Each dropped client keeps its pooled
-# keepalive sockets to the MinerU server OPEN, and is later GC'd against a
-# now-closed loop.
-#
-# On a SINGLE persistent loop this is harmless (one client, reused — verified
-# flat). But whenever OCR touches a SECOND event loop in the same process
-# (e.g. a transient ``asyncio.run`` turn beside the daemon's persistent loop),
-# every switch leaks the previous loop's pooled sockets: issue #93's outage
-# (~306 ESTABLISHED sockets to the MinerU port, ~2 leaked per OCR'd book,
-# 1024-fd cliff) and the ``'_UnixSelectorEventLoop' object has no attribute
-# '_ssock'`` teardown error (a dropped client finalized on its dead loop).
-#
-# Fix (transport-lifecycle only — call semantics/timeouts/retry/error model are
-# untouched): papervault owns the per-loop client's lifecycle. ``extract_mineru``
-# brackets each parse with a per-loop reference count; when the LAST in-flight
-# parse on a loop finishes (refcount hits 0), we ``aclose()`` THAT loop's cached
-# mineru client and evict it from mineru's cache — ON that loop, while it is
-# still alive, BEFORE it is torn down. Reference-counted so the up-to
-# ``_EXTRACT_CONCURRENCY`` concurrent parses on the daemon loop never close a
-# client another parse is still using. ALL access to mineru internals is GUARDED
-# (getattr / try) so a mineru build without these attributes — or a unit test
-# with a stubbed ``aio_do_parse`` — degrades to today's behaviour, never crashes.
-# ``PAPER_LIBRARY_MINERU_CLIENT_CLOSE=0`` disables the close (revert lever).
-
-_CLIENT_CLOSE_ENABLED = os.environ.get(
-    "PAPER_LIBRARY_MINERU_CLIENT_CLOSE", "1").strip().lower() in ("1", "true", "yes")
-
-# Per-event-loop count of extract_mineru calls currently in flight, keyed by the
-# loop object (matches mineru's own per-loop cache key). Only ever touched from
-# ON the loop it counts, so no lock is needed (asyncio is single-threaded per
-# loop). Entries are popped at refcount 0, so a transient loop is not pinned.
-_loop_parse_refcounts: "dict[object, int]" = {}
-
-
-def _incref_current_loop() -> None:
-    loop = asyncio.get_running_loop()
-    _loop_parse_refcounts[loop] = _loop_parse_refcounts.get(loop, 0) + 1
-
-
-async def _decref_current_loop_and_maybe_close() -> None:
-    """Decrement the current loop's in-flight parse count; when it reaches 0,
-    aclose + evict this loop's cached mineru async client (the #93 fix).
-
-    Under a SERIAL drain (one book at a time on the daemon loop) this closes +
-    rebuilds the client once per book. That is INTENTIONAL and negligible: the
-    MinerU endpoint is loopback plain HTTP (no TLS handshake), so a fresh
-    httpx.AsyncClient + TCP connect costs microseconds against a multi-second
-    GPU parse — and the singleton predictor (model-name, etc.) is untouched, only
-    its per-loop httpx client is rebuilt. When parses overlap (the up-to
-    _EXTRACT_CONCURRENCY daemon path) the client is reused until the burst drains
-    to 0, so the hot path keeps its pooled connections."""
-    loop = asyncio.get_running_loop()
-    n = _loop_parse_refcounts.get(loop, 0) - 1
-    if n > 0:
-        _loop_parse_refcounts[loop] = n
-        return
-    _loop_parse_refcounts.pop(loop, None)
-    if _CLIENT_CLOSE_ENABLED:
-        await _close_mineru_client_for_loop(loop)
-
-
-async def _close_mineru_client_for_loop(loop) -> None:
-    """aclose() + evict the mineru singleton's cached ``httpx.AsyncClient`` for
-    ``loop`` (must be the running loop, so aclose runs on the client's own loop).
-
-    Fully guarded/best-effort: a mineru without the expected internals, or any
-    aclose error, is swallowed — closing the client must never fail an extract.
-    """
-    # Only touch mineru's singleton if its VLM backend is ALREADY imported in
-    # this process (a real parse ran). Never TRIGGER the heavy torch/vllm import
-    # just to clean up — a unit test with a stubbed aio_do_parse (mineru's VLM
-    # backend never loaded) must stay light and hit the no-op path here.
-    mod = sys.modules.get("mineru.backend.vlm.vlm_analyze")
-    ModelSingleton = getattr(mod, "ModelSingleton", None) if mod is not None else None
-    if ModelSingleton is None:  # pragma: no cover - no real OCR in this process
-        return
-
-    def snapshot_predictors():
-        # __new__ takes the same RLock as discovery; never acquire it on-loop.
-        return list(getattr(ModelSingleton(), "_models", {}).values())
-
-    try:
-        predictors = await asyncio.to_thread(snapshot_predictors)
-    except Exception:  # noqa: BLE001 - never break the extract on cleanup
-        return
-    for predictor in predictors:
-        # A new parse can start while the snapshot or aclose is awaiting. Its
-        # eventual decref will close the client after that parse finishes.
-        if _loop_parse_refcounts.get(loop, 0) > 0:
-            return
-        client = getattr(predictor, "client", None)
-        cache = getattr(client, "_aio_client_cache", None)
-        if not isinstance(cache, dict):
-            continue
-        aio = cache.pop(loop, None)
-        if aio is None:
-            continue
-        try:
-            await aio.aclose()
-        except Exception:  # noqa: BLE001 - best-effort transport teardown
-            pass
-
-
-# ------------------ client limits on mineru's singleton (#96) ---------------
-#
-# ``aio_do_parse`` forwards its kwargs to ``ModelSingleton().get_model``, which
-# builds ONE predictor per (backend, model_path, server_url) the first time and
-# reuses it. mineru 3.4.4 reads ``max_concurrency`` from those kwargs but never
-# passes ``max_connections`` to the client, so the socket ceiling would be
-# silently lost. Before each parse we therefore obtain the SAME singleton
-# predictor (same key and kwargs) entirely off-loop and set both limits on it
-# and its HTTP client. Pass it into ``aio_do_parse`` so ``aio_doc_analyze`` skips
-# ``_get_model_async``, whose singleton lookup otherwise takes an RLock on-loop
-# even when the predictor is cached (#76, #237). The per-loop
-# ``httpx.AsyncClient`` is built lazily from ``client.max_connections``
-# during the parse, so it is created capped. Guarded like the #93 close hook: a
-# mineru without these internals (or a stubbed test) just skips this step.
-
-
-def _apply_client_limits(predictor, max_concurrency: int, max_connections: int) -> None:
-    client = getattr(predictor, "client", None)
-    if client is not None:
-        if hasattr(client, "max_connections"):
-            client.max_connections = max_connections
-        if hasattr(client, "max_concurrency"):
-            client.max_concurrency = max_concurrency
-    if hasattr(predictor, "max_concurrency"):
-        predictor.max_concurrency = max_concurrency
-
-
-async def _prepare_capped_predictor(server_url: str, client_kwargs: dict) -> object | None:
-    """Build (or fetch) mineru's singleton predictor for ``server_url`` and cap it.
-
-    Construction errors propagate to the caller's transport retry path: model
-    discovery has not parsed a document, so it cannot charge a PDF attempt."""
-    mod = sys.modules.get("mineru.backend.vlm.vlm_analyze")
-    singleton_cls = getattr(mod, "ModelSingleton", None) if mod is not None else None
-    if singleton_cls is None:
-        return
-
-    def get_predictor():
-        # Evaluating singleton_cls() before to_thread would block the MCP loop
-        # behind another worker's discovery, even with get_model offloaded.
-        get_model = getattr(singleton_cls(), "get_model", None)
-        if get_model is None:  # pragma: no cover - defensive, unknown mineru build
-            return None
-        return get_model("http-client", None, server_url, **client_kwargs)
-
-    predictor = await asyncio.to_thread(get_predictor)
-    if predictor is not None:
-        _apply_client_limits(predictor, client_kwargs["max_concurrency"],
-                             client_kwargs["max_connections"])
-    return predictor
-
-
-# --------------------- heap trim after each parse (#133) --------------------
-#
-# A whole-doc parse renders page windows (64 pages at 200 DPI by default) and
-# PNG/base64-encodes them in ``to_thread`` workers. glibc keeps the freed memory
-# in per-thread malloc arenas instead of returning it: an offline replay of an
-# 8-way burst retained +5.5 GB after every object was freed, and the service
-# ratcheted to ~15 GB RSS. ``malloc_trim(0)`` after each parse returned it
-# (+0.13 GB retained). glibc only — musl/macOS lack the symbol, so this is a
-# no-op there. The unit's ``MALLOC_MMAP_THRESHOLD_`` is the primary fix;
-# this is the in-code backstop. ``PAPER_LIBRARY_MINERU_MALLOC_TRIM=0`` disables it.
 
 _MALLOC_TRIM_ENABLED = os.environ.get(
     "PAPER_LIBRARY_MINERU_MALLOC_TRIM", "1").strip().lower() in ("1", "true", "yes")
@@ -534,7 +208,101 @@ def check_fd_watermark(logger: Optional[logging.Logger] = None) -> None:
         pass
 
 
-# ------------------------------- main entry --------------------------------
+@dataclass
+class _TaskState:
+    status: str | None = None
+    error: str | None = None
+
+    def update(self, payload: dict) -> None:
+        status = payload.get("status")
+        if status not in ("pending", "processing", "completed", "failed"):
+            raise MineruTransportError(f"invalid_task_status: {status!r}")
+        self.status = status
+        self.error = payload.get("error")
+
+
+def _remaining_time(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    remaining = deadline - time.time()
+    if remaining <= 0:
+        raise TimeoutError("wall_clock_cap")
+    return remaining
+
+
+async def _request_json(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> dict:
+    response = await client.request(method, url, **kwargs)
+    code = response.status_code
+    if not response.is_success:
+        detail = f"HTTP {code}: {response.text}"
+        if code == 400 and "failed to load image" in response.text.lower():
+            raise MineruImageDecodeError(detail)
+        if code in (400, 409, 422):
+            raise MineruExtractionError(detail)
+        # Gateway/overload responses are service failures even if their body
+        # contains JSON. A bare 500 is ambiguous and remains uncharged.
+        if code == 500:
+            try:
+                verdict = response.json()
+            except ValueError:
+                verdict = None
+            if isinstance(verdict, dict) and verdict:
+                raise MineruExtractionError(detail)
+        raise MineruTransportError(detail)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise MineruTransportError("invalid_api_json") from exc
+    if not isinstance(payload, dict):
+        raise MineruTransportError("invalid_api_payload")
+    return payload
+
+
+def _markdown_from_result(payload: dict, stem: str) -> str:
+    results = payload.get("results")
+    entry = None
+    if isinstance(results, dict):
+        entry = results.get(stem)
+        if stem not in results and len(results) == 1:
+            entry = next(iter(results.values()))
+    text = entry.get("md_content") if isinstance(entry, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise MineruExtractionError("thin_or_missing_md: empty or missing md_content")
+    return text
+
+
+async def _run_task(
+    client: httpx.AsyncClient, endpoint: Endpoint, pdf_bytes: bytes, stem: str,
+    state: _TaskState, wall_clock_deadline: float | None,
+) -> str:
+    base = endpoint.url.rstrip("/")
+    _remaining_time(wall_clock_deadline)
+    payload = await _request_json(
+        client, "POST", f"{base}/tasks",
+        files={"files": (f"{stem}.pdf", pdf_bytes, "application/pdf")},
+        data={"backend": "vlm-engine", "lang_list": "en", "formula_enable": "true",
+              "table_enable": "true", "image_analysis": "false", "return_md": "true",
+              "return_images": "false"},
+    )
+    task_id = payload.get("task_id")
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise MineruTransportError("missing_task_id")
+    state.update(payload)
+    task_url = f"{base}/tasks/{quote(task_id, safe='')}"
+    while state.status not in ("completed", "failed"):
+        _remaining_time(wall_clock_deadline)
+        state.update(await _request_json(client, "GET", task_url))
+        if state.status in ("pending", "processing"):
+            remaining = _remaining_time(wall_clock_deadline)
+            delay = _TASK_POLL_INTERVAL if remaining is None else min(_TASK_POLL_INTERVAL, remaining)
+            # Yield even with a zero polling interval, so cancellation and other
+            # extractions can run when responses arrive immediately.
+            await asyncio.sleep(delay)
+    _remaining_time(wall_clock_deadline)
+    result = await _request_json(client, "GET", f"{task_url}/result")
+    if state.status == "failed":
+        raise MineruExtractionError(f"task_failed: {state.error}")
+    return _markdown_from_result(result, stem)
 
 
 async def extract_mineru(
@@ -545,29 +313,24 @@ async def extract_mineru(
     http_timeout: float = _MINERU_HTTP_TIMEOUT,
     wall_clock_deadline: Optional[float] = None,
 ) -> str:
-    """One whole-PDF MinerU parse → returns the markdown string.
+    """Extract one whole PDF via the shared service's submit/poll/result API.
 
-    Thin transport-lifecycle wrapper (issue #93) around :func:`_extract_mineru_impl`:
-    it reference-counts in-flight parses PER EVENT LOOP and, when the last parse
-    on this loop finishes, aclose()s + evicts this loop's cached mineru async
-    client so its pooled sockets never leak on a later loop switch. After every
-    parse (success or error) it runs ``malloc_trim(0)`` off the loop (#133). The parse
-    logic, error model, timeouts and retries are entirely in the impl below —
-    UNCHANGED. See the "transport lifecycle" block above for the mechanism.
+    ``wall_clock_deadline`` is an absolute ``time.time()`` deadline. A queue
+    wait (pending, including queued_ahead > 0) never charges a PDF attempt;
+    read/wall-clock timeouts after observing processing do. Connection errors
+    and HTTP service outages remain transport failures in every phase.
+
+    Each endpoint attempt owns its HTTP client and closes it on this loop,
+    including cancellation. No process-global clients survive loop teardown.
     """
     if not endpoints:
         raise MineruTransportError("no_endpoints_configured")
-    _incref_current_loop()
     try:
         return await _extract_mineru_impl(
-            pdf_bytes,
-            endpoints,
-            stem=stem,
-            http_timeout=http_timeout,
+            pdf_bytes, endpoints, stem=stem, http_timeout=http_timeout,
             wall_clock_deadline=wall_clock_deadline,
         )
     finally:
-        await _decref_current_loop_and_maybe_close()
         await _trim_after_parse()
 
 
@@ -579,198 +342,37 @@ async def _extract_mineru_impl(
     http_timeout: float = _MINERU_HTTP_TIMEOUT,
     wall_clock_deadline: Optional[float] = None,
 ) -> str:
-    """One whole-PDF MinerU parse → returns the markdown string.
-
-    Sends the WHOLE PDF (no page cap, no chunking) to a MinerU vLLM endpoint
-    via ``aio_do_parse(backend="vlm-http-client")``, reads back the md mineru
-    writes, and returns it. Implements the §2.3 outer endpoint-failover loop on
-    top of the http-client's native per-call retry.
-
-    Raises:
-      ``MineruTransportError`` — server unreachable / connect-fail / bare-500 /
-        502/503/504/429 / zero-byte timeout / inline budget exhausted, or its
-        ``MineruImageDecodeError`` subclass (400 ``Failed to load image``: the
-        server cannot decode the client's own PNGs, issue #134). The caller does
-        NOT charge an attempt and does NOT terminalize (C1).
-      ``MineruExtractionError`` — 400/422 / structured-500 / truncation /
-        unexpected finish_reason / thin-or-missing md / the daemon wall-clock
-        cap firing while the server is alive. The caller charges toward budget.
-
-    Args:
-      pdf_bytes: the whole PDF as bytes.
-      endpoints: ordered endpoint list (round-robin failover target set).
-      stem: output file stem (drives the read-back path); the caller passes the
-        paper key so concurrent extractions never collide on the out_dir.
-      http_timeout: per-request HTTP read+write cap (mineru ``http_timeout``).
-      wall_clock_deadline: absolute ``time.time()`` deadline; crossing it while
-        the server is alive and answering is a per-doc pathology → extraction.
-    """
-    if not endpoints:
-        raise MineruTransportError("no_endpoints_configured")
-
-    # Lazy import: mineru is a heavy, optionally-absent dep (it is installed in
-    # the server unit's venv and the daemon's import path per SDD §3.0, but
-    # importing papervault.library.extract must never require it). An import failure
-    # here is a deploy/transport-class problem, not a per-doc defect.
-    try:
-        from mineru.cli.common import aio_do_parse  # noqa: WPS433
-        from mineru_vl_utils.vlm_client.base_client import (  # noqa: WPS433
-            RequestError,
-            ServerError,
-        )
-    except Exception as exc:  # pragma: no cover - exercised only without mineru
-        raise MineruTransportError(f"mineru_import_failed: {exc!r}") from exc
-
-    os.environ.setdefault("MINERU_MODEL_SOURCE", "modelscope")
-
-    last_transport: Optional[Exception] = None
-    # Did the server ANSWER but the body was too slow (a read-timeout)? If the
-    # wall-clock cap later fires, that means THIS doc is pathologically slow =
-    # a per-doc property → EXTRACTION (charge → budget-terminal, preserves old
-    # D9). A cap that fires while the server is DEAD (connect-fail / 5xx outage)
-    # = TRANSPORT (don't charge; reconcile retries). slow_doc is set ONLY by a
-    # read-timeout against a reachable server, never by 5xx/connect.
-    slow_doc = False
-    with tempfile.TemporaryDirectory(prefix="mineru_out_") as tmp:
-        outdir = Path(tmp)
-        for i in range(_INLINE_RETRIES + 1):
-            if wall_clock_deadline is not None and time.time() >= wall_clock_deadline:
-                # Wall-clock cap reached. If the server ANSWERED but the doc was
-                # too slow (read-timeout) → per-doc pathology → EXTRACTION (charge,
-                # preserves D9). If the server was DEAD/outaged → TRANSPORT.
-                if slow_doc:
-                    raise MineruExtractionError("wall_clock_cap_server_alive")
-                raise MineruTransportError("wall_clock_cap_dead_server")
-            ep = alternate(endpoints, i)
-            # Per-call remaining budget so one slow call can't overshoot the
-            # daemon wall-clock cap; if the deadline is sooner than the
-            # per-request timeout, shrink the request timeout to fit.
-            call_timeout = http_timeout
-            if wall_clock_deadline is not None:
-                remaining = wall_clock_deadline - time.time()
-                if remaining <= 0:
-                    if slow_doc:
-                        raise MineruExtractionError("wall_clock_cap_server_alive")
-                    raise MineruTransportError("wall_clock_cap_dead_server")
-                call_timeout = max(1.0, min(http_timeout, remaining))
+    last_transport: Exception | None = None
+    for i in range(_INLINE_RETRIES + 1):
+        # A new endpoint gets a new task state: processing on a previous,
+        # unreachable service cannot turn this endpoint's queue wait into a charge.
+        state = _TaskState()
+        try:
+            _remaining_time(wall_clock_deadline)
             max_concurrency, max_connections = client_limits()
-            client_kwargs = {
-                "http_timeout": call_timeout,
-                "max_retries": _MINERU_INLINE_NATIVE_RETRIES,
-                "retry_backoff_factor": _MINERU_NATIVE_BACKOFF_FACTOR,
-                "max_concurrency": max_concurrency,
-                "max_connections": max_connections,
-            }
-            try:
-                predictor = await _prepare_capped_predictor(ep.url, client_kwargs)
-            except Exception as exc:  # noqa: BLE001 - discovery is always transport
-                # A discovery timeout or invalid model metadata is a service
-                # failure before any PDF parse, never a slow/defective document.
-                last_transport = exc
-                await _async_sleep_backoff(i, wall_clock_deadline)
-                continue
-
-            try:
-                await aio_do_parse(
-                    output_dir=str(outdir),
-                    pdf_file_names=[stem],
-                    pdf_bytes_list=[pdf_bytes],
-                    p_lang_list=["en"],          # REQUIRED positional; VLM ignores
-                    backend="vlm-http-client",   # do_parse strips "vlm-" → "http-client"
-                    server_url=ep.url,
-                    predictor=predictor,
-                    formula_enable=True,
-                    table_enable=True,
-                    image_analysis=False,
-                    f_dump_md=True,
-                    f_dump_middle_json=False,
-                    f_dump_model_output=False,
-                    f_dump_content_list=False,
-                    f_draw_layout_bbox=False,
-                    f_draw_span_bbox=False,
-                    f_dump_orig_pdf=False,
-                    start_page_id=0,
-                    end_page_id=None,
-                    # ── http-client kwargs (consumed via **kwargs, §3.3) ──
-                    # http_timeout / max_retries / retry_backoff_factor, plus the
-                    # #96 max_concurrency / max_connections caps.
-                    # NOTE: NO connect_timeout — not plumbed through aio_do_parse.
-                    **client_kwargs,
-                )
-                return _read_md_from_outdir(outdir, stem)
-
-            except ServerError as exc:
-                code = _status_of(exc)
-                # ── server cannot decode the client's own PNGs (issue #134) ──
-                # Checked BEFORE the 400 → extraction test: the server is broken,
-                # not the paper. Raise at once (every page fails the same way, so an
-                # inline retry only burns time); the caller parks it uncharged.
-                if _is_server_image_decode_fail(exc):
-                    raise MineruImageDecodeError(str(exc)) from exc
-                # ── EXTRACTION-class (per-doc defect) → NO retry, charge ──
-                if code in (400, 422) or _is_structured_500(exc):
-                    raise MineruExtractionError(str(exc)) from exc
-                # ── TRANSPORT-class → inline retry only ──
-                if (code in (502, 503, 504, 429)
-                        or _is_connect_fail(exc)
-                        or _is_zero_byte_timeout(exc)):
-                    # A read-timeout = the server CONNECTED but the body was too
-                    # slow → mark slow_doc so a later wall-clock cap charges this
-                    # doc. 5xx / connect-fail are server outages → leave it clear.
-                    if _is_zero_byte_timeout(exc) and not _is_connect_fail(exc):
-                        slow_doc = True
-                    last_transport = exc
-                    await _async_sleep_backoff(i, wall_clock_deadline)
-                    continue
-                if code == 500:
-                    # BARE 500 = AMBIGUOUS → default TRANSPORT (§2.3). Do NOT
-                    # charge, do NOT terminalize; budget + reconcile catch a
-                    # genuinely-500ing doc. A service restart returns bare
-                    # 500 while weights load — must never condemn a paper.
-                    last_transport = exc
-                    await _async_sleep_backoff(i, wall_clock_deadline)
-                    continue
-                # Unknown ServerError (no parseable code, not connect/timeout):
-                # treat as transport (conservative — never wrongly charge).
-                last_transport = exc
-                await _async_sleep_backoff(i, wall_clock_deadline)
-                continue
-
-            except RequestError as exc:
-                # truncation / unexpected finish_reason / thin output → per-doc
-                # extraction failure. No retry (a retry hits the same wall).
-                raise MineruExtractionError(str(exc)) from exc
-
-            except MineruExtractionError:
-                # _read_md_from_outdir thin/missing → extraction-class. Re-raise.
-                raise
-
-            except asyncio.CancelledError:
-                raise
-
-            except Exception as exc:  # noqa: BLE001 - transport catch-all
-                # httpx ConnectError / ReadTimeout / RemoteProtocolError / reset
-                # etc. leak through as their own types — all connection-level →
-                # transport (§2.2). Inline-retry; never charge on these.
-                # A ReadTimeout means the server CONNECTED but the body was too
-                # slow → slow_doc (a later wall-clock cap then charges this doc).
-                if (type(exc).__name__ in ("ReadTimeout", "PoolTimeout", "WriteTimeout")
-                        and not _is_connect_fail(exc)):
-                    slow_doc = True
-                last_transport = exc
-                await _async_sleep_backoff(i, wall_clock_deadline)
-                continue
-
-    # Inline budget exhausted. If a reachable server kept read-timing-out
-    # (slow_doc) → per-doc slowness → EXTRACTION (charge → budget-terminal,
-    # preventing a forever hot-loop on a pathologically slow PDF). If by
-    # 5xx/connect (server outage) → TRANSPORT → reconcile re-enqueues next sweep
-    # (clean hand-off: inline = seconds-scale blips, reconcile = minutes+).
-    if slow_doc:
-        raise MineruExtractionError(
-            f"slow_doc_inline_retries_exhausted: {last_transport!r}")
-    raise MineruTransportError(
-        f"inline_retries_exhausted: {last_transport!r}")
+            async with httpx.AsyncClient(
+                timeout=http_timeout,
+                limits=httpx.Limits(max_connections=max_connections,
+                                    max_keepalive_connections=min(max_concurrency, max_connections)),
+            ) as client:
+                remaining = _remaining_time(wall_clock_deadline)
+                operation = _run_task(client, alternate(endpoints, i), pdf_bytes, stem,
+                                      state, wall_clock_deadline)
+                return await asyncio.wait_for(operation, timeout=remaining)
+        except MineruImageDecodeError:
+            raise
+        except (httpx.ReadTimeout, TimeoutError) as exc:
+            if state.status in ("processing", "failed"):
+                raise MineruExtractionError(
+                    f"task_{state.status}_timeout: {state.error or str(exc)}") from exc
+            last_transport = exc
+        except (MineruTransportError, httpx.HTTPError, httpx.InvalidURL) as exc:
+            if state.status == "failed":
+                raise MineruExtractionError(f"task_failed: {state.error}") from exc
+            last_transport = exc
+        if i < _INLINE_RETRIES:
+            await _async_sleep_backoff(i, wall_clock_deadline)
+    raise MineruTransportError(f"inline_retries_exhausted: {last_transport!r}") from last_transport
 
 
 async def _async_sleep_backoff(i: int, wall_clock_deadline: Optional[float]) -> None:

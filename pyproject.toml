@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "papervault"
-version = "0.10.0"
+version = "0.10.1"
 description = "Self-hosted literature + knowledge layer for coding agents — one MCP server: discover papers, read full text, query a graph-RAG knowledge base with cited answers."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
@@ -66,14 +66,9 @@ grey = [
     "scrapling[fetchers]>=0.2",
     "firecrawl-py>=1.0",
 ]
-# PDF -> markdown OCR. The papervault service is an http-CLIENT of a MinerU vLLM server that
-# runs in its OWN venv (.venv-mineru) — so THIS venv needs only mineru's client libs, NOT the
-# heavy local `vllm` extra. Pulling `[vllm]` here dragged in xgrammar==0.2.4 which has no
-# cp312 x86_64 wheel → uninstallable on this py3.12 host (#84). Client-only = `mineru[core]`.
-# torchvision is pinned (a mineru transitive, not a core dep): it must match the installed
-# torch's ABI — a drift to an incompatible torchvision (0.28 vs torch 2.11) crashes the shared
-# torch stack, which is what broke BGE-M3 embedding for the whole service (#84).
-mineru = ["mineru[core]>=3.2", "torchvision==0.26.0"]
+# OCR runs in the standalone mineru-service. papervault uses its HTTP task API
+# through the core httpx dependency. Keep the extra name for existing install commands.
+mineru = []
 # Zotero metadata sync (optional integration).
 zotero = ["pyzotero>=1.5"]
 dev = [

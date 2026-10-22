@@ -46,6 +46,37 @@ def test_outfeed_counts_only_verified_inline_citations_by_frequency_then_retriev
     assert data == original
 
 
+def test_receipt_retains_pinned_scope_and_available_freshness_without_mutation():
+    snapshot = {"generation_id": "g1", "manifest_revision": 7, "revision": 9,
+        "manifest": {"indexed_scope": ["paper:A"], "freshness": {"max_age_s": 300},
+                     "indexed_at": "2026-10-20T12:00:00Z", "cohort_id": "frozen-corpus"}}
+    before = deepcopy(snapshot)
+    out = aq.build_outfeed(evidence(), META, "[Alpha]", serving_manifest=snapshot)
+    receipt = out["query_receipt"]
+    assert receipt["generation_id"] == "g1" and receipt["manifest_revision"] == 7
+    assert receipt["indexed_scope"] == ["paper:A"]
+    assert receipt["freshness"] == {"max_age_s": 300}
+    assert receipt["indexed_at"] == "2026-10-20T12:00:00Z"
+    assert receipt["cohort_id"] == "frozen-corpus"
+    receipt["indexed_scope"].append("paper:Invented")
+    receipt["freshness"]["max_age_s"] = 1
+    assert snapshot == before
+
+
+def test_receipt_declares_selected_scope_and_input_revisions_without_inventing_dates():
+    snapshot = {"generation_id": "g1", "manifest_revision": 1,
+        "manifest": {"selected_unit_receipts": {"paper:A": "receipt1"}, "entries": [
+            {"unit_id": "paper:A", "consumed_input_revision": "input1", "record_revision": 3},
+            {"unit_id": "paper:B", "consumed_input_revision": "input2", "excluded": True}]}}
+    receipt = aq.build_outfeed(evidence(), META, "[Alpha]", serving_manifest=snapshot)["query_receipt"]
+    assert receipt["indexed_scope"] == ["paper:A"]
+    assert receipt["freshness"] == {"input_revisions": {"paper:A": "input1"}}
+    assert "indexed_at" not in receipt
+    legacy = aq.build_outfeed(evidence(), META, "[Alpha]")["query_receipt"]
+    assert legacy["manifest_revision"] is None
+    assert legacy["indexed_scope"] is None and legacy["freshness"] is None
+
+
 @pytest.mark.parametrize("answer", ["No inline citations.", "", synth.SYNTH_FAILED_PREFIX + ")"])
 def test_uncited_or_failed_synthesis_keeps_retrieval_separate(answer):
     out = aq.build_outfeed(evidence(), META, answer)
@@ -67,6 +98,59 @@ def test_abstract_only_coverage_is_weak_even_with_many_graph_entities():
     assert aq._assess_coverage(META, data) == "weak"
     data["chunks"].append({"file_path": "textbook:Book", "content": "Full evidence"})
     assert aq._assess_coverage(META, data) == "strong"
+
+
+@pytest.mark.parametrize("identity", [
+    {"file_path": "A"}, {"full_doc_id": "abstract-A", "paper_key": "A"},
+    {"paper_key": "A"},
+])
+def test_split_abstract_document_stays_weak_and_labels_every_prompt_chunk(identity):
+    data = {"chunks": [
+        {**identity, "content": ABSTRACT_HEADER + "\nFirst abstract chunk"},
+        {**identity, "content": "Trailing abstract chunk"},
+    ], "references": [{"file_path": "A"}]}
+    before = deepcopy(data)
+    annotated = synth.annotate_sources(data)
+    assert [c["source_tier"] for c in annotated["chunks"]] == ["abstract_only", "abstract_only"]
+    assert aq._assess_coverage(META, data) == "weak"
+    prompt = synth._build_prompt(data, "question")
+    assert prompt.count("(source tier: abstract_only)") == 2
+    assert data == before
+
+
+def test_split_abstract_outfeed_does_not_upgrade_abstract_only_paper():
+    data = {"chunks": [
+        {"file_path": "A", "content": ABSTRACT_HEADER + "\nFirst abstract chunk"},
+        {"file_path": "A", "content": "Trailing abstract chunk"},
+    ]}
+    out = aq.build_outfeed(data, META, "Finding [A].")
+    assert out["kb_coverage"] == "weak"
+    assert out["abstract_only_papers"] == ["A"]
+
+
+def test_abstract_document_with_only_paper_identity_keeps_outfeed_and_prompt_labels():
+    data = {"chunks": [
+        {"paper_key": "A", "content": ABSTRACT_HEADER + "\nAbstract start"},
+        {"paper_key": "A", "content": "Abstract continuation"},
+    ], "references": [{"file_path": "A"}]}
+    out = aq.build_outfeed(data, META, "Finding [A].")
+    assert out["abstract_only_papers"] == ["A"]
+    assert out["kb_coverage"] == "weak"
+    assert synth._build_prompt(data, "question").count("source key: A | credibility: abstract-only") == 2
+
+
+def test_distinct_fulltext_document_for_same_paper_retains_fulltext_authority():
+    data = {"chunks": [
+        {"file_path": "A", "full_doc_id": "abstract-A", "content": ABSTRACT_HEADER + "\nabstract"},
+        {"file_path": "A", "full_doc_id": "abstract-A", "content": "abstract continuation"},
+        {"file_path": "A", "full_doc_id": "fulltext-A", "content": "Full text evidence"},
+    ], "references": [{"file_path": "A"}]}
+    annotated = synth.annotate_sources(data)
+    assert [c["source_tier"] for c in annotated["chunks"]] == ["abstract_only", "abstract_only", "fulltext"]
+    assert annotated["references"][0]["source_tier"] == "fulltext"
+    out = aq.build_outfeed(data, META, "Finding [A].")
+    assert out["kb_coverage"] == "strong"
+    assert out["abstract_only_papers"] == []
 
 
 @pytest.mark.asyncio

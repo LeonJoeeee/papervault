@@ -112,23 +112,29 @@ _CITE_TAG = re.compile(r"\[([A-Za-z0-9_+-]{2,})\]")
 
 
 def strip_paper_key(file_path: str | None) -> str | None:
-    """'paper/Corti2018' -> 'Corti2018'; non-paper or blank -> None.
-
-    Mirrors aquery._cited_papers' membership rule: only 'paper/<key>' file_paths are
-    citeable; textbook/web/unknown sources are not paper keys and are dropped.
-    """
-    if not file_path or not file_path.startswith(_PAPER_PREFIX):
+    """Normalize legacy 'paper/<key>' and current bare keys; reject other sources."""
+    if not file_path or not file_path.strip() or file_path in {"unknown", "unknown_source"}:
         return None
-    key = file_path[len(_PAPER_PREFIX):]
-    return key or None
+    if file_path.startswith(_PAPER_PREFIX):
+        return file_path[len(_PAPER_PREFIX):] or None
+    if "/" not in file_path and ":" not in file_path:
+        return file_path
+    return None
+
+
+def normalize_source_key(key: str | None) -> str | None:
+    """Book/document-level operator citation identity, matching synthesis labels."""
+    if key and key.startswith(("textbook:", "notebook:", "web:")):
+        return re.sub(r"#s\d+$", "", key)
+    return None
 
 
 def _paper_set(items: list[dict] | None) -> list[str]:
-    """Ordered, deduped paper keys from a list of {file_path:...} (rank order preserved)."""
+    """Ordered, deduped keys from explicit paper_key or file_path identities."""
     out: list[str] = []
     seen: set[str] = set()
     for it in items or []:
-        key = strip_paper_key((it or {}).get("file_path"))
+        key = strip_paper_key((it or {}).get("paper_key")) or strip_paper_key((it or {}).get("file_path"))
         if key and key not in seen:
             seen.add(key)
             out.append(key)
@@ -149,6 +155,20 @@ def retrieved_papers_from_chunks(data: dict, top_n: int | None = _CHUNK_TOP_K) -
     if top_n is not None:
         chunks = chunks[:top_n]
     return _paper_set(chunks)
+
+
+def retrieved_papers_from_result(result: dict) -> list[str]:
+    """All served candidates from current outfeed and legacy saved evidence.
+
+    This is the unbounded served set, never a replacement for chunk-rank @5/@12 cuts.
+    References are the legacy candidate fallback and do not expand those chunk budgets.
+    """
+    data = result.get("data") or {}
+    return _paper_set([
+        *(data.get("chunks") or []),
+        *(data.get("references") or []),
+        *({"paper_key": key} for key in (result.get("retrieved_papers") or [])),
+    ])
 
 
 def distinct_papers_from_chunks(data: dict, top_n: int = _CHUNK_TOP_K) -> list[str]:
@@ -271,6 +291,11 @@ def compute_question_metrics(result: dict, gold: dict) -> QuestionMetrics:
     is_trap = len(gold_keys) == 0
 
     data = result.get("data") or {}
+    served_papers = retrieved_papers_from_result(result)
+    # Older/minimal dumps may omit chunks. Only then use the saved ranked candidates;
+    # an explicit chunk list retains its actual rank/slot budget, including empty lists.
+    if "chunks" not in data:
+        data = {**data, "chunks": [{"paper_key": key} for key in served_papers]}
 
     # (1) retrieval recall — both cuts enforced in-module (top_n defaults to _CHUNK_TOP_K=12).
     chunk_papers_12 = set(retrieved_papers_from_chunks(data))            # top-12 chunks (<=12)
@@ -281,12 +306,12 @@ def compute_question_metrics(result: dict, gold: dict) -> QuestionMetrics:
     recall_12 = _recall(chunk_papers_12, gold_keys)
     recall_12_distinct = _recall(distinct_papers_12, gold_keys)
     recall_5 = _recall(chunk_papers_5, gold_keys)
-    # @served: recall over ALL distinct papers actually handed to synth (top_n=None). In the
+    # @served: recall over ALL distinct retrieved candidates handed to synth. In the
     # long-context regime (serving 60 chunks) this is the meaningful COVERAGE term — @12 is slack
     # there. == recall_12_distinct whenever served<=12 (so short-context numbers are unchanged).
     # H4-safe: distinct-paper counting + the retrieval ceiling cap it; over-serving past the
     # unimodal peak is penalised by the trap/faithfulness gates, not rewarded here.
-    recall_served_distinct = _recall(set(distinct_papers_from_chunks(data, top_n=None)), gold_keys)
+    recall_served_distinct = _recall(set(served_papers), gold_keys)
     hit_12 = None if is_trap else int(bool(chunk_papers_12 & gold_keys))
 
     # (2) citation integrity
@@ -300,7 +325,7 @@ def compute_question_metrics(result: dict, gold: dict) -> QuestionMetrics:
     # Drill 2026-06-14: using chunk_papers_12 here mislabeled ~100 real cites/run as hallucinated on
     # the cap-raise variants (worse_by 0.20 was a pure artifact). No-op for the 12-chunk baseline/
     # V-MQ+V-SR runs (served==12 → top_n=None == the first-12). recall_12/hit_12 still use the @12 cut.
-    allowed = set(retrieved_papers_from_chunks(data, top_n=None))  # ALL papers handed to synth
+    allowed = set(served_papers)  # ALL papers handed to synth
     hallucinated = {k for k in prose_keys if k not in allowed}
     hallucinated_rate = _rate(hallucinated, prose_keys)
 

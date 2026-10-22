@@ -71,6 +71,7 @@ class CatalogServingFacade:
         self._pin = None
         self._pin_error = None
         self._heartbeat = None
+        self._close_task = None
 
     @classmethod
     async def pin(cls, repository, **kwargs):
@@ -100,10 +101,17 @@ class CatalogServingFacade:
         try:
             while True:
                 await asyncio.sleep(self._pin_ttl / 3)
-                self._pin = await asyncio.to_thread(self._pin_command, "renew_pin",
+                renewal = asyncio.create_task(asyncio.to_thread(self._pin_command, "renew_pin",
                     f"renew-pin:{self._pin['pin_id']}:{self._pin['revision']}",
                     {"pin_id": self._pin["pin_id"], "expected_revision": self._pin["revision"],
-                     "owner": self._pin_owner, "ttl_seconds": self._pin_ttl})
+                     "owner": self._pin_owner, "ttl_seconds": self._pin_ttl}))
+                try:
+                    self._pin = await asyncio.shield(renewal)
+                except asyncio.CancelledError:
+                    # Cancelling to_thread cannot stop its database command. Drain it
+                    # and retain the committed revision before close releases the pin.
+                    self._pin = await renewal
+                    raise
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -171,6 +179,23 @@ class CatalogServingFacade:
         return result
 
     async def close(self):
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        cancelled = False
+        while True:
+            try:
+                await asyncio.shield(self._close_task)
+                break
+            except asyncio.CancelledError:
+                if self._close_task.cancelled():
+                    raise
+                # Caller cancellation must not cancel a database command or its
+                # revision bookkeeping. Finish cleanup, then preserve cancellation.
+                cancelled = True
+        if cancelled:
+            raise asyncio.CancelledError
+
+    async def _close(self):
         if self._heartbeat is not None:
             self._heartbeat.cancel()
             try:

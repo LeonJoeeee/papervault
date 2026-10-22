@@ -155,11 +155,13 @@ def _slim_chunk(c: dict[str, Any]) -> dict[str, Any]:
     a spurious missing_chunk (SDD §6.10 B, tail 8).
     """
     from papervault.knowledge.query.aquery import _cited_papers
+    from papervault.knowledge.query.synth import _source_label
 
     keys = _cited_papers({"chunks": [c]})
     return {
         "file_path": c.get("file_path"),
         "paper_key": keys[0] if keys else None,
+        "source_key": _source_label(c.get("source_key") or c.get("file_path") or "")[0] if not keys else None,
         "content": c.get("content"),
         "reference_id": c.get("reference_id"),
         "source_tier": c.get("source_tier"),
@@ -190,7 +192,12 @@ async def run_one(rag: Any, g: dict[str, Any], base_meta: dict[str, Any], varian
         "meta": dict(base_meta),
     }
     _rr0 = _rerank_fail_count()  # per-question rerank-degradation snapshot (exact at concurrency=1)
+    owned = rag is None
     try:
+        if owned:
+            from papervault.knowledge.store.catalog_serving import get_query_graph
+
+            rag = await get_query_graph()
         if variant == "multiquery":
             # V-MQ: multi-query+RRF retrieval (multiquery.py). kb_coverage stays on the original
             # single-intent signal; fusion fires only on strong-coverage Qs (trap path unchanged).
@@ -224,6 +231,7 @@ async def run_one(rag: Any, g: dict[str, Any], base_meta: dict[str, Any], varian
         out = await aq.synthesize_outfeed(
             data, metadata, intent, no_synth=no_synth, variant=variant,
             generation_id=getattr(rag, "snapshot", {}).get("generation_id"),
+            serving_manifest=getattr(rag, "snapshot", None),
             rerank_degraded=_rerank_fail_count() > _rr0,
         )
         if hasattr(rag, "validate"):
@@ -244,13 +252,22 @@ async def run_one(rag: Any, g: dict[str, Any], base_meta: dict[str, Any], varian
             rec["metadata"] = {"processing_info": {"total_entities_found": pinfo.get("total_entities_found")}}
     except Exception as e:  # noqa: BLE001 — one bad question must not lose the run
         rec["meta"]["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        if owned and hasattr(rag, "close"):
+            try:
+                await rag.close()
+            except Exception as e:  # cancellation still propagates after cleanup
+                field = "cleanup_error" if "error" in rec["meta"] else "error"
+                rec["meta"][field] = f"{type(e).__name__}: {e}"
     rec["meta"]["rerank_degraded"] = _rerank_fail_count() > _rr0
     return rec
 
 
 async def main_async(args: argparse.Namespace) -> None:
     from papervault.knowledge.query import aquery as aq
-    from papervault.knowledge.store.graph import assert_safe_workspace, get_graph
+    from papervault.knowledge.store.catalog_serving import get_query_graph
+    from papervault.knowledge.store.graph import assert_safe_workspace
+    from papervault.store.knowledge_runtime import knowledge_jobs_mode
 
     ws = _require_probe_workspace()
     _require_exclusive_gpu()
@@ -286,7 +303,9 @@ async def main_async(args: argparse.Namespace) -> None:
     }
     print(f"EVAL RUN | tag={args.tag} | ws={ws} | variant={args.variant} | {len(gold)} questions -> {out_path}", flush=True)
 
-    rag = await get_graph()
+    # Initialize the legacy singleton once before concurrency. Catalog questions
+    # instead acquire their own generation pin for retrieval through synthesis.
+    rag = await get_query_graph() if knowledge_jobs_mode() == "legacy" else None
     _reset_rerank_fails()  # this run's rerank-failure count must reflect only this run (not a stale process global)
 
     # Concurrency: with the V-MQ rework sub-queries no longer call the LLM (pre-supplied keywords),

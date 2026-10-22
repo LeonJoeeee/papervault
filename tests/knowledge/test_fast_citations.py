@@ -16,14 +16,16 @@ def test_unresolved_citations_reports_every_occurrence():
 
 def test_unresolved_citations_accepts_papers_and_operator_sources():
     answer = "[An2017][Suvorovand] [textbook:Griffiths] [notebook:idea] [web:nasa]"
-    assert fast.unresolved_citations(answer, ["An2017", "Suvorovand"]) == []
+    assert fast.unresolved_citations(
+        answer, ["An2017", "Suvorovand"], ["textbook:Griffiths", "notebook:idea", "web:nasa"],
+    ) == []
 
 
 def test_unresolved_citation_breakdown_separates_classes_and_keeps_total():
     # #122 fixture: one resolving paper, one canonical operator cite, then one token per class.
     answer = ("[Reames2023] [textbook:Baumjohann2012] [Baumjohann2012, textbook] "
               "[preliminary CCE study] [9.74/(4.69+VBs)]")
-    assert fast.unresolved_citation_breakdown(answer, ["Reames2023"]) == {
+    assert fast.unresolved_citation_breakdown(answer, ["Reames2023"], ["textbook:Baumjohann2012"]) == {
         "paper_stand_in": 1, "operator_shape": 1, "numeric_other": 1, "total": 3,
     }
 
@@ -66,7 +68,8 @@ def test_fast_arm_scores_prose_including_traps_and_distinguishes_absent_answers(
     gold = [{"qid": qid, "gold_keys": keys} for qid, keys in [
         ("bad", ["An2017"]), ("clean", ["An2017"]), ("trap", []), ("no-synth", ["An2017"]),
     ]]
-    records = [{"qid": qid, "cited_papers": ["An2017"], "answer": answer} for qid, answer in [
+    records = [{"qid": qid, "cited_papers": ["An2017"], "cited_sources": ["web:nasa"],
+                "answer": answer} for qid, answer in [
         ("bad", "[An2017] [preliminary study]"), ("clean", "[An2017] [web:nasa]"),
         ("trap", "[Dst Index entity]"), ("no-synth", None),
     ]]

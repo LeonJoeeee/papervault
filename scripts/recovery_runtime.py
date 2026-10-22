@@ -87,7 +87,7 @@ def physical_replay_factory(config, targets, package, root):
     os.environ["PYTHON_DOTENV_DISABLED"] = "1"
     os.environ["PAPERVAULT_STORAGE"] = str(root / "knowledge")
 
-    def factory(k, **kwargs):
+    def factory(k, *, capacity_gate, **kwargs):
         operation = k.repository.fence_id
         binding = {"operation": operation, "target": identity}
         connection = pg["connection"]
@@ -100,7 +100,7 @@ def physical_replay_factory(config, targets, package, root):
                     sql.Identifier(pg["schema"], "_papervault_replay"))).fetchone()["binding"] != binding:
                 raise ValueError("physical replay backend is not this operation's empty/owned target")
         else:
-            with connection.transaction():
+            with capacity_gate.intake(), connection.transaction():
                 connection.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(pg["schema"])))
                 connection.execute(sql.SQL("SET LOCAL search_path TO {},public").format(sql.Identifier(pg["schema"])))
                 for statement in plan["postgres"]:
@@ -118,10 +118,13 @@ def physical_replay_factory(config, targets, package, root):
                 if count and (len(markers) != 1 or markers[0]["binding"] != payload_hash(binding)):
                     raise ValueError("physical replay graph is not this operation's empty/owned target")
                 if not count:
-                    transaction.run("CREATE (:_PapervaultReplay {binding:$binding})", binding=payload_hash(binding)).consume()
-                transaction.commit()
-            for statement in plan["neo4j"]:
-                session.run(statement).consume()
+                    with capacity_gate.intake():
+                        transaction.run("CREATE (:_PapervaultReplay {binding:$binding})", binding=payload_hash(binding)).consume()
+                        transaction.commit()
+                        for statement in plan["neo4j"]:
+                            session.run(statement).consume()
+                else:
+                    transaction.commit()
         from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
         return CatalogLightRAGAdapter(k, **kwargs)
 

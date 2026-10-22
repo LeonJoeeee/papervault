@@ -11,6 +11,7 @@ import fcntl
 import json
 import os
 import time
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -99,7 +100,24 @@ def replay_plan(package, *, source_generation, parent_ids=None):
         "physical": any(row["manifest"]["tier"] != "metadata" for row in inputs)}
 
 
-def _initialize(connection, schema, state, catalog):
+def _empty_target(target):
+    """An unfunded first intake may leave only its empty accounting locks."""
+    directories = {"knowledge", "knowledge/maintenance", "knowledge/maintenance/capacity"}
+    locks = {"knowledge/maintenance/capacity/" + name
+        for name in (".scheduler-accounting.lock", ".capacity.lock")}
+    for path in target.rglob("*"):
+        relative = path.relative_to(target).as_posix()
+        if path.is_symlink():
+            return False
+        if relative in directories and path.is_dir():
+            continue
+        if relative in locks and path.is_file() and path.stat().st_size == 0:
+            continue
+        return False
+    return True
+
+
+def _initialize(connection, schema, state, catalog, capacity=None):
     from psycopg.rows import dict_row
     connection.row_factory = dict_row
     repository = PostgresCatalogRepository(connection, schema=schema)
@@ -111,7 +129,7 @@ def _initialize(connection, schema, state, catalog):
         if not existing or existing["detail"] != state["binding"]:
             raise ValueError("replay catalog belongs to another operation")
     else:
-        with connection.transaction():
+        with capacity.intake() if capacity is not None else nullcontext(), connection.transaction():
             repository.ensure_schema(audit=AuditEvent("recovery", "replay_schema"))
             repository.ensure_knowledge_schema(audit=AuditEvent("recovery", "replay_schema"))
             runtime = catalog["tables"]["knowledge_runtime"][0]
@@ -131,9 +149,14 @@ def _initialize(connection, schema, state, catalog):
     return KnowledgeRepository(repository)
 
 
-def _import_inputs(k, plan, catalog, generation, operation):
+def _import_inputs(k, plan, catalog, generation, operation, capacity=None):
     def command(action, payload):
-        return k.command(action, operation + ":" + action + ":" + payload_hash(payload), payload)
+        operation_id = operation + ":" + action + ":" + payload_hash(payload)
+        previous = k.get_operation(operation_id)
+        if previous is not None:
+            return previous
+        with capacity.intake() if capacity is not None else nullcontext():
+            return k.command(action, operation_id, payload)
 
     keys = {row["record_key"] for row in plan["units"] if row["record_key"]}
     for row in catalog["tables"]["records"]:
@@ -141,8 +164,9 @@ def _import_inputs(k, plan, catalog, generation, operation):
             continue
         old = k.repository.get(row["key"])
         if old is None:
-            k.repository.upsert(Record.from_payload(row["key"], row["payload"]), expected_revision=0,
-                                audit=AuditEvent("recovery", "replay_source_record"))
+            with capacity.intake() if capacity is not None else nullcontext():
+                k.repository.upsert(Record.from_payload(row["key"], row["payload"]), expected_revision=0,
+                                    audit=AuditEvent("recovery", "replay_source_record"))
         elif old.payload != row["payload"]:
             raise ValueError("replay target record changed")
     command("create_generation", {"generation_id": generation, "candidate": True, "sample": True})
@@ -202,9 +226,13 @@ async def replay_recovery_set(package, target, *, source_generation, target_gene
         "catalog_schema": catalog_schema, "target_generation": target_generation, "plan_sha256": payload_hash(plan),
         "backends": backend_identity}
     marker = child(target, ".replay.json")
-    if target.exists() and any(target.iterdir()) and not marker.exists():
+    if target.exists() and not marker.exists() and not _empty_target(target):
         raise ValueError("replay requires an empty isolated target")
-    target.mkdir(parents=True, exist_ok=True)
+    capacity = capacity_gate if capacity_gate is not None else replay_capacity(
+        target, catalog_connection, catalog_schema, physical=plan["physical"])
+    new_operation = not marker.exists()
+    with capacity.intake() if new_operation else nullcontext():
+        target.mkdir(parents=True, exist_ok=True)
     with child(target, ".replay.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         if marker.exists():
@@ -226,16 +254,18 @@ async def replay_recovery_set(package, target, *, source_generation, target_gene
             from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
             from papervault.knowledge.store.build_breaker import BuildBreaker, BuildSchedule
 
-            capacity = capacity_gate if capacity_gate is not None else replay_capacity(
-                target, catalog_connection, catalog_schema, physical=plan["physical"])
-            with capacity.intake():
+            # A resume must inspect/recover existing work even when new intake
+            # is exhausted. Each missing bootstrap object still needs admission.
+            with capacity.intake() if new_operation else nullcontext():
                 for row in plan["inputs"]:
                     for artifact in row["manifest"]["artifacts"]:
                         relative = "catalog_inputs/" + artifact["sha256"]
-                        copy_verified_file(child(package, "inputs/" + relative), child(target, "knowledge/" + relative),
-                            {key: artifact[key] for key in ("sha256", "byte_length")})
-                k = _initialize(catalog_connection, catalog_schema, state, catalog)
-                _import_inputs(k, plan, catalog, target_generation, state["operation_id"])
+                        destination = child(target, "knowledge/" + relative)
+                        with nullcontext() if destination.exists() else capacity.intake():
+                            copy_verified_file(child(package, "inputs/" + relative), destination,
+                                {key: artifact[key] for key in ("sha256", "byte_length")})
+                k = _initialize(catalog_connection, catalog_schema, state, catalog, capacity)
+                _import_inputs(k, plan, catalog, target_generation, state["operation_id"], capacity)
             op = state["operation_id"]
             expected = [row for row in plan["requirements"] if not row["excluded"]]
             sessions = state.setdefault("sessions", [{"window_id": op, "starts_at": state["started_at"],
@@ -257,8 +287,9 @@ async def replay_recovery_set(package, target, *, source_generation, target_gene
                     "operator_nonce": session["window_id"]})
             inputs = ImmutableInputStore(target / "knowledge/catalog_inputs")
             factory = adapter_factory or CatalogLightRAGAdapter
-            with capacity.intake():
-                adapter = factory(k, working_dir=str(target / "knowledge"), input_store=inputs)
+            with capacity.intake() if new_operation else nullcontext():
+                options = {"capacity_gate": capacity} if adapter_factory is not None else {}
+                adapter = factory(k, working_dir=str(target / "knowledge"), input_store=inputs, **options)
             scheduler = CatalogScheduler(k, adapter, inputs, max_admissions=1, reserved_cost=0 if not plan["physical"] else 1,
                 capacity_gate=capacity,
                 breaker=BuildBreaker(threshold=0, schedule=BuildSchedule(enabled=False)) if not plan["physical"] else None)

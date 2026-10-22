@@ -32,19 +32,19 @@ docker volume create ks-pgdata
 docker volume create ks-neo4jdata
 docker compose --env-file .env -f deploy/docker-compose.yml up -d
 
-# 4. Install papervault (beta-standard: core + local OCR + grey download tiers)
-uv venv && uv pip install -e ".[mineru,grey]"
-#   uv pip install -e .                 # minimal core (no OCR, OA-only downloads)
+# 4. Install papervault (core HTTP OCR client + grey download tiers)
+uv venv && uv pip install -e ".[grey]"
+#   uv pip install -e .                 # core HTTP OCR client, OA-only downloads
 
 # 5. Provision MinerU independently before enabling extraction.
-#    The [mineru] extra supplies HTTP client libraries, not the vLLM server.
-#    On the shared host, mineru.service runs the backend privately on :30001;
-#    mineru-gate.service exposes :30000 and owns backend stop/start and recovery.
-#    Those services are provisioned outside this repository. papervault does not
-#    start, stop or restart them. Do not install a second listener on :30000.
+#    Core httpx supplies the client; [mineru] is an empty compatibility extra.
+#    The shared mineru-service exposes official mineru-api at :30000 and owns
+#    FIFO queuing, model preload and GPU unloading after 20 idle minutes.
+#    Provision the service outside papervault's venv. Do not install a second
+#    listener on :30000 or change a shared service from the caller.
 #    The default MINERU_URL stays http://127.0.0.1:30000; set it for another host.
 curl -fsS http://127.0.0.1:30000/health
-#    Health 200 is ready even with backend=stopped; a workload POST starts it.
+#    Health 200 confirms endpoint health; model loading is service-owned.
 
 # 6. Preflight — verify GPU, databases, LLM config, domain pack
 papervault doctor
@@ -64,8 +64,9 @@ weights, and Postgres + Neo4j connectivity:
 - **workspace (FAIL):** `NEO4J_WORKSPACE` / `POSTGRES_WORKSPACE` must both be
   non-empty AND equal (or `papervault serve` aborts at boot); the reserved prod
   name `l0` fails unless `KS_ALLOW_PROD_WORKSPACE=1` is set on purpose.
-- **MinerU (WARN):** probes the configured OCR endpoint; if it's down, extracts
-  just queue until it comes up — not fatal, so a warning, not a failure.
+- **MinerU (WARN):** probes `GET {base}/health` on the first configured OCR
+  endpoint, without importing MinerU client libraries. If it's down, extracts
+  queue until it comes up — not fatal, so a warning, not a failure.
 - **BGE weights (WARN):** the embed + reranker default to `BAAI/bge-m3` +
   `BAAI/bge-reranker-v2-m3` (~4.5 GB total), pulled lazily from Hugging Face on
   first use. `doctor` detects whether they're already local (a directory, or the
@@ -115,39 +116,59 @@ use the documented `PAPERVAULT_LLM_*` endpoint/key configuration.
 ## MinerU service boundary
 
 MinerU is a shared, independently managed service ([issue #235](https://github.com/LeonJoeeee/papervault/issues/235)).
-On the shared host, `mineru.service` is boot-enabled with a private backend at
-`:30001`. The always-on `mineru-gate.service` owns the consumer endpoint
-`http://127.0.0.1:30000`, starts the backend for workload, stops it after 600
-seconds without workload, and owns bounded backend recovery. The legacy
-`paper-library-mineru.service` is a transition alias of `mineru.service`. The retained
-`deploy/papervault-mineru.service` is a standalone direct-listener template;
-it is not the shared host's backend or gate configuration.
+The shared `mineru-service` exposes unmodified official `mineru-api` at
+`http://127.0.0.1:30000` ([issue #288](https://github.com/LeonJoeeee/papervault/issues/288)).
+Its `AsyncTaskManager` owns FIFO queuing across callers. The service runs with
+`--enable-vlm-preload true` and unloads GPU models after 20 idle minutes;
+model loading, idle release and recovery stay inside the service boundary.
+
+papervault's core `httpx` dependency supplies the entire OCR client. The
+`mineru` extra is empty and retained for compatibility: `uv sync --extra mineru`
+and installs using `.[mineru]` remain valid without adding `mineru` or
+`torchvision` to papervault's environment. Install the OCR service separately.
+
+For each PDF, the client submits multipart `POST {base}/tasks` with
+`backend=vlm-engine`, polls `GET {base}/tasks/{task_id}`, then reads markdown
+from `GET {base}/tasks/{task_id}/result`. Rendering and inference happen in
+the service. Pending queue-wait timeouts defer extraction without charging
+an attempt; read or wall-clock timeouts observed during active processing
+charge an extraction attempt. Connection failures and service outages remain
+uncharged transport failures in every phase.
 
 papervault performs no caller-side pre-flight; `ensure_ready` is an immediate
-no-op. A stopped backend is **idle and ready**: the next OCR workload POST starts
-it inside the service boundary, and the gate waits for it to become ready before
-forwarding the request (measured cold start: about 20–25 seconds). The MinerU
-client's discovery/parse calls determine reachability. Their transport errors
-defer library extraction without charging an attempt and leave operator PDF
-pickup pending. Singleton construction and discovery run off the MCP event loop,
-so concurrent cold clients wait for its lock in threads; socket cleanup still
-runs on the client's own loop. No unit start, warmup polling, load-state
-inspection, or lifecycle cooldown occurs in the caller.
+no-op. The service handles workload when its models are unloaded, including
+any backend wakeup it needs. Submit/poll/result requests determine reachability;
+transport failures leave operator PDF pickup pending. Each endpoint attempt
+owns an `httpx.AsyncClient` and closes it on its own event loop, including
+cancellation. papervault holds no MinerU singleton, parser or model-discovery
+cache and performs no unit start, warmup polling or load-state inspection.
 
 `MINERU_URL` and the active `PAPER_LIBRARY_MINERU_*` HTTP-client settings remain supported.
 Remove obsolete `PAPER_LIBRARY_MINERU_ONDEMAND`, `_WATCHDOG`, `_UNIT`,
 `_IDLE_TIMEOUT`, `_IDLE_CHECK`, `_READY_TIMEOUT`, `_HEALTH_POLL`,
 `_IMAGE_DECODE_RESTART_AFTER`, `_PRECHECK`, and `_PRECHECK_TIMEOUT` settings
-(each suffix uses the `PAPER_LIBRARY_MINERU` prefix). There are no caller-side
-lifecycle settings.
+(each suffix uses the `PAPER_LIBRARY_MINERU` prefix). Also remove
+`MINERU_PROCESSING_WINDOW_SIZE`, `PAPER_LIBRARY_MINERU_CLIENT_CLOSE`,
+`PAPER_LIBRARY_MINERU_NATIVE_RETRIES` and `PAPER_LIBRARY_MINERU_NATIVE_BACKOFF`
+from the caller's configuration. Rendering windows belong to the service;
+the client always closes its own sockets. Native retry constants remain
+import-compatible but do not affect HTTP task requests. Active request
+timeouts, endpoint retries/backoff and per-attempt connection limits are
+documented in [`.env.example`](../.env.example).
+
+The retained `deploy/papervault-mineru.service` template starts the legacy
+`mineru-vllm-server`, which does not supply the required task API; it is not
+a setup path for current papervault. `scripts/probe_mineru_socket_leak.py`
+retains the historical pre-0.10.1 parser-client reproduction, whose
+`CLIENT_CLOSE` before/after switch no longer applies to the HTTP task client.
 Maintenance-window co-tenancy guards still check `papervault.service`,
 `mineru.service`, and the retained standalone template's `papervault-mineru.service`;
 they do not inspect backend load state.
 
-After deployment, the orchestrator verifies an extraction round-trip with the
-backend stopped. The request must complete through the same `:30000` endpoint
-without caller-side intervention. Host measurements and service deployment
-remain outside the lane's unit-test evidence.
+After deployment, the orchestrator verifies a submit/poll/result round-trip
+through the same `:30000` endpoint after idle GPU unload, including any
+service-owned backend wakeup. Host measurements and service deployment remain
+outside the lane's unit-test evidence.
 
 ## BGE idle release
 

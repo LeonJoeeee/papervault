@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Live socket-leak probe for the MinerU OCR path (issue #93).
+"""Historical socket-leak probe for the pre-0.10.1 MinerU client (issue #93).
+
+The before/after modes below apply only to the retired in-process parser client.
+Current papervault uses the official mineru-api task API, always closes its own
+httpx clients, and ignores PAPER_LIBRARY_MINERU_CLIENT_CLOSE. This retained
+reproduction is not a current acceptance check; its mode labels and expected
+slopes describe the old client. See docs/INSTALL.md for the current service.
 
 Reproduces the outbound-HTTP socket leak and verifies the fix, by exercising the
 REAL ``papervault.library.mineru_client.extract_mineru`` code path against a live

@@ -1,7 +1,7 @@
 """Compatibility hooks for the independent MinerU service.
 
-There is no caller-side pre-flight. The service gate wakes the backend on
-workload; the MinerU client's discovery/parse errors determine reachability
+There is no caller-side pre-flight. The service owns backend/model wakeup;
+the HTTP client's submit/poll/result errors determine reachability
 and preserve extraction's uncharged transport deferral. Endpoint and
 HTTP-client settings remain owned by ``mineru_client``.
 """
@@ -34,7 +34,7 @@ class MineruServerController:
         yield
 
     async def ensure_ready(self) -> None:
-        """No caller-side pre-flight by design: the service gate wakes on workload."""
+        """No caller-side pre-flight: backend/model wakeup belongs to the service."""
         return None
 
 

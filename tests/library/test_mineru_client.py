@@ -1,27 +1,400 @@
-"""Tests for ``papervault.library.mineru_client`` — the in-process MinerU vLLM client.
-
-These exercise the C1 transport-vs-extraction discriminator (SDD §2.2/§2.3)
-WITHOUT a real MinerU server: the status/connect/structured-500 helpers are pure
-string functions, the endpoint parser reads the env, and the two typed
-exceptions are the contract ``extract.extract_md`` branches on. The real
-``aio_do_parse`` http path needs a live vLLM server and is exercised by the live
-smoke (SDD §8.B), not here.
-"""
+"""HTTP task protocol, C1 error classification and resource hygiene without live OCR."""
 
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import sys
-import types
+import time
+from email import policy
+from email.parser import BytesParser
+from types import SimpleNamespace
 from unittest.mock import Mock
 
+import httpx
 import pytest
 
 from papervault.library import mineru_client as mc
 
 
-# ----------------------------- endpoints -----------------------------------
+@pytest.fixture
+def server(monkeypatch):
+    """Use real httpx clients and serialization, replacing only the network."""
+    real_client = httpx.AsyncClient
+    state = SimpleNamespace(requests=[], clients=[], options=[])
+    monkeypatch.setattr(mc, "_INLINE_RETRIES", 0)
+    monkeypatch.setattr(mc, "_BACKOFF_BASE", 0)
+    monkeypatch.setattr(mc, "_TASK_POLL_INTERVAL", 0, raising=False)
+
+    def install(handler):
+        async def record(request):
+            state.requests.append(request)
+            result = handler(request)
+            return await result if inspect.isawaitable(result) else result
+
+        def client(**kwargs):
+            state.options.append(kwargs)
+            obj = real_client(transport=httpx.MockTransport(record), **kwargs)
+            state.clients.append(obj)
+            return obj
+
+        monkeypatch.setattr(httpx, "AsyncClient", client)
+        return state
+
+    return install
+
+
+def scripted(server, steps):
+    remaining = list(steps)
+
+    def handle(request):
+        assert remaining, f"unexpected request: {request.method} {request.url}"
+        method, path, result = remaining.pop(0)
+        assert (request.method, request.url.path) == (method, path)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    return server(handle)
+
+
+def submitted(status="pending", **kwargs):
+    return httpx.Response(202, json={"task_id": "t1", "status": status, **kwargs})
+
+
+def completed():
+    return httpx.Response(200, json={"task_id": "t1", "status": "completed"})
+
+
+def markdown(results=None):
+    return httpx.Response(200, json={"results": (
+        {"x": {"md_content": "# body"}} if results is None else results)})
+
+
+def run(**kwargs):
+    return asyncio.run(mc.extract_mineru(
+        b"%PDF-1.4 body", [mc.Endpoint("a", "http://a:30000/")], stem="x", **kwargs))
+
+
+def test_task_flow_submits_pdf_and_polls_without_health_preflight(server, monkeypatch):
+    # A local MinerU install must never be needed by this HTTP consumer.
+    monkeypatch.setitem(sys.modules, "mineru", None)
+    state = scripted(server, [
+        ("POST", "/tasks", submitted(queued_ahead=2)),
+        ("GET", "/tasks/t1", httpx.Response(200, json={"status": "pending", "queued_ahead": 1})),
+        ("GET", "/tasks/t1", httpx.Response(200, json={"status": "processing"})),
+        ("GET", "/tasks/t1", completed()),
+        ("GET", "/tasks/t1/result", markdown()),
+    ])
+    assert run() == "# body"
+    request = state.requests[0]
+    message = BytesParser(policy=policy.default).parsebytes(
+        f"Content-Type: {request.headers['content-type']}\r\n\r\n".encode() + request.content)
+    parts = {part.get_param("name", header="content-disposition"): part
+             for part in message.iter_parts()}
+    pdf = parts.pop("files")
+    assert pdf.get_filename() == "x.pdf"
+    assert pdf.get_content_type() == "application/pdf"
+    assert pdf.get_payload(decode=True) == b"%PDF-1.4 body"
+    assert {name: part.get_content() for name, part in parts.items()} == {
+        "backend": "vlm-engine", "lang_list": "en", "formula_enable": "true",
+        "table_enable": "true", "image_analysis": "false", "return_md": "true",
+        "return_images": "false",
+    }
+    assert len(state.requests) == 5
+    assert all(client.is_closed for client in state.clients)
+
+
+@pytest.mark.parametrize("results,want", [
+    ({"normalized_x": {"md_content": "# normalized"}}, "# normalized"),
+    ({"x": {"md_content": "# selected"}, "other": {"md_content": "wrong"}}, "# selected"),
+])
+def test_result_stem_lookup_and_single_entry_fallback(server, results, want):
+    scripted(server, [("POST", "/tasks", submitted()), ("GET", "/tasks/t1", completed()),
+                      ("GET", "/tasks/t1/result", markdown(results))])
+    assert run() == want
+
+
+@pytest.mark.parametrize("results", [
+    {}, {"x": {}}, {"x": {"md_content": None}}, {"x": {"md_content": "  \n"}},
+    {"x": {"md_content": 42}}, {"x": []},
+    {"other": {"md_content": "wrong"}, "another": {"md_content": "wrong"}},
+])
+def test_unusable_markdown_is_extraction_error(server, results):
+    state = scripted(server, [("POST", "/tasks", submitted()), ("GET", "/tasks/t1", completed()),
+                              ("GET", "/tasks/t1/result", markdown(results))])
+    with pytest.raises(mc.MineruExtractionError):
+        run()
+    assert all(client.is_closed for client in state.clients)
+
+
+def test_missing_results_is_extraction_error(server):
+    scripted(server, [("POST", "/tasks", submitted()), ("GET", "/tasks/t1", completed()),
+                      ("GET", "/tasks/t1/result", httpx.Response(200, json={}))])
+    with pytest.raises(mc.MineruExtractionError):
+        run()
+
+
+@pytest.mark.parametrize("phase", ["submit", "status", "result"])
+@pytest.mark.parametrize("code,error", [
+    (400, mc.MineruExtractionError), (422, mc.MineruExtractionError),
+    (409, mc.MineruExtractionError), (502, mc.MineruTransportError),
+    (503, mc.MineruTransportError), (504, mc.MineruTransportError),
+    (429, mc.MineruTransportError), (500, mc.MineruTransportError),
+])
+def test_http_error_classification_at_each_phase(server, phase, code, error):
+    steps = [("POST", "/tasks", submitted()), ("GET", "/tasks/t1", completed()),
+             ("GET", "/tasks/t1/result", markdown())]
+    index = {"submit": 0, "status": 1, "result": 2}[phase]
+    method, path, _ = steps[index]
+    steps[index] = (method, path, httpx.Response(code, text="plain error"))
+    state = scripted(server, steps[:index + 1])
+    with pytest.raises(error):
+        run()
+    assert len(state.requests) == index + 1
+    assert all(client.is_closed for client in state.clients)
+
+
+@pytest.mark.parametrize("payload", [
+    {"object": "error", "message": "bad document"},
+    {"detail": "cannot render document"}, {"error": {"message": "bad PDF"}},
+])
+def test_structured_500_is_extraction_error(server, payload):
+    scripted(server, [("POST", "/tasks", httpx.Response(500, json=payload))])
+    with pytest.raises(mc.MineruExtractionError):
+        run()
+
+
+@pytest.mark.parametrize("payload", [{}, "Internal Server Error", None])
+def test_500_without_structured_verdict_is_transport_error(server, payload):
+    scripted(server, [("POST", "/tasks", httpx.Response(500, json=payload))])
+    with pytest.raises(mc.MineruTransportError):
+        run()
+
+
+@pytest.mark.parametrize("phase", ["submit", "status", "result"])
+def test_image_decode_400_retains_transport_subclass(server, monkeypatch, phase):
+    monkeypatch.setattr(mc, "_INLINE_RETRIES", 3)
+    steps = [("POST", "/tasks", submitted()), ("GET", "/tasks/t1", completed()),
+             ("GET", "/tasks/t1/result", markdown())]
+    index = {"submit": 0, "status": 1, "result": 2}[phase]
+    method, path, _ = steps[index]
+    steps[index] = (method, path, httpx.Response(400, json={
+        "detail": "Failed to load image: cannot identify image file"}))
+    state = scripted(server, steps[:index + 1])
+    with pytest.raises(mc.MineruImageDecodeError):
+        run()
+    assert len(state.requests) == index + 1
+    assert issubclass(mc.MineruImageDecodeError, mc.MineruTransportError)
+
+
+@pytest.mark.parametrize("code", [400, 422, 409])
+def test_per_document_error_never_fails_over(server, monkeypatch, code):
+    monkeypatch.setattr(mc, "_INLINE_RETRIES", 3)
+    state = scripted(server, [("POST", "/tasks", httpx.Response(code, text="bad PDF"))])
+    with pytest.raises(mc.MineruExtractionError):
+        run()
+    assert len(state.requests) == 1
+
+
+def test_failed_task_fetches_409_result_and_charges_extraction(server):
+    scripted(server, [("POST", "/tasks", submitted()),
+                      ("GET", "/tasks/t1", httpx.Response(200, json={
+                          "status": "failed", "error": "invalid PDF"})),
+                      ("GET", "/tasks/t1/result", httpx.Response(409, json={
+                          "status": "failed", "error": "invalid PDF"}))])
+    with pytest.raises(mc.MineruExtractionError, match="invalid PDF"):
+        run()
+
+
+def test_failed_status_cannot_be_overridden_by_successful_result(server):
+    scripted(server, [("POST", "/tasks", submitted("failed", error="invalid PDF")),
+                      ("GET", "/tasks/t1/result", markdown())])
+    with pytest.raises(mc.MineruExtractionError, match="invalid PDF"):
+        run()
+
+
+@pytest.mark.parametrize("exception", [
+    httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout,
+    httpx.WriteTimeout, httpx.PoolTimeout, httpx.RemoteProtocolError,
+])
+def test_failure_before_processing_is_transport_error(server, exception):
+    scripted(server, [("POST", "/tasks", submitted(queued_ahead=3)),
+                      ("GET", "/tasks/t1", exception("network failure"))])
+    with pytest.raises(mc.MineruTransportError):
+        run()
+
+
+@pytest.mark.parametrize("status,error", [
+    ("pending", mc.MineruTransportError), ("processing", mc.MineruExtractionError),
+])
+def test_read_timeout_uses_last_observed_task_status(server, status, error):
+    scripted(server, [("POST", "/tasks", submitted()),
+                      ("GET", "/tasks/t1", httpx.Response(200, json={
+                          "status": status, "queued_ahead": 3 if status == "pending" else 0})),
+                      ("GET", "/tasks/t1", httpx.ReadTimeout("read stalled"))])
+    with pytest.raises(error):
+        run()
+
+
+@pytest.mark.parametrize("failure", [
+    httpx.ConnectError("refused"), httpx.ConnectTimeout("connect timeout"),
+    httpx.Response(503, text="service restarting"),
+])
+def test_connection_outage_stays_transport_during_processing(server, failure):
+    scripted(server, [("POST", "/tasks", submitted("processing")),
+                      ("GET", "/tasks/t1", failure)])
+    with pytest.raises(mc.MineruTransportError):
+        run()
+
+
+@pytest.mark.parametrize("status,error", [
+    ("pending", mc.MineruTransportError), ("processing", mc.MineruExtractionError),
+])
+def test_wall_clock_expiry_uses_task_status(server, monkeypatch, status, error):
+    clock = [100.0]
+    monkeypatch.setattr(mc.time, "time", lambda: clock[0])
+
+    def handle(request):
+        if request.method == "POST":
+            return submitted()
+        assert request.url.path == "/tasks/t1"
+        clock[0] = 102.0
+        return httpx.Response(200, json={"status": status, "queued_ahead": 3})
+
+    state = server(handle)
+    with pytest.raises(error):
+        run(wall_clock_deadline=101.0)
+    assert len(state.requests) == 2
+
+
+@pytest.mark.parametrize("status,error", [
+    ("pending", mc.MineruTransportError), ("processing", mc.MineruExtractionError),
+])
+async def test_deadline_interrupts_inflight_status_request(server, status, error):
+    async def handle(request):
+        if request.method == "POST":
+            return submitted(status, queued_ahead=2 if status == "pending" else 0)
+        await asyncio.Event().wait()
+
+    state = server(handle)
+    with pytest.raises(error):
+        await mc.extract_mineru(b"%PDF", [mc.Endpoint("a", "http://a")],
+                               wall_clock_deadline=time.time() + 0.1)
+    assert all(client.is_closed for client in state.clients)
+
+
+def test_expired_deadline_does_not_submit(server):
+    state = server(lambda request: pytest.fail("expired request was submitted"))
+    with pytest.raises(mc.MineruTransportError):
+        run(wall_clock_deadline=time.time() - 1)
+    assert state.requests == []
+
+
+def test_deadline_expiring_during_client_setup_does_not_submit(server, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(mc.time, "time", lambda: clock[0])
+    state = server(lambda request: submitted("completed"))
+    client = httpx.AsyncClient
+
+    def slow_setup(**kwargs):
+        clock[0] = 102.0
+        return client(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", slow_setup)
+    with pytest.raises(mc.MineruTransportError):
+        run(wall_clock_deadline=101.0)
+    assert state.requests == []
+    assert all(client.is_closed for client in state.clients)
+
+
+@pytest.mark.parametrize("failure", [httpx.Response(502), httpx.ConnectError("refused")])
+def test_transport_error_fails_over_to_next_endpoint(server, monkeypatch, failure):
+    monkeypatch.setattr(mc, "_INLINE_RETRIES", 1)
+    state = scripted(server, [("POST", "/tasks", failure), ("POST", "/tasks", submitted()),
+                              ("GET", "/tasks/t1", completed()),
+                              ("GET", "/tasks/t1/result", markdown())])
+    assert asyncio.run(mc.extract_mineru(b"%PDF", [mc.Endpoint("a", "http://a"),
+                        mc.Endpoint("b", "http://b")], stem="x")) == "# body"
+    assert [request.url.host for request in state.requests] == ["a", "b", "b", "b"]
+    assert all(client.is_closed for client in state.clients)
+
+
+def test_processing_state_does_not_leak_into_failover_queue(server, monkeypatch):
+    monkeypatch.setattr(mc, "_INLINE_RETRIES", 1)
+    scripted(server, [("POST", "/tasks", submitted("processing")),
+                      ("GET", "/tasks/t1", httpx.Response(503)),
+                      ("POST", "/tasks", submitted(queued_ahead=2)),
+                      ("GET", "/tasks/t1", httpx.ReadTimeout("queue wait"))])
+    with pytest.raises(mc.MineruTransportError):
+        asyncio.run(mc.extract_mineru(b"%PDF", [mc.Endpoint("a", "http://a"),
+                    mc.Endpoint("b", "http://b")]))
+
+
+@pytest.mark.parametrize("payload", [{}, {"task_id": ""}, ["unexpected"]])
+def test_malformed_submission_is_transport_error(server, payload):
+    scripted(server, [("POST", "/tasks", httpx.Response(202, json=payload))])
+    with pytest.raises(mc.MineruTransportError):
+        run()
+
+
+@pytest.mark.parametrize("response", [
+    httpx.Response(200, text="invalid JSON"), httpx.Response(200, json={"status": "unknown"}),
+    httpx.Response(200, json={}),
+])
+def test_malformed_status_is_transport_error(server, response):
+    scripted(server, [("POST", "/tasks", submitted()), ("GET", "/tasks/t1", response)])
+    with pytest.raises(mc.MineruTransportError):
+        run()
+
+
+async def test_cancellation_closes_http_client(server):
+    entered = asyncio.Event()
+
+    async def handle(request):
+        if request.method == "POST":
+            return submitted("processing")
+        entered.set()
+        await asyncio.Event().wait()
+
+    state = server(handle)
+    task = asyncio.create_task(mc.extract_mineru(b"%PDF", [mc.Endpoint("a", "http://a")]))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert all(client.is_closed for client in state.clients)
+
+
+def test_separate_event_loops_own_and_close_separate_clients(server):
+    def handle(request):
+        if request.method == "POST":
+            return submitted()
+        return markdown() if request.url.path.endswith("/result") else completed()
+
+    state = server(handle)
+    assert run() == "# body"
+    assert run() == "# body"
+    assert len(state.clients) == 2
+    assert all(client.is_closed for client in state.clients)
+
+
+def test_configured_limits_and_timeout_reach_http_client(server, monkeypatch):
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONCURRENCY", "12")
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONNECTIONS", "24")
+    state = scripted(server, [("POST", "/tasks", submitted()), ("GET", "/tasks/t1", completed()),
+                              ("GET", "/tasks/t1/result", markdown())])
+    assert run(http_timeout=17) == "# body"
+    assert state.options[0]["limits"].max_connections == 24
+    assert state.clients[0].timeout.read == 17
+
+
+def test_no_endpoints_is_transport_error():
+    with pytest.raises(mc.MineruTransportError):
+        asyncio.run(mc.extract_mineru(b"%PDF", []))
 
 
 def test_endpoints_default_when_unset(monkeypatch):
@@ -45,362 +418,6 @@ def test_alternate_round_robins():
     # Single endpoint degenerates to the same URL (steady state).
     one = [mc.Endpoint("a", "http://a")]
     assert mc.alternate(one, 5).url == "http://a"
-
-
-# ---------------- the C1 discriminator (status / connect / 500) -------------
-
-
-@pytest.mark.parametrize("msg,code", [
-    ("Unexpected status code: [502], response body: ...", 502),
-    ("Unexpected status code: [400], response body: bad", 400),
-    ("... Status code: 503, response body: ...", 503),
-    ("no code here at all", None),
-])
-def test_status_of_parses_code(msg, code):
-    assert mc._status_of(Exception(msg)) == code
-
-
-def test_is_connect_fail_detects_restart_window():
-    assert mc._is_connect_fail(Exception("Failed to connect to server http://x"))
-    assert mc._is_connect_fail(Exception("Connection refused"))
-    assert not mc._is_connect_fail(Exception("Unexpected status code: [400]"))
-
-
-def test_is_structured_500_only_on_structured_body():
-    structured = Exception("Error from server: {'object': 'error', 'message': 'bad'}")
-    assert mc._is_structured_500(structured)
-    # A BARE 500 (no structured object:error body) is NOT structured → transport.
-    assert not mc._is_structured_500(Exception("Unexpected status code: [500]"))
-
-
-def test_zero_byte_timeout_is_transport():
-    assert mc._is_zero_byte_timeout(Exception("Read timed out"))
-    assert mc._is_zero_byte_timeout(Exception("connection timeout"))
-    assert not mc._is_zero_byte_timeout(Exception("Unexpected status code: [422]"))
-
-
-# ----------------------- extract_mineru guard paths -------------------------
-
-
-def test_extract_mineru_no_endpoints_is_transport():
-    """No endpoint configured → MineruTransportError (deploy/transport-class,
-    never a per-doc charge)."""
-    with pytest.raises(mc.MineruTransportError):
-        asyncio.run(mc.extract_mineru(b"%PDF", [], stem="x"))
-
-
-def test_extract_mineru_import_failure_is_transport(monkeypatch):
-    """An absent optional parser is a deploy/transport failure, without HTTP."""
-    monkeypatch.setitem(sys.modules, "mineru.cli.common", None)
-    eps = [mc.Endpoint("a", "http://unreachable.invalid:30000")]
-    with pytest.raises(mc.MineruTransportError, match="mineru_import_failed"):
-        asyncio.run(mc.extract_mineru(b"%PDF-1.4 fake", eps, stem="x"))
-
-
-def test_extract_reaches_parser_without_http_preflight(monkeypatch):
-    import httpx
-
-    def unexpected_http(*args, **kwargs):
-        pytest.fail("client admission must not construct an HTTP client")
-
-    async def parse(**kwargs):
-        from pathlib import Path
-        out = Path(kwargs["output_dir"]) / "x" / "vlm"
-        out.mkdir(parents=True)
-        (out / "x.md").write_text("# body")
-
-    _install_fake_mineru(monkeypatch, parse)
-    monkeypatch.setattr(httpx, "AsyncClient", unexpected_http)
-    eps = [mc.Endpoint("a", "http://unreachable.invalid:30000")]
-    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
-
-
-def test_read_md_from_outdir_missing_is_extraction(tmp_path):
-    """A 200-OK that wrote no md (or an empty md) is EXTRACTION-class — the
-    server ran but produced nothing usable."""
-    from pathlib import Path
-    with pytest.raises(mc.MineruExtractionError):
-        mc._read_md_from_outdir(Path(tmp_path), "nope")
-
-    # Empty md body → also extraction-class.
-    md = Path(tmp_path) / "stem" / "vlm" / "stem.md"
-    md.parent.mkdir(parents=True, exist_ok=True)
-    md.write_text("   \n")
-    with pytest.raises(mc.MineruExtractionError):
-        mc._read_md_from_outdir(Path(tmp_path), "stem")
-
-
-def test_read_md_from_outdir_returns_body(tmp_path):
-    from pathlib import Path
-    md = Path(tmp_path) / "stem" / "vlm" / "stem.md"
-    md.parent.mkdir(parents=True, exist_ok=True)
-    md.write_text("# real md body")
-    assert mc._read_md_from_outdir(Path(tmp_path), "stem") == "# real md body"
-
-
-# ----------------- wall-clock / slow-doc classification (reviewer must-fix) --
-# A read-timeout = the server CONNECTED but this doc is too slow → per-doc
-# pathology → EXTRACTION (charge → budget-terminal), so a pathologically slow
-# PDF can't black-hole forever. A connect-fail / outage stays TRANSPORT.
-
-
-def _install_fake_mineru(monkeypatch, aio_do_parse):
-    """Inject fake mineru.cli.common + mineru_vl_utils.vlm_client.base_client so
-    extract_mineru's lazy import succeeds without a real MinerU install, and the
-    full retry loop runs against a stubbed aio_do_parse."""
-    import sys
-    import types
-
-    class RequestError(ValueError):
-        pass
-
-    class ServerError(RuntimeError):
-        pass
-
-    class UnsupportedError(NotImplementedError):
-        pass
-
-    common = types.ModuleType("mineru.cli.common")
-    common.aio_do_parse = aio_do_parse
-    base = types.ModuleType("mineru_vl_utils.vlm_client.base_client")
-    base.RequestError = RequestError
-    base.ServerError = ServerError
-    base.UnsupportedError = UnsupportedError
-    for name, mod in (
-        ("mineru", types.ModuleType("mineru")),
-        ("mineru.cli", types.ModuleType("mineru.cli")),
-        ("mineru.cli.common", common),
-        ("mineru_vl_utils", types.ModuleType("mineru_vl_utils")),
-        ("mineru_vl_utils.vlm_client", types.ModuleType("mineru_vl_utils.vlm_client")),
-        ("mineru_vl_utils.vlm_client.base_client", base),
-    ):
-        monkeypatch.setitem(sys.modules, name, mod)
-    monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0, raising=False)  # no real sleeps
-
-    return ServerError
-
-
-def test_slow_doc_read_timeout_exhausted_is_extraction(monkeypatch):
-    """A server that keeps read-timing-out (alive but slow) → after the inline
-    budget is spent → EXTRACTION (charge), NOT a forever transport hot-loop."""
-    async def read_timeout(**_kw):
-        raise type("ReadTimeout", (Exception,), {})("body too slow")
-
-    _install_fake_mineru(monkeypatch, read_timeout)
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    with pytest.raises(mc.MineruExtractionError):
-        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
-
-
-def test_connect_fail_exhausted_is_transport(monkeypatch):
-    """A server that's DOWN (connect-fail) stays TRANSPORT even after the inline
-    budget — reconcile retries, never charges/terminalizes (C1)."""
-    ServerError = _install_fake_mineru(monkeypatch, None)
-
-    async def connect_fail(**_kw):
-        raise ServerError("Failed to connect to server: connection refused")
-
-    import sys
-    sys.modules["mineru.cli.common"].aio_do_parse = connect_fail
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    with pytest.raises(mc.MineruTransportError):
-        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
-
-
-# =================== transport-lifecycle: per-loop client close (#93) =========
-#
-# These are PURE-PYTHON regression tests for the socket-leak fix: NO mineru
-# install and NO live server. They fake ``sys.modules["mineru.backend.vlm.
-# vlm_analyze"]`` with a stub ``ModelSingleton`` -> predictor -> client ->
-# ``_aio_client_cache`` graph, exactly the internals ``_close_mineru_client_for_loop``
-# walks, and assert the refcount / eviction / kill-switch / fd-guard behaviour so a
-# future refactor can't silently reintroduce the leak (issue #93).
-
-
-class _StubAioClient:
-    """Stand-in for a mineru per-loop ``httpx.AsyncClient``; records aclose()."""
-
-    def __init__(self) -> None:
-        self.aclosed = False
-
-    async def aclose(self) -> None:
-        self.aclosed = True
-
-
-class _RaisingAioClient:
-    """aclose() records the call THEN raises — proves eviction is aclose-safe."""
-
-    def __init__(self) -> None:
-        self.aclose_called = False
-
-    async def aclose(self) -> None:
-        self.aclose_called = True
-        raise RuntimeError("aclose boom")
-
-
-class _StubHttpClient:
-    def __init__(self, cache: dict) -> None:
-        self._aio_client_cache = cache
-
-
-class _StubPredictor:
-    def __init__(self, cache: dict) -> None:
-        self.client = _StubHttpClient(cache)
-
-
-class _StubModelSingleton:
-    """Mimics mineru's process-global singleton: ``ModelSingleton()._models`` is a
-    class-level dict of predictors (populated per test)."""
-
-    _models: dict = {}
-
-
-def _install_fake_singleton(monkeypatch, models: dict) -> None:
-    """Install a fake ``mineru.backend.vlm.vlm_analyze`` module whose
-    ``ModelSingleton()._models`` is ``models``."""
-    _StubModelSingleton._models = dict(models)
-    mod = types.ModuleType("mineru.backend.vlm.vlm_analyze")
-    mod.ModelSingleton = _StubModelSingleton
-    monkeypatch.setitem(sys.modules, "mineru.backend.vlm.vlm_analyze", mod)
-
-
-def test_client_close_refcount_closes_only_at_zero(monkeypatch):
-    """Two in-flight parses on ONE loop: the first decref does NOT close the
-    shared client (another parse still using it); the second (count 0) does."""
-    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
-    mc._loop_parse_refcounts.clear()
-    stub = _StubAioClient()
-
-    async def _body():
-        loop = asyncio.get_running_loop()
-        _install_fake_singleton(monkeypatch, {"k": _StubPredictor({loop: stub})})
-        mc._incref_current_loop()
-        mc._incref_current_loop()
-        await mc._decref_current_loop_and_maybe_close()      # 2 -> 1, NO close
-        assert stub.aclosed is False
-        assert mc._loop_parse_refcounts.get(loop) == 1
-        await mc._decref_current_loop_and_maybe_close()      # 1 -> 0, CLOSE
-        assert stub.aclosed is True
-        assert loop not in mc._loop_parse_refcounts
-
-    asyncio.run(_body())
-
-
-def test_client_close_evicts_only_current_loop(monkeypatch):
-    """Close-at-zero acloses + evicts ONLY the current loop's cached client;
-    another loop's cached client in the same cache is left untouched."""
-    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
-    mc._loop_parse_refcounts.clear()
-    cur = _StubAioClient()
-    other = _StubAioClient()
-    other_loop = object()   # stand-in key for a DIFFERENT event loop
-
-    async def _body():
-        loop = asyncio.get_running_loop()
-        cache = {loop: cur, other_loop: other}
-        _install_fake_singleton(monkeypatch, {"k": _StubPredictor(cache)})
-        mc._incref_current_loop()
-        await mc._decref_current_loop_and_maybe_close()      # 0 -> close current only
-        assert cur.aclosed is True
-        assert loop not in cache
-        assert other.aclosed is False
-        assert cache.get(other_loop) is other
-
-    asyncio.run(_body())
-
-
-def test_client_close_evicts_even_if_aclose_raises(monkeypatch):
-    """If aclose() raises, the entry is STILL evicted (pop precedes aclose) and
-    the error is swallowed, so the next parse rebuilds a fresh client cleanly."""
-    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
-    mc._loop_parse_refcounts.clear()
-    bad = _RaisingAioClient()
-
-    async def _body():
-        loop = asyncio.get_running_loop()
-        cache = {loop: bad}
-        _install_fake_singleton(monkeypatch, {"k": _StubPredictor(cache)})
-        mc._incref_current_loop()
-        await mc._decref_current_loop_and_maybe_close()      # aclose raises -> swallowed
-        assert bad.aclose_called is True
-        assert loop not in cache                             # evicted -> rebuild path clear
-
-    asyncio.run(_body())
-
-
-def test_client_close_disabled_leaves_client_cached(monkeypatch):
-    """PAPER_LIBRARY_MINERU_CLIENT_CLOSE=0 (``_CLIENT_CLOSE_ENABLED`` False):
-    the wrapper is inert — refcount still cleaned up, but the client is left
-    OPEN + cached (no aclose, no eviction)."""
-    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", False)
-    mc._loop_parse_refcounts.clear()
-    stub = _StubAioClient()
-
-    async def _body():
-        loop = asyncio.get_running_loop()
-        cache = {loop: stub}
-        _install_fake_singleton(monkeypatch, {"k": _StubPredictor(cache)})
-        mc._incref_current_loop()
-        await mc._decref_current_loop_and_maybe_close()      # 0, but close DISABLED
-        assert stub.aclosed is False
-        assert cache.get(loop) is stub                       # left open + cached
-        assert loop not in mc._loop_parse_refcounts          # refcount still popped
-
-    asyncio.run(_body())
-
-
-def test_extract_mineru_wrapper_brackets_and_closes_on_success(monkeypatch):
-    """The public wrapper increfs BEFORE the parse (refcount==1 during it) and,
-    in its finally, decrefs + closes this loop's client on the success path."""
-    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
-    mc._loop_parse_refcounts.clear()
-    closed: list = []
-
-    async def _fake_impl(*_a, **_k):
-        assert mc._loop_parse_refcounts.get(asyncio.get_running_loop()) == 1
-        return "MD"
-
-    async def _fake_close(loop):
-        closed.append(loop)
-
-    monkeypatch.setattr(mc, "_extract_mineru_impl", _fake_impl)
-    monkeypatch.setattr(mc, "_close_mineru_client_for_loop", _fake_close)
-
-    async def _body():
-        loop = asyncio.get_running_loop()
-        eps = [mc.Endpoint("a", "http://127.0.0.1:30000")]
-        assert await mc.extract_mineru(b"%PDF", eps, stem="x") == "MD"
-        assert loop not in mc._loop_parse_refcounts
-        assert closed == [loop]
-
-    asyncio.run(_body())
-
-
-def test_extract_mineru_wrapper_decrefs_and_closes_on_error(monkeypatch):
-    """The finally runs on the ERROR path too: a raising parse still decrefs +
-    closes, so an exception never leaks a refcount or a client."""
-    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
-    mc._loop_parse_refcounts.clear()
-    closed: list = []
-
-    async def _boom_impl(*_a, **_k):
-        raise mc.MineruTransportError("boom")
-
-    async def _fake_close(loop):
-        closed.append(loop)
-
-    monkeypatch.setattr(mc, "_extract_mineru_impl", _boom_impl)
-    monkeypatch.setattr(mc, "_close_mineru_client_for_loop", _fake_close)
-
-    async def _body():
-        loop = asyncio.get_running_loop()
-        eps = [mc.Endpoint("a", "http://127.0.0.1:30000")]
-        with pytest.raises(mc.MineruTransportError):
-            await mc.extract_mineru(b"%PDF", eps, stem="x")
-        assert loop not in mc._loop_parse_refcounts
-        assert closed == [loop]
-
-    asyncio.run(_body())
 
 
 def test_fd_watermark_warns_once_then_throttles(monkeypatch):
@@ -440,119 +457,6 @@ def test_fd_watermark_never_raises_on_proc_error(monkeypatch):
     assert logger.warning.call_count == 0
 
 
-# ========= issue #134: server-side image decode failure is TRANSPORT =========
-# A MinerU vLLM server whose Pillow plugins could not load (a stale process on a
-# deleted venv) answers EVERY page with HTTP 400 "Failed to load image". The client
-# renders the PNGs itself, so this is never the paper's fault: it must be a
-# transport-class error (no attempt charged), not a per-doc extraction verdict.
-
-_IMAGE_DECODE_400 = (
-    'Unexpected status code: [400], response body: {"error":{"message":'
-    '"Failed to load image: cannot identify image file <_io.BytesIO object>",'
-    '"type":"BadRequestError","param":null,"code":400}}')
-
-
-def _raising_parse(ServerError_holder, message, calls):
-    async def _parse(**_kw):
-        calls.append(1)
-        raise ServerError_holder[0](message)
-    return _parse
-
-
-def test_image_decode_400_is_transport_not_extraction(monkeypatch):
-    holder: list = [None]
-    calls: list = []
-    holder[0] = _install_fake_mineru(
-        monkeypatch, _raising_parse(holder, _IMAGE_DECODE_400, calls))
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    with pytest.raises(mc.MineruTransportError) as ei:
-        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
-    assert not isinstance(ei.value, mc.MineruExtractionError)
-    assert isinstance(ei.value, mc.MineruImageDecodeError)
-    assert "Failed to load image" in str(ei.value)
-    # No inline retry: a broken server fails every page the same way.
-    assert len(calls) == 1
-
-
-def test_plain_400_is_still_extraction(monkeypatch):
-    holder: list = [None]
-    calls: list = []
-    holder[0] = _install_fake_mineru(monkeypatch, _raising_parse(
-        holder, 'Unexpected status code: [400], response body: {"error":'
-                '{"message":"prompt too long","code":400}}', calls))
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    with pytest.raises(mc.MineruExtractionError):
-        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
-
-
-def test_plain_422_is_still_extraction(monkeypatch):
-    holder: list = [None]
-    calls: list = []
-    holder[0] = _install_fake_mineru(monkeypatch, _raising_parse(
-        holder, "Unexpected status code: [422], response body: unprocessable", calls))
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    with pytest.raises(mc.MineruExtractionError):
-        asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x"))
-
-
-def test_image_decode_text_on_non_400_is_not_reclassified():
-    """Only the 400 + 'Failed to load image' pair is the stale-server signature."""
-    assert mc._is_server_image_decode_fail(Exception(_IMAGE_DECODE_400))
-    assert not mc._is_server_image_decode_fail(Exception(
-        "Unexpected status code: [422], response body: Failed to load image"))
-    assert not mc._is_server_image_decode_fail(Exception(
-        "Unexpected status code: [400], response body: bad prompt"))
-
-
-# ============ issue #96: bounded request fan-out + socket ceiling ============
-# Each parse fanned out to mineru's default 100 concurrent requests with an
-# uncapped httpx pool (8 slots x 100 = 747 sockets observed). The client now
-# passes max_concurrency (default 32 = the unit's --max-num-seqs 32) and a
-# max_connections ceiling. mineru 3.4.4's ModelSingleton forwards
-# max_concurrency but DROPS max_connections, so the ceiling is also applied to
-# the singleton's HTTP client before the parse creates its per-loop pool.
-
-
-class _CapClient:
-    def __init__(self):
-        self.max_connections = None
-        self.max_concurrency = 100
-
-
-class _CapPredictor:
-    def __init__(self):
-        self.client = _CapClient()
-        self.max_concurrency = 100
-
-
-def _install_fake_capping_singleton(monkeypatch, order):
-    predictor = _CapPredictor()
-    seen = {}
-
-    class _Singleton:
-        def get_model(self, backend, model_path, server_url, **kwargs):
-            order.append("get_model")
-            seen.update(backend=backend, model_path=model_path,
-                        server_url=server_url, kwargs=kwargs)
-            return predictor
-
-    mod = types.ModuleType("mineru.backend.vlm.vlm_analyze")
-    mod.ModelSingleton = _Singleton
-    monkeypatch.setitem(sys.modules, "mineru.backend.vlm.vlm_analyze", mod)
-    return predictor, seen
-
-
-def _recording_parse(order, captured):
-    async def _parse(**kw):
-        order.append("aio_do_parse")
-        captured.update(kw)
-        from pathlib import Path
-        out = Path(kw["output_dir"]) / kw["pdf_file_names"][0] / "vlm"
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"{kw['pdf_file_names'][0]}.md").write_text("# body")
-    return _parse
-
-
 def test_client_limits_defaults(monkeypatch):
     monkeypatch.delenv("PAPER_LIBRARY_MINERU_MAX_CONCURRENCY", raising=False)
     monkeypatch.delenv("PAPER_LIBRARY_MINERU_MAX_CONNECTIONS", raising=False)
@@ -571,79 +475,9 @@ def test_client_limits_ignore_invalid_env(monkeypatch):
     assert mc.client_limits() == (32, 64)
 
 
-def test_parse_passes_caps_to_mineru_client(monkeypatch):
-    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONCURRENCY", "16")
-    monkeypatch.setenv("PAPER_LIBRARY_MINERU_MAX_CONNECTIONS", "40")
-    order: list = []
-    captured: dict = {}
-    _install_fake_mineru(monkeypatch, _recording_parse(order, captured))
-    predictor, seen = _install_fake_capping_singleton(monkeypatch, order)
-
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
-    # Passed through aio_do_parse (mineru forwards max_concurrency) ...
-    assert captured["predictor"] is predictor
-    assert captured["max_concurrency"] == 16
-    assert captured["max_connections"] == 40
-    # ... and the singleton predictor is built with the same kwargs for the same
-    # (backend, model_path, server_url) key, then capped, BEFORE the parse runs.
-    assert order == ["get_model", "aio_do_parse"]
-    assert (seen["backend"], seen["model_path"], seen["server_url"]) == (
-        "http-client", None, "http://a:30000")
-    assert seen["kwargs"]["max_concurrency"] == 16
-    assert predictor.client.max_connections == 40
-    assert predictor.client.max_concurrency == 16
-    assert predictor.max_concurrency == 16
-
-
-def test_parse_without_mineru_singleton_still_passes_caps(monkeypatch):
-    """A mineru build without the singleton internals degrades to the kwargs
-    alone — never an error."""
-    order: list = []
-    captured: dict = {}
-    _install_fake_mineru(monkeypatch, _recording_parse(order, captured))
-    monkeypatch.delitem(sys.modules, "mineru.backend.vlm.vlm_analyze", raising=False)
-    eps = [mc.Endpoint("a", "http://a:30000")]
-    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
-    assert order == ["aio_do_parse"]
-    assert captured["max_concurrency"] == mc.client_limits()[0]
-
-
-def test_discovery_failure_retries_on_next_endpoint(monkeypatch):
-    order, captured, discovered = [], {}, []
-    _install_fake_mineru(monkeypatch, _recording_parse(order, captured))
-    request_error = sys.modules["mineru_vl_utils.vlm_client.base_client"].RequestError
-    predictor = _CapPredictor()
-
-    class Singleton:
-        def get_model(self, backend, model_path, server_url, **kwargs):
-            discovered.append(server_url)
-            if server_url == "http://a":
-                raise request_error("invalid model metadata from first endpoint")
-            return predictor
-
-    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
-    module.ModelSingleton = Singleton
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    eps = [mc.Endpoint("a", "http://a"), mc.Endpoint("b", "http://b")]
-    assert asyncio.run(mc.extract_mineru(b"%PDF-1.4", eps, stem="x")) == "# body"
-    assert discovered == ["http://a", "http://b"]
-    assert captured["server_url"] == "http://b"
-    assert captured["predictor"] is predictor
-
-
-# ============ issue #133: return freed parse memory to the OS ============
-# A whole-doc parse renders + base64-encodes page windows in worker threads;
-# glibc keeps the freed memory in per-thread arenas (+5.5 GB retained after an
-# 8-way burst). After each parse the client calls malloc_trim(0) — glibc only,
-# a no-op elsewhere, never an error.
-
-
 def _count_trims(monkeypatch):
     calls = []
     monkeypatch.setattr(mc, "trim_heap", lambda: calls.append(1) or True)
-    monkeypatch.setattr(mc, "_close_mineru_client_for_loop",
-                        lambda _loop: asyncio.sleep(0))
     return calls
 
 
@@ -678,8 +512,6 @@ def test_trim_failure_never_fails_the_parse(monkeypatch):
         raise RuntimeError("trim exploded")
 
     monkeypatch.setattr(mc, "trim_heap", _boom)
-    monkeypatch.setattr(mc, "_close_mineru_client_for_loop",
-                        lambda _loop: asyncio.sleep(0))
 
     async def _impl(*_a, **_k):
         return "MD"
@@ -725,115 +557,3 @@ def test_trim_heap_resolves_real_glibc_symbol(monkeypatch):
     monkeypatch.setattr(mc, "_malloc_trim_fn", mc._UNLOADED)
     monkeypatch.setattr(mc, "_MALLOC_TRIM_ENABLED", True)
     assert mc.trim_heap() is True
-
-
-# Issue #237: a slow discovery must hold the singleton lock only off-loop.
-@pytest.mark.parametrize("operation", ["prepare", "cleanup"])
-async def test_slow_discovery_does_not_block_event_loop(monkeypatch, operation):
-    import threading
-
-    loop = asyncio.get_running_loop()
-    entered = threading.Event()
-    release = threading.Event()
-    closed = []
-
-    class AioClient:
-        async def aclose(self):
-            closed.append(asyncio.get_running_loop())
-
-    predictor = _CapPredictor()
-    predictor.client._aio_client_cache = {loop: AioClient()}
-
-    class Singleton:
-        _lock = threading.RLock()
-        _models = {"k": predictor}
-
-        def __new__(cls):
-            with cls._lock:
-                return super().__new__(cls)
-
-        def get_model(self, *args, **kwargs):
-            with self._lock:
-                entered.set()
-                if not release.wait(2):
-                    raise AssertionError("synthetic discovery was not released")
-                return predictor
-
-    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
-    module.ModelSingleton = Singleton
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    kwargs = {"max_concurrency": 16, "max_connections": 40}
-    first = asyncio.create_task(mc._prepare_capped_predictor("http://a", kwargs))
-    second = None
-    timer = None
-    try:
-        assert await asyncio.to_thread(entered.wait, 2)
-        heartbeat = loop.create_future()
-        started = loop.time()
-        handle = loop.call_later(0.01, lambda: heartbeat.set_result(
-            (loop.time() - started, release.is_set())))
-        # Independent timer prevents a regression from deadlocking the test.
-        timer = threading.Timer(0.4, release.set)
-        timer.start()
-        if operation == "prepare":
-            second = asyncio.create_task(mc._prepare_capped_predictor("http://b", kwargs))
-        else:
-            second = asyncio.create_task(mc._close_mineru_client_for_loop(loop))
-        lag, discovery_finished = await heartbeat
-        assert lag < 0.2, f"10ms heartbeat delayed by {lag:.3f}s"
-        assert not discovery_finished
-    finally:
-        release.set()
-        if timer is not None:
-            timer.cancel()
-            timer.join()
-        if second is not None:
-            await asyncio.gather(first, second)
-        else:
-            await first
-    handle.cancel()
-    if operation == "cleanup":
-        assert closed == [loop]
-        assert loop not in predictor.client._aio_client_cache
-
-
-async def test_cleanup_keeps_client_if_parse_starts_during_singleton_lookup(monkeypatch):
-    import threading
-
-    loop = asyncio.get_running_loop()
-    release = threading.Event()
-    aio = _StubAioClient()
-    cache = {loop: aio}
-
-    class Singleton:
-        _models = {"k": _StubPredictor(cache)}
-
-        def __new__(cls):
-            if not release.wait(2):
-                raise AssertionError("singleton lookup was not released")
-            return super().__new__(cls)
-
-    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
-    module.ModelSingleton = Singleton
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(mc, "_CLIENT_CLOSE_ENABLED", True)
-    mc._incref_current_loop()
-    start_parse = loop.call_later(0.01, mc._incref_current_loop)
-    timer = threading.Timer(0.4, release.set)
-    timer.start()
-    try:
-        await mc._decref_current_loop_and_maybe_close()
-        # Ensure the scheduled parse has started even on the old blocked path.
-        await asyncio.sleep(0.02)
-        assert mc._loop_parse_refcounts[loop] == 1
-        assert cache[loop] is aio
-        assert not aio.aclosed
-        await mc._decref_current_loop_and_maybe_close()
-        assert aio.aclosed
-        assert loop not in cache
-    finally:
-        release.set()
-        timer.cancel()
-        timer.join()
-        start_parse.cancel()
-        mc._loop_parse_refcounts.pop(loop, None)

@@ -874,58 +874,27 @@ def test_confirmed_gate_failopen_second_pass_does_not_overturn():
 # healthy papers went terminal. It is now transport-class (no charge, status kept);
 # the independent MinerU service owns recovery.
 
-_IMAGE_DECODE_400 = (
-    'Unexpected status code: [400], response body: {"error":{"message":'
-    '"Failed to load image: cannot identify image file <_io.BytesIO object>",'
-    '"type":"BadRequestError","param":null,"code":400}}')
-
-
-def _install_fake_mineru(monkeypatch, aio_do_parse):
-    """Replace the external parser imports, keeping the real client wrapper."""
-    import sys
-    import types
-
-    class ServerError(RuntimeError):
-        pass
-
-    class RequestError(ValueError):
-        pass
-
-    common = types.ModuleType("mineru.cli.common")
-    common.aio_do_parse = aio_do_parse
-    base = types.ModuleType("mineru_vl_utils.vlm_client.base_client")
-    base.ServerError = ServerError
-    base.RequestError = RequestError
-    for name, mod in (
-        ("mineru", types.ModuleType("mineru")),
-        ("mineru.cli", types.ModuleType("mineru.cli")),
-        ("mineru.cli.common", common),
-        ("mineru_vl_utils", types.ModuleType("mineru_vl_utils")),
-        ("mineru_vl_utils.vlm_client", types.ModuleType("mineru_vl_utils.vlm_client")),
-        ("mineru_vl_utils.vlm_client.base_client", base),
-    ):
-        monkeypatch.setitem(sys.modules, name, mod)
-    return base
-
-
-def _install_fake_mineru_raising(monkeypatch, message):
-    """Run real client classification against a parser that raises ServerError."""
+def _install_task_http(monkeypatch, handler):
+    """Keep the real extraction/client pipeline; replace only HTTP transport."""
+    import httpx
     from papervault.library import mineru_client as mc
 
-    async def aio_do_parse(**_kw):
-        raise base.ServerError(message)
+    client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(
+        transport=httpx.MockTransport(handler), **kwargs))
+    monkeypatch.setattr(mc, "_INLINE_RETRIES", 0)
+    monkeypatch.setattr(mc, "_TASK_POLL_INTERVAL", 0)
 
-    base = _install_fake_mineru(monkeypatch, aio_do_parse)
 
-    monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0)
+def _install_mineru_error(monkeypatch, message):
+    import httpx
+
+    _install_task_http(monkeypatch, lambda request: httpx.Response(400, json={"detail": message}))
 
 
 def test_extraction_sends_workload_without_health_preflight(tmp_path, monkeypatch):
-    """Caller admission needs no health response before the self-waking POST."""
-    from pathlib import Path
-
+    """The real caller submits one task without health or model discovery."""
     import httpx
-
     from papervault.library.services.mineru_server import MineruServerController
 
     lib, paper = _pdf_paper(tmp_path)
@@ -939,36 +908,16 @@ def test_extraction_sends_workload_without_health_preflight(tmp_path, monkeypatc
 
     def handler(request):
         requests.append((request.method, request.url.path))
-        if request.method == "POST" and request.url.path == "/v1/chat/completions":
-            return httpx.Response(200, json={
-                "choices": [{"message": {"role": "assistant", "content": markdown}}],
-            })
-        return httpx.Response(503)
+        if (request.method, request.url.path) == ("POST", "/tasks"):
+            return httpx.Response(202, json={"task_id": "t1", "status": "pending", "queued_ahead": 2})
+        if request.url.path == "/tasks/t1":
+            return httpx.Response(200, json={"status": "completed"})
+        assert request.url.path == "/tasks/t1/result"
+        return httpx.Response(200, json={"results": {paper.key: {"md_content": markdown}}})
 
-    client = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client(
-        transport=httpx.MockTransport(handler), **kwargs))
-
-    async def parse(**kwargs):
-        # Simulate only the external OCR adapter; controller and client admission
-        # run unmodified, without health pre-flights.
-        # mineru-vl-utils 1.0.5 discovers the model via GET /v1/models at client
-        # construction, before any workload POST. This fake bypasses discovery:
-        # the gate must synthesize /v1/models while stopped. Live acceptance must
-        # include the real adapter; this test covers only caller admission.
-        async with httpx.AsyncClient() as http:
-            response = await http.post(f"{kwargs['server_url']}/v1/chat/completions", json={
-                "model": "MinerU2.5-Pro-2605-1.2B", "messages": [],
-            })
-        response.raise_for_status()
-        stem = kwargs["pdf_file_names"][0]
-        outdir = Path(kwargs["output_dir"]) / stem / "vlm"
-        outdir.mkdir(parents=True)
-        (outdir / f"{stem}.md").write_text(response.json()["choices"][0]["message"]["content"])
-
-    _install_fake_mineru(monkeypatch, parse)
+    _install_task_http(monkeypatch, handler)
     assert asyncio.run(extract.extract_md(paper, lib, llm=object())) == markdown
-    assert requests == [("POST", "/v1/chat/completions")]
+    assert requests == [("POST", "/tasks"), ("GET", "/tasks/t1"), ("GET", "/tasks/t1/result")]
     assert lib.has_extract(paper.key, "md")
     assert paper.download_status == "ok"
     assert paper.extract_attempts == 0
@@ -989,7 +938,7 @@ def test_image_decode_400_parks_paper_uncharged(tmp_path, monkeypatch, status):
     p.download_status = status
     p.extract_attempts = MAX_EXTRACT_ATTEMPTS - 1     # one charge from terminal
     _stub_good_probe(monkeypatch)
-    _install_fake_mineru_raising(monkeypatch, _IMAGE_DECODE_400)
+    _install_mineru_error(monkeypatch, "Failed to load image: cannot identify image file")
     monkeypatch.setattr(extract, "get_server_controller", _ReadyController)
 
     out = asyncio.run(extract.extract_md(p, lib, llm=object()))
@@ -1008,8 +957,7 @@ def test_plain_400_still_charges_through_real_client(tmp_path, monkeypatch):
     lib, p = _pdf_paper(tmp_path)
     p.download_status = "ok"
     _stub_good_probe(monkeypatch)
-    _install_fake_mineru_raising(
-        monkeypatch, "Unexpected status code: [400], response body: bad request")
+    _install_mineru_error(monkeypatch, "bad request")
     monkeypatch.setattr(extract, "get_server_controller", _ReadyController)
 
     out = asyncio.run(extract.extract_md(p, lib, llm=object()))
@@ -1018,14 +966,9 @@ def test_plain_400_still_charges_through_real_client(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("status", ["ok", "pending"])
-@pytest.mark.parametrize("failure", ["connect", "read_timeout", "request_error"])
-def test_client_discovery_unavailable_defers_without_charging(tmp_path, monkeypatch, status, failure):
-    import sys
-    import types
-
+@pytest.mark.parametrize("failure", ["connect", "read_timeout", "invalid_api_json"])
+def test_client_submission_unavailable_defers_without_charging(tmp_path, monkeypatch, status, failure):
     import httpx
-
-    from papervault.library import mineru_client as mc
     from papervault.library.services.mineru_server import MineruServerController
 
     lib, paper = _pdf_paper(tmp_path)
@@ -1033,30 +976,21 @@ def test_client_discovery_unavailable_defers_without_charging(tmp_path, monkeypa
     paper.extract_attempts = 2
     _stub_good_probe(monkeypatch)
 
-    async def unexpected_parse(**kwargs):
-        pytest.fail("failed model discovery must defer before parsing")
+    def handler(request):
+        assert (request.method, request.url.path) == ("POST", "/tasks")
+        if failure == "read_timeout":
+            raise httpx.ReadTimeout("synthetic submission refused")
+        if failure == "connect":
+            raise httpx.ConnectError("synthetic submission refused")
+        return httpx.Response(202, text="synthetic submission refused")
 
-    base = _install_fake_mineru(monkeypatch, unexpected_parse)
-
-    class Singleton:
-        def get_model(self, *args, **kwargs):
-            if failure == "read_timeout":
-                raise httpx.ReadTimeout("synthetic discovery refused")
-            if failure == "request_error":
-                raise base.RequestError("synthetic discovery refused")
-            raise base.ServerError("Failed to connect to server: synthetic discovery refused")
-
-    module = types.ModuleType("mineru.backend.vlm.vlm_analyze")
-    module.ModelSingleton = Singleton
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    monkeypatch.setattr(mc, "_BACKOFF_BASE", 0.0)
-    monkeypatch.setattr(mc, "_INLINE_RETRIES", 0)
+    _install_task_http(monkeypatch, handler)
     monkeypatch.setattr(extract, "get_server_controller", MineruServerController)
     assert asyncio.run(extract.extract_md(paper, lib, llm=object())) is None
     assert paper.download_status == status
     assert paper.extract_attempts == 2
     assert paper.extract_deferred_sig is not None
     events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
-    assert any(e.get("event") == "extract_md_transport_retry"
-               and "synthetic discovery refused" in e["error"] for e in events)
+    reason = "invalid_api_json" if failure == "invalid_api_json" else "synthetic submission refused"
+    assert any(e.get("event") == "extract_md_transport_retry" and reason in e["error"] for e in events)
     assert not any(e.get("event") == "extract_md_engine_failed" for e in events)

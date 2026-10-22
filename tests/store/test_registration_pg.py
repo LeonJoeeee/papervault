@@ -110,13 +110,19 @@ async def test_registration_cannot_bless_stale_local_identity_over_another_write
     incoming[field] = winner
     outcomes = await RegistrationService(one, SimpleNamespace(add=lambda key: None)).register_candidates(
         [incoming], actor="test", reason="two-writer-conflict")
+    assert outcomes[0]["status"] == "duplicate"
+    assert outcomes[0]["key"] == paper.key
     assert outcomes[0]["reason"] == "identity_conflict"
+    conflicts = [{"field": field, "authority": winner, "observed": local, "origin": "local"}]
+    assert outcomes[0]["identity_conflicts"] == conflicts
     assert one.get(paper.key) is paper
     assert getattr(paper, field) == winner
     assert one._catalog_backend.persisted[paper.key].revision == repo.get(paper.key).revision
     assert repo.get(paper.key).revision >= authoritative.revision
     events = rows(repo, "audit", "event='registration'")
-    assert events[-1]["detail"]["identity_conflicts"]
+    assert events[-1]["key"] == paper.key
+    assert events[-1]["detail"]["identity_conflicts"] == conflicts
+    assert events[-1]["detail"]["observations"][0]["identity_conflicts"] == conflicts
     one.save(force=True)
     assert repo.get(paper.key).payload[field] == winner
 

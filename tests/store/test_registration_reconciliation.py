@@ -98,9 +98,16 @@ async def test_registration_refreshes_divergent_local_identity_before_later_save
     assert getattr(paper, field) == winner
     assert one.get(paper.key) is paper
     assert one._catalog_backend.persisted[paper.key].revision >= committed.revision
+    assert outcomes[0]["status"] == "duplicate"
+    assert outcomes[0]["key"] == paper.key
     assert outcomes[0]["reason"] == "identity_conflict"
-    assert any(event.detail.get("identity_conflicts") for _, event in repo.events
-               if event.event == "registration")
+    conflicts = [{"field": field, "authority": winner, "observed": local, "origin": "local"}]
+    assert outcomes[0]["identity_conflicts"] == conflicts
+    events = [event for key, event in repo.events
+              if key == paper.key and event.event == "registration"]
+    assert len(events) == 1
+    assert events[0].detail["identity_conflicts"] == conflicts
+    assert events[0].detail["observations"][0]["identity_conflicts"] == conflicts
 
 
 async def test_registration_reloads_existing_row_at_accept_time(memory_catalog, tmp_path, monkeypatch):
@@ -127,13 +134,14 @@ async def test_registration_reloads_existing_row_at_accept_time(memory_catalog, 
     assert lib._catalog_backend.persisted[paper.key].revision == repo.get(paper.key).revision
 
 
-@pytest.mark.parametrize("field,winner,alternative", [
-    ("doi", "10.1234/D", "10.1234/E"),
-    ("arxiv_id", "2401.00002v1", "2401.00001v1"),
-    ("paper_id", "D", "E"),
+@pytest.mark.parametrize("field,winner,alternative,status", [
+    ("doi", "10.1234/D", "10.1234/E", "registered"),
+    ("arxiv_id", "2401.00002v1", "2401.00001v1", "registered"),
+    ("arxiv_id", "2401.00002v1", "2401.00002v2", "rejected"),
+    ("paper_id", "D", "E", "duplicate"),
 ])
 async def test_candidate_cannot_replace_authoritative_identity(
-        memory_catalog, tmp_path, monkeypatch, field, winner, alternative):
+        memory_catalog, tmp_path, monkeypatch, field, winner, alternative, status):
     repo = memory_catalog
     lib = pg_library(repo, tmp_path, monkeypatch)
     data = candidate(doi="", paper_id="")
@@ -144,10 +152,24 @@ async def test_candidate_cannot_replace_authoritative_identity(
     incoming[field] = alternative
     outcomes = await RegistrationService(lib, SimpleNamespace(add=lambda key: None)).register_candidates(
         [incoming], actor="test", reason="conflicting-observation")
-    assert outcomes[0]["reason"] == "identity_conflict"
+    result = outcomes[0]
+    assert result["status"] == status
+    if status == "registered":
+        assert result["key"] != paper.key
+        assert getattr(lib.get(result["key"]), field) == alternative
+        assert repo.get(result["key"]).payload[field] == alternative
+        assert len(list(repo.all())) == 2
+    else:
+        assert result["reason"] == "identity_conflict"
+        assert len(list(repo.all())) == 1
+        if status == "duplicate":
+            assert result["key"] == paper.key
+            assert result["identity_conflicts"][0]["decision"] == "refused-existing"
+        else:
+            assert result["key"] is None
+    lib.save(force=True)
     assert getattr(paper, field) == winner
     assert repo.get(paper.key).payload[field] == winner
-    assert outcomes[0]["identity_conflicts"][0]["decision"] == "refused-existing"
 
 
 @pytest.mark.parametrize("claim", ["owner", "reservation"])

@@ -624,6 +624,10 @@ class RegistrationService:
                 outcome["reason"] = "identity_conflict"
                 continue
             existing = existing or (view.get(live.key) if live else None)
+            if existing is not None:
+                # Authority fixes the record key even when a divergent local
+                # identifier made candidate-based lookup miss its counterpart.
+                live = live_view.get(existing.key)
             if live and existing is None:
                 outcome.update(status="duplicate", key=live.key, reason="uncommitted_local_identity")
                 continue

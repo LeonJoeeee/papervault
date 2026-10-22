@@ -6,6 +6,8 @@
 - lint: `.venv/bin/ruff check src tests`
 
 ## Gotchas
+- In read-only home cache sandboxes, prefix `uv` commands with `UV_CACHE_DIR=/tmp/uv-cache`
+  (e.g. `UV_CACHE_DIR=/tmp/uv-cache uv sync --extra dev`).
 - The live `papervault.service` (user unit) runs `.venv/bin/papervault-mcp` from the primary
   checkout on `main`. Never edit that checkout, its `.venv`, or its data from a lane, and never
   restart, stop, or reconfigure the service.

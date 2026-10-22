@@ -14,6 +14,22 @@ three tools:
 The corpus compounds without babysitting: search → queryable knowledge in tens of minutes,
 self-healing ingest queues, cited answers grounded in real sources.
 
+Search serving runs through the six-stage `library/services/search_pipeline.py`
+(intent → plan → retrieval → fusion → return gate → serving), with registration
+admitted separately from the served list. Canonical deduplication and named-entity
+slot reservation preserve relevant evidence; the default `by_relevance` ordering
+uses `PAPERVAULT_SEARCH_AUTHORITY_PRIOR=1` and a gentle `0.25` RRF authority blend
+(`PAPERVAULT_SEARCH_AUTHORITY_LAMBDA`; set the prior to `0` to disable).
+Official ADS `ADS_SCAN` PDFs can proceed to OCR with deferred identity verification;
+`extract.py` requires a positive post-OCR identity check before publishing their text.
+
+On the catalog query path, one single-generation `serving_manifest` stays pinned
+through retrieval and synthesis. Responses distinguish evidence candidates in
+`retrieved_papers` from verified inline `[paper_key]` citations in `cited_papers`.
+Empty coverage skips synthesis, and evidence drawn only from abstracts is capped
+at `"weak"` coverage. See [architecture](docs/architecture.md#search-query-and-lifecycle-contracts)
+for the delivered search, query and lifecycle contracts.
+
 > **Status:** pre-release (closed beta). See `docs/PRD.md` for scope and `docs/architecture.md`
 > for structure. This is industrial-grade infrastructure, not a toy — read the hardware floor
 > before installing.
@@ -463,18 +479,25 @@ must be censored. Request counts/status/rate headers and same-window host proces
 memory measurements remain necessary to validate upstream limits and resource costs.
 This instrumentation changes neither the four workers nor the four semaphore permits.
 
-## Catalog persistence preparation
+## Catalog persistence
 
-The default authority remains `index.json`. The optional
-`PAPERVAULT_CATALOG_AUTHORITY=postgres` backend requires an explicit
-`PAPERVAULT_CATALOG_DSN` and a migrated catalog. Library saves commit guarded delta
-batches with audit and pending work; stale conflicts surface as `catalog_conflict`.
-PG saves leave JSON untouched; run `scripts/export_catalog.py --output <path> --verify`
-for the canonical export. PG purge/deletion is refused during P2.
+Deployment #1 has used PostgreSQL database **`papervault_catalog` as the live catalog
+authority** since the [owner-approved cutover on 2026-10-19](https://github.com/LeonJoeeee/papervault/issues/268#issuecomment-6257668738),
+with `PAPERVAULT_CATALOG_AUTHORITY=postgres`, an explicit `PAPERVAULT_CATALOG_DSN`
+and a migrated catalog. Library saves commit revision-guarded delta batches with
+audit and pending work; stale conflicts surface as `catalog_conflict`.
+PG saves leave JSON untouched. The user unit `papervault-export.timer` generates
+the verified canonical `index.json` export hourly at **:17** (host CST,
+`OnCalendar=*:17`); JSON is a projection rather than a second authority.
+`scripts/export_catalog.py --output <path> --verify` is the explicit export command.
+Configuration still defaults to JSON when the authority setting is unset;
+PostgreSQL record purge/deletion remains refused.
 
-The [readiness checklist and rehearsal runbook](docs/specs/2026-10-18-p2-readiness.md)
-cover the copy-only cutover/rollback tools and remaining owner gates. Live activation
-is not authorized by this release.
+The [execution record and historical rehearsal runbook](docs/specs/2026-10-18-p2-readiness.md)
+record the live cutover and the closed frozen-snapshot rollback boundary: after
+authoritative writes resumed, recovery is forward-only. Knowledge publication is a
+separate handoff: `PAPERVAULT_KNOWLEDGE_JOBS` still defaults to `legacy`, and switching
+it to `postgres` requires its own rehearsed and committed authority transition.
 
 ## Coordinated recovery
 

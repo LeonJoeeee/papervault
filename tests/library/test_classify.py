@@ -80,6 +80,30 @@ def test_pdf_plus_md_is_terminal(lib):
     assert classify(p, lib) == TERMINAL
 
 
+@pytest.mark.parametrize("marker", ["deferred", "source", "evidence"])
+@pytest.mark.parametrize("status,attempts,want", [
+    ("ok", 0, EXTRACT), ("pending", 0, EXTRACT),
+    ("ok", MAX_EXTRACT_ATTEMPTS, TERMINAL), ("extract_failed", 0, TERMINAL),
+])
+def test_unverified_scan_with_old_md_routes_to_ocr(lib, marker, status, attempts, want):
+    import hashlib
+    from papervault.library.models import ADSDocumentEvidence
+
+    p = _add(lib, status)
+    p.extract_attempts = attempts
+    _write_pdf(lib, p.key)
+    _write_md(lib, p.key)
+    if marker == "deferred":
+        p.verification_deferred_to_ocr = True
+    elif marker == "source":
+        p.download_source = "ads_scan"
+    else:
+        p.ads_availability.documents = [ADSDocumentEvidence(
+            outcome="pdf", document_kind="scanned_full_text",
+            sha256=hashlib.sha256(lib.pdf_path(p.key).read_bytes()).hexdigest())]
+    assert classify(p, lib) == want
+
+
 # ---- rule 3: no PDF → DOWNLOAD (incl. firecrawl-md) ----
 
 

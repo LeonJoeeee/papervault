@@ -1100,3 +1100,102 @@ def test_ads_scan_with_prior_completion_still_verifies_new_ocr_output(tmp_path, 
     assert asyncio.run(extract.extract_md(p, lib, llm=_GateLLM('{"match": false}'))) is None
     assert p.domain_status == 'identity_mismatch'
     assert not lib.has_extract(p.key, 'md')
+
+
+@pytest.mark.parametrize("processing_expires", [False, True])
+async def test_local_slot_wait_preserves_execution_budget(tmp_path, monkeypatch, processing_expires):
+    import httpx
+    from papervault.library import mineru_client
+    from papervault.library.services import concurrency
+
+    lib, paper = _pdf_paper(tmp_path)
+    paper.extract_attempts = 1
+    _stub_good_probe(monkeypatch)
+    _stub_judges_pass(monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(extract.time, "time", lambda: clock[0])
+    monkeypatch.setattr(extract, "_CEILING_SECONDS", 10)
+    monkeypatch.setattr(mineru_client, "_INLINE_RETRIES", 0)
+    monkeypatch.setattr(mineru_client, "_TASK_POLL_INTERVAL", 0)
+    slots = asyncio.Semaphore(1)
+    monkeypatch.setattr(concurrency, "extract_slots", slots)
+    await slots.acquire()
+    waiting = asyncio.Event()
+    real_acquire = concurrency.acquire_extract_slot
+
+    async def acquire():
+        waiting.set()
+        return await real_acquire()
+
+    monkeypatch.setattr(concurrency, "acquire_extract_slot", acquire)
+    requests = []
+    body = "Readable scientific output. " * 40
+
+    def handle(request):
+        requests.append(request)
+        if request.method == "POST":
+            return httpx.Response(202, json={"task_id": "x", "status": "processing"})
+        if request.url.path.endswith("/result"):
+            return httpx.Response(200, json={"results": {paper.key: {"md_content": body}}})
+        clock[0] = 1011.0 if processing_expires else 1005.0
+        return httpx.Response(200, json={"status": "processing" if processing_expires else "completed"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(handle), **kw))
+    task = asyncio.create_task(extract.extract_md(paper, lib, llm=object()))
+    await waiting.wait()
+    assert requests == []
+    assert paper.extract_attempts == 1
+    clock[0] = 1000.0  # local queue wait far exceeds the ten-second execution budget
+    slots.release()
+    result = await task
+    assert requests, "admission must give the PDF a fresh execution budget"
+    if processing_expires:
+        assert result is None
+        assert paper.extract_attempts == 2
+        assert paper.extract_deferred_sig is None
+    else:
+        assert result == body
+        assert paper.extract_attempts == 1
+        assert paper.extraction_completion_id
+    assert slots._value == 1
+
+
+@pytest.mark.parametrize("cursor,want", [
+    (0, ["a", "b", "b", "b"]),
+    (1, ["b", "c", "c", "c"]),
+    (2, ["c", "a", "a", "a"]),
+])
+def test_extraction_starts_failover_at_selected_round_robin_endpoint(tmp_path, monkeypatch, cursor, want):
+    import httpx
+    from papervault.library import mineru_client
+    from papervault.library.services import concurrency
+
+    lib, paper = _pdf_paper(tmp_path)
+    _stub_good_probe(monkeypatch)
+    _stub_judges_pass(monkeypatch)
+    monkeypatch.setenv("MINERU_URL", "http://a,http://b,http://c")
+    monkeypatch.setattr(concurrency, "_endpoint_rr_index", cursor)
+    monkeypatch.setattr(concurrency, "extract_slots", asyncio.Semaphore(1))
+    monkeypatch.setattr(mineru_client, "_INLINE_RETRIES", 1)
+    monkeypatch.setattr(mineru_client, "_BACKOFF_BASE", 0)
+    monkeypatch.setattr(mineru_client, "_TASK_POLL_INTERVAL", 0)
+    hosts = []
+    body = "Readable scientific output. " * 40
+
+    def handle(request):
+        hosts.append(request.url.host)
+        if len(hosts) == 1:
+            return httpx.Response(503)
+        if request.method == "POST":
+            return httpx.Response(202, json={"task_id": "x", "status": "pending"})
+        if request.url.path.endswith("/result"):
+            return httpx.Response(200, json={"results": {paper.key: {"md_content": body}}})
+        return httpx.Response(200, json={"status": "completed"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient",
+                        lambda **kw: real_client(transport=httpx.MockTransport(handle), **kw))
+    assert asyncio.run(extract.extract_md(paper, lib, llm=object())) == body
+    assert hosts == want

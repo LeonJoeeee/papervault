@@ -622,8 +622,9 @@ async def _fetch_one_backend(
     Circuit breaker (#115): an OPEN circuit short-circuits this pair BEFORE the
     lookup, the pacing wait and the thread hop — the backend is not called at
     all — while still recording the pair as DEGRADED. Otherwise the outcome
-    feeds the breaker: any of the three failure classes counts one consecutive
-    degrade, a completed fetch resets the counter.
+    feeds the breaker: service-scoped failures count one consecutive degrade;
+    item-scoped failures retain their observations without blaming the service.
+    A completed fetch resets the counter.
     """
     started = time.monotonic()
 
@@ -669,7 +670,8 @@ async def _fetch_one_backend(
         logger.warning("search: backend %s DEGRADED: %s", backend_name, failure.code)
         if degraded_map is not None:
             degraded_map[backend_name] += 1
-        _breaker_record_degraded(backend_name)
+        if failure.scope == "service":
+            _breaker_record_degraded(backend_name)
         observe("degraded", error=failure)
         return []
     _breaker_record_success(backend_name)

@@ -26,12 +26,12 @@ def add_record(lib, key, **data):
 
 
 async def run_search(monkeypatch, lib, nodes, *, query="detector measurements",
-                     terms=None, limit=2, scores=None, authority=False, hint="by_relevance"):
+                     terms=None, limit=2, scores=None, authority=False, hint="by_relevance", filters=None):
     seen = {}
     monkeypatch.setattr(protocol, "get_llm", lambda: SimpleNamespace())
     monkeypatch.setattr(protocol, "SEARCH_AUTHORITY_PRIOR", authority)
     monkeypatch.setattr(protocol, "parse_intent", lambda *a: {
-        "search_terms": terms or ["detector measurements"], "filters": {},
+        "search_terms": terms or ["detector measurements"], "filters": filters or {},
         "limit_suggested": limit, "ranking_hint": hint})
 
     async def retrieve(*a, **kw):
@@ -211,15 +211,20 @@ async def test_enriched_canonical_preview_keeps_later_external_vouches(tmp_path,
     assert lib.get("Collaboration2013a").arxiv_id == ""
 
 
-async def test_explicit_alias_resolves_before_pooling(tmp_path, monkeypatch):
+@pytest.mark.parametrize("merge_enabled", [False, True])
+async def test_explicit_alias_resolves_before_pooling(tmp_path, monkeypatch, merge_enabled):
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1" if merge_enabled else "0")
     from papervault.library.state_v2 import Merge, TerminalState
     lib = Library(tmp_path)
     a = node("Canonical", "PAMELA detector measurements of positron abundance")
     b = node("Alias", "PAMELA detector measurements of energetic particle spectrum")
     add_record(lib, **a)
     alias = add_record(lib, **b)
-    alias.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key="Canonical")
-    result, seen, _ = await run_search(monkeypatch, lib, [b, a], limit=3)
+    alias.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key="Canonical", quarantine=True)
+    result, seen, events = await run_search(monkeypatch, lib, [b, a], limit=3)
+    assert any(e["stage"] == "fusion" and e.get("candidate") == "doi:" + b["doi"].lower()
+               and e.get("decision") == "folded" and e.get("canonical_key") == "Canonical"
+               for e in events)
     assert [r["key"] for r in result["results"]] == ["Canonical"]
     assert [c["key"] for c in seen["pool"]] == ["Canonical"]
 
@@ -301,3 +306,43 @@ def test_authority_prior_defaults_to_gentle_enabled_blend(monkeypatch):
     assert protocol.SEARCH_AUTHORITY_LAMBDA == 0.25
     monkeypatch.setenv("PAPERVAULT_SEARCH_AUTHORITY_PRIOR", "0")
     assert config.search_authority_prior_enabled() is False
+
+
+@pytest.mark.parametrize("year,filters", [(1990, {"year_min": 2020}), (2025, {"year_max": 2020})])
+async def test_preview_rechecks_year_after_resolving_unknown_year_hit(tmp_path, monkeypatch, year, filters):
+    lib = Library(tmp_path)
+    local = node("Dated", "Precision detector measurements of cosmic positron fraction", year=year)
+    add_record(lib, **local)
+    result, seen, _ = await run_search(
+        monkeypatch, lib, [dict(local, year=None, doi="")], filters=filters)
+    assert result["results"] == []
+    assert seen["pool"] == []
+
+
+async def test_year_bounds_use_enriched_preview_projection(tmp_path, monkeypatch):
+    lib = Library(tmp_path)
+    title = "Precision detector measurements of cosmic positron fraction"
+    local = node("Undated", title, year=None)
+    local.update(doi="", arxiv_id="")
+    add_record(lib, **local)
+    first = node("DoiObservation", title, year=None)
+    second = node("PreprintObservation", title, year=1990, rank=1)
+    second.update(doi="", arxiv_id="2001.00001v1")
+    result, seen, _ = await run_search(monkeypatch, lib, [first, second], filters={"year_min": 2020})
+    assert result["results"] == []
+    assert seen["pool"] == []
+    assert lib.get("Undated").year is None
+
+
+async def test_bibliographic_canonical_mapping_cannot_bridge_conflicting_doi(tmp_path, monkeypatch):
+    lib = Library(tmp_path)
+    title = "Precision detector measurements of cosmic positron fraction"
+    canonical = node("Canonical", title, doi="10.1234/first")
+    poor = dict(canonical, key="IdentifierPoor", doi="")
+    add_record(lib, **canonical)
+    add_record(lib, **poor)
+    distinct = node("Distinct", title, doi="10.1234/second")
+    result, seen, _ = await run_search(monkeypatch, lib, [distinct], limit=3)
+    assert "10.1234/second" in {r["doi"] for r in result["results"]}
+    assert "10.1234/second" in {r["doi"] for r in seen["pool"]}
+    assert lib.get("Canonical").doi == "10.1234/first"

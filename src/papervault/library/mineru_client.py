@@ -71,12 +71,6 @@ def endpoints_from_env() -> list[Endpoint]:
 # the complete submit/poll/result flow and every retry/backoff.
 _MINERU_HTTP_TIMEOUT = float(os.environ.get("PAPER_LIBRARY_MINERU_HTTP_TIMEOUT", "600"))
 
-# Compatibility names for consumers of the former in-process MinerU client.
-# HTTP task requests use the endpoint retry budget below; there is no nested
-# MinerU parser or native retry transport in this process anymore.
-_MINERU_INLINE_NATIVE_RETRIES = int(os.environ.get("PAPER_LIBRARY_MINERU_NATIVE_RETRIES", "3"))
-_MINERU_NATIVE_BACKOFF_FACTOR = float(os.environ.get("PAPER_LIBRARY_MINERU_NATIVE_BACKOFF", "0.5"))
-
 _DEFAULT_MAX_CONCURRENCY = 32
 _DEFAULT_MAX_CONNECTIONS = 64
 

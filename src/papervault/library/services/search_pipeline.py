@@ -28,7 +28,7 @@ from .bm25_search import (
     reorder_ranklists_by_rrf, round_robin, rrf_fuse,
 )
 from .intent_parser import named_entity_groups, observe_intent
-from .registration import ServingTrace, preview_candidates, registration_rejection
+from .registration import ServingTrace, preview_candidates, registration_rejection, serving_excluded
 
 logger = logging.getLogger(__name__)
 RETURN_THRESHOLD = 0.4
@@ -272,7 +272,7 @@ class SearchPipeline:
                 (external, degraded), local = await asyncio.gather(
                     self.retrieve(plan.terms, year_min=plan.filters.get("year_min"),
                                   year_max=plan.filters.get("year_max"), ranking_hint=plan.ranking_hint),
-                    asyncio.to_thread(self.library.all_papers))
+                    asyncio.to_thread(self.library.all_papers, include_quarantined=True))
         # Snapshot Paper objects as well as external dicts before later async gates.
         result = RetrievedSearch(copy.deepcopy(external), [p.model_copy(deep=True) for p in local], degraded)
         trace.record("retrieval", external=len(external), local=len(local))
@@ -291,7 +291,7 @@ class SearchPipeline:
                 canonical = snapshot.get(canonical.acquisition_state.alias_key)
                 if canonical is None:
                     break
-            if canonical is None or canonical.key in path:
+            if canonical is None or canonical.key in path or serving_excluded(canonical):
                 trace.record("fusion", key=paper.key, decision="dropped", reason="unresolved_alias")
                 continue
             node = paper_to_dict(canonical)
@@ -386,6 +386,9 @@ class SearchPipeline:
         # combine that with direct external folds before replacing the local row.
         local_evidence = {n["key"]: n for n in fused.local + fused.vouched}
         for node in external:
+            # Later observations can fill an unknown year on the isolated
+            # projection after its first scoring snapshot was captured.
+            node["year"] = projections[node["key"]].year
             donor = local_evidence.get(node["key"])
             if donor is not None:
                 for field in ("folded_vouch", "external_rrf_score"):
@@ -394,6 +397,7 @@ class SearchPipeline:
                     node["best_external_rank"] = min(node["best_external_rank"], donor["best_external_rank"])
         external_keys = set(projections)
         pool = [n for n in fused.local if n["key"] not in external_keys] + external
+        pool = [n for n in pool if plan.year_eligible(n)]
         await self.progress(4, "scoring relevance")
         judgments, return_dropped = await self.judge_return(
             pool, query, search_terms=plan.terms, filters=plan.filters, llm=llm)
@@ -427,6 +431,8 @@ class SearchPipeline:
             key = candidate["key"]
             paper = self.library.get(key)
             if paper is not None:
+                if serving_excluded(paper):
+                    continue
                 record = self.project(selection.projections.get(key, paper), self.library)
             else:
                 record = {field: candidate.get(field) or default for field, default in (
@@ -434,6 +440,8 @@ class SearchPipeline:
                     ("abstract", ""), ("doi", ""), ("arxiv_id", ""), ("citation_count", 0))}
                 record.update(key=key, text_status="pending", source_identities=normalized_source_identities(
                     candidate, candidate.get("source") or ""))
+            if not plan.year_eligible(record):
+                continue
             results.append(record)
             trace.record("serving", candidate=record, key=record["key"], position=position, decision="served",
                          text_status=record.get("text_status"), text_available="text_path" in record)

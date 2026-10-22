@@ -196,12 +196,13 @@ async def test_registration_reuses_worker_filled_identity_and_retains_restrictio
     assert queued == []
 
 
-@pytest.mark.parametrize("field,verified,incoming", [
-    ("doi", "10.1234/registration", "https://doi.org/10.1234/REGISTRATION"),
-    ("arxiv_id", "2401.12345v1", "arXiv:2401.12345v2"),
+@pytest.mark.parametrize("field,verified,incoming,expected", [
+    ("doi", "10.1234/registration", "https://doi.org/10.1234/REGISTRATION", "duplicate"),
+    ("arxiv_id", "2401.12345v1", "arXiv:2401.12345v1", "duplicate"),
+    ("arxiv_id", "2401.12345v1", "arXiv:2401.12345v2", "rejected"),
 ])
 async def test_registration_reconciles_verified_fill_during_save(
-        tmp_path, monkeypatch, field, verified, incoming):
+        tmp_path, monkeypatch, field, verified, incoming, expected):
     import threading
     from papervault.library.services.registration import RegistrationService
 
@@ -233,8 +234,10 @@ async def test_registration_reconciles_verified_fill_during_save(
         release.set()
         outcomes = await registration
 
-    assert outcomes[0]["status"] == "duplicate"
-    assert outcomes[0]["key"] == paper.key
+    assert outcomes[0]["status"] == expected
+    assert outcomes[0]["key"] == (paper.key if expected == "duplicate" else None)
+    if expected == "rejected":
+        assert outcomes[0]["reason"] == "identity_conflict"
     assert lib.keys() == [paper.key]
     assert lib.get(paper.key) is paper
     assert getattr(paper, field) == verified
@@ -242,10 +245,12 @@ async def test_registration_reconciles_verified_fill_during_save(
     persisted = Library(tmp_path)
     assert persisted.keys() == [paper.key]
     assert getattr(persisted.get(paper.key), field) == verified
-    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
-    audit = [e for e in events if e.get("event") == "registration"]
-    assert [(e["key"], e["outcome"]) for e in audit] == [(paper.key, "duplicate")]
-    assert audit[0]["observations"][0][field] == incoming
+    lines = lib.manifest_path.read_text().splitlines() if lib.manifest_path.exists() else []
+    audit = [e for line in lines if (e := json.loads(line)).get("event") == "registration"]
+    assert [(e["key"], e["outcome"]) for e in audit] == (
+        [(paper.key, "duplicate")] if expected == "duplicate" else [])
+    if audit:
+        assert audit[0]["observations"][0][field] == incoming
 
 
 @pytest.mark.parametrize("field,verified,incoming", [
@@ -642,3 +647,125 @@ async def test_conflicting_duplicate_metadata_is_retained_as_registration_eviden
     events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
     evidence = next(e for e in events if e.get("event") == "registration" and e.get("reason") == "alternate")
     assert evidence["observations"][0]["title"] == alternate["title"]
+
+
+@pytest.mark.parametrize("identities", [
+    ({"doi": "10.1234/first"}, {"doi": "10.1234/second"}),
+    ({"doi": "", "arxiv_id": "2001.00001v1"},
+     {"doi": "", "arxiv_id": "2001.00001v2"}),
+])
+async def test_registration_does_not_report_distinct_identities_as_duplicates(tmp_path, identities):
+    from papervault.library.services.registration import RegistrationService, preview_candidates
+
+    lib = Library(tmp_path)
+    service = RegistrationService(lib, SimpleNamespace(add=lambda key: None))
+    first, second = [admitted(**identity) for identity in identities]
+    original = (await service.register_candidates([first], actor="test", reason="original"))[0]
+    previews, _ = preview_candidates(lib, [second])
+    assert previews[0]["key"] != original["key"]
+    result = (await service.register_candidates([second], actor="test", reason="distinct"))[0]
+    assert result["status"] != "duplicate"
+    if second.get("arxiv_id"):
+        # The shared arbiter owns the version-stripped identity. Do not allocate
+        # an identifier-less row or silently merge a distinct explicit version.
+        assert result["status"] == "rejected"
+        assert result["reason"] == "identity_conflict"
+        assert lib.keys() == [original["key"]]
+    else:
+        assert result["status"] == "registered"
+        assert lib.get(result["key"]).doi == "10.1234/second"
+    assert lib.get(original["key"]).doi == first["doi"]
+    assert lib.get(original["key"]).arxiv_id == first.get("arxiv_id", "")
+
+
+@pytest.mark.parametrize("marker", ["identity_mismatch", "off_domain", "non_paper", "bad_extract",
+                                   "quarantine", "excluded"])
+def test_preview_does_not_resolve_quarantined_or_excluded_records(tmp_path, marker):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import Policy, TerminalState
+    from papervault.library.services.registration import preview_candidates
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Blocked", **{k: v for k, v in candidate().items() if k in Paper.model_fields})
+    if marker in {"quarantine", "excluded"}:
+        paper.terminal_state = TerminalState(policy=Policy.EXCLUDED if marker == "excluded" else Policy.CLEAR,
+                                             quarantine=marker == "quarantine")
+    else:
+        paper.domain_status = marker
+    lib._papers[paper.key] = paper
+    lib._reindex(paper)
+    lib.md_path(paper.key).write_text("untrusted evidence")
+    nodes, projections = preview_candidates(lib, [candidate()])
+    assert "Blocked" not in projections
+    assert all(node["key"] != "Blocked" for node in nodes)
+    assert all("text_path" not in node for node in nodes)
+
+
+async def test_preview_accepts_canonical_identity_reached_through_alias(tmp_path, monkeypatch):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import Merge, TerminalState
+    from papervault.library.services.registration import preview_candidates
+
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    lib = Library(tmp_path)
+    for key, doi, alias_key in [("Canonical", "10.1234/canonical", ""),
+                                ("Alias", "10.1234/alias", "Canonical")]:
+        p = Paper(key=key, **{k: v for k, v in candidate(doi=doi).items() if k in Paper.model_fields})
+        p.terminal_state = TerminalState(merge=Merge.ALIAS if alias_key else Merge.CANONICAL,
+                                         alias_key=alias_key, quarantine=bool(alias_key))
+        lib._papers[key] = p
+        lib._reindex(p)
+    nodes, projections = preview_candidates(lib, [candidate(doi="10.1234/alias")])
+    assert [node["key"] for node in nodes] == ["Canonical"]
+    assert nodes[0]["doi"] == "10.1234/canonical"
+    assert set(projections) == {"Canonical"}
+
+
+async def test_identifier_poor_alias_title_cannot_collapse_distinct_doi(tmp_path, monkeypatch):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import Merge, TerminalState
+    from papervault.library.services.registration import RegistrationService, preview_candidates
+
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    lib = Library(tmp_path)
+    canonical = Paper(key="Canonical", **{k: v for k, v in candidate(doi="10.1234/first").items()
+                                          if k in Paper.model_fields})
+    alias = canonical.model_copy(update={"key": "Alias", "doi": "", "arxiv_id": "2001.00001v1",
+        "terminal_state": TerminalState(merge=Merge.ALIAS, alias_key="Canonical", quarantine=True)})
+    for p in [canonical, alias]:
+        lib._papers[p.key] = p
+        lib._reindex(p)
+    incoming = admitted(doi="10.1234/second", paper_id="different")
+    nodes, _ = preview_candidates(lib, [incoming])
+    assert nodes[0]["key"] != canonical.key
+    outcome = (await RegistrationService(lib, SimpleNamespace(add=lambda key: None)).register_candidates(
+        [incoming], actor="test", reason="distinct-doi-alias-title"))[0]
+    assert outcome["status"] == "registered"
+    assert lib.get(outcome["key"]).doi == "10.1234/second"
+    assert canonical.doi == "10.1234/first"
+
+
+async def test_exact_doi_owner_precedes_identifier_poor_alias_title(tmp_path, monkeypatch):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import Merge, TerminalState
+    from papervault.library.services.registration import RegistrationService, preview_candidates
+
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    lib = Library(tmp_path)
+    canonical = Paper(key="Canonical", **{k: v for k, v in candidate(doi="", arxiv_id="2001.00001").items()
+                                          if k in Paper.model_fields})
+    alias = canonical.model_copy(update={"key": "Alias", "arxiv_id": "2001.00002",
+        "terminal_state": TerminalState(merge=Merge.ALIAS, alias_key="Canonical", quarantine=True)})
+    exact = canonical.model_copy(update={"key": "Exact", "doi": "10.1234/exact", "arxiv_id": "", "paper_id": "exact123"})
+    for p in [canonical, alias, exact]:
+        lib._papers[p.key] = p
+        lib._reindex(p)
+    incoming = admitted(doi="10.1234/exact", paper_id="exact123")
+    nodes, _ = preview_candidates(lib, [incoming])
+    assert [node["key"] for node in nodes] == ["Exact"]
+    nodes, _ = preview_candidates(lib, [dict(incoming, arxiv_id=alias.arxiv_id)])
+    assert [node["key"] for node in nodes] == ["Exact"]
+    outcome = (await RegistrationService(lib, SimpleNamespace(add=lambda key: None)).register_candidates(
+        [incoming], actor="test", reason="doi-before-alias-title"))[0]
+    assert outcome["status"] == "duplicate"
+    assert outcome["key"] == "Exact"

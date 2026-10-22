@@ -224,7 +224,8 @@ def _llm_verify_identity(head: str, paper: Paper, *, llm=None,
                 v = None
             if (isinstance(v, dict) and "match" in v
                     and (not require_boolean or isinstance(v["match"], bool))):
-                ok = bool(v["match"])
+                match = v["match"]
+                ok = match is True or (isinstance(match, str) and match.strip().lower() == "true")
                 reason = str(v.get("reason", ""))[:120]
                 return ok, (f"llm_match: {reason}" if ok else f"llm_mismatch: {reason}")
         last = "malformed_output"                      # retry on missing/bad JSON
@@ -315,23 +316,61 @@ def _try_concurrent_first_hit(
     paper: Paper,
     members: list[tuple[str, Callable[[Paper], Optional[bytes]]]],
     timeout: int = 60,
+    *,
+    on_reject: Optional[Callable[[str, bytes, str], None]] = None,
 ) -> Optional[bytes]:
-    """Run multiple tier callables in parallel; return the first non-None
-    result. Members that miss or raise are ignored. Verification of the
-    returned bytes happens in the main download loop (same as serial)."""
+    """Return the first identity-accepted PDF, retaining its verification.
+
+    Rejecting one member must leave completed and pending siblings eligible.
+    The coordinator reuses the winning verdict before saving its bytes.
+    """
     with span("group"), concurrent.futures.ThreadPoolExecutor(
             max_workers=max(2, len(members))) as pool:
-        futures = {pool.submit(copy_context().run, _timed_member, name, fn, paper): name
-                    for name, fn in members}
+        deadline = time.monotonic() + timeout
+        completed_at = {}
+
+        def fetch_member(index, name, fn):
+            data = _timed_member(name, fn, paper)
+            completed_at[index] = time.monotonic()
+            return data
+
+        futures = {pool.submit(copy_context().run, fetch_member, index, name, fn): (name, index)
+                    for index, (name, fn) in enumerate(members)}
+
+        def completed_candidates():
+            seen = set()
+            try:
+                for future in concurrent.futures.as_completed(
+                        futures, timeout=max(0.0, deadline - time.monotonic())):
+                    seen.add(future)
+                    yield future
+            except concurrent.futures.TimeoutError:
+                # as_completed checks its deadline before draining completions
+                # queued while an earlier candidate was being verified.
+                yield from (future for future in futures if future not in seen and future.done())
+
         try:
-            for fut in concurrent.futures.as_completed(
-                    futures, timeout=timeout):
+            for fut in completed_candidates():
                 data = fut.result()
-                if data:
+                member, index = futures[fut]
+                # Verification latency cannot extend the original fetch budget.
+                if data and completed_at[index] <= deadline:
+                    deferred_scan = member == "ads" and _trusted_ads_scan(paper, data)
+                    with span("verification", member=member):
+                        ok, reason = ((True, "identity_unverifiable_scanned") if deferred_scan
+                                      else _verify_pdf_matches_metadata(data, paper))
+                    if member == "ads":
+                        _record_ads_verification(paper, data, ok)
+                    if not ok:
+                        if on_reject is not None:
+                            on_reject(member, data, reason)
+                        emit("candidate_rejected", member=member)
+                        continue
                     if type(data) is bytes:
                         data = _SourcePDF(data)
-                    emit("winner", member=futures[fut])
-                    data.acquisition_source = futures[fut]
+                    data._group_verification = (ok, reason)
+                    emit("winner", member=member)
+                    data.acquisition_source = member
                     return data
         except concurrent.futures.TimeoutError:
             pass
@@ -344,7 +383,7 @@ def _try_concurrent_first_hit(
     return None
 
 
-def _try_oa_aggregators(paper: Paper) -> Optional[bytes]:
+def _try_oa_aggregators(paper: Paper, *, on_reject=None) -> Optional[bytes]:
     """Concurrent first-hit over four open-access metadata aggregators.
 
     Replaces four serial cascade tiers (unpaywall, semantic_scholar_oa,
@@ -356,12 +395,13 @@ def _try_oa_aggregators(paper: Paper) -> Optional[bytes]:
         ("semantic_scholar_oa", _try_semantic_scholar_oa),
         ("openalex", _try_openalex),
         ("core", _try_core),
-    ])
+    ], on_reject=on_reject)
 
 
 def _try_domain_aggregators(
     paper: Paper, *, ads_member: Optional[Callable[[Paper], Optional[bytes]]] = None,
     library: Optional[Library] = None,
+    on_reject=None,
 ) -> Optional[bytes]:
     """Concurrent first-hit over four domain-specific paper indexes.
 
@@ -374,7 +414,7 @@ def _try_domain_aggregators(
         ("ads", _try_ads if ads_member is None else ads_member),
         ("europepmc", _try_europepmc),
         ("zenodo", _try_zenodo),
-    ])
+    ], on_reject=on_reject)
 
 
 # Ordered cascade. Sorted by Round 1 hit-rate (high first), with
@@ -685,6 +725,15 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
         strategies = [("ads", ads_member), *_STRATEGIES]
 
     for source, strategy in strategies:
+        group_rejected = False
+
+        def reject_group_member(member, data, reason):
+            nonlocal group_rejected
+            group_rejected = True
+            library.log({"event": "download_pdf_mismatch", "key": paper.key,
+                         "source": source, "member_source": member,
+                         "size": len(data), "reason": reason})
+
         with span("tier", source=source):
             try:
                 skip_reason = _download_skip_reason(source, paper, arxiv_record=arxiv_record)
@@ -700,7 +749,10 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                     elif strategy is _try_arxiv_by_title:
                         data = _try_arxiv_by_title(paper, record=arxiv_record, library=library)
                     elif strategy is _try_domain_aggregators:
-                        data = _try_domain_aggregators(paper, ads_member=ads_member, library=library)
+                        data = _try_domain_aggregators(paper, ads_member=ads_member, library=library,
+                                                       on_reject=reject_group_member)
+                    elif strategy is _try_oa_aggregators:
+                        data = _try_oa_aggregators(paper, on_reject=reject_group_member)
                     elif strategy is _try_ads:
                         data = ads_member(paper)
                     elif strategy is _try_inspire:
@@ -716,9 +768,12 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
             if data:
                 deferred_scan = (source in {"ads", "domain_aggregators"}
                                  and _trusted_ads_scan(paper, data))
-                with span("verification"):
-                    ok, verify_reason = ((True, "identity_unverifiable_scanned") if deferred_scan
-                                         else _verify_pdf_matches_metadata(data, paper))
+                verification = getattr(data, "_group_verification", None)
+                if verification is None:
+                    with span("verification"):
+                        verification = ((True, "identity_unverifiable_scanned") if deferred_scan
+                                        else _verify_pdf_matches_metadata(data, paper))
+                ok, verify_reason = verification
                 if source in {"ads", "domain_aggregators"}:
                     _record_ads_verification(paper, data, ok)
                     _log_ads_availability(paper, library)
@@ -752,6 +807,8 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                 _log_ads_availability(paper, library)
                 if _settle_ads_abstract(paper, library):
                     return False
+            if group_rejected:
+                continue
             if skip_reason:
                 library.log({"event": "download_skip", "key": paper.key,
                              "source": source, "reason": skip_reason})

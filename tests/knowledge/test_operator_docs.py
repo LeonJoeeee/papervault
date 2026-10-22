@@ -644,3 +644,38 @@ def test_paused_operator_pipeline_does_not_record_a_failure(monkeypatch, tmp_pat
         _run(od.ingest_document(rag, 'textbook', 'textbook:Fixture2020', path,
                                 tokenizer=FakeTok()))
     assert all(w[3] == 'processing' for w in writes)
+
+
+@pytest.mark.parametrize("outcome", ["failed", "refused", "missing-status", "raises"])
+def test_force_replacement_retains_failed_deletion_ledger(monkeypatch, tmp_path, outcome):
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_ledger(monkeypatch, {"Fixture2020": _rec("textbook:Fixture2020", "Fixture2020")})
+    path = tmp_path / "book.md"
+    path.write_text("# Fixture\nreplacement content")
+
+    class RefusingRag(FakeRag):
+        async def adelete_by_doc_id(self, doc_id):
+            self.deleted_doc_ids.append(doc_id)
+            if outcome == "raises":
+                raise RuntimeError("backend refusal")
+            return {} if outcome == "missing-status" else {"status": outcome}
+
+    rag = RefusingRag()
+    with pytest.raises(od.AlreadyIngestedError):
+        _run(od.ingest_document(rag, "textbook", "textbook:Fixture2020", str(path),
+            tokenizer=FakeTok(), force=True))
+    assert "Fixture2020" in _run(od.ledger.load("textbook"))
+    assert rag.enqueued is None
+
+
+def test_mixed_operator_purge_clears_only_successful_deletions(monkeypatch):
+    _patch_ledger(monkeypatch, {sid: _rec("textbook:" + sid, sid)
+        for sid in ("Fixture2020#s0", "Fixture2020#s1")})
+
+    class MixedRag(FakeRag):
+        async def adelete_by_doc_id(self, doc_id):
+            return {"status": "success" if doc_id.endswith("#s0") else "refused"}
+
+    counts = _run(od.purge_key(MixedRag(), "textbook", "textbook:Fixture2020"))
+    assert counts == {"docs_deleted": 1, "docs_failed": 1, "ledger_rows_deleted": 1}
+    assert set(_run(od.ledger.load("textbook"))) == {"Fixture2020#s1"}

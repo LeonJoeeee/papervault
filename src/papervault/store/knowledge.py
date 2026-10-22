@@ -624,9 +624,14 @@ class KnowledgeRepository:
 
     def list_admission_jobs(self, scope=None, limit=100):
         from psycopg import sql
+        from .knowledge_commands import require_record_policy
+
+        if limit <= 0:
+            return []
         keys = self.resolve_scope_units(scope)
-        rows = self.connection.execute(sql.SQL(
-            "SELECT j.* FROM {jobs} j JOIN {requirements} q ON q.unit_id=j.unit_id AND q.generation_id=j.target_generation "
+        query = sql.SQL(
+            "SELECT j.*,u.record_key AS policy_record_key,parent.record_key AS policy_parent_key "
+            "FROM {jobs} j JOIN {requirements} q ON q.unit_id=j.unit_id AND q.generation_id=j.target_generation "
             "JOIN {generations} g ON g.generation_id=j.target_generation JOIN {units} u ON u.unit_id=j.unit_id "
             "JOIN {inputs} i ON i.consumed_input_revision=j.consumed_input_revision "
             "JOIN {recipes} recipe ON recipe.recipe_digest=j.recipe_digest "
@@ -662,14 +667,36 @@ class KnowledgeRepository:
             "AND q.consumed_input_revision=j.consumed_input_revision AND q.recipe_digest=j.recipe_digest "
             "AND (j.state IN ('queued','failed') OR (j.state='running' AND a.lease_expires_at<=clock_timestamp()) "
             "OR (j.state='succeeded' AND op.operation_id IS NULL AND a.aggregate_base_manifest_revision<>g.manifest_revision)) "
-            "AND (%s::text[] IS NULL OR j.key=ANY(%s) OR j.unit_id=ANY(%s)) ORDER BY j.enqueued_at,j.id LIMIT %s"
+            "AND (%s::text[] IS NULL OR j.key=ANY(%s) OR j.unit_id=ANY(%s)) ORDER BY j.enqueued_at,j.id LIMIT %s OFFSET %s"
         ).format(**{name: self.repository._table(table) for name, table in {
             "jobs": "jobs", "requirements": "knowledge_requirements", "generations": "generations", "units": "units",
             "inputs": "input_manifests", "recipes": "recipes", "records": "records", "attempts": "knowledge_attempts",
             "operations": "knowledge_operations", "reducers": "knowledge_unit_reducers", "mappings": "section_mappings",
             "current_inventories": "current_inventories", "inventories": "unit_inventories",
-            "windows": "knowledge_maintenance_windows"}.items()}), (keys, keys, keys, limit))
-        return [{**r, "job_id": r["id"], "generation_id": r["target_generation"]} for r in rows]
+            "windows": "knowledge_maintenance_windows"}.items()})
+        # Scoped grants are evaluated by the same predicate as claim/publication.
+        # Continue through denied pages so they cannot consume the returned limit.
+        policies, admitted, offset = {}, [], 0
+        while len(admitted) < limit:
+            rows = list(self.connection.execute(query, (keys, keys, keys, limit, offset)))
+            for row in rows:
+                record_keys = (row.pop("policy_record_key"), row.pop("policy_parent_key"))
+                for key in record_keys:
+                    if key not in policies:
+                        try:
+                            require_record_policy(self, key)
+                        except ClaimRejected:
+                            policies[key] = False
+                        else:
+                            policies[key] = True
+                if all(policies[key] for key in record_keys):
+                    admitted.append({**row, "job_id": row["id"], "generation_id": row["target_generation"]})
+                    if len(admitted) == limit:
+                        break
+            if len(rows) < limit:
+                break
+            offset += len(rows)
+        return admitted
 
     def get_section(self, unit_id, mapping_revision=None):
         rows = self._rows("section_mappings", unit_id=unit_id)

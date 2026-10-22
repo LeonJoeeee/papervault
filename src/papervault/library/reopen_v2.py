@@ -25,7 +25,8 @@ from .telemetry_v2 import identity_snapshot, publication_fields, record_censored
 
 _IDENTITY_FIELDS = {"key", "doi", "arxiv_id", "paper_id", "inspire_record_id", "url", "title", "authors", "year"}
 _RESULT_FIELDS = {"verification_deferred_to_ocr", "download_source", "download_source_member", "ads_availability", "arxiv_withdrawal",
-                  "firecrawl_pdf_hunt_exhausted", "txt_engine", "txt_engine_version", "md_engine", "md_engine_version"}
+                  "firecrawl_pdf_hunt_exhausted", "inspire_document_urls", "insight_invalid_reason",
+                  "txt_engine", "txt_engine_version", "md_engine", "md_engine_version"}
 
 
 def _require_enabled():
@@ -143,11 +144,13 @@ class StagedAttempt:
             return "publication policy/identity/budget fence"
         for field in _IDENTITY_FIELDS:
             old, new = getattr(self.before, field), getattr(result, field)
-            if old != new and (field not in {"doi", "arxiv_id"} or old):
+            if old != new and (field not in {"doi", "arxiv_id", "inspire_record_id"} or old):
                 return "result changed an adopted identity"
-        for name in ("doi", "arxiv_id"):
+        for name in ("doi", "arxiv_id", "inspire_record_id"):
             if not getattr(self.before, name) and getattr(result, name):
-                holder = self.live.find(**{name: getattr(result, name)})
+                value = getattr(result, name)
+                holder = (self.live._identifier_owner(name, self.live._identifier_token(name, value))
+                          if name == "inspire_record_id" else self.live.find(**{name: value}))
                 if holder is not None and holder.key != paper.key:
                     return "verified identity collides at publication"
         return ""
@@ -179,14 +182,15 @@ class StagedAttempt:
             before_publication = paper.model_copy(deep=True)
             try:
                 with self.live.catalog_completion(self.token):
-                    fills = {name: getattr(result, name) for name in ("doi", "arxiv_id")
+                    fills = {name: getattr(result, name) for name in ("doi", "arxiv_id", "inspire_record_id")
                              if not getattr(self.before, name) and getattr(result, name)}
                     measurement_identity = identity_snapshot(self.before, library=self.live) if stoprules_v2_enabled() else None
                     if fills:
                         # The publication fences above authorize only this existing
                         # dispatched result, including same-row verified blank fills.
-                        applied = self.live._fill_verified_identifiers(paper, **fills, completion=self.token,
+                        outcomes = self.live.adopt_identifiers(paper.key, **fills, completion=self.token,
                             provenance={"operation": "reopen", "generation": self.token.generation})
+                        applied = {name: value for name, value in fills.items() if outcomes.get(name) == "adopted"}
                         if applied != fills:
                             store._quarantine(paper, "identity fill refused at publication")
                             return False

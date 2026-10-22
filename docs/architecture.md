@@ -77,8 +77,8 @@ and reason in a stopped-service maintenance window. Extraction maintenance
 (`audit --retry-low-quality`, `audit --retry-extract-keys`) routes through named
 operator services and retains immutable extraction evidence. The routine
 `JANITOR_PURGE`/`purge()` route is retired: reconciliation does not delete research
-assets; PostgreSQL record purge/deletion remains refused. A legacy JSON `Library.purge()`
-compatibility method remains outside that routine path.
+assets; `Library.purge()` refuses destructive record/artifact deletion in both
+PostgreSQL and standalone JSON modes.
 
 ## Catalog, publication and maintenance
 

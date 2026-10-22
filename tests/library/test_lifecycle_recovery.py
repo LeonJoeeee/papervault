@@ -235,3 +235,261 @@ async def test_recovery_reconciles_refund_committed_before_interrupted_record_sa
     assert sum(row["event"] == "refund" for row in ledger.events()) == 1
     result = await operate(fresh, action="campaign-halt", campaign_id=token.campaign_id, drained=True)
     assert result["finished"] is True
+
+
+async def orphan_reservation(recovery, *, dispatched=False):
+    """Restore the durable record from immediately before claim persistence."""
+    library, paper, ledger, store = recovery
+    before = library.index_path.read_bytes()
+    token = await reserve(recovery)
+    if dispatched:
+        assert await store.pre_dispatch(token)
+    library.index_path.write_bytes(before)
+    return Library(library.root), token
+
+
+async def test_claim_recover_reconciles_reservation_without_record_claim(recovery):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery)
+    assert fresh.get(paper.key).reopen_claim is None
+    result = await operate(fresh, action="claim-recover", key=paper.key, lease_id=token.lease_id)
+    assert result["changed"] is True
+    persisted = Library(fresh.root).get(paper.key)
+    assert persisted.reopen_claim.lease_id == token.lease_id
+    assert persisted.reopen_claim.phase == "not_sent"
+    assert ledger.spent(token.campaign_id) == 0
+    assert ledger.outstanding([paper.key]) == []
+    again = await operate(fresh, action="claim-recover", key=paper.key)
+    assert again["changed"] is False
+    assert sum(row["event"] == "refund" for row in ledger.events()) == 1
+
+
+async def test_orphan_dispatch_requires_executor_proof_before_refund(recovery):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery, dispatched=True)
+    result = await operate(fresh, action="claim-recover", key=paper.key, lease_id=token.lease_id)
+    assert result["changed"] is False
+    assert ledger.spent(token.campaign_id) == 1
+    assert fresh.get(paper.key).reopen_claim is None
+    result = await operate(fresh, action="claim-recover", key=paper.key, executor_proof=True)
+    assert result["changed"] is True
+    assert ledger.spent(token.campaign_id) == 0
+    assert Library(fresh.root).get(paper.key).reopen_claim.phase == "not_sent"
+
+
+async def test_claim_recover_reconciles_completed_record_without_refund(recovery):
+    library, paper, ledger, store = recovery
+    token = await reserve(recovery)
+    assert await store.pre_dispatch(token)
+    paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "completed"})
+    paper.download_status = "ok"
+    library.save(force=True, durable=True)
+    fresh = Library(library.root)
+    result = await operate(fresh, action="claim-recover", key=paper.key, executor_proof=True)
+    assert result["changed"] is True
+    assert ledger.phase(token) == "complete"
+    assert ledger.spent(token.campaign_id) == 1
+    assert fresh.get(paper.key).download_status == "ok"
+    assert fresh.get(paper.key).reopen_claim.phase == "completed"
+    assert not any(row["event"] == "refund" for row in ledger.events())
+    assert (await operate(fresh, action="claim-recover", key=paper.key))["changed"] is False
+
+
+@pytest.mark.parametrize("completed", [False, True])
+async def test_campaign_drain_reconciles_only_orphaned_or_completed_work(recovery, completed):
+    library, paper, ledger, store = recovery
+    if completed:
+        token = await reserve(recovery)
+        assert await store.pre_dispatch(token)
+        paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "completed"})
+        library.save(force=True, durable=True)
+        fresh = Library(library.root)
+    else:
+        fresh, token = await orphan_reservation(recovery)
+    result = await operate(fresh, action="campaign-halt", campaign_id=token.campaign_id, drained=True)
+    assert result["finished"] is True
+    assert ledger.outstanding([paper.key]) == []
+    assert ledger.spent(token.campaign_id) == (1 if completed else 0)
+
+
+async def test_campaign_drain_cannot_refund_orphaned_dispatched_work(recovery):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery, dispatched=True)
+    with pytest.raises(LedgerError, match="outstanding"):
+        await operate(fresh, action="campaign-halt", campaign_id=token.campaign_id, drained=True)
+    assert ledger.spent(token.campaign_id) == 1
+    assert ledger.phase(token) == "dispatch"
+    assert fresh.get(paper.key).reopen_claim is None
+
+
+async def test_orphan_quarantine_release_fences_without_refund(recovery):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery, dispatched=True)
+    orphan = fresh.get(paper.key)
+    orphan.terminal_state = replace(orphan.acquisition_state, quarantine=True, policy=Policy.UNKNOWN)
+    fresh.save(force=True, durable=True)
+    result = await operate(fresh, action="release-quarantine", key=paper.key, lease_id=token.lease_id)
+    assert result["changed"] is True
+    persisted = Library(fresh.root).get(paper.key)
+    assert persisted.reopen_claim.generation == token.generation + 1
+    assert persisted.reopen_claim.phase == "released"
+    assert persisted.acquisition_state.quarantine is False
+    assert persisted.acquisition_state.policy == Policy.UNKNOWN
+    assert ledger.spent(token.campaign_id) == 1
+    assert ledger.outstanding([paper.key]) == []
+    assert not any(row["event"] == "refund" for row in ledger.events())
+
+
+async def test_recovery_rejects_orphan_lease_or_campaign_mismatch(recovery):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery)
+    before = ledger.path.read_bytes()
+    with pytest.raises(ValueError, match="lease"):
+        await operate(fresh, action="claim-recover", key=paper.key, lease_id="wrong")
+    with pytest.raises(ValueError, match="campaign"):
+        await operate(fresh, action="claim-recover", key=paper.key, campaign_id="wrong")
+    assert ledger.path.read_bytes() == before
+    assert fresh.get(paper.key).reopen_claim is None
+    assert ledger.spent(token.campaign_id) == 1
+
+
+async def test_recovery_prefers_new_orphan_reservation_over_old_settled_claim(recovery):
+    library, paper, ledger, store = recovery
+    first = await reserve(recovery)
+    assert await store.not_sent(first)
+    ledger.finish_campaign(first.campaign_id, drained=True)
+    before = library.index_path.read_bytes()
+    campaign = ledger.start_campaign(cap=1, keys=[paper.key])
+    token = await store.claim(paper.key, expected_state=paper.acquisition_state,
+                             expected_generation=1, campaign_id=campaign)
+    assert token is not None
+    library.index_path.write_bytes(before)
+    fresh = Library(library.root)
+    result = await operate(fresh, action="claim-recover", key=paper.key, lease_id=token.lease_id)
+    assert result["changed"] is True
+    assert ledger.spent(campaign) == 0
+    assert Library(library.root).get(paper.key).reopen_claim.generation == 2
+
+
+async def test_orphan_recovery_replays_refund_after_interrupted_record_save(recovery, monkeypatch):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery)
+    with monkeypatch.context() as patch:
+        def fail(**kwargs):
+            raise OSError("record save interrupted")
+        patch.setattr(fresh, "save", fail)
+        with pytest.raises(OSError, match="interrupted"):
+            await operate(fresh, action="claim-recover", key=paper.key)
+    assert ledger.phase(token) == "refund"
+    replay = Library(fresh.root)
+    assert replay.get(paper.key).reopen_claim is None
+    assert (await operate(replay, action="claim-recover", key=paper.key))["changed"] is True
+    assert Library(fresh.root).get(paper.key).reopen_claim.phase == "not_sent"
+    assert sum(row["event"] == "refund" for row in ledger.events()) == 1
+
+
+async def test_release_quarantine_settles_completed_ledger_gap_without_refund(recovery):
+    library, paper, ledger, store = recovery
+    token = await reserve(recovery)
+    assert await store.pre_dispatch(token)
+    paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "completed"})
+    paper.download_status = "ok"
+    paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
+    library.save(force=True, durable=True)
+    result = await operate(library, action="release-quarantine", key=paper.key)
+    assert result["changed"] is True
+    assert any(row["event"] == "complete" for row in ledger.events())
+    assert not any(row["event"] == "refund" for row in ledger.events())
+    assert ledger.spent(token.campaign_id) == 1
+    assert ledger.outstanding([paper.key]) == []
+    assert paper.reopen_claim.phase == "released"
+    assert paper.download_status == "ok"
+
+
+async def test_completed_recovery_requires_full_reservation_identity(recovery):
+    library, paper, ledger, store = recovery
+    token = await reserve(recovery)
+    assert await store.pre_dispatch(token)
+    paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "completed", "generation": 99})
+    library.save(force=True, durable=True)
+    result = await operate(library, action="claim-recover", key=paper.key)
+    assert result["changed"] is False
+    assert ledger.phase(token) == "dispatch"
+    assert ledger.spent(token.campaign_id) == 1
+
+
+async def test_orphan_recovery_preserves_independent_acquired_record_state(recovery):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery)
+    current = fresh.get(paper.key)
+    current.download_status = "ok"
+    current.terminal_state = replace(current.acquisition_state, retrieval=Retrieval.ACQUIRED,
+                                     policy=Policy.UNKNOWN)
+    before = current.acquisition_state
+    fresh.save(force=True, durable=True)
+    result = await operate(fresh, action="claim-recover", key=paper.key)
+    assert result["changed"] is True
+    assert current.acquisition_state == before
+    assert current.download_status == "ok"
+    assert ledger.spent(token.campaign_id) == 0
+
+
+async def test_orphan_release_replays_fence_after_interrupted_record_save(recovery, monkeypatch):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery, dispatched=True)
+    current = fresh.get(paper.key)
+    current.terminal_state = replace(current.acquisition_state, quarantine=True)
+    fresh.save(force=True, durable=True)
+    with monkeypatch.context() as patch:
+        def fail(**kwargs):
+            raise OSError("release record save interrupted")
+        patch.setattr(fresh, "save", fail)
+        with pytest.raises(OSError, match="interrupted"):
+            await operate(fresh, action="release-quarantine", key=paper.key)
+    replay = Library(fresh.root)
+    assert replay.get(paper.key).reopen_claim is None
+    assert ledger.latest_generation(paper.key) == token.generation + 1
+    result = await operate(replay, action="release-quarantine", key=paper.key, lease_id=token.lease_id)
+    assert result["changed"] is True
+    persisted = Library(fresh.root).get(paper.key)
+    assert persisted.reopen_claim.phase == "released"
+    assert persisted.reopen_claim.generation == token.generation + 1
+    assert persisted.acquisition_state.quarantine is False
+    assert ledger.spent(token.campaign_id) == 1
+    assert sum(row["event"] == "fence" for row in ledger.events()) == 1
+
+
+async def test_completed_quarantine_release_requires_full_reservation_identity(recovery):
+    library, paper, ledger, store = recovery
+    token = await reserve(recovery)
+    assert await store.pre_dispatch(token)
+    paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "completed", "generation": 99})
+    paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
+    library.save(force=True, durable=True)
+    before = ledger.path.read_bytes()
+    result = await operate(library, action="release-quarantine", key=paper.key)
+    assert result["changed"] is False
+    assert ledger.path.read_bytes() == before
+    assert paper.acquisition_state.quarantine is True
+
+
+async def test_campaign_drain_replays_orphan_refund_after_interrupted_record_save(recovery, monkeypatch):
+    _, paper, ledger, _ = recovery
+    fresh, token = await orphan_reservation(recovery)
+    with monkeypatch.context() as patch:
+        def fail(**kwargs):
+            raise OSError("drain record save interrupted")
+        patch.setattr(fresh, "save", fail)
+        with pytest.raises(OSError, match="interrupted"):
+            await operate(fresh, action="campaign-halt", campaign_id=token.campaign_id, drained=True)
+    assert ledger.phase(token) == "refund"
+    replay = Library(fresh.root)
+    assert replay.get(paper.key).reopen_claim is None
+    result = await operate(replay, action="campaign-halt", campaign_id=token.campaign_id, drained=True)
+    assert result["finished"] is True
+    persisted = Library(fresh.root).get(paper.key)
+    assert persisted.reopen_claim is not None
+    assert persisted.reopen_claim.generation == token.generation
+    assert persisted.reopen_claim.phase == "not_sent"
+    assert sum(row["event"] == "refund" for row in ledger.events()) == 1
+    assert ledger.spent(token.campaign_id) == 0

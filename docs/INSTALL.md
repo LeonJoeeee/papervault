@@ -47,19 +47,22 @@ curl -fsS http://127.0.0.1:30000/health
 #    Health 200 confirms endpoint health; model loading is service-owned.
 
 # 6. Preflight — verify GPU, databases, LLM config, domain pack
-papervault doctor
+.venv/bin/papervault doctor
 
 # 7. Run the server
-papervault serve                         # streamable-http on 127.0.0.1:8080
-#   papervault serve --stdio             # subprocess transport
+.venv/bin/papervault serve               # streamable-http on 127.0.0.1:8080
+#   .venv/bin/papervault serve --stdio    # subprocess transport
 ```
 
-> Note: `doctor` checks that an LLM key is PRESENT, not that it authenticates — a wrong
+> Note: `doctor` checks that a key for the selected direct or gateway transport is PRESENT,
+> not that it authenticates — a wrong
 > key surfaces only at the first real `query()` (as an auth error).
 
 `papervault doctor` must be green before serving. It checks the .env, data dirs,
 the workspace vars, the domain pack, GPU/VRAM, the OCR endpoint + local model
-weights, and Postgres + Neo4j connectivity:
+weights, and Postgres + Neo4j connectivity. With `PAPERVAULT_CATALOG_AUTHORITY=postgres`,
+it also checks the explicit catalog DSN and base P2 schema in a read-only connection;
+it never installs or migrates a schema:
 
 - **workspace (FAIL):** `NEO4J_WORKSPACE` / `POSTGRES_WORKSPACE` must both be
   non-empty AND equal (or `papervault serve` aborts at boot); the reserved prod
@@ -77,6 +80,19 @@ weights, and Postgres + Neo4j connectivity:
 For a deeper check, `papervault smoke` runs doctor, boots the MCP server over
 stdio, and round-trips its tools (`list_tools` + a read-only `get_paper`) — no
 LLM required (`papervault smoke --skip-db` skips the DB connectivity checks).
+The child uses a temporary JSON vault with legacy knowledge jobs and auto-ingest off;
+it removes the catalog DSN and prevents the operator's `.env` from restoring it.
+
+The install commands create a project-local `.venv`; invoke its binaries as shown,
+or activate it before using bare `papervault` commands elsewhere in this guide.
+
+`KS_AUTO_INGEST_ENABLED=false` is the shipped default. Set it to `true` (also
+accepts `1` or `yes`) after the vault and stores are ready to start background
+distillation. Without this opt-in, the advertised search-to-queryable loop does not
+run. `KS_AUTO_INGEST_INTERVAL_SEC` defaults to `60` seconds. Query retrieval,
+synthesis, evaluation controls and their defaults are documented in
+[Evaluation](eval.md#retrieval-tuning-knobs-benchmark-arbitrated); the template
+includes commented examples. Changes affecting retrieval quality require arbitration.
 
 ## LLM routing and migration
 
@@ -91,7 +107,7 @@ The endpoint resolves its model and effort per key. Defaults are:
 | Extract clarity/completeness gates | flash | `PAPERVAULT_LLM_GATE` |
 | PDF metadata verification | flash | `PAPERVAULT_LLM_VERIFY` |
 | Library intent/judges/resolver/re-rank | standard | `PAPERVAULT_LLM_JUDGE` |
-| Decomposition (eval-only variant) | standard | `PAPERVAULT_LLM_DECOMPOSE` |
+| Decomposition (production multiquery and eval) | standard | `PAPERVAULT_LLM_DECOMPOSE` |
 | Eval judges | standard | `PAPERVAULT_LLM_EVAL_JUDGE` |
 
 For example, `PAPERVAULT_LLM_SYNTH=standard` overrides synthesis. Values must be
@@ -112,6 +128,49 @@ and effort. Pool entries supply credentials/endpoints; their model field does
 not override a call site's role level. There is no caller-side provider-model
 mapping. Bare `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` model fallbacks are retired;
 use the documented `PAPERVAULT_LLM_*` endpoint/key configuration.
+
+`doctor` accepts a configured gateway key without a direct endpoint key or key-pool
+file when gateway mode is on; a missing gateway key fails even if direct credentials
+exist. To select an environment file, set `PAPERVAULT_ENV` to an existing file;
+otherwise configuration looks for `.env` in the current directory, then the checkout.
+Existing process variables take precedence over file values. `POSTGRES_DB` is bridged
+to `POSTGRES_DATABASE` only when the latter is unset; keep them equal when explicitly
+setting both so the ledger and LightRAG use the same database.
+
+## Advanced runtime settings
+
+The template covers the usual deployment controls. These additional active settings
+are useful for diagnosis or capacity tuning; defaults come from the current runtime:
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `KS_STARTUP_AWAIT_SEC` | `3` | Maximum startup wait in seconds; initialization/retries continue in the background after it expires. `0` skips waiting. |
+| `KS_SKIP_EMBED_SELFCHECK` | `0` | `1`, `true` or `yes` bypasses the embedding boot probe; use only for diagnosis or a separately verified stack. |
+| `KS_EMBED_MAX_ASYNC` / `KS_EMBED_GPU_MAX_ASYNC` | `16` / `1` | LightRAG embedding-call queue concurrency versus actual GPU forward-pass concurrency. |
+| `KS_EMBED_OFFLOAD` | `1` | Offload embedding to a worker thread; `0` restores blocking inference on the server loop. |
+| `KS_LLM_MAX_TOKENS` | `131000` | Knowledge LLM output ceiling unless the caller sets its own limit. |
+| `KS_LLM_BACKOFF_JITTER` | `0.75` | Jitter added to direct key-pool retry backoff in seconds. |
+| `KS_GATEWAY_CONN_RETRIES` / `KS_GATEWAY_CONN_BACKOFF_CAP` | `6` / `15` | Unreachable-gateway connection retries and backoff cap in seconds, still bounded by the configured retry budget. |
+| `KS_SLOW_CALL_LOG_S` | `60` | Log successful knowledge LLM calls exceeding this duration in seconds. |
+| `PAPERVAULT_LIB_FIRST_CHUNK_S` / `PAPERVAULT_LIB_RETRY_BUDGET_S` | `100` / `480` | Library-side first-chunk deadline and total retry-admission budget in seconds; separate from the `KS_*` knowledge settings. |
+| `PAPERVAULT_SAVE_MIN_INTERVAL_S` / `PAPERVAULT_BIB_MIN_INTERVAL_S` | `0` / `60` | Non-forced library save debounce and BibTeX refresh cadence in seconds. Forced durable lifecycle saves bypass debounce. |
+| `PAPERVAULT_EXTRACT_DEFER_CANARY` | `8` | Maximum deferred extraction recovery canaries promoted per reconcile sweep; `0` disables canaries. |
+| `PAPERVAULT_LOOP_LAG_MONITOR_MS` | `0` | Event-loop stall warning threshold in milliseconds; `0` disables monitoring. |
+| `PAPERVAULT_LOOP_LAG_INTERVAL_MS` / `PAPERVAULT_LOOP_LAG_ROLLUP_S` | `50` / `30` | Monitor sample interval in milliseconds and summary cadence in seconds. |
+| `NEO4J_DATABASE` | sanitized storage namespace | Catalog reader's preferred Neo4j database; it also tries the default database when unavailable. |
+| `NEO4J_MAX_CONNECTION_POOL_SIZE` | `100` | Catalog Neo4j reader connection-pool ceiling. |
+| `NEO4J_CONNECTION_TIMEOUT` / `NEO4J_CONNECTION_ACQUISITION_TIMEOUT` / `NEO4J_MAX_TRANSACTION_RETRY_TIME` | `30` each | Neo4j reader connect, pool acquisition and transaction-retry limits in seconds. |
+| `NEO4J_MAX_CONNECTION_LIFETIME` / `NEO4J_LIVENESS_CHECK_TIMEOUT` / `NEO4J_KEEP_ALIVE` | `300` / `300` / `true` | Neo4j reader connection lifetime/liveness thresholds in seconds and TCP keepalive. |
+| `REQUESTS_CA_BUNDLE` | unset | Custom CA bundle for the bounded OpenAlex downloader; unset uses normal certificate verification. |
+
+`ENTITY_EXTRACTION_USE_JSON` must stay unset/false: domain examples currently support
+text extraction only, and graph initialization refuses JSON mode. `LLM_KEYS_FILE` is
+a legacy fallback name for `PAPERVAULT_LLM_KEYS`; use the latter in new deployments.
+The retained `MIMO_API_KEY_1`…`MIMO_API_KEY_6` and `MIMO_BASE_URL_1`…`MIMO_BASE_URL_6`
+fields populate a legacy config view; current completion credentials come from the
+documented direct key/pool or gateway transport. `PAPER_LIBRARY_MCP_TOKEN` only
+suppresses a warning in the legacy standalone library launcher; use the unified
+server's `PAPERVAULT_MCP_TOKEN` for HTTP authentication.
 
 ## MinerU service boundary
 
@@ -448,11 +507,11 @@ is your responsibility.
 ## Grey-zone download tiers
 
 Shadow libraries (Sci-Hub, Anna's Archive) and anti-bot scraping tiers are
-**enabled in the beta posture**: the standard install includes the `grey` extra and
-`.env.example` ships `PAPER_PIPELINE_USE_SCIHUB=1`. Running them is still your own
-legal decision — comment the flag out (and skip the extra) to opt out. Anna's
+**off by default**. Installing the `grey` extra supplies dependencies but does not
+enable these tiers. To opt in, uncomment `PAPER_PIPELINE_USE_SCIHUB=1` in `.env`;
+that decision remains the operator's responsibility. Anna's
 Archive additionally requires a personal member key (`ANNAS_ARCHIVE_API_KEY`).
-Before the repo flips public, this shipped default reverts to OFF — see
+See
 [ADR-0004](adr/0004-grey-download-tiers-flag-gated.md) and its amendment.
 
 

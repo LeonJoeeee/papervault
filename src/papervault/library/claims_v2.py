@@ -458,6 +458,81 @@ class ClaimStore:
         paper = self.library.get(token.key)
         return paper if paper and same_attempt(paper.reopen_claim, token) else None
 
+    def recovery_claim(self, key: str) -> ReopenClaim | None:
+        """Find a reservation lost before record persistence without reviving old work."""
+        paper = self.library.get(key)
+        if paper is None:
+            return None
+        current = paper.reopen_claim
+        if current is not None and current.phase in {"queued", "dispatched"}:
+            return current
+        for row in reversed(self.ledger.events()):
+            if row["event"] in {"reserve", "fence"} and row["claim"]["key"] == key:
+                token = ReopenClaim.model_validate(row["claim"])
+                if (record_generation(paper) < token.generation
+                        and token.generation == self.ledger.latest_generation(key)):
+                    return token
+                break
+        return current
+
+    def _reserved(self, token: ReopenClaim) -> bool:
+        return any(row["event"] == "reserve"
+                   and same_attempt(ReopenClaim.model_validate(row["claim"]), token)
+                   for row in self.ledger.events())
+
+    def _release_fence(self, token: ReopenClaim) -> ReopenClaim | None:
+        """Replay an acknowledged human fence without incrementing it again."""
+        for row in reversed(self.ledger.events()):
+            if row["event"] != "fence" or row["claim"]["lease_id"] != token.lease_id:
+                continue
+            fenced = ReopenClaim.model_validate(row["claim"])
+            if (fenced.phase == "released" and fenced.generation in {token.generation, token.generation + 1}
+                    and fenced.generation == self.ledger.latest_generation(token.key)
+                    and same_attempt(fenced, token.model_copy(update={"generation": fenced.generation}))
+                    and self._reserved(fenced.model_copy(update={"generation": fenced.generation - 1}))):
+                return fenced
+            break
+        return None
+
+    def _orphaned(self, paper, token: ReopenClaim) -> bool:
+        return (paper is not None and record_generation(paper) < token.generation
+                and (paper.reopen_claim is None
+                     or paper.reopen_claim.phase in {"completed", "not_sent", "released"})
+                and token.generation == self.ledger.latest_generation(token.key)
+                and self._reserved(token))
+
+    async def recover(self, token: ReopenClaim, *, executor_proof: bool = False) -> bool:
+        """Reconcile both durable sides of claim publication under the writer fence."""
+        async with self.lock:
+            check_index_readable(self.library.root)
+            paper = self.library.get(token.key)
+            current = self.current(token)
+            phase = self.ledger.phase(token)
+            if current is not None:
+                if current.reopen_claim.phase == "completed":
+                    if phase != "dispatch" or not self._reserved(token):
+                        return False
+                    self.ledger.complete(token)
+                    return True
+                if (not executor_proof and phase != "refund"
+                        and (current.reopen_claim.phase != "queued" or phase != "reserve")):
+                    return False
+                return self._not_sent(current, token)
+            if not self._orphaned(paper, token):
+                return False
+            # A reservation precedes dispatch durably. Absence from the record
+            # alone supplies no unsent proof once dispatch reached the ledger.
+            if phase not in {"reserve", "refund"} and not (executor_proof and phase == "dispatch"):
+                return False
+            if phase != "refund" and not self.ledger.refund_if_not_sent(token, proven_not_sent=True):
+                return False
+            paper.reopen_claim = token.model_copy(update={"phase": "not_sent"})
+            if (paper.download_status == "pending"
+                    and paper.acquisition_state.retrieval in {Retrieval.ELIGIBLE, Retrieval.IN_PROGRESS}):
+                paper.download_status = "failed"
+            self.save()
+            return True
+
     def allowed(self, token: ReopenClaim, *, executing: bool = False) -> bool:
         paper = self.current(token)
         if not reopen_v2_enabled() or paper is None or self.clock() >= paper.reopen_claim.lease_expiry:
@@ -556,13 +631,22 @@ class ClaimStore:
         async with self.lock:
             check_index_readable(self.library.root)
             paper = self.library.get(key)
-            if (paper is None or paper.reopen_claim is None or not paper.acquisition_state.quarantine
-                    or (expected_lease_id and paper.reopen_claim.lease_id != expected_lease_id)
-                    or not (human_reason.strip() or drained_lease_id == paper.reopen_claim.lease_id)):
+            claim = self.recovery_claim(key)
+            fenced = self._release_fence(claim) if claim is not None else None
+            if (paper is None or claim is None or not paper.acquisition_state.quarantine
+                    or (expected_lease_id and claim.lease_id != expected_lease_id)
+                    or not (human_reason.strip() or drained_lease_id == claim.lease_id)
+                    or not (fenced is not None or (self._reserved(claim)
+                        and (same_attempt(paper.reopen_claim, claim) or self._orphaned(paper, claim))))):
                 return False
-            token = paper.reopen_claim.model_copy(update={"generation": paper.reopen_claim.generation + 1,
-                                                         "phase": "released"})
-            self.ledger.fence(token, evidence=human_reason.strip() or f"drained:{drained_lease_id}")
+            if fenced is not None:
+                token = fenced
+            else:
+                if (same_attempt(paper.reopen_claim, claim) and paper.reopen_claim.phase == "completed"
+                        and self.ledger.phase(claim) == "dispatch"):
+                    self.ledger.complete(claim)
+                token = claim.model_copy(update={"generation": claim.generation + 1, "phase": "released"})
+                self.ledger.fence(token, evidence=human_reason.strip() or f"drained:{drained_lease_id}")
             paper.reopen_claim = token
             if (paper.download_status == "pending"
                     and paper.acquisition_state.retrieval in {Retrieval.ELIGIBLE, Retrieval.IN_PROGRESS}):

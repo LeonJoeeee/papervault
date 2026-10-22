@@ -126,15 +126,27 @@ def claim_result(job, attempt):
          "base_selected_unit_receipts", "retired_receipt_ids")}, "revision": job["revision"]}
 
 
+def require_record_policy(k, record_key):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import derive_legacy, effective_policy, project_domain_policy
+
+    if not record_key:
+        return
+    record = require(k.repository.get(record_key), "record absent")
+    paper = Paper.model_validate(record.payload)
+    policy_state = (project_domain_policy(paper.terminal_state, paper) if paper.terminal_state
+                    else derive_legacy(paper, include_domain=True))
+    require(not record.quarantine and record.policy in {"clear", "override"}
+            and record.merge == "canonical" and effective_policy(policy_state, key=record.key),
+            "record policy prohibits execution/publication")
+
+
 def eligible(k, job, *, current=True):
     from .extract_lifecycle import admit_input
     admit_input(k, k.get_input(job["consumed_input_revision"])["manifest"])
     unit = require(k.get_unit(job["unit_id"]), "unit absent")
     require(not unit["quarantine"] and not job["quarantine"], "unit/job quarantined")
-    if unit["record_key"]:
-        record = require(k.repository.get(unit["record_key"]), "record absent")
-        require(not record.quarantine and record.policy in {"clear", "override"} and record.merge == "canonical",
-                "record policy prohibits execution/publication")
+    require_record_policy(k, unit["record_key"])
     generation = require(k.get_generation(job["target_generation"]), "generation absent")
     require(generation["state"] in {"active", "candidate"}, "generation closed")
     desired = k.get_requirement(job["unit_id"], job["target_generation"])
@@ -143,6 +155,7 @@ def eligible(k, job, *, current=True):
         mapping = k.get_section(unit["unit_id"], source.get("section_definition_revision", source.get("section_mapping_revision")))
         parent = require(k.get_unit(mapping["parent_unit_id"]), "section parent absent")
         require(not parent["quarantine"], "section parent quarantined")
+        require_record_policy(k, parent.get("record_key"))
         if current:
             inventory = k.get_current_inventory(parent["unit_id"], job["target_generation"])
             require(inventory and not inventory["invalidated"] and desired and

@@ -62,6 +62,16 @@ class KnowledgeRepositoryProxy:
 
         return invoke
 
+    def catalog_relation_bytes(self) -> int:
+        """Measure catalog storage while this proxy still owns its connection."""
+        with self.repository() as repository:
+            row = repository.connection.execute(
+                "SELECT COALESCE(sum(pg_total_relation_size(c.oid)),0) AS bytes FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relkind='r'",
+                (self.schema,),
+            ).fetchone()
+            return int(row["bytes"])
+
     @asynccontextmanager
     async def namespace_access(self, claim: dict, seal: bool = False):
         with self.repository() as repository:

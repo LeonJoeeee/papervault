@@ -277,9 +277,10 @@ async def test_changed_snapshot_cannot_receive_a_previously_verified_identity(tm
         elif change == "doi":
             lib.set_resolved_doi(paper.key, "10.1234/concurrent")
         else:
-            lib.purge(paper.key, reason="fixture_replaced")
-            replacement = stub(lib, 0, title="Replacement scientific publication with a reused citation key")
-            assert replacement.key == paper.key
+            # Inject a concurrently replaced snapshot without invoking asset deletion.
+            replacement = paper.model_copy(update={"title": "Replacement scientific publication with a reused citation key"})
+            lib._papers[paper.key] = replacement
+            lib._reindex(replacement)
         return result
     monkeypatch.setattr(identity_backfill, "inspect_identities", changed)
     result = await run_event(lib, trigger="source_repaired", source="ads", cap=1, keys=[paper.key])

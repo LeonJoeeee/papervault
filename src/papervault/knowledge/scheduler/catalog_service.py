@@ -202,11 +202,7 @@ def get_catalog_service():
                 vault_root=config.VAULT_PATH, knowledge_root=working_dir)
             # Metadata writes share the same global derivative budget. Fresh
             # backend accounting is required even when this job creates no graph.
-            row = repository.connection.execute(
-                "SELECT COALESCE(sum(pg_total_relation_size(c.oid)),0) AS bytes FROM pg_class c "
-                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relkind='r'",
-                (repository.repository.schema,)).fetchone()
-            return {**external, "backend_bytes": external["backend_bytes"] + int(row["bytes"])}
+            return {**external, "backend_bytes": external["backend_bytes"] + repository.catalog_relation_bytes()}
 
         capacity = SchedulerCapacity(working_dir / "maintenance" / "capacity",
             derivative_roots=(Path(config.VAULT_PATH) / "extracts", working_dir),

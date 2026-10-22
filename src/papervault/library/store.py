@@ -808,51 +808,10 @@ class Library:
         return write_locked(consolidate)
 
     def purge(self, key: str, reason: str = "") -> dict:
-        """Remove a paper from the library. Breaks the append-only invariant —
-        use only to clean up phantom / corrupt entries.
-
-        Removes:
-          - in-memory paper + indexes (doi/arxiv/title)
-          - PDF + md + txt files on disk (if present)
-
-        Does NOT call save() — caller is responsible for batching saves.
-        Logs ``{"event": "purged", "key": ..., "reason": ...}`` to manifest
-        so the action is observable + auditable.
-
-        Returns a dict describing what was removed.
-        """
+        """Refuse the retired destructive route, retaining records and research assets."""
         self._check_writer()
-        if self._catalog_backend is not None:
-            from papervault.store.repository import DeletionRefused
-            raise DeletionRefused("PG purge is refused in P2; retention/tombstones await P5")
-        existing = self._papers.get(key)
-        if existing is None:
-            return {"key": key, "removed": False, "reason": "not in library"}
-
-        # Drop from indexes
-        self._papers.pop(key, None)
-        if existing.doi:
-            self._by_doi.pop(_normalize_doi(existing.doi), None)
-        if existing.arxiv_id:
-            self._by_arxiv.pop(_normalize_arxiv(existing.arxiv_id), None)
-        nt = normalize_title(existing.title)
-        if nt:
-            self._by_title.pop(nt, None)
-
-        # Drop on-disk files
-        files_removed = []
-        for path in (self.pdf_path(key), self.md_path(key), self.txt_path(key)):
-            if path.is_file():
-                try:
-                    path.unlink()
-                    files_removed.append(str(path.relative_to(self.root)))
-                except Exception:
-                    pass
-
-        self.log({"event": "purged", "key": key, "reason": reason or "manual",
-                  "files_removed": files_removed,
-                  "doi": existing.doi or "", "arxiv_id": existing.arxiv_id or ""})
-        return {"key": key, "removed": True, "files_removed": files_removed}
+        from papervault.store.repository import DeletionRefused
+        raise DeletionRefused("Library.purge is retired; research records and artifacts must be retained")
 
     # Locator fields the enrich queue is allowed to fill (NEVER title/authors/
     # year/doi — those already passed ingest). Fill-blanks only.

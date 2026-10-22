@@ -547,3 +547,31 @@ def test_required_section_with_missing_aggregate_layer_is_counted_missing():
     record = query([parent, section])["records"][0]
     assert record["sections"]["missing"] == 1
     assert record["required_unit_outcomes"][0]["aggregate_roles"][0]["state"] == "missing"
+
+
+@pytest.mark.parametrize("change,allowed", [
+    ({}, True), ({"override": None}, False),
+    ({"override": {"key": "B"}}, False),
+    ({"override": {"reasons": ["other"]}}, False),
+    ({"override": {"scope": ["other"]}}, False),
+    ({"required_revision": 3}, False),
+    ({"policy": "clear"}, False),
+])
+def test_coverage_checks_full_scoped_policy(change, allowed):
+    from papervault.library.models import Paper
+    from papervault.store.repository import Record
+
+    state = {"policy": "override", "policy_reasons": ["off_domain"], "required_revision": 2,
+             "override": {"key": "A", "scope": ["acquire"], "reasons": ["off_domain"], "revision": 2}}
+    if isinstance(change.get("override"), dict):
+        state["override"].update(change["override"])
+    else:
+        state.update(change)
+    record = Record.from_payload("A", Paper(key="A", title="Policy fixture", terminal_state=state).model_dump(mode="json"))
+    source = row()
+    source["record"].update(policy=record.policy, payload=record.payload)
+    unit = query([source])["units"][0]
+    assert unit["policy_eligible"] is allowed
+    assert unit["source_eligible"] is allowed
+    assert unit["published"] is allowed
+    assert unit["indexed"] is allowed

@@ -17,6 +17,24 @@ EXECUTION_FIELDS = ("attempt_id", "submission_id", "authority_epoch", "fencing_t
 IDENTITY_FIELDS = (*VERSION_FIELDS, *EXECUTION_FIELDS)
 
 
+def _record_policy_allowed(record):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import Policy, TerminalState, derive_legacy, effective_policy, project_domain_policy
+
+    if not record:
+        return True
+    if record.get("policy") not in {"clear", "override"} or record.get("merge") != "canonical":
+        return False
+    if "payload" in record:
+        paper = Paper.model_validate(record["payload"])
+        state = (project_domain_policy(paper.terminal_state, paper) if paper.terminal_state
+                 else derive_legacy(paper, include_domain=True))
+    else:
+        # Compact read snapshots without a grant can only establish clear policy.
+        state = TerminalState(policy=Policy(record["policy"]))
+    return effective_policy(state, key=record.get("key", ""))
+
+
 def _time(value):
     if isinstance(value, str):
         try:
@@ -254,8 +272,9 @@ def _unit(row, selectors, now, age, contexts=None):
     record = row.get("record") or {}
     if record.get("quarantine") is True:
         quarantine = True
-    if record.get("policy") in {"excluded", "unknown"}:
-        reasons.append("record_policy_" + record["policy"])
+    policy_allowed = _record_policy_allowed(record)
+    if not policy_allowed:
+        reasons.append("record_policy_" + str(record.get("policy", "unknown")))
     if record.get("merge") == "alias":
         reasons.append("record_is_alias")
     if record.get("revision") is not None and requirement.get("record_revision") != record["revision"]:
@@ -310,11 +329,9 @@ def _unit(row, selectors, now, age, contexts=None):
             "receipt_id": selected.get("receipt_id"), "receipt": receipt,
             "achieved_tier": tier, "execution": row.get("jobs") or [], "quarantine": quarantine,
             "excluded": excluded, "readable": readable, "published": published,
-            "policy_eligible": not quarantine and (not record or (
-                record.get("policy") in {"clear", "override"} and record.get("merge") == "canonical")),
+            "policy_eligible": not quarantine and policy_allowed,
             "source_eligible": not quarantine and not excluded and not requirement.get("invalidated")
-                and (not record or (record.get("policy") in {"clear", "override"}
-                                    and record.get("merge") == "canonical"))
+                and policy_allowed
                 and (record.get("revision") is None or requirement.get("record_revision") == record["revision"]),
             "tier_covered": covered, "indexed": covered and tier == "fulltext" and readable,
             "roles": roles, "aggregate_roles": aggregate_roles,

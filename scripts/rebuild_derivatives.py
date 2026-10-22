@@ -27,6 +27,8 @@ def main(argv=None):
         parser.error("replay requires --source-generation")
     if args.apply and not args.config:
         parser.error("--apply requires --config with explicit isolated targets")
+    from papervault.store.recovery import checked_path
+    args.package, args.root = checked_path(args.package), checked_path(args.root)
     from papervault.store.recovery_restore import restore_recovery_set
     from papervault.store.recovery_replay import replay_recovery_set
     from snapshot_derivatives import connections

@@ -20,12 +20,16 @@ corpus, so the harness splits into what CI can prove and what only reference har
   # The harness runs only against the reserved eval workspace 'l0_probe' (a prod-safety
   # gate). Point BOTH workspace envs at it for the run, or run_eval aborts.
   export NEO4J_WORKSPACE=l0_probe POSTGRES_WORKSPACE=l0_probe
-  python -m papervault.eval.run_eval --gold src/papervault/eval/gold_fast.jsonl \
+  .venv/bin/python -m papervault.eval.run_eval --gold src/papervault/eval/gold_fast.jsonl \
       --tag mytag --variant multiquery --concurrency 4
   ```
 
-  This needs the full stack up (`papervault serve` + GPU + databases + a populated vault) and
-  an LLM endpoint. It is the gate you run before shipping a change that could move retrieval
+  The harness runs its own process against the GPU, databases, populated vault and an
+  LLM endpoint. Run it in a stopped-service maintenance window: it refuses when
+  `papervault.service`, `mineru.service`, or `papervault-mineru.service` is active or
+  activating. The databases stay available. `KS_EVAL_ALLOW_COTENANCY=1` deliberately
+  overrides that guard; it does not establish a safe GPU budget or freeze the corpus.
+  It is the gate you run before shipping a change that could move retrieval
   quality (reranker dtype, chunking, decompose prompts, model routing).
 
   **Workspace gate.** `run_eval` hard-aborts unless `NEO4J_WORKSPACE == POSTGRES_WORKSPACE ==
@@ -33,6 +37,13 @@ corpus, so the harness splits into what CI can prove and what only reference har
   production graph). These names are fixed in the harness — your serving workspace (e.g. the
   `main` shipped in `.env.example`) is **not** accepted, so set the eval workspace explicitly as
   above and populate it with the corpus you want scored.
+
+Production `KS_QUERY_VARIANT` defaults to `multiquery`, whose decomposition uses
+`PAPERVAULT_LLM_DECOMPOSE` (default `standard`), as does eval's `--variant multiquery`.
+Eval selects its variant with `--variant` (`baseline` by default, also `multiquery`
+and `standard`); `KS_QUERY_VARIANT` does not override that CLI choice. Specify the
+variant explicitly when comparing production retrieval. Most query settings below
+are read at module import, so restart the eval or serving process after changes.
 
 `eval/run_eval.py` shares production's post-retrieval synthesis and response assembly
 in `knowledge/query/aquery.py` (`synthesize_outfeed` and the pure `build_outfeed`).
@@ -115,11 +126,41 @@ the shipped values.
 | `KS_MQ_MIN_COVERAGE` | `thin` | Minimum anchor coverage required for multi-query fusion; below it, retain anchor evidence. Empty coverage always skips synthesis. |
 | `KS_MQ_CITATION_PRIOR` | `0` | Citation-count prior on fused ranking (`0` = off). |
 | `KS_MQ_CITATION_LAMBDA` | `0.5` | Weight of the citation prior when it is on. |
+| `KS_CITATION_MAP` | unset | Override the citation-map path; otherwise use `PAPERVAULT_CITATION_MAP`, default `<PAPERVAULT_DATA>/citation_map.json`. Used by the optional citation prior. |
 | `KS_MQ_FANOUT` | `1` | Adaptive fan-out on/off (`KS_MQ_FANOUT_MAX`=100, `KS_MQ_FANOUT_SLOPE`=7 shape it). |
 | `KS_SYNTH_STRICT_REFUSAL` | `1` | Refuse to answer on thin/absent evidence (`0` = permissive). |
 | `KS_SYNTH_COVERAGE` | `0` | Coverage-oriented synthesis variant (`1` = on). |
+| `KS_RERANK_MAX_LENGTH` | `4096` | Per-chunk cross-encoder token limit; shortening can change ranking quality. |
+| `KS_KW_PROMPT_COMPAT` | `0` | Restore the historical LightRAG keyword prompt for experiments; stock prompt is the shipped path. |
 | `PAPERVAULT_SEARCH_AUTHORITY_PRIOR` | `1` | `search_papers` return ordering: gentle RRF rank-blend of relevance with age-normalized citation **authority**, enabled by default in `by_relevance` mode; set `0` to disable. Rank-based and pool-only: it cannot admit gate-rejected papers. Explicit recency/importance hints bypass the blend. |
 | `PAPERVAULT_SEARCH_AUTHORITY_LAMBDA` | `0.25` | Weight λ of the enabled search authority prior (non-numeric → `0.25`, out-of-range → clamped to `[0,1]`, both with a warning). Record the flag and λ explicitly for each arbitration arm. |
 
 Changing any of these is a retrieval-affecting change: it must clear the eval noise floor before
 you flip the default.
+
+Operational deadlines, concurrency and harness-specific settings also need to be
+held constant between arms:
+
+| Env var | Default | Effect |
+| --- | --- | --- |
+| `KS_DECOMPOSE_TIMEOUT_S` | `300` | Production/eval decomposition deadline in seconds. |
+| `KS_SYNTH_TIMEOUT_S` | `840` | Shared synthesis deadline in seconds. |
+| `KS_SYNTH_MAX_RETRIES` / `KS_SYNTH_BACKOFF_BASE` | `2` / `2.0` | Extra synthesis attempts and exponential-backoff base in seconds. |
+| `KS_RERANK_DTYPE` / `KS_RERANK_BATCH_SIZE` | `float32` / `32` when unset; template `float16` / `8` | Reranker precision and GPU batch size. Precision changes need arbitration. |
+| `KS_RERANK_MAX_ASYNC` / `RERANK_TIMEOUT` | `1` / `480` | Concurrent rerank calls and LightRAG worker timeout in seconds. |
+| `PAPERVAULT_EVAL_DIR` | `/data/paper-vault/eval-results` | Root for raw runs and judge artifacts; never a source directory. |
+| `KS_EVAL_ALLOW_COTENANCY` | unset | Exact `1` bypasses the stopped-service guard; workspace checks still apply. |
+| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `standard` / `standard` | Decomposition and judge role levels; the latter is shared by eval judge utilities. |
+
+The retained standalone `judge_mimo` utility uses `KS_GATEWAY_URL` (default
+`http://127.0.0.1:4000/v1`) and requires `KS_VIRTUAL_KEY`; these utility names are
+separate from the production `PAPERVAULT_LLM_GATEWAY_*` transport settings. It also
+reads `JUDGE_GOLD` (`gold_v2.jsonl`), `JUDGE_MAX_TOKENS` (`32000`),
+`JUDGE_MAX_ATTEMPTS` (`2`) and `JUDGE_CALL_TIMEOUT` (`300` seconds). Its
+`--concurrency` CLI option controls concurrency. `_ab_u1_judge` shares those gateway
+settings and reads `AB_JUDGE_CONC` (`20`). `recall_curve` accepts
+`RECALL_CURVE_GOLD` (`gold_v4.jsonl`); `verdict_lctx` accepts `VERDICT_GOLD`
+(`gold_v4.jsonl`), `VERDICT_BASE_TAGS` (`lctx_v4_r1,lctx_v4_r2,lctx_v4_r3`) and
+`VERDICT_VAR_SEEDS` (`1,2,3`). Set those selectors explicitly for reproducible reruns
+of historical experiments. Do not confuse their historical defaults with the gold
+file or tags selected for a new arbitration.

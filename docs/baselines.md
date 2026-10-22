@@ -196,8 +196,10 @@ Snapshot usage (operator only, with the project's dependencies installed):
 The verbatim tool is specific to deployment #1: it reads `/data/paper-vault/index.json`,
 PDF/extract directory entries and sizes, and the pool file at
 `/home/leon/lab/papervault/src/papervault/eval/gold_search_pools.jsonl`. Its sole file write is
-the report at `/home/leon/.claude/jobs/ac15ab17/tmp/f0-snapshot-2026-10-18.json`; the output
-parent must already exist and be writable. It never constructs `Library`: records are parsed
+the report selected by `--output`, defaulting to
+`/data/paper-vault/snapshots/catalog-snapshot.json`. Repeated default runs replace that
+file; choose a dated `--output` to retain separate baselines. The output parent must
+already exist and be writable. It never constructs `Library`: records are parsed
 with `Paper` (invalid records are skipped). Both PostgreSQL connections use
 `default_transaction_read_only=on` and issue only `SELECT`s. Supply credentials through the
 existing operator environment, never committed files. The aggregate query accepts

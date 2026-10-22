@@ -166,7 +166,12 @@ revision. Grants apply only to acquisition on their original key and remain unti
 superseded by a later ruling/revision. Under PostgreSQL, record changes, ruling,
 audit and pending work commit atomically; stale decisions refuse. The JSON
 correction ledger is a compatibility copy after commit. In JSON mode intent is
-saved before state, allowing recovery after an interrupted index save.
+saved before state with an explicit record snapshot. Only the latest intent for
+each key can recover an interrupted index save, and only while that snapshot and
+its covered policy reasons still match. Legacy rows without recovery metadata
+are completed history. Replaying a spent or superseded grant never reopens it;
+reconsideration requires a new ruling reason. Merges retain the revision barrier
+of every dropped grant.
 
 Download audit retries and `add --force-refresh` record an `operator_reopen` act
 and set retrieval eligible without granting policy permission. Audit accepts

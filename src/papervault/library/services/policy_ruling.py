@@ -9,7 +9,7 @@ from pathlib import Path
 
 from filelock import FileLock
 
-from ..state_v2 import Merge, Policy, PolicyOverride, Retrieval
+from ..state_v2 import Merge, Policy, PolicyOverride, Retrieval, check_index_readable
 from ..store import Library
 from .correction_ledger import CorrectionLedger, utc_now
 from .identity_backfill import read_identity_records
@@ -60,12 +60,6 @@ def _mismatch(paper) -> str:
     return ""
 
 
-def _replay(rows, *, key, action, reason):
-    # Replays reuse immutable evidence, including after a superseding ruling.
-    return next((r for r in reversed(rows) if key in r["keys"]
-                 and ACTIONS[r["action"]] == action and r["reason"] == reason), None)
-
-
 def _inspect(papers, rows, *, keys, action, reason):
     if action not in ACTIONS or not isinstance(reason, str) or not reason.strip():
         raise ValueError("policy ruling requires a supported action and a nonempty reason")
@@ -89,8 +83,12 @@ def _inspect(papers, rows, *, keys, action, reason):
             mismatches.append({"key": key, "reason": mismatch})
             continue
         matched.append(key)
-        prior = next((r for r in reversed(rows) if key in r["keys"]), None)
-        replay = _replay(rows, key=key, action=action, reason=reason)
+        history = [r for r in rows if key in r["keys"]]
+        prior = history[-1] if history else None
+        # Historical identity prevents an old reason from becoming a new grant.
+        # It does not establish that the intent is eligible for crash recovery.
+        replay = next((r for r in reversed(history)
+                       if ACTIONS[r["action"]] == action and r["reason"] == reason), None)
         if replay:
             revisions[key] = replay["revision"]
         else:
@@ -108,6 +106,8 @@ def _inspect(papers, rows, *, keys, action, reason):
 
 def inspect_ruling(root: Path, *, keys: list[str], action: str, reason: str) -> dict:
     """Inspect authority without creating locks, projections, or directories."""
+    if os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json") != "postgres":
+        check_index_readable(Path(root))
     papers = {p.key: p for p in read_identity_records(Path(root))}
     return _inspect(papers, _history(root), keys=keys, action=action, reason=reason)
 
@@ -136,38 +136,47 @@ def apply_ruling(root: Path, *, keys: list[str], action: str, reason: str, actor
             action = report["action"]
             intents, new_by_revision = {}, {}
             for key in report["matched_keys"]:
-                replay = _replay(rows, key=key, action=action, reason=reason)
-                if replay:
-                    intents[key] = replay
-                else:
+                history = [r for r in rows if key in r["keys"]]
+                prior = history[-1] if history else None
+                replay = next((r for r in reversed(history)
+                    if ACTIONS[r["action"]] == action and r["reason"] == reason), None)
+                if replay is None:
                     new_by_revision.setdefault(report["revisions"][key], []).append(key)
-            new_keys = set()
+                    continue
+                # Only the latest explicit JSON intent can be unfinished.
+                # Legacy, superseded and spent rows remain immutable history.
+                paper = library.get(key)
+                pre_states = replay.get("crash_recovery_pre_state")
+                covered_reasons = replay.get("covered_policy_reasons")
+                if (library._catalog_backend is not None or replay is not prior
+                        or not isinstance(pre_states, dict) or key not in pre_states
+                        or not isinstance(covered_reasons, dict) or key not in covered_reasons
+                        or paper.acquisition_state.required_revision >= replay["revision"]):
+                    continue
+                if (pre_states[key] != paper.model_dump(mode="json")
+                        or covered_reasons[key] != list(paper.acquisition_state.policy_reasons)):
+                    raise ValueError("policy restrictions changed or record state changed since intent; "
+                                     "record a new ruling reason")
+                intents[key] = replay
+            # Validate every recovery before staging any new compatibility rows.
             for revision, selected in new_by_revision.items():
                 row = {"timestamp": utc_now(), "action": action, "scope": "acquire" if action == "acquire" else "policy",
                        "reason": reason, "keys": selected, "revision": revision,
                        "covered_policy_reasons": {k: list(library.get(k).acquisition_state.policy_reasons)
                                                   for k in selected},
                        "actor": actor, "event": "policy_ruling"}
+                if library._catalog_backend is None:
+                    row["crash_recovery_pre_state"] = {
+                        k: library.get(k).model_dump(mode="json") for k in selected}
                 stage_operator(library, action=action, keys=selected, reason=reason, actor=actor,
                                event="policy_ruling", row=row)
                 report["rulings_added"] += 1
                 intents.update((key, row) for key in selected)
-                new_keys.update(selected)
-            for key in report["matched_keys"]:
+            for key, intent in intents.items():
                 paper = library.get(key)
                 current = paper.acquisition_state
-                intent = intents[key]
                 revision = intent["revision"]
-                if key not in new_keys:
-                    # PG intents are atomic. JSON intent precedes state: a
-                    # strictly newer installed revision proves application.
-                    # Never reapply it to restrictions observed afterward.
-                    if library._catalog_backend is not None or (
-                            paper.terminal_state and paper.terminal_state.required_revision >= revision):
-                        continue
-                covered = tuple(intent.get("covered_policy_reasons", {}).get(key, ()))
-                if key not in new_keys and current.policy_reasons != covered:
-                    raise ValueError("policy restrictions changed since intent; record a new ruling reason")
+                covered = tuple(intent["covered_policy_reasons"][key])
                 if action == "acquire":
                     grant = PolicyOverride(scope=("acquire",), reasons=covered,
                                            revision=revision, key=key)

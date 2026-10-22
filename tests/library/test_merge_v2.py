@@ -454,7 +454,7 @@ async def test_restrictions_union_and_no_one_sided_grant(pair, left_policy, righ
     assert await coordinator(pair).merge_records(left.key, right.key) is left
     assert left.acquisition_state.policy == want
     assert left.acquisition_state.policy_reasons == ("off_domain", "non_paper")
-    assert left.acquisition_state.required_revision == 7
+    assert left.acquisition_state.required_revision == 9
     assert left.acquisition_state.override is None
     assert not effective_policy(left.acquisition_state, key=left.key)
 

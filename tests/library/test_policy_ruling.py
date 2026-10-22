@@ -333,3 +333,170 @@ def test_interrupted_clear_replay_refuses_restrictions_outside_original_scope(ru
     assert cli.main(args) == 2
     assert "restrictions changed" in capsys.readouterr().err
     assert tree_bytes(root) == before
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_legacy_consumed_or_merged_grant_is_historical_not_crash_intent(ruling_vault, merged):
+    from papervault.library.services.policy_ruling import apply_ruling
+    root, _ = ruling_vault
+    lib = Library(root)
+    legacy = state_v2.TerminalState(policy=state_v2.Policy.OVERRIDE,
+        retrieval=state_v2.Retrieval.EXHAUSTED,
+        override=state_v2.PolicyOverride(scope=("acquire",), revision=1, key="A"))
+    lib.get("A").terminal_state = (state_v2.retain_observed_restrictions(
+        legacy, state_v2.TerminalState(policy=state_v2.Policy.CLEAR)) if merged else legacy)
+    with lib.corrections.transaction(durable=True) as ledger:
+        ledger["policy_rulings"] = [{"timestamp": "2026-10-22T00:00:00+00:00",
+            "action": "acquire", "reason": "R", "keys": ["A"], "revision": 1}]
+    lib.save()
+    (root / ".reopen-campaign.lock").touch()
+    before = tree_bytes(root)
+    report = apply_ruling(root, keys=["A"], action="acquire", reason="R")
+    after = Library(root).get("A").acquisition_state
+    assert report["applied"] == report["rulings_added"] == 0
+    assert after.retrieval == state_v2.Retrieval.EXHAUSTED
+    if merged:
+        assert after.policy == state_v2.Policy.EXCLUDED
+        assert not state_v2.effective_policy(after, key="A")
+    assert tree_bytes(root) == before
+
+
+@pytest.mark.parametrize("mutation", ["attempt", "merge", "metadata", "consumed_grant"])
+def test_interrupted_intent_cannot_recover_after_record_changes(ruling_vault, monkeypatch, mutation):
+    from papervault.library.services.policy_ruling import apply_ruling
+    root, _ = ruling_vault
+    with monkeypatch.context() as patch:
+        def fail(*a, **kw):
+            raise OSError("interrupted save")
+        patch.setattr(Library, "save", fail)
+        with pytest.raises(OSError, match="interrupted save"):
+            apply_ruling(root, keys=["A"], action="acquire", reason="R")
+    lib = Library(root)
+    paper = lib.get("A")
+    if mutation == "attempt":
+        paper.download_status = "failed"
+    elif mutation == "merge":
+        paper.terminal_state = replace(paper.acquisition_state, policy=state_v2.Policy.EXCLUDED)
+    elif mutation == "metadata":
+        paper.title = "Changed after the intent was staged"
+    else:
+        paper.terminal_state = replace(paper.acquisition_state, policy=state_v2.Policy.OVERRIDE,
+            override=state_v2.PolicyOverride(scope=("acquire",), revision=1, key="A"))
+    lib.save()
+    before = tree_bytes(root)
+    try:
+        report = apply_ruling(root, keys=["A"], action="acquire", reason="R")
+    except ValueError as exc:
+        assert "new ruling reason" in str(exc)
+    else:
+        assert report["applied"] == report["rulings_added"] == 0
+    assert tree_bytes(root) == before
+
+
+@pytest.mark.parametrize("existing_grant", [False, True])
+def test_exact_interrupted_pre_state_recovers_only_once(ruling_vault, monkeypatch, existing_grant):
+    from papervault.library.services.policy_ruling import apply_ruling
+    root, _ = ruling_vault
+    lib = Library(root)
+    if existing_grant:
+        lib.get("A").terminal_state = state_v2.TerminalState(policy=state_v2.Policy.OVERRIDE,
+            retrieval=state_v2.Retrieval.EXHAUSTED,
+            override=state_v2.PolicyOverride(scope=("acquire",), revision=3, key="A"))
+        lib.save()
+    with monkeypatch.context() as patch:
+        def fail(*a, **kw):
+            raise OSError("interrupted save")
+        patch.setattr(Library, "save", fail)
+        with pytest.raises(OSError, match="interrupted save"):
+            apply_ruling(root, keys=["A"], action="acquire", reason="new decision")
+    # A later intent for B must not hide the last intent for A.
+    apply_ruling(root, keys=["B"], action="clear", reason="unrelated decision")
+    rows = Library(root).corrections.read()["policy_rulings"]
+    recovered = apply_ruling(root, keys=["A"], action="acquire", reason="new decision")
+    assert recovered["applied"] == 1 and recovered["rulings_added"] == 0
+    state = Library(root).get("A").acquisition_state
+    assert state.required_revision == (4 if existing_grant else 1)
+    assert state.retrieval == state_v2.Retrieval.ELIGIBLE
+    assert state_v2.effective_policy(state, key="A")
+    before = tree_bytes(root)
+    repeated = apply_ruling(root, keys=["A"], action="acquire", reason="new decision")
+    assert repeated["applied"] == repeated["rulings_added"] == 0
+    assert Library(root).corrections.read()["policy_rulings"] == rows
+    assert tree_bytes(root) == before
+
+
+def test_superseded_intent_cannot_recover_even_if_old_pre_state_returns(ruling_vault, monkeypatch):
+    from papervault.library.services.policy_ruling import apply_ruling
+    root, _ = ruling_vault
+    original = Library(root).get("A").model_dump()
+    with monkeypatch.context() as patch:
+        def fail(*a, **kw):
+            raise OSError("interrupted save")
+        patch.setattr(Library, "save", fail)
+        with pytest.raises(OSError, match="interrupted save"):
+            apply_ruling(root, keys=["A"], action="acquire", reason="R")
+    apply_ruling(root, keys=["A"], action="clear", reason="superseding decision")
+    lib = Library(root)
+    lib._papers["A"] = Paper.model_validate(original)
+    lib.save()
+    before = tree_bytes(root)
+    repeated = apply_ruling(root, keys=["A"], action="acquire", reason="R")
+    assert repeated["applied"] == repeated["rulings_added"] == 0
+    assert tree_bytes(root) == before
+
+
+@pytest.mark.parametrize("header", [{"version": 2}, {"acquisition_versions": {"identity": 99}}])
+def test_inspect_rejects_unsupported_json_before_staging_intent(ruling_vault, header):
+    from papervault.library.compat_v2 import CompatibilityError
+    from papervault.library.services.policy_ruling import apply_ruling, inspect_ruling
+    root, _ = ruling_vault
+    index = json.loads((root / "index.json").read_text())
+    index.update(header)
+    (root / "index.json").write_text(json.dumps(index))
+    before = tree_bytes(root)
+    for command in (inspect_ruling, apply_ruling):
+        with pytest.raises(CompatibilityError):
+            command(root, keys=["A"], action="acquire", reason="R")
+        assert tree_bytes(root) == before
+
+
+@pytest.mark.parametrize("metadata", ["crash_recovery_pre_state", "covered_policy_reasons"])
+@pytest.mark.parametrize("missing", ["field", "key"])
+def test_recovery_requires_both_explicit_per_key_metadata_fields(ruling_vault, monkeypatch, metadata, missing):
+    from papervault.library.services.policy_ruling import apply_ruling
+    root, _ = ruling_vault
+    with monkeypatch.context() as patch:
+        def fail(*a, **kw):
+            raise OSError("interrupted save")
+        patch.setattr(Library, "save", fail)
+        with pytest.raises(OSError, match="interrupted save"):
+            apply_ruling(root, keys=["A"], action="acquire", reason="R")
+    # Simulate an incomplete/older intent format, not a newly staged intent.
+    with Library(root).corrections.transaction(durable=True) as ledger:
+        row = ledger["policy_rulings"][0]
+        if missing == "field":
+            row.pop(metadata)
+        else:
+            row[metadata].pop("A")
+    before = tree_bytes(root)
+    report = apply_ruling(root, keys=["A"], action="acquire", reason="R")
+    assert report["applied"] == report["rulings_added"] == 0
+    assert tree_bytes(root) == before
+
+
+def test_mixed_request_validates_recovery_before_staging_new_intents(ruling_vault, monkeypatch):
+    from papervault.library.services.policy_ruling import apply_ruling
+    root, _ = ruling_vault
+    with monkeypatch.context() as patch:
+        def fail(*a, **kw):
+            raise OSError("interrupted save")
+        patch.setattr(Library, "save", fail)
+        with pytest.raises(OSError, match="interrupted save"):
+            apply_ruling(root, keys=["A"], action="acquire", reason="R")
+    lib = Library(root)
+    lib.get("A").title = "Changed after the interrupted intent"
+    lib.save()
+    before = tree_bytes(root)
+    with pytest.raises(ValueError, match="new ruling reason"):
+        apply_ruling(root, keys=["B", "A"], action="acquire", reason="R")
+    assert tree_bytes(root) == before

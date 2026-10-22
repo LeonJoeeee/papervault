@@ -33,6 +33,23 @@ def _selection(snapshot):
     return tuple(sorted(admitted))
 
 
+class _PinnedCoverageRows:
+    """Use the pinned aggregate while retaining fresh catalog authority/evidence rows."""
+
+    def __init__(self, repository, snapshot):
+        self.repository = repository
+        self.generation_id = snapshot["generation_id"]
+        self.manifest = {"generation_id": self.generation_id,
+                         "manifest_revision": snapshot["manifest_revision"],
+                         "manifest": snapshot["manifest"]}
+
+    def coverage_rows(self, scope=None):
+        # One shared manifest object preserves coverage's aggregate-verification cache.
+        return [dict(row, generation_manifest=self.manifest)
+                if (row.get("requirement") or {}).get("generation_id") == self.generation_id else row
+                for row in self.repository.coverage_rows(scope)]
+
+
 class CatalogServingFacade:
     def __init__(self, repository, snapshot, *, rag_factory=None, working_dir=None, pin_ttl_seconds=300):
         from papervault.knowledge.store.graph import build_catalog_graph
@@ -107,11 +124,29 @@ class CatalogServingFacade:
         expiry = datetime.fromisoformat(expiry.replace("Z", "+00:00")) if isinstance(expiry, str) else expiry
         if expiry <= datetime.now(timezone.utc):
             raise RuntimeError("catalog reader pin expired")
-        current = self.repository.get_serving_manifest(max_observation_age=300)
-        identity = lambda row: (row.get("generation_id"), row.get("manifest_revision"))
-        if (identity(current) != identity(self.snapshot) or _selection(current) != self.selection or
-                tuple(current.get("manifest", {}).get("aggregate_layers", [])) != self.layers):
-            raise RuntimeError("catalog serving manifest or eligibility changed during query")
+        if (_selection(self.snapshot) != self.selection or
+                tuple(self.snapshot.get("manifest", {}).get("aggregate_layers", [])) != self.layers):
+            raise RuntimeError("pinned catalog serving manifest invariants changed")
+        if self.selection:
+            from papervault.store.coverage import query_coverage
+
+            # Promotion cannot change the view midway through a read. Recheck policy,
+            # input compatibility and fresh evidence for the exact pinned aggregate,
+            # rather than selecting a different active generation or newer layer set.
+            coverage = query_coverage(
+                _PinnedCoverageRows(self.repository, self.snapshot),
+                scope=[unit_id for unit_id, _, _ in self.selection],
+                generation_id=self.snapshot["generation_id"], max_observation_age=300,
+            )
+            by_unit = {unit["unit_id"]: unit for unit in coverage["units"]}
+            for unit_id, namespace, receipt_id in self.selection:
+                unit = by_unit.get(unit_id, {})
+                receipt = unit.get("receipt") or {}
+                if (not unit.get("source_eligible") or not unit.get("tier_covered")
+                        or (unit.get("achieved_tier") == "fulltext" and not unit.get("readable"))
+                        or receipt.get("receipt_id") != receipt_id
+                        or receipt.get("namespace") != namespace):
+                    raise RuntimeError("pinned catalog selection is ineligible or evidence unavailable")
 
     async def _graph(self):
         async with self._open_lock:

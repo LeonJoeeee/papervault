@@ -1,46 +1,24 @@
-"""S3 query out-feed (SDD §5.4 / §6.4) — the v1 `query(intent)` entrypoint.
+"""Read-only retrieval and evidence-bound synthesis with a shared pure out-feed.
 
-Pipeline (verified against LightRAG 1.4.16 source):
-  res = await rag.aquery_data(intent,
-            QueryParam(mode='mix', top_k=100, chunk_top_k=60, enable_rerank=True))  # #5 default 2026-06-14
-    → plain dict, NO LLM generation:
-      success: {status:'success', message, data:{entities,relationships,chunks,references},
-                metadata:{query_mode, keywords, processing_info}}
-      failure: {status:'failure', message, data:{}, metadata:{failure_reason, mode}}  # no processing_info
-  guard status != 'success' or empty data → empty out-feed
-  answer       = KS-written synth prose over data.{entities,relationships,chunks}
-  cited_papers = strip 'paper/' from data.references[].file_path (chunk-level, deduped,
-                 single-valued, unknown_source filtered — NOT entity-level which is
-                 FIFO-truncated 100/300; SDD §4.3 F12). NEVER regex-scraped from prose.
-  cited_sources= operator-supplied source keys (textbook:/notebook:/web:) from the same
-                 references[], kept SEPARATE from cited_papers (issues #45/#47) so a
-                 colon-prefixed provenance key is never mistaken for a pl paper key.
-  abstract_only_papers = the cited_papers whose served chunks come from an abstract-only doc
-                 (#144) — the caller knows those keys hold only an abstract, no full text.
-  kb_coverage  = assess(metadata.processing_info.total_entities_found); None-safe (empty
-                 on failure/empty where processing_info is absent — SDD §6.4).
-
-mode='mix' (graph + vector): naive clears entities/relationships → cited can't aggregate
-(F11). top_k=100 / chunk_top_k=60 / enable_rerank=True (#5 default-promote 2026-06-14; was 40/12)
-per §6.4 / §6.9.1 (wide recall → bge rerank → 60 chunks to synth; the rerank_model_func is wired in
-store/graph.get_graph()). NOTE: the live default variant is now 'multiquery' (retrieve_fused), not
-this single-query path; both share these top_k/chunk_top_k constants.
-
-`_cited_papers` and `_assess_coverage` are pure functions over an aquery_data dict so they
-unit-test offline against canned dicts with no LightRAG running (tests/test_query.py).
+A query pins one catalog generation across retrieval and synthesis. Citations are
+verified inline keys; retrieval candidates and observation counts remain separate.
+FAST eval uses the same builder with an explicit no-synthesis citation fallback.
 """
 from __future__ import annotations
 
 import logging
 import asyncio
 import os
+import re
+import time
+from collections import Counter
 from typing import Any
 
 from lightrag import QueryParam
 
-from papervault.knowledge.ingest.abstract_doc import is_abstract_text
 from papervault.knowledge.ingest.operator_docs import strip_section_suffix
-from papervault.knowledge.query.synth import _source_label, synth_answer
+from papervault.knowledge.query.synth import _source_label, annotate_sources, source_tier, synth_answer
+from papervault.llm_routing import route
 
 logger = logging.getLogger("ks.query.aquery")
 
@@ -60,11 +38,11 @@ _TOP_K = int(os.getenv("KS_TOP_K", "100"))   # #5 default-promote 2026-06-14 (wa
 # headline budget stays fair regardless of this cap.
 _CHUNK_TOP_K = int(os.getenv("KS_CHUNK_TOP_K", "60"))   # #5 default-promote 2026-06-14 (was 12): the unimodal peak
 _ENABLE_RERANK = True
-# Live retrieval variant for the shipped query() / MCP path. Default 'single' = the original
-# single-query mix path (byte-identical when unset). 'multiquery' routes through
+# Live retrieval variant for the shipped query() / MCP path. 'single' selects the
+# single-query mix path. The default 'multiquery' routes through
 # multiquery.retrieve_fused (V-MQ) — the #5-loop winner when paired with KS_SYNTH_STRICT_REFUSAL=1
 # + the long-context env (MAX_TOTAL_TOKENS=300000, KS_MQ_ENABLE_RERANK=false, KS_CHUNK_TOP_K=60,
-# KS_MQ_SUB_CHUNK_TOP_K=60, KS_MQ_N_SUBQ=5, KS_TOP_K=100). Flag-gated deploy, never auto-on.
+# KS_MQ_SUB_CHUNK_TOP_K=60, KS_MQ_N_SUBQ=5, KS_TOP_K=100).
 _QUERY_VARIANT = os.getenv("KS_QUERY_VARIANT", "multiquery")  # #5 default-promote 2026-06-14 (was 'single'): V-MQ live
 
 _EMPTY = {"answer": "(KB 无相关知识)", "cited_papers": [], "cited_sources": [],
@@ -83,41 +61,29 @@ def _is_source_key(fp: str) -> bool:
     return any(fp.startswith(p) for p in _SOURCE_PREFIXES)
 
 
-def _cited_papers(data: dict[str, Any]) -> list[str]:
-    """Aggregate pl citation keys from data.references[].file_path (SDD §6.4 / §4.3).
-
-    references[] = chunk-level, deduped, single-valued file_path, unknown_source already
-    filtered out by LightRAG (utils.py generate_reference_list_from_chunks). We keep only
-    the 'paper/' prefix ones and strip the prefix → pl citation key. Sorted + deduped.
-    Operator-doc keys (textbook:/notebook:/web:) are excluded here — they go to
-    _cited_sources so a colon-prefixed source is never mistaken for a paper key.
-    """
-    refs = data.get("references") or []
-    keys = set()
-    for r in refs:
-        fp = r.get("file_path") or ""
-        if not fp or fp == "unknown_source":
+def _retrieved_keys(data: dict[str, Any], *, sources: bool = False) -> list[str]:
+    """Deduplicate by evidence identity in retrieval rank, with references as fallback."""
+    keys = []
+    for item in [*(data.get("chunks") or []), *(data.get("references") or [])]:
+        fp = item.get("file_path") or ""
+        label, _ = _source_label(fp)
+        if label == "unknown":
             continue
-        # An operator source (colon-prefixed provenance key) is NOT a paper — skip it here
-        # (it would otherwise fall into the slash-free bare-key branch below and pollute
-        # cited_papers). It is collected by _cited_sources instead.
-        if _is_source_key(fp):
-            continue
-        # Two coexisting formats: 1.4-built data stores 'paper/<key>' (the distill-side
-        # prefix), while LightRAG 1.5.x normalizes file_path to its BASENAME at enqueue
-        # (pipeline 'canonical stored basename'), so fresh docs carry the bare key — the
-        # probe caught fresh-built docs vanishing from cited_papers under the prefix-only
-        # rule. Accept both eras; any OTHER slash-prefixed source class (hypothetical
-        # textbook/, web/) keeps the old defensive exclusion.
-        if fp.startswith("paper/"):
-            key = fp.split("/", 1)[1]
-        elif "/" not in fp:
-            key = fp  # 1.5-era basename; our distill is the only writer, so this IS a key
+        if sources:
+            valid = _is_source_key(fp)
         else:
-            continue
-        if key:
-            keys.add(key)
-    return sorted(keys)
+            valid = fp.startswith("paper/") or ("/" not in fp and ":" not in fp)
+        if valid and label not in keys:
+            keys.append(label)
+    return keys
+
+
+def _cited_papers(data: dict[str, Any]) -> list[str]:
+    """Retrieval-ranked paper candidates (the FAST no-synthesis citation fallback).
+
+    Synthesized answers use build_outfeed to restrict this pool to verified inline keys.
+    """
+    return _retrieved_keys(data)
 
 
 def _cited_sources(data: dict[str, Any]) -> list[str]:
@@ -147,7 +113,7 @@ def _abstract_only_papers(data: dict[str, Any]) -> list[str]:
     cited = set(_cited_papers(data))
     keys = set()
     for c in data.get("chunks") or []:
-        if not is_abstract_text((c.get("content") or "").strip()):
+        if source_tier(c) != "abstract_only":
             continue
         label, _cred = _source_label(c.get("file_path") or "")
         if label in cited:  # cited_papers already excludes operator sources (textbook:/…)
@@ -166,12 +132,14 @@ def _assess_coverage(metadata: dict[str, Any] | None, data: dict[str, Any]) -> s
     Failure/empty responses carry no processing_info → e is None → empty.
       e is None or chunks empty → empty
       e < 5  → empty
-      5 <= e < 20 → thin
-      e >= 20 → strong
+      e >= 5 with exclusively abstract-only chunks → weak
+      5 <= e < 20 with full-text evidence → thin
+      e >= 20 with full-text evidence → strong
     cosine (still present in v3, threshold 0.2) is only an auxiliary signal; graph-signal
     coverage is the deliberate design choice (§6.4 注), not 'no cosine'.
     """
-    if not (data.get("chunks") or []):
+    chunks = [c for c in data.get("chunks") or [] if (c.get("content") or "").strip()]
+    if not chunks:
         return "empty"
     pinfo = (metadata or {}).get("processing_info")
     if not pinfo:
@@ -179,9 +147,74 @@ def _assess_coverage(metadata: dict[str, Any] | None, data: dict[str, Any]) -> s
     e = pinfo.get("total_entities_found")
     if e is None or e < 5:
         return "empty"
+    if all(source_tier(c) == "abstract_only" for c in chunks):
+        return "weak"
     if e < 20:
         return "thin"
     return "strong"
+
+
+def build_outfeed(
+    data: dict[str, Any], metadata: dict[str, Any] | None, answer: str | None,
+    *, no_synth: bool = False, generation_id: str | None = None,
+    query_mode: str = _QUERY_MODE, variant: str = "single", rerank_degraded: bool = False,
+    synthesis_model: str | None = None, synthesis_latency_s: float = 0.0,
+) -> dict[str, Any]:
+    """Pure production/eval contract over one captured retrieval and its answer.
+
+    No-synthesis eval retains retrieval-ranked candidates as cited_papers for recall
+    compatibility. All synthesized outputs admit only exact inline keys in that pool.
+    The model records the requested routing level; the gateway's underlying model is
+    undisclosed and is never inferred from configuration.
+    """
+    data = annotate_sources(data)
+    coverage = _assess_coverage(metadata, data)
+    papers = _retrieved_keys(data)
+    sources = _retrieved_keys(data, sources=True)
+    if coverage == "empty" and not no_synth:
+        answer = _EMPTY["answer"]
+    counts = Counter(re.findall(r"\[([^\[\]\n]+)\]", answer or ""))
+    def cited(keys):
+        if no_synth:
+            return list(keys)
+        return sorted((k for k in keys if counts[k]), key=lambda k: (-counts[k], keys.index(k)))
+    cited_papers, cited_sources = cited(papers), cited(sources)
+    abstract = set(_abstract_only_papers(data))
+    fulltext = {_source_label(c.get("file_path") or "")[0] for c in data["chunks"]
+                if source_tier(c) != "abstract_only"}
+    receipt = {
+        "generation_id": generation_id, "query_mode": query_mode, "variant": variant,
+        "kb_coverage": coverage, "retrieved_chunk_count": len(data["chunks"]),
+        "retrieved_paper_count": len(papers), "cited_paper_count": len(cited_papers),
+        "rerank_degraded": rerank_degraded, "synthesis_model": synthesis_model,
+        "synthesis_latency_s": synthesis_latency_s, "no_synth": no_synth,
+    }
+    return {
+        "answer": answer, "cited_papers": cited_papers, "cited_sources": cited_sources,
+        "retrieved_papers": papers, "retrieved_sources": sources,
+        "abstract_only_papers": [k for k in cited_papers if k in abstract and k not in fulltext],
+        "kb_coverage": coverage, "query_receipt": receipt,
+    }
+
+
+async def synthesize_outfeed(
+    data: dict[str, Any], metadata: dict[str, Any] | None, intent: str,
+    *, no_synth: bool = False, **receipt_fields: Any,
+) -> dict[str, Any]:
+    """Apply the coverage gate before synthesis, then assemble one observable out-feed."""
+    data = annotate_sources(data)
+    coverage = _assess_coverage(metadata, data)
+    answer = None
+    model, latency = None, 0.0
+    if not no_synth and coverage != "empty":
+        model = route("synth")
+        started = time.monotonic()
+        answer = await synth_answer(data, intent, kb_coverage=coverage)
+        latency = time.monotonic() - started
+    out = build_outfeed(data, metadata, answer, no_synth=no_synth,
+                        synthesis_model=model, synthesis_latency_s=latency, **receipt_fields)
+    logger.info("query_receipt %s", out["query_receipt"], extra={"query_receipt": out["query_receipt"]})
+    return out
 
 
 async def query(intent: str, rag: Any = None) -> dict[str, Any]:
@@ -192,8 +225,10 @@ async def query(intent: str, rag: Any = None) -> dict[str, Any]:
 
         rag = await get_query_graph()
     try:
+        if hasattr(rag, "validate"):
+            await asyncio.to_thread(rag.validate)
         result = await _query(intent, rag)
-        if owned and hasattr(rag, "validate"):
+        if hasattr(rag, "validate"):
             await asyncio.to_thread(rag.validate)
         return result
     finally:
@@ -202,7 +237,7 @@ async def query(intent: str, rag: Any = None) -> dict[str, Any]:
 
 
 async def _query(intent: str, rag: Any) -> dict[str, Any]:
-    """Unchanged retrieval/synthesis pipeline over one already pinned store view."""
+    """Retrieve and synthesize over one already pinned store view."""
     # #29: surface reranker degradation on the LIVE path (run_eval already does, via rec["meta"]).
     # The rerank hook (store/lightrag_init) increments a process-global counter + logs LOUD on each
     # OOM/failure, then silently falls back to original-order chunks — so at the data layer a
@@ -221,8 +256,7 @@ async def _query(intent: str, rag: Any) -> dict[str, Any]:
 
     if _QUERY_VARIANT == "multiquery":
         # V-MQ live path (#5 winner). retrieve_fused gates on coverage and falls back to the
-        # baseline single-query data when coverage is thin / decomposition fails, so this is safe:
-        # a thin query behaves exactly like the single path. Lazy import avoids the aquery↔multiquery
+        # baseline single-query data when the coverage gate rejects fusion or decomposition fails. Lazy import avoids the aquery↔multiquery
         # import cycle (multiquery imports this module as `aq`).
         from papervault.knowledge.query.multiquery import retrieve_fused
 
@@ -244,31 +278,15 @@ async def _query(intent: str, rag: Any) -> dict[str, Any]:
             ),
         )
         if not isinstance(res, dict) or res.get("status") != "success" or not res.get("data"):
-            return dict(_EMPTY)
-        data = res["data"]
-        metadata = res.get("metadata")
+            data = {}
+        else:
+            data = res["data"]
+        metadata = res.get("metadata") if isinstance(res, dict) else None
 
-    if _rr_count is not None and _rr0 is not None and _rr_count() > _rr0:
-        logger.warning(
-            "rerank DEGRADED during query — reranker OOM/failure fell back to original-order "
-            "chunks, so retrieval quality is reduced for this answer. intent=%r", intent[:160]
-        )
-
-    # Nothing retrieved (status success but all arrays empty — e.g. a query whose
-    # keywords matched no graph/vector content): skip the LLM round-trip, return empty.
-    if not (data.get("entities") or data.get("relationships") or data.get("chunks")):
-        return dict(_EMPTY)
-
-    answer = await synth_answer(data, intent)
-    cited_papers = _cited_papers(data)
-    cited_sources = _cited_sources(data)
-    abstract_only = _abstract_only_papers(data)
-    kb_coverage = _assess_coverage(metadata, data)
-
-    return {
-        "answer": answer,
-        "cited_papers": cited_papers,
-        "cited_sources": cited_sources,
-        "abstract_only_papers": abstract_only,
-        "kb_coverage": kb_coverage,
-    }
+    degraded = bool(_rr_count is not None and _rr0 is not None and _rr_count() > _rr0)
+    if degraded:
+        logger.warning("rerank DEGRADED during query intent=%r", intent[:160])
+    return await synthesize_outfeed(
+        data, metadata, intent, variant=_QUERY_VARIANT, rerank_degraded=degraded,
+        generation_id=getattr(rag, "snapshot", {}).get("generation_id"),
+    )

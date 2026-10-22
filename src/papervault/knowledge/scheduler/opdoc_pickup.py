@@ -43,8 +43,8 @@ The drain had NEITHER guard. Both are now mirrored here:
   - BOUNDED OCR CALL (backstop): `_ocr_to_staged_md` threads a `wall_clock_deadline`
     (`KS_OPDOC_OCR_TIMEOUT_SEC`, default 30 min) into `extract_mineru`, so even a corruption
     the probe misses (or a server-side hang) costs ONE bounded period, never an indefinite
-    stall — on the cap the client raises `MineruExtractionError` (server alive) → failed/, or
-    `MineruTransportError` (server dead) → left in pending.
+    stall — expiry during observed processing raises `MineruExtractionError` → failed/;
+    expiry while pending in the shared queue raises `MineruTransportError` → left in pending.
 
 PDF OCR error routing mirrors the paper extract path's transport-vs-extraction split (C1):
   - CORRUPT/UNPARSEABLE PDF (pre-OCR probe `bad`) → move to failed/ + `.reason`, NEVER call
@@ -169,13 +169,13 @@ _DEFAULT_OCR_TIMEOUT_SEC = 30 * 60.0
 def _ocr_timeout_seconds() -> float:
     """Seconds to bound a single `extract_mineru` OCR call in the drain (issue #89).
 
-    Threaded into `extract_mineru` as a `wall_clock_deadline`. When the cap fires while the
-    MinerU server is ALIVE (a slow/looping doc read-timing-out) the client raises
-    `MineruExtractionError` → the pdf is routed to failed/; when it fires while the server is
-    DEAD the client raises `MineruTransportError` → the pdf is left in pending (deferred). A
-    value <= 0 DISABLES the backstop (deadline=None) — the call is then bounded only by the
-    mineru_client's own per-request http_timeout × inline-retry budget (the pre-#89 behaviour),
-    an escape hatch for an operator loading a document larger than the default cap allows.
+    Threaded into `extract_mineru` as a `wall_clock_deadline`. A read or wall-clock timeout
+    after observing task status `processing` raises `MineruExtractionError` → the PDF is
+    routed to failed/. Expiry while pending in the service queue, connection failures and
+    service outages raise `MineruTransportError` → the PDF stays pending (deferred). A value
+    <= 0 DISABLES the total deadline (deadline=None). Per-request HTTP timeouts and endpoint
+    retry limits still apply, but successful pending/processing polls can continue without
+    a total cap; this is an escape hatch for documents larger than the default cap allows.
     """
     try:
         return float(os.getenv("KS_OPDOC_OCR_TIMEOUT_SEC", str(_DEFAULT_OCR_TIMEOUT_SEC)))
@@ -229,19 +229,18 @@ async def _ocr_to_staged_md(pdf_path: Path) -> Path:
     `MINERU_URL` endpoints and never blocks the loop), then writes the produced markdown
     OFF-LOOP to `<pending>/.ocr/<pdf-stem>.md` and returns that path. The `.md` suffix routes
     `ingest_document` to heading-aware chunking; the `.ocr` staging subdir is never scanned by
-    the drain. `stem=pdf_path.stem` (e.g. `textbook-Foo2020`) is a real filesystem name, so it
-    is inherently fs-safe for MinerU's `<out>/<stem>/vlm/<stem>.md` read-back path.
+    the drain. `stem=pdf_path.stem` (e.g. `textbook-Foo2020`) names the uploaded PDF and
+    selects its `md_content` entry from the task API result, with normalized-name fallback.
 
     Raises `MineruTransportError` (server down/unreachable — TRANSIENT, caller leaves the pdf
     in pending) or `MineruExtractionError` (per-doc OCR defect — TERMINAL, caller → failed/).
 
-    BOUNDED (issue #89): the call carries a `wall_clock_deadline` (`KS_OPDOC_OCR_TIMEOUT_SEC`,
-    default 30 min) so a corrupt PDF that slipped past the pre-OCR probe — or any server-side
-    hang — can NEVER stall this serial drain indefinitely. Crossing the cap raises
-    `MineruExtractionError` (server alive → the caller routes to failed/) or `MineruTransportError`
-    (server dead → the caller leaves the pdf in pending). Before #89 the drain passed NO deadline,
-    so a doomed file was bounded only by the client's per-request http_timeout × inline retries
-    (~40 min worst case) — the root of the 30-min stall this guards.
+    BOUNDED (issue #89): by default the call carries a `wall_clock_deadline`
+    (`KS_OPDOC_OCR_TIMEOUT_SEC`, default 30 min). Expiry during observed processing raises
+    `MineruExtractionError` (caller routes to failed/); expiry while pending in the service
+    queue raises `MineruTransportError` (caller leaves the PDF pending). A value <= 0
+    explicitly disables the total deadline; successful status polling can then continue
+    indefinitely despite per-request HTTP timeouts and endpoint retry limits.
     """
     pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
     timeout = _ocr_timeout_seconds()

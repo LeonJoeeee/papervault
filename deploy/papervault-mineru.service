@@ -1,18 +1,20 @@
 # papervault MinerU OCR server — systemd --user unit (template).
 #
-# Legacy standalone server template, managed by the operator independently of
-# papervault. The shared host deployment instead uses mineru.service behind
+# Legacy pre-0.10.1 standalone vLLM template, retained for existing deployments.
+# It does not expose /tasks and cannot serve the current papervault client.
+# Provision the shared official mineru-api service separately (docs/INSTALL.md).
+# The shared host deployment historically used mineru.service behind
 # mineru-gate.service; that gate owns :30000 and backend stop/start and recovery.
 # Do not install this direct-listener template alongside the gate on :30000.
-# papervault only probes readiness over HTTP and never manages this unit.
+# papervault never manages this unit.
 #
-# Install:
+# Historical install (legacy VLM consumers only, not current papervault):
 #   cp deploy/papervault-mineru.service ~/.config/systemd/user/
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now papervault-mineru.service
 #
 # Requires a separately provisioned venv providing `mineru-vllm-server`.
-# papervault[mineru] supplies only the HTTP client libraries.
+# papervault's HTTP client uses core httpx; [mineru] is an empty compatibility extra.
 
 [Unit]
 Description=papervault MinerU2.5 vLLM OCR server
@@ -29,7 +31,7 @@ Type=simple
 ExecStart=/bin/bash -lc 'exec mineru-vllm-server --host 127.0.0.1 --port 30000'
 Restart=on-failure
 RestartSec=5
-# Service timeouts are operator-owned; papervault's readiness budget is independent.
+# Service timeouts are operator-owned; papervault's HTTP deadline is independent.
 # First start pulls the MinerU2.5 weights and loads the model into VRAM.
 TimeoutStartSec=300
 TimeoutStopSec=60

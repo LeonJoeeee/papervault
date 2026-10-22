@@ -637,7 +637,7 @@ async def extract_md(paper: Paper, library: Library, *,
     # > _EXTRACT_CONCURRENCY, a freed slot is immediately re-dispatched → GPU stays fed.
     await concurrency.acquire_extract_slot()
     try:
-        # Retained compatibility hook: no pre-flight. Client discovery/parse
+        # Retained compatibility hook: no pre-flight. HTTP submit/poll/result
         # transport failures below defer through C1 without charging an attempt.
         await get_server_controller().ensure_ready()
         mineru_md = await extract_mineru(

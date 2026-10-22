@@ -1,7 +1,7 @@
 """Tests for the authority-weighted return ordering (issue #46).
 
 The prior is a SOFT RRF rank-blend layered on the return-gate relevance order in
-``search_papers`` (server.py Stage 4→5), DEFAULT OFF and byte-identical when off.
+``search_papers`` (server.py Stage 4→5), DEFAULT ON at weight 0.25; byte-identical when explicitly disabled.
 These exercise the pure ``_authority_reorder`` / ``_authority_value`` helpers with
 injected knobs (env-independent) so the age-normalization math is deterministic.
 """
@@ -20,13 +20,13 @@ def _cand(key, *, year, citation_count):
     return {"key": key, "year": year, "citation_count": citation_count}
 
 
-# ----------- default is OFF -------------------------------------------------
+# ----------- default is ON -------------------------------------------------
 
 
-def test_default_flag_is_off():
-    """Ships DEFAULT OFF: no env set → prior disabled, λ at the documented default."""
-    assert SEARCH_AUTHORITY_PRIOR is False
-    assert SEARCH_AUTHORITY_LAMBDA == 0.5
+def test_default_flag_is_on():
+    """Ships DEFAULT ON: no env set → prior enabled at gentle weight 0.25."""
+    assert SEARCH_AUTHORITY_PRIOR is True
+    assert SEARCH_AUTHORITY_LAMBDA == 0.25
 
 
 # ----------- off = byte-identical -------------------------------------------

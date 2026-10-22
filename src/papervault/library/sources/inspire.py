@@ -13,6 +13,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 import requests
+from .exceptions import BackendDegraded, backend_degraded, source_errors, source_results
 from .identity import source_identity
 
 API_URL = "https://inspirehep.net/api/literature"
@@ -239,6 +240,7 @@ def lookup_inspire_record(reference: dict, *, recid: str = "", timeout: int = 30
         return None
 
 
+@source_errors
 def search_inspire(query: str, max_results: int = 30) -> list[dict[str, Any]]:
     """Search Inspire-HEP and return structured paper metadata."""
     if not query:
@@ -255,29 +257,29 @@ def search_inspire(query: str, max_results: int = 30) -> list[dict[str, Any]]:
         "fields": FIELDS,
     }
 
+    failure = BackendDegraded("INSPIRE no response")
     for attempt in range(MAX_RETRIES):
         try:
             resp = requests.get(API_URL, params=params, timeout=30)
             if resp.status_code == 429:
+                failure = backend_degraded(response=resp)
                 time.sleep(RETRY_DELAY)
                 continue
             resp.raise_for_status()
             break
-        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError):
+        except requests.ConnectionError as error:
+            failure = backend_degraded(error)
             time.sleep(RETRY_DELAY)
-            continue
-        except requests.exceptions.HTTPError:
-            return []
+        except requests.HTTPError as error:
+            raise backend_degraded(error) from error
     else:
-        return []
+        raise failure
 
-    try:
-        data = resp.json()
-    except ValueError:
-        return []
+    data = resp.json()
+    hits = source_results(data, "hits", "hits")
 
     papers: list[dict[str, Any]] = []
-    for hit in (data.get("hits") or {}).get("hits", []) or []:
+    for hit in hits:
         papers.append(_paper_from_hit(hit))
 
     return papers

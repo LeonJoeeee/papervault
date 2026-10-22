@@ -18,7 +18,7 @@ from typing import Any
 
 import requests
 
-from .exceptions import BackendDegraded
+from .exceptions import BackendDegraded, backend_degraded, source_errors, source_results
 from .identity import source_identity
 
 API_URL = "https://api.adsabs.harvard.edu/v1/search/query"
@@ -65,6 +65,7 @@ def _extract_arxiv_id(identifiers: list[str]) -> str:
     return ""
 
 
+@source_errors
 def search_ads(query: str, max_results: int = 30) -> list[dict[str, Any]]:
     """Search NASA ADS and return structured paper metadata.
 
@@ -90,63 +91,38 @@ def search_ads(query: str, max_results: int = 30) -> list[dict[str, Any]]:
         "sort": "relevance",
     }
 
-    resp = None
+    failure = BackendDegraded("ADS no response")
     for attempt in range(MAX_RETRIES):
         try:
             resp = requests.get(API_URL, params=params, headers=headers, timeout=30)
             if resp.status_code == 429:
+                failure = backend_degraded(response=resp)
                 time.sleep(RETRY_DELAY)
                 continue
-            # WAF captcha-header guard — placed BEFORE the 401/403 block ON
-            # PURPOSE: AWS WAF serves its captcha challenge with a 403 status, so
-            # if the 401/403 block ran first a captcha-403 would be MIS-labeled an
-            # "auth 403" (wrong cause). Detecting the x-amzn-waf-action header
-            # first labels it correctly as a WAF degrade (a bad token without the
-            # WAF header still falls through to the auth block below).
-            if resp.headers.get("x-amzn-waf-action") == "captcha":
-                raise BackendDegraded("ADS WAF")
+            # A WAF captcha is not evidence of rejected credentials.
+            if resp.headers.get("x-amzn-waf-action") == "captcha" or resp.status_code == 405:
+                raise BackendDegraded("ADS WAF", code="provider_blocked")
             if resp.status_code in (401, 403):
-                # Auth rejected (bad/expired token) — DEGRADED, not a 0-hit. The
-                # §8 unconfigured signal (no token at all) is separate; a present
-                # but rejected token is a degrade. BackendDegraded is NOT an
-                # HTTPError subclass so the loop's ``except HTTPError`` below does
-                # not swallow it.
                 _warn_auth_once(
                     f"ADS auth failed ({resp.status_code}); check ADS_API_TOKEN."
                 )
-                raise BackendDegraded(f"ADS auth {resp.status_code}")
-            # WAF 405 guard — placed AFTER the 401/403 block and BEFORE the 5xx
-            # block (a WAF 405 is < 500 so it would otherwise fall through to
-            # raise_for_status → HTTPError → swallowed-to-[]). Being non-HTTPError
-            # it escapes both ``except HTTPError`` and ``except (Connection,SSL)``.
-            if resp.status_code == 405:
-                raise BackendDegraded("ADS WAF")
-            if 500 <= resp.status_code < 600:
-                return []
+                raise BackendDegraded(f"ADS auth {resp.status_code}",
+                                      code="authentication_failed", retryability="permanent")
             resp.raise_for_status()
             break
-        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError):
+        except requests.ConnectionError as error:
+            failure = backend_degraded(error)
             time.sleep(RETRY_DELAY)
-            continue
-        except requests.exceptions.HTTPError:
-            return []
+        except requests.HTTPError as error:
+            raise backend_degraded(error) from error
     else:
-        # Bounded retries exhausted (repeated 429 / connection errors) — a
-        # transient failure, NOT an authoritative 0-hit. Raise BackendDegraded so
-        # _fetch_one_backend records ADS as degraded (consistent with the other
-        # sources), instead of silently returning [].
-        raise BackendDegraded("ADS retry exhausted")
+        raise failure
 
-    if resp is None:
-        raise BackendDegraded("ADS no response")
-
-    try:
-        data = resp.json()
-    except ValueError:
-        return []
+    data = resp.json()
+    docs = source_results(data, "response", "docs")
 
     papers: list[dict[str, Any]] = []
-    for doc in (data.get("response") or {}).get("docs", []) or []:
+    for doc in docs:
         titles = doc.get("title") or []
         title = (titles[0] if titles else "") or ""
 

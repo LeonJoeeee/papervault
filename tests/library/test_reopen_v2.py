@@ -811,3 +811,22 @@ async def test_restored_claimless_index_cannot_bypass_campaign_ownership(vault, 
     assert download.download_paper(candidate, restored) is False
     assert calls == [] and candidate.download_status == "pending"
     assert store.ledger.spent(token.campaign_id) == 1
+
+
+async def test_staged_trusted_scan_preserves_deferred_identity_through_writeback(vault):
+    from papervault.library.reopen_v2 import StagedAttempt
+    lib, paper = vault
+    claims, token = await prepare(vault)
+    assert await claims.pre_dispatch(token)
+    stage = StagedAttempt(lib, token)
+    result = stage.library.get(paper.key)
+    stage.path('pdf').write_bytes(b'%PDF trusted scanned artifact')
+    result.download_status = 'ok'
+    result.download_source = 'ads_scan'
+    result.verification_deferred_to_ocr = True
+    assert await stage.writeback(claims)
+    stage.cleanup()
+    persisted = Library(lib.root).get(paper.key)
+    assert persisted.download_source == 'ads_scan'
+    assert persisted.verification_deferred_to_ocr
+    assert lib.pdf_path(paper.key).read_bytes() == b'%PDF trusted scanned artifact'

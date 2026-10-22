@@ -34,6 +34,11 @@ def _load_env() -> Path | None:
 ENV_FILE = _load_env()
 
 
+def search_authority_prior_enabled() -> bool:
+    """Gentle authority blending is on by default; operators may disable it."""
+    return os.environ.get("PAPERVAULT_SEARCH_AUTHORITY_PRIOR", "1") == "1"
+
+
 def terminal_v2_enabled() -> bool:
     """Read the opt-in acquisition flag at use time, like library tier flags."""
     return os.environ.get("PAPERVAULT_TERMINAL_V2", "").strip().lower() in {"1", "true", "yes"}

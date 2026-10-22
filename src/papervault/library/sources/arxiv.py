@@ -9,7 +9,7 @@ import requests
 
 from ..polite_http import polite_get
 
-from .exceptions import BackendDegraded
+from .exceptions import BackendDegraded, backend_degraded, source_errors
 from .identity import source_identity
 
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
@@ -27,6 +27,7 @@ _MAX_RETRIES = 3
 _BACKOFF_CAP = 4.0   # per-attempt backoff ceiling; 3 attempts → total wall ≲12s
 
 
+@source_errors
 def search_arxiv(query: str, max_results: int = 30, *,
                  sort_by_recency: bool = False) -> list[dict[str, Any]]:
     """Search arXiv and return structured paper metadata.
@@ -51,27 +52,30 @@ def search_arxiv(query: str, max_results: int = 30, *,
         "sortOrder": "descending",
     }
 
-    resp = None
+    failure = BackendDegraded("arXiv no response")
     for attempt in range(_MAX_RETRIES):
         try:
             resp = polite_get(requests.get, ARXIV_API_URL, params=params, timeout=30)
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.Timeout):
+        except (requests.ConnectionError, requests.Timeout) as error:
+            failure = backend_degraded(error)
             time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)
             continue
         if resp.status_code == 429 or resp.status_code >= 500:
+            failure = backend_degraded(response=resp)
             time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)
             continue
+        if not resp.ok:
+            raise backend_degraded(response=resp)
         break
-
-    if resp is None or not resp.ok:
-        # Retry-exhausted / transient failure → DEGRADED (not an empty result).
-        raise BackendDegraded("arXiv retry exhausted")
+    else:
+        raise failure
 
     try:
         root = ET.fromstring(resp.text)
-    except ET.ParseError:
-        return []
+    except ET.ParseError as error:
+        raise backend_degraded(ValueError("invalid XML")) from error
+    if root.tag != "{http://www.w3.org/2005/Atom}feed":
+        raise backend_degraded(ValueError("invalid Atom feed"))
     papers = []
 
     for entry in root.findall("atom:entry", NS):

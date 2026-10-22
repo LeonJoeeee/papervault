@@ -32,6 +32,8 @@ here it runs ONCE on the whole-doc md.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -561,10 +563,20 @@ async def extract_md(paper: Paper, library: Library, *,
     # re-hunt. classify() routes such a paper to rule-2 TERMINAL (has_pdf ∧
     # has_md) and serve-safety keeps surfacing the firecrawl md via text_path;
     # nothing forces a re-OCR.
-    if not force:
+    # An outstanding scan verdict must not use recovery or an existing alias
+    # as a shortcut around identity verification.
+    scan_evidence = [document for document in paper.ads_availability.documents
+                     if document.document_kind == "scanned_full_text"]
+    deferred_identity = paper.verification_deferred_to_ocr or (
+        not paper.extraction_completion_id and paper.download_source == "ads_scan")
+    if (not deferred_identity and not paper.extraction_completion_id and scan_evidence
+            and library.has_pdf(paper.key)):
+        source_hash = hashlib.sha256(library.pdf_path(paper.key).read_bytes()).hexdigest()
+        deferred_identity = any(document.sha256 == source_hash for document in scan_evidence)
+    if not force and not deferred_identity:
         from .services.extraction_registration import recover_completions
         recover_completions(library, key=paper.key)
-    if not force and library.has_extract(paper.key, "md"):
+    if not force and not deferred_identity and library.has_extract(paper.key, "md"):
         from .services.extraction_registration import require_selected_registration
         require_selected_registration(library, paper)
         return library.md_path(paper.key).read_text()
@@ -698,6 +710,37 @@ async def extract_md(paper: Paper, library: Library, *,
            f"attempt {paper.extract_attempts}/{MAX_EXTRACT_ATTEMPTS}")
         return None
 
+    # A trusted scan carries bytes, not a verified identity. Require a positive
+    # title/author verdict on the OCR output before any completion is published.
+    from .download import _llm_verify_identity
+    digest = hashlib.sha256(pdf_bytes).hexdigest()
+    deferred_identity = (paper.verification_deferred_to_ocr or paper.download_source == "ads_scan"
+                         or any(document.sha256 == digest for document in scan_evidence))
+    if deferred_identity:
+        async with concurrency.gate_sem:
+            identity_ok, identity_reason = await asyncio.to_thread(
+                _llm_verify_identity, mineru_md[:6000], paper, llm=llm, require_boolean=True)
+        # The general PDF verifier permits API failures; a deferred scan needs
+        # affirmative verification, so unavailable/malformed verdicts abstain.
+        if not identity_ok or not identity_reason.startswith("llm_match:"):
+            output_hash = hashlib.sha256(mineru_md.encode()).hexdigest()
+            retained = library.root / "extracts" / "rejected" / f"{extraction_request['completion_id']}.md"
+            from papervault.store.extraction import write_once
+            write_once(retained, mineru_md.encode())
+            write_once(retained.with_suffix(".json"), json.dumps({
+                "request": extraction_request, "reason": identity_reason,
+                "output_sha256": output_hash, "disposition": "identity_unverified",
+            }, sort_keys=True).encode())
+            library.set_domain_status(paper.key, "identity_mismatch")
+            paper.domain_status = "identity_mismatch"
+            paper.download_status = DOWNLOAD_STATUS_EXTRACT_FAILED
+            library.log({"event": "extract_md_identity_reject", "key": paper.key,
+                         "reason": identity_reason, "source_sha256": digest,
+                         "output_sha256": output_hash, "retained_output": str(retained.relative_to(library.root))})
+            library.save(force=True, durable=True)
+            _p("extract: OCR identity unverified — quarantined")
+            return None
+
     # The whole-doc clarity judge (the firecrawl-path consumer's twin, run here
     # once on the assembled md). Fail-open on LLM/parse error (never discards
     # readable text). A genuine clarity FAIL is treated like the gate reject
@@ -736,8 +779,17 @@ async def extract_md(paper: Paper, library: Library, *,
         return None
 
     # ---- 6. Save (label → mineru2.5-pro) ----
-    finish_extraction(paper, library, extraction_request, mineru_md)
+    observations = ({"actual_model": "unknown", "identity_verification": {
+        "match": True, "reason": identity_reason, "source_sha256": digest,
+    }} if deferred_identity else None)
+    finish_extraction(paper, library, extraction_request, mineru_md,
+                      provider_observations=observations)
     paper.download_status = DOWNLOAD_STATUS_OK
+    if deferred_identity:
+        paper.verification_deferred_to_ocr = False
+        library.log({"event": "extract_md_identity_verified", "key": paper.key,
+                     "source_sha256": digest, "reason": identity_reason})
+        library.save(force=True, durable=True)
     # Issue #43: a successful extraction proves the backend is producing output —
     # advance the process-global success epoch so any papers deferred during the
     # outage go stale next reconcile sweep and are re-enqueued (auto-recovery).

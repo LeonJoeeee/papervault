@@ -293,6 +293,7 @@ def test_pdf_identity_rejection_clears_retrievable(lib, paper, monkeypatch):
     assert not lib.has_pdf(paper.key)
     assert paper.ads_availability.availability == 'unknown'
     assert paper.ads_availability.reason == 'document_identity_mismatch'
+    assert paper.ads_availability.documents[0].reason == 'document_identity_mismatch'
 
 
 @pytest.mark.parametrize('outcome', ['incomplete', 'html', 'invalid_pdf', 'transport_error'])
@@ -630,12 +631,10 @@ def test_firecrawl_preflight_unknown_is_reused(lib, paper, monkeypatch):
 
 
 @responses.activate
-def test_firecrawl_preflight_refreshes_when_arxiv_identity_changes(lib, paper, monkeypatch):
+def test_firecrawl_preflight_does_not_repeat_ads_when_arxiv_identity_changes(lib, paper, monkeypatch):
     lib.md_path(paper.key).write_text('---\nsource: firecrawl\n---\nExisting text.')
     paper.arxiv_id = '2401.0001'
     responses.get(API, json={'response': {'docs': []}})
-    stub_metadata()
-    responses.get(GATEWAY, body=paper_pdf())
     monkeypatch.setattr(download, '_gate_firecrawl_md', lambda *_: True)
     monkeypatch.setattr(download, '_verify_pdf_matches_metadata', lambda *_: (True, 'test match'))
 
@@ -644,7 +643,117 @@ def test_firecrawl_preflight_refreshes_when_arxiv_identity_changes(lib, paper, m
         return None
 
     monkeypatch.setattr(download, '_STRATEGIES', [('arxiv', arxiv_miss)] + download._STRATEGIES)
-    assert download.download_paper(paper, lib) is True
+    assert download.download_paper(paper, lib) is False
     queries = [parse_qs(urlsplit(c.request.url).query)['q'][0]
                for c in responses.calls if 'search/query' in c.request.url]
-    assert queries == ['identifier:"2401.0001"', f'bibcode:"{BIBCODE}"']
+    assert queries == ['identifier:"2401.0001"']
+    assert not lib.has_pdf(paper.key)
+
+
+def scan_pdf(text=''):
+    if text:
+        return _text_pdf(text)
+    import io
+    from pypdf import PdfWriter
+    writer = PdfWriter()
+    writer.add_blank_page(width=612, height=792)
+    output = io.BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
+@pytest.mark.parametrize('text', ['', 'Illegible scan'])
+def test_ads_scan_inspection_defers_identity_instead_of_reporting_mismatch(paper, text):
+    evidence = ads._inspect_ads_document(scan_pdf(text), paper)
+    assert evidence.document_kind == 'scanned_full_text'
+    assert evidence.reason == 'identity_unverifiable_scanned'
+    assert not evidence.identity_match and not evidence.identity_rejected
+
+
+@pytest.mark.parametrize('route', ['ADS_SCAN', 'ADS_PDF', 'legacy'])
+@responses.activate
+def test_trusted_ads_scan_is_saved_once_without_fallback_and_survives_reload(lib, paper, monkeypatch, route):
+    stub_metadata(esources=[] if route == 'legacy' else [route])
+    url = LEGACY if route == 'legacy' else f'https://ui.adsabs.harvard.edu/link_gateway/{BIBCODE}/{route}'
+    data = scan_pdf()
+    responses.get(url, body=data)
+    monkeypatch.setattr(download, '_STRATEGIES', [('later', lambda _: pytest.fail('scan triggered fallback'))])
+    assert download.download_paper(paper, lib)
+    assert lib.pdf_path(paper.key).read_bytes() == data
+    assert paper.download_source == 'ads_scan'
+    assert paper.verification_deferred_to_ocr
+    assert paper.ads_availability.documents[0].document_kind == 'scanned_full_text'
+    lib.save()
+    reloaded = Library(lib.root).get(paper.key)
+    assert reloaded.verification_deferred_to_ocr
+    assert reloaded.ads_availability.documents[0].document_kind == 'scanned_full_text'
+    assert len(responses.calls) == 2
+
+
+@responses.activate
+def test_ads_native_miss_does_not_repeat_ads_inside_domain_aggregators(lib, paper):
+    responses.get(API, status=403)
+    assert not download.download_paper(paper, lib)
+    assert len(responses.calls) == 1
+
+
+@responses.activate
+def test_readable_wrong_work_from_official_scan_route_never_defers(lib, paper, monkeypatch):
+    stub_metadata(esources=['ADS_SCAN'])
+    data = _text_pdf('A different research work with a different title\nOther Author\n1. Introduction\nUnrelated results follow.')
+    responses.get(f'https://ui.adsabs.harvard.edu/link_gateway/{BIBCODE}/ADS_SCAN', body=data)
+    monkeypatch.setattr(download, '_verify_pdf_matches_metadata', lambda *_: (False, 'llm_mismatch: different work'))
+    assert not download.download_paper(paper, lib)
+    assert not lib.has_pdf(paper.key)
+    assert not getattr(paper, 'verification_deferred_to_ocr', False)
+    assert paper.ads_availability.reason == 'document_identity_mismatch'
+    assert paper.ads_availability.documents[0].reason == 'document_identity_mismatch'
+
+
+@responses.activate
+def test_untrusted_publisher_scan_does_not_gain_ads_scan_provenance(lib, paper):
+    stub_metadata()
+    responses.get(GATEWAY, body=scan_pdf())
+    responses.get(LEGACY, status=404)
+    assert not download.download_paper(paper, lib)
+    assert not lib.has_pdf(paper.key)
+    assert not getattr(paper, 'verification_deferred_to_ocr', False)
+
+
+def test_ads_scan_exception_does_not_hide_readable_identity_on_second_page(paper):
+    import io
+    from pypdf import PdfReader, PdfWriter
+    writer = PdfWriter()
+    for text in ['12345 ~!@#$ ' * 80,
+                 'A different scientific work with another title\nOther Author\n1. Introduction\nResults for another study.']:
+        writer.add_page(PdfReader(io.BytesIO(_text_pdf(text))).pages[0])
+    output = io.BytesIO()
+    writer.write(output)
+    evidence = ads._inspect_ads_document(output.getvalue(), paper)
+    assert evidence.document_kind != 'scanned_full_text'
+    assert evidence.reason == 'document_identity_unconfirmed'
+
+
+def test_noisy_official_ads_text_defers_identity(paper):
+    evidence = ads._inspect_ads_document(_text_pdf('12345 ~!@#$ ' * 80), paper)
+    assert evidence.document_kind == 'scanned_full_text'
+    assert evidence.reason == 'identity_unverifiable_scanned'
+
+
+@responses.activate
+def test_official_ads_scan_with_noisy_cover_and_wrong_readable_work_is_rejected(lib, paper, monkeypatch):
+    import io
+    from pypdf import PdfReader, PdfWriter
+    writer = PdfWriter()
+    for text in ['12345 ~!@#$ ' * 80,
+                 'A different scientific work with another title\nOther Author\n1. Introduction\nResults for another study.']:
+        writer.add_page(PdfReader(io.BytesIO(_text_pdf(text))).pages[0])
+    output = io.BytesIO()
+    writer.write(output)
+    stub_metadata(esources=['ADS_SCAN'])
+    responses.get(f'https://ui.adsabs.harvard.edu/link_gateway/{BIBCODE}/ADS_SCAN', body=output.getvalue())
+    monkeypatch.setattr('papervault.library.llm.get_llm', lambda **_: SimpleNamespace(
+        call=lambda _: '{"match": false, "reason": "wrong title and author"}'))
+    assert not download.download_paper(paper, lib)
+    assert not lib.has_pdf(paper.key)
+    assert paper.ads_availability.reason == 'document_identity_mismatch'

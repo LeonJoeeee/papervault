@@ -24,7 +24,7 @@ from papervault.store.persistence import CatalogConflict
 from .telemetry_v2 import identity_snapshot, publication_fields, record_censored
 
 _IDENTITY_FIELDS = {"key", "doi", "arxiv_id", "paper_id", "inspire_record_id", "url", "title", "authors", "year"}
-_RESULT_FIELDS = {"download_source", "download_source_member", "ads_availability", "arxiv_withdrawal",
+_RESULT_FIELDS = {"verification_deferred_to_ocr", "download_source", "download_source_member", "ads_availability", "arxiv_withdrawal",
                   "firecrawl_pdf_hunt_exhausted", "txt_engine", "txt_engine_version", "md_engine", "md_engine_version"}
 
 

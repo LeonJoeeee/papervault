@@ -73,6 +73,8 @@ from .download_sources.ads import (
     _log_ads_availability,
     _record_ads_verification,
     _settle_ads_abstract,
+    _trusted_ads_scan,
+    _unverifiable_scan_text,
     _try_ads as _try_ads,
 )
 from .download_sources.annas_archive import (
@@ -181,7 +183,7 @@ _VERIFY_PROMPT = (
 
 
 def _llm_verify_identity(head: str, paper: Paper, *, llm=None,
-                         attempts: int = 3) -> tuple[bool, str]:
+                         attempts: int = 3, require_boolean: bool = False) -> tuple[bool, str]:
     """Ask a cheap LLM (MiMo v2.5) whether ``head`` (the PDF's first pages) is the
     paper described by ``paper``'s metadata.
 
@@ -220,7 +222,8 @@ def _llm_verify_identity(head: str, paper: Paper, *, llm=None,
                 v = json.loads(m.group(0))
             except json.JSONDecodeError:
                 v = None
-            if isinstance(v, dict) and "match" in v:
+            if (isinstance(v, dict) and "match" in v
+                    and (not require_boolean or isinstance(v["match"], bool))):
                 ok = bool(v["match"])
                 reason = str(v.get("reason", ""))[:120]
                 return ok, (f"llm_match: {reason}" if ok else f"llm_mismatch: {reason}")
@@ -264,7 +267,7 @@ def _verify_pdf_matches_metadata(data: bytes, paper: Paper, *, llm=None) -> tupl
     # Custom-font garbage: very low alpha ratio AND no English stopwords on
     # page 1 (old arxiv preprints in custom Type-1 fonts pypdf can't decode).
     p1 = pages_text[0] if pages_text else ''
-    if len(p1) >= 200:
+    if len(p1) >= 200 and _unverifiable_scan_text(pages_text):
         p1_alpha = sum(1 for c in p1 if c.isalpha()) / len(p1)
         if p1_alpha < 0.55:
             p1_lower = p1.lower()
@@ -611,7 +614,21 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
         return False
     if _settle_ads_abstract(paper, library):
         return False
-    ads_member = None
+    ads_observed = False
+    ads_identity = None
+    ads_data = None
+
+    def ads_member(current):
+        # One request sequence per download, including native-first, preflight
+        # and concurrent tier use. Changed identifiers invalidate the result;
+        # they never trigger an unbounded second lookup in this operation.
+        nonlocal ads_observed, ads_identity, ads_data
+        current_identity = (current.doi, current.arxiv_id, _ads_bibcode(current))
+        if not ads_observed:
+            ads_observed = True
+            ads_identity = current_identity
+            ads_data = _safe_call(_try_ads, current)
+        return ads_data if current_identity == ads_identity else None
 
     # ── Re-gate an un-gated HISTORICAL firecrawl md BEFORE hunting a PDF ──
     # (issue #1, manifestation 1). The ~48 migrated firecrawl md predate the
@@ -635,16 +652,10 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
         # the historical firecrawl gate can delete it. Reuse this one ADS
         # observation inside the normal group; no shared/global cache or retry.
         if _ads_bibcode(paper) and os.environ.get("ADS_API_TOKEN", "").strip():
-            ads_identity = (paper.doi, paper.arxiv_id, _ads_bibcode(paper))
-            ads_data = _safe_call(_try_ads, paper)
+            ads_member(paper)
             _log_ads_availability(paper, library)
             if _settle_ads_abstract(paper, library):
                 return False
-
-            def ads_member(current):
-                if (current.doi, current.arxiv_id, _ads_bibcode(current)) != ads_identity:
-                    return _try_ads(current)
-                return ads_data
 
         try:
             on_disk = library.md_path(paper.key).read_text(
@@ -671,7 +682,7 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
             and not (paper.doi or paper.arxiv_id) and _ads_bibcode(paper)):
         # #258: ADS-only papers crawled at ~0.7/min through irrelevant tiers;
         # their native route succeeds in seconds. A miss keeps the full order.
-        strategies = [("ads", ads_member or _try_ads), *_STRATEGIES]
+        strategies = [("ads", ads_member), *_STRATEGIES]
 
     for source, strategy in strategies:
         with span("tier", source=source):
@@ -690,6 +701,8 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                         data = _try_arxiv_by_title(paper, record=arxiv_record, library=library)
                     elif strategy is _try_domain_aggregators:
                         data = _try_domain_aggregators(paper, ads_member=ads_member, library=library)
+                    elif strategy is _try_ads:
+                        data = ads_member(paper)
                     elif strategy is _try_inspire:
                         data = _try_inspire(paper, library=library)
                     else:
@@ -701,8 +714,11 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
             if _settle_arxiv_withdrawal(paper, library, source=source, attempted=not skip_reason):
                 return False
             if data:
+                deferred_scan = (source in {"ads", "domain_aggregators"}
+                                 and _trusted_ads_scan(paper, data))
                 with span("verification"):
-                    ok, verify_reason = _verify_pdf_matches_metadata(data, paper)
+                    ok, verify_reason = ((True, "identity_unverifiable_scanned") if deferred_scan
+                                         else _verify_pdf_matches_metadata(data, paper))
                 if source in {"ads", "domain_aggregators"}:
                     _record_ads_verification(paper, data, ok)
                     _log_ads_availability(paper, library)
@@ -720,7 +736,8 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
                 paper.pdf_path = str(dest.relative_to(library.root))
                 # D7: status routes, source labels — never fuse them into one cell.
                 paper.download_status = DOWNLOAD_STATUS_OK
-                paper.download_source = source
+                paper.download_source = "ads_scan" if deferred_scan else source
+                paper.verification_deferred_to_ocr = deferred_scan
                 paper.download_source_member = getattr(data, "acquisition_source", "")
                 positively_verified = verify_reason.startswith("llm_match:")
                 if stoprules_v2_enabled():

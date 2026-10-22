@@ -60,6 +60,12 @@ def _mismatch(paper) -> str:
     return ""
 
 
+def _replay(rows, *, key, action, reason):
+    # Replays reuse immutable evidence, including after a superseding ruling.
+    return next((r for r in reversed(rows) if key in r["keys"]
+                 and ACTIONS[r["action"]] == action and r["reason"] == reason), None)
+
+
 def _inspect(papers, rows, *, keys, action, reason):
     if action not in ACTIONS or not isinstance(reason, str) or not reason.strip():
         raise ValueError("policy ruling requires a supported action and a nonempty reason")
@@ -67,7 +73,7 @@ def _inspect(papers, rows, *, keys, action, reason):
         raise ValueError("policy ruling requires nonempty citation keys")
     action = ACTIONS[action]
     matched, missing, mismatches, records = [], [], [], []
-    revision = 1
+    revisions = {}
     for key in dict.fromkeys(keys):
         paper = papers.get(key)
         if paper is None:
@@ -84,15 +90,16 @@ def _inspect(papers, rows, *, keys, action, reason):
             continue
         matched.append(key)
         prior = next((r for r in reversed(rows) if key in r["keys"]), None)
-        same = prior and ACTIONS[prior["action"]] == action and prior["reason"] == reason
-        if same and prior["revision"] >= current.required_revision:
-            proposed = prior["revision"]
+        replay = _replay(rows, key=key, action=action, reason=reason)
+        if replay:
+            revisions[key] = replay["revision"]
         else:
-            proposed = max(1, current.required_revision + 1,
-                           current.override.revision + 1 if current.override else 1,
-                           prior["revision"] + 1 if prior else 1)
-        revision = max(revision, proposed)
-    return {"dry_run": True, "action": action, "reason": reason, "revision": revision,
+            revisions[key] = max(1, current.required_revision + 1,
+                                 current.override.revision + 1 if current.override else 1,
+                                 prior["revision"] + 1 if prior else 1)
+    # The legacy summary is informational; every mutation uses a per-key revision.
+    return {"dry_run": True, "action": action, "reason": reason,
+            "revision": max(revisions.values(), default=1), "revisions": revisions,
             "requested": len(dict.fromkeys(keys)), "matched_keys": matched, "matched_count": len(matched),
             "missing_keys": missing, "missing_count": len(missing),
             "mismatches": mismatches, "mismatch_count": len(mismatches), "records": records,
@@ -126,25 +133,31 @@ def apply_ruling(root: Path, *, keys: list[str], action: str, reason: str, actor
             report["dry_run"] = False
             if report["missing_count"] or report["mismatch_count"]:
                 return report
-            revision, action = report["revision"], report["action"]
-            new_keys = []
+            action = report["action"]
+            intents, new_by_revision = {}, {}
             for key in report["matched_keys"]:
-                prior = next((r for r in reversed(rows) if key in r["keys"]), None)
-                if not (prior and ACTIONS[prior["action"]] == action
-                        and prior["reason"] == reason and prior["revision"] == revision):
-                    new_keys.append(key)
-            if new_keys:
+                replay = _replay(rows, key=key, action=action, reason=reason)
+                if replay:
+                    intents[key] = replay
+                else:
+                    new_by_revision.setdefault(report["revisions"][key], []).append(key)
+            new_keys = set()
+            for revision, selected in new_by_revision.items():
                 row = {"timestamp": utc_now(), "action": action, "scope": "acquire" if action == "acquire" else "policy",
-                       "reason": reason, "keys": new_keys, "revision": revision,
+                       "reason": reason, "keys": selected, "revision": revision,
                        "covered_policy_reasons": {k: list(library.get(k).acquisition_state.policy_reasons)
-                                                  for k in new_keys},
+                                                  for k in selected},
                        "actor": actor, "event": "policy_ruling"}
-                stage_operator(library, action=action, keys=new_keys, reason=reason, actor=actor,
+                stage_operator(library, action=action, keys=selected, reason=reason, actor=actor,
                                event="policy_ruling", row=row)
-                report["rulings_added"] = 1
+                report["rulings_added"] += 1
+                intents.update((key, row) for key in selected)
+                new_keys.update(selected)
             for key in report["matched_keys"]:
                 paper = library.get(key)
                 current = paper.acquisition_state
+                intent = intents[key]
+                revision = intent["revision"]
                 if key not in new_keys:
                     # PG intents are atomic. JSON intent precedes state: a
                     # strictly newer installed revision proves application.
@@ -152,7 +165,6 @@ def apply_ruling(root: Path, *, keys: list[str], action: str, reason: str, actor
                     if library._catalog_backend is not None or (
                             paper.terminal_state and paper.terminal_state.required_revision >= revision):
                         continue
-                intent = row if key in new_keys else next(r for r in reversed(rows) if key in r["keys"])
                 covered = tuple(intent.get("covered_policy_reasons", {}).get(key, ()))
                 if key not in new_keys and current.policy_reasons != covered:
                     raise ValueError("policy restrictions changed since intent; record a new ruling reason")

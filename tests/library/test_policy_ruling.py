@@ -51,7 +51,7 @@ def test_dry_run_reports_current_policies_without_creating_files(ruling_vault, c
     assert tree_bytes(root) == before
 
 
-def test_apply_appends_one_ruling_and_scoped_revision_aware_grants(ruling_vault, capsys):
+def test_apply_records_independent_key_revisions_and_scoped_grants(ruling_vault, capsys):
     root, keys = ruling_vault
     lib = Library(root)
     paper = lib.get("A")
@@ -60,19 +60,20 @@ def test_apply_appends_one_ruling_and_scoped_revision_aware_grants(ruling_vault,
     unrelated = lib.get("Unlisted").model_dump()
     assert cli.main(command(keys, "--apply")) == 0
     report = json.loads(capsys.readouterr().out)
-    assert report["applied"] == 2 and report["rulings_added"] == 1
+    assert report["applied"] == 2 and report["rulings_added"] == 2
+    assert report["revisions"] == {"B": 1, "A": 5}
     lib = Library(root)
     rows = lib.corrections.read()["policy_rulings"]
-    assert len(rows) == 1
-    assert rows[0]["keys"] == ["B", "A"] and rows[0]["action"] == "acquire"
-    assert rows[0]["reason"] == "Owner approved ADS recovery #245" and rows[0]["revision"] == 5
-    assert datetime.fromisoformat(rows[0]["timestamp"]).tzinfo is not None
+    assert len(rows) == 2
+    assert [(row["keys"], row["revision"]) for row in rows] == [(["B"], 1), (["A"], 5)]
+    assert all(row["action"] == "acquire" and row["reason"] == "Owner approved ADS recovery #245"
+               and datetime.fromisoformat(row["timestamp"]).tzinfo is not None for row in rows)
     for key in ("A", "B"):
         paper = lib.get(key)
         state = paper.acquisition_state
         assert state.policy == state_v2.Policy.OVERRIDE
         assert state.retrieval == state_v2.Retrieval.ELIGIBLE and paper.download_status == "metadata_only"
-        assert state.override == state_v2.PolicyOverride(scope=("acquire",), revision=5, key=key)
+        assert state.override == state_v2.PolicyOverride(scope=("acquire",), revision={"A": 5, "B": 1}[key], key=key)
         assert state_v2.effective_policy(state, key=key)
         assert not state_v2.effective_policy(state, key="Other")
         assert not state_v2.effective_policy(state, key=key, action="serve")
@@ -86,8 +87,8 @@ def test_apply_appends_one_ruling_and_scoped_revision_aware_grants(ruling_vault,
     assert cli.main(command(keys, "--apply")) == 0
     capsys.readouterr()
     later = Library(root).corrections.read()["policy_rulings"]
-    assert later[0] == rows[0] and len(later) == 2
-    assert later[1]["keys"] == ["Unlisted"]
+    assert later[:-1] == rows and len(later) == 3
+    assert later[-1]["keys"] == ["Unlisted"]
 
 
 @pytest.mark.parametrize("apply", [False, True])
@@ -146,8 +147,12 @@ def test_service_guard_precedes_writable_store(ruling_vault, monkeypatch, capsys
     assert cli.main(command(keys)) == 0  # read-only inspection remains available
 
 
-def test_interrupted_index_save_reuses_durable_ruling_on_retry(ruling_vault, monkeypatch, capsys):
+@pytest.mark.parametrize("required_revision", [0, 4])
+def test_interrupted_index_save_reuses_durable_ruling_on_retry(ruling_vault, monkeypatch, capsys, required_revision):
     root, keys = ruling_vault
+    lib = Library(root)
+    lib.get("A").terminal_state = replace(lib.get("A").acquisition_state, required_revision=required_revision)
+    lib.save()
     original = Library.save
     with monkeypatch.context() as patch:
         def fail(*a, **kw):
@@ -157,7 +162,8 @@ def test_interrupted_index_save_reuses_durable_ruling_on_retry(ruling_vault, mon
     assert "interruption" in capsys.readouterr().err
     assert Library(root).get("A").acquisition_state.policy == state_v2.Policy.UNKNOWN
     rows = Library(root).corrections.read()["policy_rulings"]
-    assert len(rows) == 1
+    assert [(row["keys"], row["revision"]) for row in rows] == (
+        [(["B", "A"], 1)] if required_revision == 0 else [(["B"], 1), (["A"], 5)])
     assert Library.save is original
     assert cli.main(command(keys, "--apply")) == 0
     report = json.loads(capsys.readouterr().out)
@@ -237,6 +243,76 @@ def test_replay_cannot_authorize_a_later_policy_restriction(ruling_vault, capsys
     assert report["applied"] == report["rulings_added"] == 0
     assert not state_v2.effective_policy(Library(root).get("A").acquisition_state, key="A")
     assert tree_bytes(root) == before
+
+
+@pytest.mark.parametrize("action", ["acquire", "clear"])
+@pytest.mark.parametrize("restriction", ["observation", "ruling"])
+def test_replay_preserves_scope_when_required_revision_advances(ruling_vault, capsys, action, restriction):
+    root, keys = ruling_vault
+    keys.write_text("A\n")
+    args = command(keys, "--apply")
+    args[args.index("--action") + 1] = action
+    assert cli.main(args) == 0
+    capsys.readouterr()
+    lib = Library(root)
+    assert lib.get("A").acquisition_state.required_revision == 1
+    if restriction == "observation":
+        lib.get("A").terminal_state = replace(lib.get("A").acquisition_state,
+            policy_reasons=("later exclusion",), required_revision=2)
+        lib.save()
+    else:
+        exclusion = command(keys, "--apply")
+        exclusion[exclusion.index("--action") + 1] = "exclude"
+        exclusion[exclusion.index("--reason") + 1] = "later exclusion"
+        assert cli.main(exclusion) == 0
+        capsys.readouterr()
+    lib = Library(root)
+    assert lib.get("A").acquisition_state.required_revision == 2
+    assert not state_v2.effective_policy(lib.get("A").acquisition_state, key="A")
+    before = tree_bytes(root)
+
+    assert cli.main(args) == 0
+    replay = json.loads(capsys.readouterr().out)
+    assert replay["applied"] == replay["rulings_added"] == 0
+    assert tree_bytes(root) == before
+    assert not state_v2.effective_policy(Library(root).get("A").acquisition_state, key="A")
+
+    args[args.index("--reason") + 1] = "Owner approved later exclusion"
+    assert cli.main(args) == 0
+    renewed = json.loads(capsys.readouterr().out)
+    current = Library(root).get("A").acquisition_state
+    assert renewed["applied"] == renewed["rulings_added"] == 1
+    assert current.required_revision == 3
+    assert state_v2.effective_policy(current, key="A")
+
+
+@pytest.mark.parametrize("action", ["acquire", "clear"])
+def test_higher_revision_in_batch_does_not_renew_a_settled_key(ruling_vault, capsys, action):
+    root, keys = ruling_vault
+    keys.write_text("A\n")
+    args = command(keys, "--apply")
+    args[args.index("--action") + 1] = action
+    assert cli.main(args) == 0
+    capsys.readouterr()
+    lib = Library(root)
+    lib.get("A").download_status = "failed"
+    lib.get("B").terminal_state = replace(lib.get("B").acquisition_state, required_revision=4)
+    lib.save()
+    settled = lib.get("A").model_dump()
+    rows = lib.corrections.read()["policy_rulings"]
+    keys.write_text("A\nB\n")
+
+    assert cli.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    fresh = Library(root)
+    assert fresh.get("A").model_dump() == settled
+    assert fresh.get("A").acquisition_state.retrieval == state_v2.Retrieval.EXHAUSTED
+    assert fresh.get("B").acquisition_state.required_revision == 5
+    assert report["revisions"] == {"A": 1, "B": 5}
+    assert report["applied"] == report["rulings_added"] == 1
+    later = fresh.corrections.read()["policy_rulings"]
+    assert later[:-1] == rows
+    assert later[-1]["keys"] == ["B"] and later[-1]["revision"] == 5
 
 
 def test_interrupted_clear_replay_refuses_restrictions_outside_original_scope(ruling_vault, monkeypatch, capsys):

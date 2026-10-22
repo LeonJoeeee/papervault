@@ -136,6 +136,17 @@ def test_cited_sources_empty_when_none():
     assert _cited_sources({"references": [{"file_path": "paper/X2020"}]}) == []
 
 
+def test_legacy_source_accessor_uses_current_chunk_and_reference_identity_assembly():
+    from papervault.knowledge.query.aquery import build_outfeed
+
+    data = {"chunks": [{"file_path": "textbook:Book#s2", "content": "evidence"}],
+            "references": [{"file_path": "notebook:Notes#s1"}]}
+    out = build_outfeed(data, {"processing_info": {"total_entities_found": 20}},
+                        "Supported [textbook:Book] [notebook:Notes].")
+    assert out["cited_sources"] == ["textbook:Book", "notebook:Notes"]
+    assert _cited_sources(data) == sorted(out["retrieved_sources"])
+
+
 def test_legacy_paper_slash_and_bare_keys_never_leak_into_cited_sources():
     # pin: both coexisting paper file_path forms — the 1.4 'paper/<key>' slash form AND the
     # 1.5 bare '<key>' basename — resolve to cited_papers and must NEVER appear in

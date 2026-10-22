@@ -2,11 +2,12 @@
 
 Reads results/<tag>.jsonl (a run_eval dump) + a gold file, computes the DETERMINISTIC metrics that
 need no judge: paper_recall_at_served_distinct (@served, the headline's recall half), gold_citation_
-recall, hallucinated_rate. These come from the retrieval (data.chunks[].paper_key + cited_papers) vs
-gold, so they're instant + judge-free. Use to FILTER retrieval levers (fcap/v3) on gold_fast.jsonl;
+recall, hallucinated_rate. Recall compares retrieved evidence with gold; hallucination
+compares raw inline citation tokens with retrieved evidence, so they're instant + judge-free.
+Use to FILTER retrieval levers (fcap/v3) on gold_fast.jsonl;
 the full tier (judge) is still required to PROMOTE (trap/nugget/cit_sp/faith).
 When answer text is available, also report every bracket token that does not resolve to
-cited_papers or an operator-source label, with the same total broken out by class (paper
+retrieved paper or operator-source candidates, with the same total broken out by class (paper
 stand-in, operator-shape, numeric/other) so a paper-stand-in regression stays visible (#122).
 Answers absent in --no-synth dumps are unscored, not clean. This check measures token
 resolution, not whether a source supports a claim.
@@ -18,6 +19,7 @@ import json, statistics, sys
 import re
 from pathlib import Path
 from papervault.eval._paths import eval_path
+from papervault.eval.backbone import is_real_prose, normalize_source_key, retrieved_papers_from_result
 
 EVAL = Path(__file__).resolve().parent
 
@@ -38,15 +40,53 @@ def _load(p):
     return {json.loads(l)["qid"]: json.loads(l) for l in open(p)}
 
 
-def unresolved_citations(answer: str, cited_papers: list[str]) -> list[str]:
+def unresolved_citations(
+    answer: str, cited_papers: list[str], source_keys: list[str] | None = None,
+) -> list[str]:
     """Return non-resolving bracket tokens in order, retaining repeated occurrences.
 
     Deliberately include descriptive stand-ins and numeric tokens: a paper-key-shaped
-    regex would hide the defect this check measures. Operator colon labels are allowed.
+    regex would hide the defect this check measures. Operator labels must resolve to
+    supplied evidence, with section suffixes collapsed to their document identity.
     """
     cited = set(cited_papers)
+    sources = {normalize_source_key(key) for key in (source_keys or [])}
     return [token for token in re.findall(r"\[([^\[\]]+)\]", answer)
-            if token not in cited and not token.startswith(("textbook:", "notebook:", "web:"))]
+            if token not in cited and not (
+                normalize_source_key(token) and normalize_source_key(token) in sources
+            )]
+
+
+def retrieved_sources_from_result(record: dict) -> list[str]:
+    """Use the retrieval receipt when present; legacy dumps retain source fallbacks."""
+    if "retrieved_sources" in record:
+        candidates = record.get("retrieved_sources") or []
+    else:
+        data = record.get("data") or {}
+        candidates = [
+            *(record.get("cited_sources") or []),
+            *(item.get("source_key") or item.get("file_path")
+              for item in [*(data.get("chunks") or []), *(data.get("references") or [])]),
+        ]
+    return list(dict.fromkeys(key for candidate in candidates
+                             if (key := normalize_source_key(candidate))))
+
+
+def prose_citation_tokens(answer: str) -> set[str]:
+    """Raw inline citation candidates; omit math, numeric notes and Markdown links.
+
+    Unlike cited_papers these tokens have not passed retrieval membership filtering.
+    Descriptive stand-ins remain candidates, as do unknown operator-source labels.
+    """
+    if not is_real_prose(answer):
+        return set()
+    definitions = set(re.findall(r"(?m)^ {0,3}\[([^]\n]+)\]:\s+\S+.*$", answer))
+    answer = re.sub(r"(?m)^ {0,3}\[([^]\n]+)\]:\s+\S+.*$", "", answer)
+    answer = re.sub(r"\[([^\[\]]+)\]\[([^\[\]]+)\]",
+                    lambda match: "" if match[2] in definitions else match[0], answer)
+    tokens = re.findall(r"(?<!\[)\[([^\[\]]+)\](?![\](])", answer)
+    return {normalize_source_key(token) or token for token in tokens
+            if len(token) > 1 and classify_unresolved(token) != "numeric_other"}
 
 
 def classify_unresolved(token: str) -> str:
@@ -59,13 +99,15 @@ def classify_unresolved(token: str) -> str:
     return "paper_stand_in"
 
 
-def unresolved_citation_breakdown(answer: str, cited_papers: list[str]) -> dict[str, int]:
+def unresolved_citation_breakdown(
+    answer: str, cited_papers: list[str], source_keys: list[str] | None = None,
+) -> dict[str, int]:
     """Per-class counts of unresolved_citations(answer, cited_papers), plus their total.
 
     Nothing is dropped: bracketed mathematics still counts, under numeric_other.
     """
     counts = dict.fromkeys(UNRESOLVED_CLASSES, 0)
-    tokens = unresolved_citations(answer, cited_papers)
+    tokens = unresolved_citations(answer, cited_papers, source_keys)
     for token in tokens:
         counts[classify_unresolved(token)] += 1
     return {**counts, "total": len(tokens)}
@@ -87,12 +129,16 @@ def main():
         if not r:
             continue
         answer = r.get("answer")
+        served = set(retrieved_papers_from_result(r))
+        sources = retrieved_sources_from_result(r)
+        # Legacy prose-only fixtures have no retrieval trace for the diagnostic check.
+        diagnostic_papers = served if ("retrieved_papers" in r or "data" in r) else (r.get("cited_papers") or [])
         if isinstance(answer, str):
             prose_checked += 1
-            bad_tokens = unresolved_citations(answer, r.get("cited_papers") or [])
+            bad_tokens = unresolved_citations(answer, diagnostic_papers, sources)
             if bad_tokens:
                 unresolved[qid] = bad_tokens
-            for cls, n in unresolved_citation_breakdown(answer, r.get("cited_papers") or []).items():
+            for cls, n in unresolved_citation_breakdown(answer, diagnostic_papers, sources).items():
                 unresolved_classes[cls] += n
         else:
             prose_unavailable.append(qid)
@@ -100,11 +146,16 @@ def main():
         if not gk:
             continue  # trap — @served undefined (judge handles trap refusal in the full tier)
         n_ans += 1
-        served = {c.get("paper_key") for c in (r.get("data", {}).get("chunks") or []) if c.get("paper_key")}
         cited = set(r.get("cited_papers") or [])
         served_recall.append(len(gk & served) / len(gk))
         gcr.append(len(gk & cited) / len(gk))
-        hallu.append(len(cited - served) / max(1, len(cited)))
+        if isinstance(answer, str):
+            raw_citations = prose_citation_tokens(answer)
+            if raw_citations:
+                hallu.append(len(raw_citations - served - set(sources)) / len(raw_citations))
+        else:
+            # --no-synth explicitly advertises retrieved candidates as citation fallback.
+            hallu.append(len(cited - served) / max(1, len(cited)))
     m = lambda xs: round(statistics.mean(xs), 4) if xs else None
     print(json.dumps({
         "tag": tag, "gold": gold_name, "answerable_scored": n_ans,

@@ -210,16 +210,33 @@ def source_tier(item: dict[str, Any]) -> str:
 
 def annotate_sources(data: dict[str, Any]) -> dict[str, Any]:
     """Return annotated chunk/reference copies without altering the retrieval snapshot."""
+    def document(item):
+        # A full document ID distinguishes abstract and full-text versions of the
+        # same paper. Older stores expose only the file_path, or a paper key.
+        if item.get("full_doc_id"):
+            return ("doc", item["full_doc_id"])
+        fp = item.get("file_path") or ""
+        if fp and fp not in {"unknown", "unknown_source"}:
+            return ("path", fp)
+        if item.get("paper_key"):
+            return ("paper", item["paper_key"])
+        return None
+
+    abstract_docs = {document(c) for c in data.get("chunks") or []
+                     if source_tier(c) == "abstract_only" and document(c) is not None}
     chunks = [dict(c, source_tier=source_tier(c)) for c in data.get("chunks") or []]
+    for chunk in chunks:
+        if document(chunk) in abstract_docs:
+            chunk["source_tier"] = "abstract_only"
     tiers: dict[str, str] = {}
     for chunk in chunks:
-        key, _ = _source_label(chunk.get("file_path") or "")
+        key, _ = _source_label(chunk.get("file_path") or chunk.get("paper_key") or "")
         tier = chunk["source_tier"]
         if key not in tiers or SOURCE_TIER_RANK[tier] < SOURCE_TIER_RANK[tiers[key]]:
             tiers[key] = tier
     refs = []
     for ref in data.get("references") or []:
-        key, _ = _source_label(ref.get("file_path") or "")
+        key, _ = _source_label(ref.get("file_path") or ref.get("paper_key") or "")
         refs.append(dict(ref, source_tier=tiers.get(key, source_tier(ref))))
     return {**data, "chunks": chunks, "references": refs}
 
@@ -231,6 +248,7 @@ def _build_prompt(data: dict[str, Any], intent: str, kb_coverage: str | None = N
     chunk prefixed with its citeable source label + credibility band so the LLM can
     cite real [paper_key]s and honor tentativeness.
     """
+    data = annotate_sources(data)
     blocks: list[str] = []
 
     entities = data.get("entities") or []
@@ -257,7 +275,7 @@ def _build_prompt(data: dict[str, Any], intent: str, kb_coverage: str | None = N
     if chunks:
         chunk_blocks = []
         for c in chunks:
-            label, cred = _source_label(c.get("file_path") or "")
+            label, cred = _source_label(c.get("file_path") or c.get("paper_key") or "")
             content = (c.get("content") or "").strip()
             if label != "unknown" and cred == _CRED_BY_SOURCE["paper"] and source_tier(c) == "abstract_only":
                 # #144: the label carries the class; the header line (square brackets) is dropped so

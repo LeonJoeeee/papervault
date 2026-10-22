@@ -17,6 +17,7 @@ import re
 import sys
 from pathlib import Path
 from papervault.eval._paths import eval_path
+from papervault.eval.backbone import normalize_source_key, strip_paper_key
 
 EVAL = Path(__file__).resolve().parent
 _TEMPLATE = (EVAL / "judge_prompt.md").read_text()
@@ -24,10 +25,18 @@ _TEMPLATE = (EVAL / "judge_prompt.md").read_text()
 
 def fill_prompt(rec: dict, g: dict) -> str:
     """Fill the judge_prompt.md mustache for ONE (result record, gold entry)."""
-    chunks = "\n".join(
-        f"--- chunk (paper_key={c.get('paper_key')}) ---\n{c.get('content', '') or ''}"
-        for c in (rec.get("data", {}).get("chunks") or [])
-    )
+    chunks = []
+    for chunk in (rec.get("data", {}).get("chunks") or []):
+        path = chunk.get("file_path")
+        source = chunk.get("source_key")
+        paper_key = chunk.get("paper_key") or (strip_paper_key(path) if not source else None)
+        if paper_key:
+            identity = f"paper_key={paper_key}"
+        else:
+            source = source or path
+            identity = f"source_key={normalize_source_key(source) or source}"
+        chunks.append(f"--- chunk ({identity}) ---\n{chunk.get('content', '') or ''}")
+    chunks = "\n".join(chunks)
     nuggets = "\n".join(f"- (n{i}) {t}" for i, t in enumerate(g.get("nuggets") or []))
     is_trap = "true" if not (g.get("gold_keys") or []) else "false"
 

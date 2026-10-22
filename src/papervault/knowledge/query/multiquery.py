@@ -195,19 +195,27 @@ def _parse_facets(raw: str, cap: int) -> list[dict]:
     try:
         s = raw[raw.find("["): raw.rfind("]") + 1]
         arr = json.loads(s)
+        if not isinstance(arr, list):
+            raise ValueError("facets must be an array")
+        facets: list[dict] = []
+        for o in arr:
+            if not isinstance(o, dict):
+                raise ValueError("each facet must be an object")
+            q, hl, ll = o.get("query", ""), o.get("hl", []), o.get("ll", [])
+            if not isinstance(q, str):
+                raise ValueError("facet query must be a string")
+            if any(not isinstance(words, list) or any(not isinstance(x, str) for x in words)
+                   for words in (hl, ll)):
+                raise ValueError("facet keywords must be arrays of strings")
+            q = q.strip()
+            hl = [x.strip() for x in hl if x.strip()]
+            ll = [x.strip() for x in ll if x.strip()]
+            if q and (hl or ll):
+                facets.append({"query": q, "hl": hl, "ll": ll})
+        return facets[:cap]
     except Exception as e:  # noqa: BLE001
         logger.warning("multiquery decompose parse failed: %s | raw=%.200s", e, raw)
         return []
-    facets: list[dict] = []
-    for o in arr:
-        if not isinstance(o, dict):
-            continue
-        q = str(o.get("query") or "").strip()
-        hl = [str(x).strip() for x in (o.get("hl") or []) if str(x).strip()]
-        ll = [str(x).strip() for x in (o.get("ll") or []) if str(x).strip()]
-        if q and (hl or ll):
-            facets.append({"query": q, "hl": hl, "ll": ll})
-    return facets[:cap]
 
 
 # Decompose (V-MQ + STANDARD) outer deadline (Phase 0, 2026-06-04 — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md).
@@ -348,6 +356,17 @@ def _empty_data() -> dict[str, Any]:
     return {"chunks": [], "references": [], "entities": [], "relationships": []}
 
 
+def _annotated_chunk_lists(datas: list[dict]) -> list[list[dict]]:
+    """Classify document tiers across facets before any ranking or window cut."""
+    chunks = annotate_sources({"chunks": [c for d in datas for c in d.get("chunks") or []]})["chunks"]
+    lists, offset = [], 0
+    for data in datas:
+        size = len(data.get("chunks") or [])
+        lists.append(chunks[offset:offset + size])
+        offset += size
+    return lists
+
+
 _citation_cache: dict | None = None
 
 
@@ -402,6 +421,7 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
     # Speculate only on decomposition. If the anchor rejects fusion (or fails),
     # cancel and drain it so a cheap refusal cannot leave a detached LLM call.
     decomposition = asyncio.create_task(_decompose(intent))
+    planning_tasks = [decomposition]
     try:
         base = await rag.aquery_data(intent, params)
         base_ok = isinstance(base, dict) and base.get("status") == "success" and base.get("data")
@@ -412,13 +432,24 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
             return base_data, base_meta, False
         # Fanout estimation is admitted only after the anchor passes the gate.
         if os.getenv("KS_MQ_FANOUT", "1") == "1":
-            facets, _n_src = await asyncio.gather(decomposition, _estimate_n_sources(intent))
+            estimate = asyncio.create_task(_estimate_n_sources(intent))
+            planning_tasks.append(estimate)
+            # Surface either planner's failure promptly, but do not wait for an
+            # estimator whose budget cannot be used when decomposition is empty.
+            done, _ = await asyncio.wait(planning_tasks, return_when=asyncio.FIRST_COMPLETED)
+            if estimate in done:
+                estimate.result()
+            facets = await decomposition
+            if not facets:
+                return base_data, base_meta, False
+            _n_src = await estimate
         else:
             facets, _n_src = await decomposition, 0
     finally:
-        if not decomposition.done():
-            decomposition.cancel()
-        await asyncio.gather(decomposition, return_exceptions=True)
+        for task in planning_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*planning_tasks, return_exceptions=True)
     if not facets:
         return base_data, base_meta, False
 
@@ -439,9 +470,16 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
             max_total_tokens=_MAX_TOTAL_TOKENS,
         )
 
-    sub_res = await asyncio.gather(
-        *[rag.aquery_data(f["query"], _sub_param(f)) for f in facets], return_exceptions=True
-    )
+    retrieval_tasks = []
+    try:
+        for f in facets:
+            retrieval_tasks.append(asyncio.create_task(rag.aquery_data(f["query"], _sub_param(f))))
+        sub_res = await asyncio.gather(*retrieval_tasks, return_exceptions=True)
+    finally:
+        for task in retrieval_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*retrieval_tasks, return_exceptions=True)
 
     datas: list[dict] = [base_data]
     n_failed = 0  # facet sub-queries that ERRORED or returned non-success — a REAL failure, as
@@ -471,7 +509,7 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
         )
 
     _ranked_chunks = _rrf(
-        [annotate_sources(d)["chunks"] for d in datas],
+        _annotated_chunk_lists(datas),
         key_fn=lambda c: (_source_label(c.get("file_path") or "")[0], c.get("content") or c.get("chunk_id")),
         # Tier priority must apply before any served-window cut.
         top=None,
@@ -682,9 +720,16 @@ async def retrieve_standard(intent: str, rag: Any) -> tuple[dict[str, Any], dict
         )
 
     # Anchor first (index 0) so it leads every round-robin cycle; facets follow in order.
-    results = await asyncio.gather(
-        *[rag.aquery_data(f["query"], _param(f)) for f in facets], return_exceptions=True
-    )
+    retrieval_tasks = []
+    try:
+        for f in facets:
+            retrieval_tasks.append(asyncio.create_task(rag.aquery_data(f["query"], _param(f))))
+        results = await asyncio.gather(*retrieval_tasks, return_exceptions=True)
+    finally:
+        for task in retrieval_tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*retrieval_tasks, return_exceptions=True)
 
     # anchor_meta = the ANCHOR query's metadata (kb_coverage source). The anchor is facets[0]; its
     # result is results[0]. This pins coverage to the full-intent signal, never the merged count.
@@ -710,6 +755,7 @@ async def retrieve_standard(intent: str, rag: Any) -> tuple[dict[str, Any], dict
     # Merge the chunks (anchor-led RRF⊕round-robin), then pack from the front up to the TOKEN
     # budget — robust to chunk-size changes (vs a fixed chunk count). entities/relationships keep
     # their fixed top-K caps.
+    chunk_lists = _annotated_chunk_lists([{"chunks": chunks} for chunks in chunk_lists])
     chunks = _merge_rrf_round_robin(chunk_lists, _STD_TOP_K, _chunk_key)
     chunks = _pack_chunks_to_token_budget(chunks, _STD_CHUNK_TOKEN_BUDGET)
     entities = _merge_rrf_round_robin(ent_lists, _STD_TOP_K_GRAPH, _entity_key)

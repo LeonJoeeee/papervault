@@ -1,6 +1,8 @@
 """Pinned generation reads survive promotion without relaxing authority or evidence."""
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+import asyncio
+import threading
 
 import pytest
 
@@ -41,6 +43,8 @@ class Repository:
 @pytest.mark.parametrize("same_generation", [False, True])
 async def test_query_uses_pinned_manifest_after_promotion_during_synthesis(monkeypatch, same_generation):
     repo = Repository()
+    repo.snapshot["manifest"].update(indexed_scope=["paper:A"],
+        freshness={"indexed_at": "2026-10-20T12:00:00Z", "cohort": "baseline"})
     seen = []
     class Rag:
         async def aquery_data(self, intent, param):
@@ -56,6 +60,7 @@ async def test_query_uses_pinned_manifest_after_promotion_during_synthesis(monke
         if not same_generation:
             repo.snapshot["generation_id"] = "g2"
         repo.snapshot["manifest_revision"] = 2
+        repo.snapshot["manifest"]["freshness"]["cohort"] = "new-cohort"
         repo.snapshot["manifest"]["aggregate_layers"].append("new-layer")
         # The newest per-generation manifest's new layer lacks observations. The
         # pinned aggregate does not contain that layer and must not validate it.
@@ -69,6 +74,10 @@ async def test_query_uses_pinned_manifest_after_promotion_during_synthesis(monke
         result = await aq.query("question", rag=facade)
         assert result["cited_papers"] == ["A"]
         assert result["query_receipt"]["generation_id"] == "g1"
+        assert result["query_receipt"]["manifest_revision"] == 1
+        assert result["query_receipt"]["indexed_scope"] == ["paper:A"]
+        assert result["query_receipt"]["freshness"] == {
+            "indexed_at": "2026-10-20T12:00:00Z", "cohort": "baseline"}
         assert seen == [{"namespace": "private-A", "aggregate_layers": ["private-A"]}]
         assert repo.active_reads == 1
     finally:
@@ -115,3 +124,81 @@ async def test_reader_pin_health_remains_mandatory(fault):
             facade.validate()
     finally:
         await facade.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_close", [False, True])
+async def test_query_close_drains_committed_renewal_before_releasing_latest_revision(monkeypatch, cancel_close):
+    renewal_committed = threading.Event()
+    finish_renewal = threading.Event()
+    closing = asyncio.Event()
+
+    class RenewingRepository(Repository):
+        revision = 1
+
+        def get_operation(self, operation_id):
+            return None
+
+        def command(self, action, operation_id, payload):
+            if action == "renew_pin":
+                self.revision += 1
+                renewal_committed.set()
+                assert finish_renewal.wait(5), "test did not unblock renewal"
+            elif action == "release_pin":
+                assert payload["expected_revision"] == self.revision
+                self.released = True
+            return {"pin_id": "pin1", "revision": self.revision,
+                    "expires_at": datetime.now(timezone.utc) + timedelta(seconds=300)}
+
+    class Facade(CatalogServingFacade):
+        async def close(self):
+            closing.set()
+            await super().close()
+
+    class Rag:
+        async def aquery_data(self, intent, param):
+            return {"status": "success", "data": {"chunks": [{"file_path": "A", "content": "evidence"}]},
+                    "metadata": {"processing_info": {"total_entities_found": 30}}}
+
+        async def finalize_storages(self):
+            pass
+
+    async def factory(*args, **kwargs):
+        return Rag()
+
+    async def synth(*args, **kwargs):
+        assert await asyncio.to_thread(renewal_committed.wait, 5)
+        return "Completed finding [A]."
+
+    from papervault.knowledge.store import catalog_serving
+
+    repo = RenewingRepository()
+    facade = await Facade.pin(repo, rag_factory=factory, pin_ttl_seconds=0.03)
+
+    async def get_graph():
+        return facade
+
+    monkeypatch.setattr(catalog_serving, "get_query_graph", get_graph)
+    monkeypatch.setattr(aq, "_QUERY_VARIANT", "single")
+    monkeypatch.setattr(aq, "synth_answer", synth)
+    task = asyncio.create_task(aq.query("question"))
+    try:
+        await asyncio.wait_for(closing.wait(), 5)
+        # Let close cancel the heartbeat while its renewal thread holds a committed revision.
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not repo.released
+        if cancel_close:
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not repo.released
+    finally:
+        finish_renewal.set()
+    if cancel_close:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+    else:
+        result = await asyncio.wait_for(task, 5)
+        assert result["answer"] == "Completed finding [A]."
+    assert repo.released
+    await facade.close()  # repeated cleanup remains harmless

@@ -12,11 +12,11 @@ import os
 import re
 import time
 from collections import Counter
+from copy import deepcopy
 from typing import Any
 
 from lightrag import QueryParam
 
-from papervault.knowledge.ingest.operator_docs import strip_section_suffix
 from papervault.knowledge.query.synth import _source_label, annotate_sources, source_tier, synth_answer
 from papervault.llm_routing import route
 
@@ -65,7 +65,7 @@ def _retrieved_keys(data: dict[str, Any], *, sources: bool = False) -> list[str]
     """Deduplicate by evidence identity in retrieval rank, with references as fallback."""
     keys = []
     for item in [*(data.get("chunks") or []), *(data.get("references") or [])]:
-        fp = item.get("file_path") or ""
+        fp = item.get("file_path") or item.get("paper_key") or ""
         label, _ = _source_label(fp)
         if label == "unknown":
             continue
@@ -87,22 +87,11 @@ def _cited_papers(data: dict[str, Any]) -> list[str]:
 
 
 def _cited_sources(data: dict[str, Any]) -> list[str]:
-    """Aggregate operator-supplied source keys (textbook:/notebook:/web:) from
-    data.references[].file_path — SEPARATE from cited_papers (issues #45 / #47).
+    """Legacy sorted retrieval accessor using the shared out-feed identity logic.
 
-    These carry the colon-prefixed provenance key (e.g. `textbook:Schlickeiser2002`), kept so
-    the caller can tell the source class from the key. A multi-section operator doc carries a
-    per-section file_path (`<key>#s<N>`, issue #79) — strip the `#s<N>` so every section of one
-    book collapses to a SINGLE book-level entry here (the caller cites the whole book, not a
-    section). Sorted + deduped.
+    Actual cited sources are verified against inline citations by build_outfeed.
     """
-    refs = data.get("references") or []
-    keys = set()
-    for r in refs:
-        fp = r.get("file_path") or ""
-        if fp and _is_source_key(fp):
-            keys.add(strip_section_suffix(fp))  # #79: book-level key, sections collapse to one
-    return sorted(keys)
+    return sorted(_retrieved_keys(data, sources=True))
 
 
 def _abstract_only_papers(data: dict[str, Any]) -> list[str]:
@@ -115,7 +104,7 @@ def _abstract_only_papers(data: dict[str, Any]) -> list[str]:
     for c in data.get("chunks") or []:
         if source_tier(c) != "abstract_only":
             continue
-        label, _cred = _source_label(c.get("file_path") or "")
+        label, _cred = _source_label(c.get("file_path") or c.get("paper_key") or "")
         if label in cited:  # cited_papers already excludes operator sources (textbook:/…)
             keys.add(label)
     return sorted(keys)
@@ -138,7 +127,7 @@ def _assess_coverage(metadata: dict[str, Any] | None, data: dict[str, Any]) -> s
     cosine (still present in v3, threshold 0.2) is only an auxiliary signal; graph-signal
     coverage is the deliberate design choice (§6.4 注), not 'no cosine'.
     """
-    chunks = [c for c in data.get("chunks") or [] if (c.get("content") or "").strip()]
+    chunks = [c for c in annotate_sources(data)["chunks"] if (c.get("content") or "").strip()]
     if not chunks:
         return "empty"
     pinfo = (metadata or {}).get("processing_info")
@@ -159,6 +148,7 @@ def build_outfeed(
     *, no_synth: bool = False, generation_id: str | None = None,
     query_mode: str = _QUERY_MODE, variant: str = "single", rerank_degraded: bool = False,
     synthesis_model: str | None = None, synthesis_latency_s: float = 0.0,
+    serving_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Pure production/eval contract over one captured retrieval and its answer.
 
@@ -180,7 +170,7 @@ def build_outfeed(
         return sorted((k for k in keys if counts[k]), key=lambda k: (-counts[k], keys.index(k)))
     cited_papers, cited_sources = cited(papers), cited(sources)
     abstract = set(_abstract_only_papers(data))
-    fulltext = {_source_label(c.get("file_path") or "")[0] for c in data["chunks"]
+    fulltext = {_source_label(c.get("file_path") or c.get("paper_key") or "")[0] for c in data["chunks"]
                 if source_tier(c) != "abstract_only"}
     receipt = {
         "generation_id": generation_id, "query_mode": query_mode, "variant": variant,
@@ -189,6 +179,25 @@ def build_outfeed(
         "rerank_degraded": rerank_degraded, "synthesis_model": synthesis_model,
         "synthesis_latency_s": synthesis_latency_s, "no_synth": no_synth,
     }
+    snapshot = serving_manifest or {}
+    manifest = snapshot.get("manifest") or {}
+    receipt.update(generation_id=snapshot.get("generation_id", generation_id),
+                   manifest_revision=snapshot.get("manifest_revision"),
+                   indexed_scope=None, freshness=None)
+    if serving_manifest is not None:
+        selected = manifest.get("selected_unit_receipts", {})
+        receipt["indexed_scope"] = sorted(selected)
+        revisions = {entry["unit_id"]: entry["consumed_input_revision"]
+                     for entry in manifest.get("entries", [])
+                     if entry["unit_id"] in selected and entry.get("consumed_input_revision") is not None}
+        if revisions:
+            receipt["freshness"] = {"input_revisions": revisions}
+        # Only declared read metadata leaves the pinned manifest, never internal
+        # receipts, backend details or a newly selected generation's timestamps.
+        for key in ("indexed_scope", "freshness", "indexed_at", "freshness_timestamp",
+                    "cohort", "cohort_id", "requirements_revision"):
+            if key in snapshot or key in manifest:
+                receipt[key] = deepcopy(snapshot[key] if key in snapshot else manifest[key])
     return {
         "answer": answer, "cited_papers": cited_papers, "cited_sources": cited_sources,
         "retrieved_papers": papers, "retrieved_sources": sources,
@@ -289,4 +298,5 @@ async def _query(intent: str, rag: Any) -> dict[str, Any]:
     return await synthesize_outfeed(
         data, metadata, intent, variant=_QUERY_VARIANT, rerank_degraded=degraded,
         generation_id=getattr(rag, "snapshot", {}).get("generation_id"),
+        serving_manifest=getattr(rag, "snapshot", None),
     )

@@ -134,6 +134,83 @@ async def test_identifier_poor_duplicate_does_not_take_a_second_slot(tmp_path, m
     assert "Collaboration2013a" not in {r["key"] for r in result["results"]}
 
 
+@pytest.mark.parametrize("second_hit", [None, "identified", "identifier_poor"])
+@pytest.mark.parametrize("limit", [1, 2])
+async def test_preview_cannot_reintroduce_suppressed_twin_under_slot_pressure(
+        tmp_path, monkeypatch, second_hit, limit):
+    lib = Library(tmp_path)
+    original = node("Collaboration2013", "The cosmic-ray positron energy spectrum measured by PAMELA")
+    original["arxiv_id"] = "1308.0133"
+    twin = dict(original, key="Collaboration2013a", doi="", arxiv_id="",
+                title="Cosmic-Ray Positron Energy Spectrum Measured by PAMELA")
+    for candidate in [original, twin]:
+        add_record(lib, **candidate)
+    for i in range(5):
+        add_record(lib, **node(f"Other{i}", f"Unrelated photospheric magnetic reconnection study {i}"))
+    # Exercise the real preview lookup: fusion suppresses this row, but the
+    # identifier-poor external observation still resolves to its exact title.
+    poor_hit = dict(twin, rank=0)
+    assert lib.find(title=poor_hit["title"]).key == "Collaboration2013a"
+    external = [poor_hit,
+                node("Competitor", "Other detector measurements of energetic particles", rank=1),
+                node("Extra", "Further detector measurements of cosmic particles", rank=2)]
+    if second_hit == "identified":
+        external.append(dict(original, rank=4))
+    elif second_hit == "identifier_poor":
+        external.append(dict(original, doi="", arxiv_id="", rank=4))
+    before = {p.key: p.model_dump() for p in lib.all_papers()}
+    index_before = lib.index_path.read_bytes()
+    result, seen, events = await run_search(
+        monkeypatch, lib, external, limit=limit, terms=["PAMELA positron spectrum"])
+    pool = {c["key"]: c for c in seen["pool"]}
+    assert "Collaboration2013a" not in pool
+    assert len(pool) == 3 > limit
+    canonical = pool["Collaboration2013"]
+    assert canonical["folded_vouch"] == (2 if second_hit else 1)
+    assert canonical["best_external_rank"] == 0
+    assert canonical["external_rrf_score"] == pytest.approx(
+        1 / 60 + (1 / 64 if second_hit else 0))
+    assert canonical["doi"] == original["doi"]
+    assert canonical["arxiv_id"] == "1308.0133"
+    served = [r["key"] for r in result["results"]]
+    assert served == ["Collaboration2013", "doi:10.1234/competitor"][:limit]
+    assert [e["key"] for e in events if e["stage"] == "serving"
+            and e.get("decision") == "served"] == served
+    assert not any(e.get("key") == "Collaboration2013a"
+                   for e in events if e["stage"] in {"return_gate", "ranking", "serving"})
+    assert {p.key: p.model_dump() for p in lib.all_papers()} == before
+    assert lib.index_path.read_bytes() == index_before
+
+
+async def test_enriched_canonical_preview_keeps_later_external_vouches(tmp_path, monkeypatch):
+    lib = Library(tmp_path)
+    original = node("Collaboration2013", "The cosmic-ray positron energy spectrum measured by PAMELA")
+    twin = dict(original, key="Collaboration2013a", doi="", arxiv_id="",
+                title="Cosmic-Ray Positron Energy Spectrum Measured by PAMELA")
+    competitor = node("Competitor", "Other detector measurements of energetic particles", rank=1)
+    for candidate in [original, twin, competitor]:
+        add_record(lib, **candidate)
+    first = dict(twin, arxiv_id="1308.0133", rank=0)
+    later = dict(twin, arxiv_id="1308.0133v1", rank=4,
+                 title="Revised instrument data release with extended positron statistics")
+    # Only preview's enriched copy knows this arXiv ID; the live catalog remains
+    # unchanged and cannot find the later observation by title or identifiers.
+    assert lib.find(arxiv_id=later["arxiv_id"], title=later["title"]) is None
+    assert lib._find_preprint_journal_dup(later) is None
+    result, seen, _ = await run_search(
+        monkeypatch, lib, [first, later, competitor, dict(competitor, rank=5)],
+        limit=1, terms=["PAMELA positron spectrum"])
+    pool = {c["key"]: c for c in seen["pool"]}
+    assert set(pool) == {"Collaboration2013", "Competitor"}
+    canonical = pool["Collaboration2013"]
+    assert canonical["folded_vouch"] == 2
+    assert canonical["best_external_rank"] == 0
+    assert canonical["external_rrf_score"] == pytest.approx(1 / 60 + 1 / 64)
+    assert [r["key"] for r in result["results"]] == ["Collaboration2013"]
+    assert lib.get("Collaboration2013").arxiv_id == ""
+    assert lib.get("Collaboration2013a").arxiv_id == ""
+
+
 async def test_explicit_alias_resolves_before_pooling(tmp_path, monkeypatch):
     from papervault.library.state_v2 import Merge, TerminalState
     lib = Library(tmp_path)

@@ -125,6 +125,7 @@ class FusedSearch:
     external: list[dict]
     local: list[dict]
     vouched: list[dict]
+    canonical_keys: dict[str, str]
 
 
 @dataclass
@@ -278,7 +279,7 @@ class SearchPipeline:
         return result
 
     def fusion(self, plan, retrieved, trace):
-        seen, local_by_key = {}, {}
+        seen, local_by_key, canonical_keys = {}, {}, {}
         bibliography = collections.defaultdict(list)
         snapshot = {p.key: p for p in retrieved.local}
         # Register identified versions first so an identifier-poor observation
@@ -301,12 +302,14 @@ class SearchPipeline:
                     and len(matches) == 1):
                 seen[identity] = matches[0]
             if identity in seen:
+                canonical_keys[paper.key] = seen[identity]["key"]
                 if paper.key != canonical.key:
                     seen[_identity_key(paper_to_dict(paper))] = seen[identity]
                 trace.record("fusion", candidate=paper_to_dict(paper), key=paper.key,
                              decision="folded", canonical_key=seen[identity]["key"], reason="local_duplicate")
                 continue
             seen[identity] = node
+            canonical_keys[paper.key] = node["key"]
             if paper.key != canonical.key:
                 seen[_identity_key(paper_to_dict(paper))] = node
             local_by_key[node["key"]] = node
@@ -326,6 +329,7 @@ class SearchPipeline:
                 trace.record("fusion", candidate=node, decision="folded", canonical_key=hit.get("key"))
             hit["best_external_rank"] = min(hit.get("best_external_rank", rank), rank)
             hit["external_rrf_score"] = hit.get("external_rrf_score", 0) + 1 / (RRF_K + rank)
+            hit["_external_hit_count"] = hit.get("_external_hit_count", 0) + 1
             if hit.get("_source_origin") == "library":
                 hit["folded_vouch"] = hit.get("folded_vouch", 0) + 1
                 continue
@@ -360,7 +364,7 @@ class SearchPipeline:
                          reason="pool_selection", folded_vouch=node.get("folded_vouch", 0),
                          external_rrf_score=node.get("external_rrf_score"), best_external_rank=node.get("best_external_rank"))
         trace.record("fusion", external_pool=len(external), local_pool=len(local))
-        return FusedSearch(external, local, vouched)
+        return FusedSearch(external, local, vouched, canonical_keys)
 
     async def return_gate(self, query, plan, fused, llm, trace):
         await self.progress(3, "judging new papers for ingest")
@@ -376,15 +380,18 @@ class SearchPipeline:
             if not rejection:
                 eligible.append(candidate)
         registration = eligible + [dict(n, _registration_known_key=n["key"]) for n in fused.vouched]
-        external, projections = preview_candidates(self.library, eligible)
-        # Preview returns isolated bibliographic projections. Keep request-local
-        # rank evidence alongside them; it is never persisted as catalog fact.
-        rank_evidence = {_identity_key(n): n for n in eligible}
+        external, projections = preview_candidates(self.library, eligible, canonical_keys=fused.canonical_keys)
+        # Preview may resolve a new identity to a local row suppressed by fusion.
+        # Its canonical snapshot already carries the preview hits' rank evidence;
+        # combine that with direct external folds before replacing the local row.
+        local_evidence = {n["key"]: n for n in fused.local + fused.vouched}
         for node in external:
-            donor = rank_evidence.get(_identity_key(node))
+            donor = local_evidence.get(node["key"])
             if donor is not None:
-                for field in ("external_rrf_score", "best_external_rank"):
-                    node[field] = donor[field]
+                for field in ("folded_vouch", "external_rrf_score"):
+                    node[field] = node.get(field, 0) + donor.get(field, 0)
+                if "best_external_rank" in donor:
+                    node["best_external_rank"] = min(node["best_external_rank"], donor["best_external_rank"])
         external_keys = set(projections)
         pool = [n for n in fused.local if n["key"] not in external_keys] + external
         await self.progress(4, "scoring relevance")

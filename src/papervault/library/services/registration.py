@@ -179,11 +179,12 @@ def _fill(paper: Paper, incoming: dict, *, identities=True):
             setattr(paper, name, copy.deepcopy(value))
 
 
-def preview_candidates(library, candidates):
+def preview_candidates(library, candidates, *, canonical_keys=None):
     """Apply the legacy lookup/fill ladder to isolated serving objects only.
 
     The first occurrence keeps its scoring position/snapshot; later aliases may
-    enrich its response projection without taking another result slot.
+    enrich its response projection without taking another result slot. Fusion's
+    request-local canonical mapping also applies to matches found by preview.
     """
     from ..store import _normalize_arxiv, _normalize_doi
 
@@ -206,8 +207,11 @@ def preview_candidates(library, candidates):
     def preview_find(owner, candidate):
         # Title and preprint lookups may find a different explicit version.
         # Serving projections cannot turn that bibliographic match into a merge.
-        return (compatible(_find(owner, candidate), candidate)
-                or compatible(owner._find_preprint_journal_dup(candidate), candidate))
+        paper = (compatible(_find(owner, candidate), candidate)
+                 or compatible(owner._find_preprint_journal_dup(candidate), candidate))
+        if paper is not None and canonical_keys and paper.key in canonical_keys:
+            paper = compatible(owner.get(canonical_keys[paper.key]), candidate)
+        return paper
 
     view, snapshots = _view(library, {}), {}
     for candidate in candidates:
@@ -229,6 +233,15 @@ def preview_candidates(library, candidates):
         if paper.key not in snapshots:
             snapshots[paper.key] = dict(paper_to_dict(paper), source=paper.source, paper_id=paper.paper_id,
                                        _source_origin="library" if library.get(paper.key) else "external")
+        if "external_rrf_score" in candidate:
+            # Rank evidence belongs to this serving request, never to Paper or
+            # registration. Aggregate before identity enrichment changes lookup.
+            snapshot = snapshots[paper.key]
+            snapshot["external_rrf_score"] = snapshot.get("external_rrf_score", 0) + candidate["external_rrf_score"]
+            rank = candidate["best_external_rank"]
+            snapshot["best_external_rank"] = min(snapshot.get("best_external_rank", rank), rank)
+            if snapshot["_source_origin"] == "library":
+                snapshot["folded_vouch"] = snapshot.get("folded_vouch", 0) + candidate.get("_external_hit_count", 1)
     return list(snapshots.values()), view._papers
 
 

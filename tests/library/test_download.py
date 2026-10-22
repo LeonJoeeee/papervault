@@ -22,6 +22,92 @@ PDF_BYTES = b"%PDF-1.4\n%fake-pdf"
 HTML_BYTES = b"<html>not a pdf</html>"
 
 
+@pytest.mark.parametrize("value", [False, 0, "false", " FALSE ", "0", "no", "maybe", "1", {}, [], 1])
+def test_identity_verifier_rejects_explicit_negative_values(value):
+    llm = SimpleNamespace(call=lambda _: json.dumps({"match": value, "reason": "different work"}))
+    ok, reason = download._llm_verify_identity(
+        "Readable title and author", Paper(key="fixture", title="Requested work"), llm=llm)
+    assert ok is False
+    assert reason == "llm_mismatch: different work"
+
+
+@pytest.mark.parametrize("value", [True, "true", " TRUE "])
+def test_identity_verifier_accepts_only_explicit_positive_values(value):
+    llm = SimpleNamespace(call=lambda _: json.dumps({"match": value, "reason": "same work"}))
+    ok, reason = download._llm_verify_identity(
+        "Readable title and author", Paper(key="fixture", title="Requested work"), llm=llm)
+    assert ok is True
+    assert reason == "llm_match: same work"
+
+
+def test_strict_identity_verifier_retries_string_boolean_before_accepting_real_boolean():
+    replies = iter(['{"match": "true"}', '{"match": false, "reason": "different work"}'])
+    llm = SimpleNamespace(call=lambda _: next(replies))
+    ok, reason = download._llm_verify_identity(
+        "OCR title and author", Paper(key="fixture", title="Requested work"),
+        llm=llm, require_boolean=True)
+    assert ok is False
+    assert reason == "llm_mismatch: different work"
+
+
+@pytest.mark.parametrize("target", [
+    "https://cdn.example/paper.pdf", "https://api.wiley.com.evil.example/paper.pdf",
+    "http://api.wiley.com/paper.pdf", "https://api.wiley.com:444/paper.pdf",
+])
+@responses.activate
+def test_wiley_redirect_drops_token_outside_trusted_https_origins(monkeypatch, target):
+    from papervault.library.download_sources import wiley
+
+    monkeypatch.setenv("WILEY_TDM_TOKEN", "private-fixture-token")
+    api = "https://api.wiley.com/onlinelibrary/tdm/v1/articles/10.1002%2Ftest"
+    responses.get(api, status=302, headers={"Location": target})
+    responses.get(target, body=PDF_BYTES)
+    assert wiley._try_wiley_tdm(Paper(key="fixture", title="Test", doi="10.1002/test")) == PDF_BYTES
+    assert responses.calls[0].request.headers["Wiley-TDM-Client-Token"] == "private-fixture-token"
+    assert "Wiley-TDM-Client-Token" not in responses.calls[1].request.headers
+
+
+@pytest.mark.parametrize("target", ["/paper.pdf", "https://onlinelibrary.wiley.com/paper.pdf"])
+@responses.activate
+def test_wiley_redirect_retains_token_on_trusted_https_origins(monkeypatch, target):
+    from papervault.library.download_sources import wiley
+
+    monkeypatch.setenv("WILEY_TDM_TOKEN", "private-fixture-token")
+    api = "https://api.wiley.com/onlinelibrary/tdm/v1/articles/10.1002%2Ftest"
+    final = "https://api.wiley.com/paper.pdf" if target.startswith("/") else target
+    responses.get(api, status=302, headers={"Location": target})
+    responses.get(final, body=PDF_BYTES)
+    assert wiley._try_wiley_tdm(Paper(key="fixture", title="Test", doi="10.1002/test")) == PDF_BYTES
+    assert [call.request.headers.get("Wiley-TDM-Client-Token") for call in responses.calls] == [
+        "private-fixture-token", "private-fixture-token"]
+
+
+@responses.activate
+def test_wiley_redirect_never_restores_token_after_leaving_trusted_host(monkeypatch):
+    from papervault.library.download_sources import wiley
+
+    monkeypatch.setenv("WILEY_TDM_TOKEN", "private-fixture-token")
+    api = "https://api.wiley.com/onlinelibrary/tdm/v1/articles/10.1002%2Ftest"
+    responses.get(api, status=302, headers={"Location": "https://cdn.example/redirect"})
+    responses.get("https://cdn.example/redirect", status=302,
+                  headers={"Location": "https://api.wiley.com/final.pdf"})
+    responses.get("https://api.wiley.com/final.pdf", body=PDF_BYTES)
+    assert wiley._try_wiley_tdm(Paper(key="fixture", title="Test", doi="10.1002/test")) == PDF_BYTES
+    assert [call.request.headers.get("Wiley-TDM-Client-Token") for call in responses.calls] == [
+        "private-fixture-token", None, None]
+
+
+@responses.activate
+def test_wiley_redirect_loop_has_a_bounded_request_budget(monkeypatch):
+    from papervault.library.download_sources import wiley
+
+    monkeypatch.setenv("WILEY_TDM_TOKEN", "private-fixture-token")
+    api = "https://api.wiley.com/onlinelibrary/tdm/v1/articles/10.1002%2Ftest"
+    responses.get(api, status=302, headers={"Location": api})
+    assert wiley._try_wiley_tdm(Paper(key="fixture", title="Test", doi="10.1002/test")) is None
+    assert len(responses.calls) <= 6
+
+
 @pytest.fixture
 def lib(tmp_path):
     return Library(tmp_path)
@@ -64,6 +150,117 @@ def _text_pdf(text: str) -> bytes:
     output = io.BytesIO()
     writer.write(output)
     return output.getvalue()
+
+
+@pytest.mark.parametrize("sibling_state", ["completed", "pending"])
+def test_concurrent_group_rejects_wrong_pdf_before_selecting_valid_sibling(
+        lib, paper, monkeypatch, sibling_state):
+    import threading
+
+    wrong = _text_pdf("Unrelated meeting program. This is a conference schedule and poster list.")
+    valid = _text_pdf(f"{paper.title}. A. We study cosmic ray transport and report our results.")
+    release_valid = threading.Event()
+    if sibling_state == "completed":
+        release_valid.set()
+    original_log = lib.log
+
+    def log_event(event):
+        original_log(event)
+        if event.get("phase") == "winner":
+            # Release the worker even under the broken first-bytes implementation.
+            release_valid.set()
+
+    monkeypatch.setattr(lib, "log", log_event)
+    prompts = []
+
+    def verify(messages):
+        prompts.append(messages[1]["content"])
+        mismatch = "Unrelated meeting program" in prompts[-1]
+        if mismatch:
+            release_valid.set()
+        return json.dumps({"match": not mismatch, "reason": "fixture identity"})
+
+    monkeypatch.setattr("papervault.library.llm.get_llm",
+                        lambda **_: SimpleNamespace(call=verify))
+
+    def valid_member(_):
+        assert release_valid.wait(5)
+        return valid
+
+    original_completed = download.concurrent.futures.as_completed
+
+    def wrong_first(futures, timeout):
+        wrong_future, valid_future = futures
+        wrong_future.result(timeout=timeout)
+        if sibling_state == "completed":
+            valid_future.result(timeout=timeout)
+        yield wrong_future
+        yield from original_completed([valid_future], timeout=timeout)
+
+    monkeypatch.setattr(download.concurrent.futures, "as_completed", wrong_first)
+
+    def group(candidate):
+        return download._try_concurrent_first_hit(candidate, [
+            ("wrong", lambda _: wrong), ("valid", valid_member)])
+
+    monkeypatch.setattr(download, "_STRATEGIES", [("oa_aggregators", group)])
+    monkeypatch.setattr(download, "_try_firecrawl_text_fallback", lambda *_: False)
+    assert download.download_paper(paper, lib) is True
+    assert lib.pdf_path(paper.key).read_bytes() == valid
+    assert paper.download_source_member == "valid"
+    assert len(prompts) == 2  # Each candidate is judged once, including the winner.
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    assert [event["member"] for event in events if event.get("phase") == "winner"] == ["valid"]
+
+
+@pytest.mark.parametrize("completed_at,accepted", [(10.0, True), (70.0, False)])
+def test_slow_group_verification_preserves_siblings_within_original_fetch_deadline(
+        paper, monkeypatch, completed_at, accepted):
+    import concurrent.futures._base
+    import threading
+
+    clock = [0.0]
+    fake_time = SimpleNamespace(monotonic=lambda: clock[0])
+    monkeypatch.setattr(download, "time", fake_time)
+    monkeypatch.setattr(concurrent.futures._base, "time", fake_time)
+    release_valid = threading.Event()
+    submitted = []
+    original_executor = download.concurrent.futures.ThreadPoolExecutor
+
+    class ObservedExecutor(original_executor):
+        def submit(self, *args, **kwargs):
+            future = super().submit(*args, **kwargs)
+            submitted.append(future)
+            return future
+
+    monkeypatch.setattr(download.concurrent.futures, "ThreadPoolExecutor", ObservedExecutor)
+    wrong = _text_pdf("Unrelated meeting program with conference schedules and poster presentations.")
+    valid = _text_pdf(f"{paper.title}. A. We study cosmic ray transport and report our results.")
+    judgments = []
+
+    def verify(messages):
+        mismatch = "Unrelated meeting program" in messages[1]["content"]
+        judgments.append("wrong" if mismatch else "valid")
+        if mismatch:
+            # The sibling finishes during verification, either before or after
+            # the original 60-second network budget. Verification then ends late.
+            clock[0] = completed_at
+            release_valid.set()
+            assert submitted[1].result(timeout=5) == valid
+            clock[0] = max(61.0, completed_at)
+        return json.dumps({"match": not mismatch, "reason": "fixture identity"})
+
+    monkeypatch.setattr("papervault.library.llm.get_llm",
+                        lambda **_: SimpleNamespace(call=verify))
+
+    def valid_member(_):
+        assert release_valid.wait(5)
+        return valid
+
+    result = download._try_concurrent_first_hit(paper, [
+        ("wrong", lambda _: wrong), ("valid", valid_member)], timeout=60)
+    assert result == (valid if accepted else None)
+    assert judgments == (["wrong", "valid"] if accepted else ["wrong"])
 
 
 @pytest.mark.parametrize("incoming_arxiv", ["0708.2587", "0708.2587v1", "arXiv:0708.2587v2"])

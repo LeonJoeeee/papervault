@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import re
 from typing import Any, Callable, Optional
 
@@ -218,9 +219,8 @@ def _parse_ingest(raw: str, expected: set[int]) -> dict[int, dict]:
                 "reason": str(item.get("reason", ""))[:200],
                 "tier": str(item.get("tier", "?")).strip()[:4],
                 # LLM's is_paper — a BACKSTOP used by the caller only when source
-                # metadata can't decide. Default True (lenient) if the LLM omits it;
-                # the domain-tier gate is the primary contamination guard.
-                "llm_is_paper": bool(item.get("is_paper", True)),
+                # metadata can't decide. Only an explicit boolean can admit a paper.
+                "llm_is_paper": item.get("is_paper") is True,
             }
         except (KeyError, ValueError, TypeError):
             continue
@@ -314,7 +314,8 @@ def _parse_score(raw: str, expected: set[int]) -> dict[int, dict]:
             i = int(item["i"])
             if i not in expected:
                 continue
-            score = max(0.0, min(1.0, float(item.get("score", 0.0))))
+            score = float(item.get("score", 0.0))
+            score = max(0.0, min(1.0, score)) if math.isfinite(score) else 0.0
             out[i] = {"reason": str(item.get("reason", ""))[:200], "score": score}
         except (KeyError, ValueError, TypeError):
             continue

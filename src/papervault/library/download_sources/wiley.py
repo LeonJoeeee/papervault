@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import Optional
+from urllib.parse import quote, urljoin, urlsplit
 
 import requests
 
@@ -38,13 +39,28 @@ def _try_wiley_tdm(paper: Paper) -> Optional[bytes]:
     prefix = paper.doi.split("/", 1)[0]
     if prefix not in ("10.1002", "10.1029", "10.1111", "10.1046"):
         return None
-    from urllib.parse import quote
     encoded_doi = quote(paper.doi, safe="")
     api_url = f"https://api.wiley.com/onlinelibrary/tdm/v1/articles/{encoded_doi}"
     try:
-        r = polite_get(requests.get, api_url, timeout=60,
-                         headers={"Wiley-TDM-Client-Token": token},
-                         allow_redirects=True)
+        url = api_url
+        headers = {"Wiley-TDM-Client-Token": token}
+        for hop in range(6):  # Initial request and at most five redirects.
+            r = polite_get(requests.get, url, timeout=60, headers=headers,
+                           allow_redirects=False)
+            if r.status_code not in {301, 302, 303, 307, 308} or not r.headers.get("Location"):
+                break
+            if hop == 5:
+                log.warning("wiley_tdm[%s]: redirect budget exhausted", paper.key)
+                return None
+            url = urljoin(url, r.headers["Location"])
+            target = urlsplit(url)
+            if (target.scheme != "https" or target.hostname not in {
+                    "api.wiley.com", "onlinelibrary.wiley.com"}
+                    or target.port not in {None, 443}
+                    or target.username is not None or target.password is not None):
+                # Continue public CDN downloads, but never restore the token
+                # after this redirect chain leaves the trusted HTTPS origins.
+                headers = {}
     except Exception as exc:
         log.warning("wiley_tdm[%s]: request exception %r", paper.key, exc)
         return None

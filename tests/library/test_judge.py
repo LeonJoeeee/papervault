@@ -63,6 +63,25 @@ _CANDS = [
 ]
 
 
+@pytest.mark.parametrize("value,expected", [
+    (True, True), (False, False), ("false", False), ("true", False),
+    ("0", False), ("no", False), (0, False), (1, False), (None, False),
+])
+def test_ingest_paper_backstop_requires_a_real_boolean(value, expected):
+    raw = json.dumps({"items": [{"i": 0, "tier": "1A", "is_paper": value}]})
+    assert judge._parse_ingest(raw, {0})[0]["llm_is_paper"] is expected
+
+
+def test_ingest_missing_paper_backstop_cannot_admit_a_record():
+    assert judge._parse_ingest('{"items":[{"i":0,"tier":"1A"}]}', {0})[0]["llm_is_paper"] is False
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf"), "NaN", "Infinity"])
+def test_return_nonfinite_relevance_scores_default_to_zero(value):
+    raw = json.dumps({"items": [{"i": 0, "score": value}]})
+    assert judge._parse_score(raw, {0})[0]["score"] == 0.0
+
+
 # ───────────────────────── shared projection ─────────────────────────
 
 def test_candidate_to_item_carries_citation_and_review():

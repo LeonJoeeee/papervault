@@ -2044,3 +2044,57 @@ async def test_search_rejected_candidate_does_not_store_source_identity(
     monkeypatch.setattr("papervault.library.mcp.server.judge_return", ret)
     await _call_with_registration(server, "search_papers", {"query": "cosmic ray transport"})
     assert populated_lib.find(doi="10.1234/rejected") is None
+
+
+@pytest.mark.parametrize("marker", ["identity_mismatch", "off_domain", "non_paper", "bad_extract",
+                                   "quarantine", "excluded"])
+async def test_quarantined_records_are_unavailable_by_all_identifiers(
+        populated_lib, server, marker):
+    from papervault.library.mcp.server import _paper_dict
+    paper = populated_lib.get("Wei2024")
+    if marker in {"quarantine", "excluded"}:
+        paper.terminal_state = TerminalState(policy=Policy.EXCLUDED if marker == "excluded" else Policy.CLEAR,
+                                             quarantine=marker == "quarantine")
+    else:
+        paper.domain_status = marker
+    for identifier in [paper.key, paper.doi, paper.title]:
+        result = await _get_one(server, identifier)
+        assert result["status"] == "not_found"
+        assert "text_path" not in result
+    assert "text_path" not in _paper_dict(paper, populated_lib)
+
+
+async def test_get_paper_resolves_alias_citation_key(populated_lib, server, monkeypatch):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import Merge
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    alias = Paper(key="Alias2024", title="Earlier identity", doi="10.1234/old",
+                  terminal_state=TerminalState(merge=Merge.ALIAS, alias_key="Wei2024", quarantine=True))
+    populated_lib._papers[alias.key] = alias
+    populated_lib._reindex(alias)
+    result = await _get_one(server, alias.key)
+    assert result["status"] == "found"
+    assert result["key"] == "Wei2024"
+    assert result["text_path"].endswith("Wei2024.md")
+
+
+async def test_pending_ocr_identity_with_old_markdown_does_not_serve_text(populated_lib, server):
+    paper = populated_lib.get("Wei2024")
+    paper.verification_deferred_to_ocr = True
+    result = await _get_one(server, paper.key)
+    assert result["status"] == "found"
+    assert result["text_status"] == "pending"
+    assert "text_path" not in result
+    assert await _read(server, "library://extract/Wei2024.md") == ""
+
+
+@pytest.mark.parametrize("marker", ["off_domain", "quarantine", "excluded"])
+async def test_raw_extract_resources_honor_current_exclusion(populated_lib, server, marker):
+    paper = populated_lib.get("Wei2024")
+    if marker == "off_domain":
+        paper.domain_status = marker
+    else:
+        paper.terminal_state = TerminalState(policy=Policy.EXCLUDED if marker == "excluded" else Policy.CLEAR,
+                                             quarantine=marker == "quarantine")
+    assert await _read(server, "library://extract/Wei2024.md") == ""
+    assert await _read(server, "library://extract/Wei2024.txt") == ""

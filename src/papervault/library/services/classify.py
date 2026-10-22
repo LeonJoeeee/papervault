@@ -17,7 +17,8 @@ hit, so each paper lands in exactly one Action (SDD §5 ``post``):
 
   1. TERMINAL  ⟸ status ∈ {extract_failed, failed, metadata_only}
                  (terminal first — never auto-revive; operator audit only)
-  2. TERMINAL  ⟸ has_pdf ∧ has_md   (a real PDF already on disk alongside any
+  2. TERMINAL  ⟸ has_pdf ∧ has_md ∧ ¬pending_ocr_identity
+                 (a real PDF already on disk alongside verified
                  md = done; this is ALSO where a firecrawl-md paper that later
                  acquires a real PDF lands — it RESTS served as the firecrawl
                  md and is NEVER re-OCR'd. Per D5 "if firecrawl's fetch is no good, that's final":
@@ -36,7 +37,8 @@ hit, so each paper lands in exactly one Action (SDD §5 ``post``):
        • else (REAL-OCR md whose PDF is gone, OR an EXHAUSTED firecrawl-md)
                                                      → TERMINAL (REST; the full
                  text is still served via text_path — never a hot-loop)
-  4. EXTRACT   ⟸ has_pdf ∧ ¬has_md ∧ status ∈ {ok, pending} ∧ attempts<MAX
+  4. EXTRACT   ⟸ has_pdf ∧ (¬has_md ∨ pending_ocr_identity)
+                 ∧ status ∈ {ok, pending} ∧ attempts<MAX
                  (``pending`` accepted: a crash between the PDF write and the
                   status flip leaves a real PDF under a still-'pending' record;
                   it MUST extract, not black-hole — restart-safety §8 inv #4)
@@ -50,6 +52,8 @@ admission mutates policy. With the flag off, these rules are unchanged.
 """
 
 from __future__ import annotations
+
+import hashlib
 
 from papervault.config import merge_v2_enabled, reopen_v2_enabled, terminal_v2_enabled
 
@@ -69,6 +73,22 @@ EXTRACT = "EXTRACT"
 TERMINAL = "TERMINAL"
 
 Action = str
+
+
+def pending_ocr_identity(paper: Paper, library) -> bool:
+    """Whether the current PDF still requires a positive post-OCR identity verdict."""
+    if paper.verification_deferred_to_ocr:
+        return True
+    if paper.extraction_completion_id:
+        return False
+    if paper.download_source == "ads_scan":
+        return True
+    scans = [document for document in paper.ads_availability.documents
+             if document.document_kind == "scanned_full_text"]
+    if scans and library.has_pdf(paper.key):
+        digest = hashlib.sha256(library.pdf_path(paper.key).read_bytes()).hexdigest()
+        return any(document.sha256 == digest for document in scans)
+    return False
 
 
 def classify(paper: Paper, library, *, identity_provider=resolved_identity,
@@ -115,15 +135,17 @@ def _classify_legacy(paper: Paper, library) -> Action:
 
     has_pdf = library.has_pdf(key)
     has_md = library.has_extract(key, "md")
+    needs_identity = has_pdf and pending_ocr_identity(paper, library)
 
-    # (2) Real PDF already on disk alongside an md = done. This also catches a
+    # (2) Real PDF alongside an md = done once any OCR identity obligation clears.
+    #     This also catches a
     #     firecrawl-md paper that later acquired a real PDF: it RESTS here,
     #     served as the firecrawl md, and is NEVER re-OCR'd (D5 "if firecrawl's
     #     fetch is no good, that's final" — no PDF-upgrade path; the dead force-upgrade branch in
     #     extract_md was removed). The persisted status may read cosmetically
     #     stale (e.g. a crash-lost 'pending'+pdf+md) but serve-safety keys off
     #     the on-disk md, so the user still gets the full text.
-    if has_pdf and has_md:
+    if has_pdf and has_md and not needs_identity:
         return TERMINAL
 
     # (3) No real PDF on disk → decide DOWNLOAD vs REST.
@@ -143,12 +165,12 @@ def _classify_legacy(paper: Paper, library) -> Action:
             return DOWNLOAD
         return TERMINAL
 
-    # (4) PDF on disk, no md yet, retries left → extract. Accept status ∈
+    # (4) PDF on disk, missing md or pending identity, retries left → extract. Accept status ∈
     #     {ok, pending}: a crash between the PDF write and the status flip
     #     leaves a real PDF under a still-'pending' record — it MUST extract,
     #     not black-hole to TERMINAL (restart-safety, SDD §8 inv #4).
     if (
-        not has_md
+        (not has_md or needs_identity)
         and status in (DOWNLOAD_STATUS_OK, DOWNLOAD_STATUS_PENDING)
         and paper.extract_attempts < MAX_EXTRACT_ATTEMPTS
     ):

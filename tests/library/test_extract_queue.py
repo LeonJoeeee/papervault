@@ -140,6 +140,91 @@ def test_process_one_skips_when_has_md(lib_four_papers, monkeypatch):
     assert chain.added == [key_b]  # but downstream still notified
 
 
+@pytest.mark.parametrize("marker", ["deferred", "source", "evidence"])
+@pytest.mark.parametrize("match", [True, False])
+def test_existing_md_pending_scan_reaches_ocr_verification(
+        lib_four_papers, monkeypatch, marker, match):
+    import hashlib
+    from papervault.library import extract
+    from papervault.library.models import ADSDocumentEvidence
+
+    lib, _, key, *_ = lib_four_papers
+    paper = lib.get(key)
+    previous = lib.md_path(key).read_bytes()
+    if marker == "deferred":
+        paper.verification_deferred_to_ocr = True
+    elif marker == "source":
+        paper.download_source = "ads_scan"
+    else:
+        paper.ads_availability.documents = [ADSDocumentEvidence(
+            outcome="pdf", document_kind="scanned_full_text",
+            sha256=hashlib.sha256(lib.pdf_path(key).read_bytes()).hexdigest())]
+    body = "# Verified research paper\n" + "Readable scientific prose. " * 40
+
+    async def ocr(*args, **kwargs):
+        return body
+
+    class IdentityLLM:
+        def call(self, messages):
+            return '{"match": ' + str(match).lower() + ', "reason": "title and author"}'
+
+    real_extract = extract.extract_md
+
+    async def run_extract(paper, library):
+        return await real_extract(paper, library, llm=IdentityLLM())
+
+    monkeypatch.setattr(eq_mod, "extract_md", run_extract)
+    monkeypatch.setattr(extract, "extract_mineru", ocr)
+    monkeypatch.setattr(extract, "pdf_probe", lambda *args: extract.PDFProbe(False, 10, "ok"))
+    monkeypatch.setattr(extract, "review_extract", lambda *args, **kwargs: {"ok": True})
+    monkeypatch.setattr(extract, "confirmed_completeness_gate",
+                        lambda *args, **kwargs: {"complete": True})
+    chain = _Recorder()
+    asyncio.run(ExtractQueue(lib, on_success=chain)._process_one(key))
+    if match:
+        assert paper.extraction_completion_id
+        assert body in lib.md_path(key).read_text()
+        assert chain.added == [key]
+    else:
+        assert paper.domain_status == "identity_mismatch"
+        assert paper.extraction_completion_id is None
+        assert lib.md_path(key).read_bytes() == previous
+        assert chain.added == []
+
+
+@pytest.mark.parametrize("corrupt_other_completion", [False, True])
+def test_start_recovery_cannot_clear_pending_scan_verification(
+        lib_four_papers, monkeypatch, corrupt_other_completion):
+    from papervault.library.services.extraction_registration import begin_extraction
+    from papervault.store.extraction import ExtractionStore
+
+    lib, other_key, key, *_ = lib_four_papers
+    paper = lib.get(key)
+    paper.download_source = "ads_scan"
+    previous = lib.md_path(key).read_bytes()
+    request = begin_extraction(paper, lib, lib.pdf_path(key).read_bytes())
+    ExtractionStore(lib.root).finalize(request, b"Unverified retained output")
+    if corrupt_other_completion:
+        other = lib.get(other_key)
+        store = ExtractionStore(lib.root)
+        other_request = begin_extraction(other, lib, lib.pdf_path(other_key).read_bytes())
+        completion = store.finalize(other_request, b"Initially valid output")
+        store.path(completion["output_inventory"][0]["path"]).write_bytes(b"Corrupted output")
+    q = ExtractQueue(lib)
+    monkeypatch.setattr(q, "_target_worker_count", lambda: 0)
+
+    async def run():
+        await q.start()
+        try:
+            assert key in q._pending
+            assert paper.extraction_completion_id is None
+            assert lib.md_path(key).read_bytes() == previous
+        finally:
+            await q.stop()
+
+    asyncio.run(run())
+
+
 def test_extract_failure_does_not_chain_insight(lib_four_papers, monkeypatch):
     """If extract_md doesn't produce md on disk (e.g., review_low_quality),
     we must NOT chain to insight."""

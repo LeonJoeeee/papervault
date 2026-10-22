@@ -50,7 +50,7 @@ from ..extract import (
 from ..mineru_client import check_fd_watermark
 from ..store import Library
 from . import concurrency
-from .classify import EXTRACT, classify
+from .classify import EXTRACT, classify, pending_ocr_identity
 
 log = logging.getLogger("papervault.library.extract_queue")
 
@@ -135,8 +135,26 @@ class ExtractQueue:
         if self._started:
             return
         from .extraction_registration import recover_completions
-        recovered = await asyncio.to_thread(recover_completions, self.library)
-        if recovered["recovered"]:
+        pending_identity = {paper.key for paper in self.library.all_papers()
+                            if pending_ocr_identity(paper, self.library)}
+        if pending_identity:
+            # Recovery may set completion_id, erasing an inferred scan obligation.
+            # Keep those records out of alias/registration recovery until OCR verifies them.
+            recovered_count = 0
+            for paper in self.library.all_papers():
+                if paper.key not in pending_identity:
+                    try:
+                        recovered = await asyncio.to_thread(
+                            recover_completions, self.library, key=paper.key)
+                    except (OSError, ValueError):
+                        # Match global recovery's isolation of invalid evidence.
+                        log.warning("extract queue: invalid retained evidence for %s", paper.key)
+                        continue
+                    recovered_count += recovered["recovered"]
+        else:
+            recovered = await asyncio.to_thread(recover_completions, self.library)
+            recovered_count = recovered["recovered"]
+        if recovered_count:
             self.library.save(force=True, durable=True)
         self._started = True
 
@@ -318,9 +336,11 @@ class ExtractQueue:
             log.warning("extract queue: %s not in library, dropping", key)
             return
         from .extraction_registration import recover_completions
-        recovered = await asyncio.to_thread(recover_completions, self.library, key=key)
-        if recovered["recovered"]:
-            self.library.save(force=True, durable=True)
+        needs_identity = pending_ocr_identity(paper, self.library)
+        if not needs_identity:
+            recovered = await asyncio.to_thread(recover_completions, self.library, key=key)
+            if recovered["recovered"]:
+                self.library.save(force=True, durable=True)
         if not self.library.has_pdf(key):
             log.warning(
                 "extract queue: %s has no PDF, dropping (download chain bug?)",
@@ -330,7 +350,7 @@ class ExtractQueue:
         # Idempotence — md already extracted (concurrent worker, prior
         # run, firecrawl text-only path, etc.). Skip extract; forward
         # to on_success if present (no-op in post-route-B production).
-        if self.library.has_extract(key, "md"):
+        if not needs_identity and self.library.has_extract(key, "md"):
             from .extraction_registration import require_selected_registration
             require_selected_registration(self.library, paper)
             log.debug(
@@ -358,8 +378,7 @@ class ExtractQueue:
         # phase never pins a GPU slot. Here we just run extract_md + log a crash.
         completed = False
         try:
-            await extract_md(paper, self.library)
-            completed = True
+            completed = await extract_md(paper, self.library) is not None
         except Exception:
             log.exception("extract queue: extract_md failed for %s", key)
 

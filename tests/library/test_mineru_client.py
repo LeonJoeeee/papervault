@@ -397,6 +397,16 @@ def test_no_endpoints_is_transport_error():
         asyncio.run(mc.extract_mineru(b"%PDF", []))
 
 
+def test_invalid_retired_native_retry_settings_do_not_break_import(monkeypatch):
+    import subprocess
+
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_NATIVE_RETRIES", "retired-invalid-value")
+    monkeypatch.setenv("PAPER_LIBRARY_MINERU_NATIVE_BACKOFF", "retired-invalid-value")
+    result = subprocess.run([sys.executable, "-c", "import papervault.library.mineru_client"],
+                            capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+
+
 def test_endpoints_default_when_unset(monkeypatch):
     monkeypatch.delenv("MINERU_URL", raising=False)
     eps = mc.endpoints_from_env()

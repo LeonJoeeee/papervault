@@ -554,7 +554,7 @@ async def extract_md(paper: Paper, library: Library, *,
         ONLY (there is no instant-terminal-on-first-failure — the old
         ``n_chunks == 1`` disjunct is dropped).
 
-    Idempotent: an md already on disk is terminal truth and is never re-OCR'd.
+    Idempotent after any outstanding post-OCR identity verification is resolved.
     """
     # An md already on disk is terminal truth. We do NOT re-OCR a firecrawl-md
     # paper just because a real PDF later appears: per D5 ("if firecrawl's grab
@@ -567,12 +567,8 @@ async def extract_md(paper: Paper, library: Library, *,
     # as a shortcut around identity verification.
     scan_evidence = [document for document in paper.ads_availability.documents
                      if document.document_kind == "scanned_full_text"]
-    deferred_identity = paper.verification_deferred_to_ocr or (
-        not paper.extraction_completion_id and paper.download_source == "ads_scan")
-    if (not deferred_identity and not paper.extraction_completion_id and scan_evidence
-            and library.has_pdf(paper.key)):
-        source_hash = hashlib.sha256(library.pdf_path(paper.key).read_bytes()).hexdigest()
-        deferred_identity = any(document.sha256 == source_hash for document in scan_evidence)
+    from .services.classify import pending_ocr_identity
+    deferred_identity = pending_ocr_identity(paper, library)
     if not force and not deferred_identity:
         from .services.extraction_registration import recover_completions
         recover_completions(library, key=paper.key)
@@ -620,18 +616,8 @@ async def extract_md(paper: Paper, library: Library, *,
            f"attempt {paper.extract_attempts}/{MAX_EXTRACT_ATTEMPTS}")
         return None
 
-    # ---- 2. Endpoint set + wall-clock clock (SDD §2.1 step 2/§4.1) ----------
-    # Concurrency admission (the asyncio.Semaphore permit) lives ONE layer up in
-    # ``ExtractQueue._process_one_inner`` (SDD §4.1): the worker pool is sized to
-    # ``_EXTRACT_CONCURRENCY`` and the semaphore gates dispatch, so a permit is
-    # already held before ``extract_md`` is awaited. Here we only resolve the
-    # endpoint set from the env (``MINERU_URL``, comma-sep) — ``extract_mineru``
-    # round-robins / fails over across it internally. The wall-clock clock starts
-    # at the call boundary (after admission), so queue-wait is never metered (D9
-    # invariant preserved).
+    # ---- 2. Capture source + configured endpoint set -----------------------
     endpoints = endpoints_from_env()
-    t_pinned_start = time.time()
-    wall_clock_deadline = t_pinned_start + _CEILING_SECONDS
 
     pdf_bytes = pdf_path.read_bytes()
     from .services.extraction_registration import begin_extraction, finish_extraction
@@ -647,8 +633,16 @@ async def extract_md(paper: Paper, library: Library, *,
     # call and release it in the ``finally`` below — BEFORE the LLM gates — so a
     # worker in its off-loop gate phase never pins an OCR slot. With _EXTRACT_WORKERS
     # > _EXTRACT_CONCURRENCY, a freed slot is immediately re-dispatched → GPU stays fed.
-    await concurrency.acquire_extract_slot()
+    selected_endpoint = await concurrency.acquire_extract_slot()
     try:
+        # Queueing for a local OCR permit consumes no document execution time.
+        t_pinned_start = time.time()
+        wall_clock_deadline = t_pinned_start + _CEILING_SECONDS
+        if selected_endpoint is not None:
+            start = next((i for i, endpoint in enumerate(endpoints)
+                          if endpoint.url == selected_endpoint.url), None)
+            endpoints = ([selected_endpoint, *endpoints] if start is None
+                         else endpoints[start:] + endpoints[:start])
         # Retained compatibility hook: no pre-flight. HTTP submit/poll/result
         # transport failures below defer through C1 without charging an attempt.
         await get_server_controller().ensure_ready()

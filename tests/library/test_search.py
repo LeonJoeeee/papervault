@@ -403,6 +403,38 @@ def _freeze_clock(monkeypatch, start=1000.0):
     return clock
 
 
+@pytest.mark.parametrize("retryability", ["permanent", "transient_no_delay"])
+def test_item_scoped_failures_keep_receipts_without_opening_service_breaker(monkeypatch, retryability):
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 2)
+    calls = []
+
+    def backend(query, **kwargs):
+        calls.append(query)
+        if query.startswith("bad"):
+            raise BackendDegraded("query rejected", code="invalid_request", scope="item",
+                                  retryability=retryability)
+        return [_paper("Valid later query")]
+
+    _stub_backends(monkeypatch, semantic_scholar=backend)
+    degraded = collections.Counter()
+    observations = []
+
+    async def run():
+        with search.observe_source_gates(observations.append):
+            for i, term in enumerate(("bad one", "bad two")):
+                assert await search._fetch_one_backend(
+                    term, "semantic_scholar", 5, term_idx=i, degraded_map=degraded) == []
+            return await search._fetch_one_backend("valid", "semantic_scholar", 5, term_idx=2)
+
+    results = asyncio.run(run())
+    assert [paper["title"] for paper in results] == ["Valid later query"]
+    assert calls == ["bad one", "bad two", "valid"]
+    assert degraded == {"semantic_scholar": 2}
+    assert [(item.status, item.scope, item.code) for item in observations[:2]] == [
+        ("degraded", "item", "invalid_request"), ("degraded", "item", "invalid_request")]
+    assert search._breaker_open_backends() == []
+
+
 def test_breaker_defaults_match_the_documented_contract():
     """Defaults are 3 consecutive degraded outcomes and a 3600s cooldown
     (#115 Bounds) — an operator reads these off ``.env.example``."""

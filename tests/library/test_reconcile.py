@@ -62,6 +62,17 @@ def metadata_sweeps(monkeypatch):
     return enrich, abstract
 
 
+def test_reconcile_enqueues_pending_scan_verification_with_existing_md(tmp_path, metadata_sweeps):
+    lib = Library(tmp_path)
+    paper = _mk(lib, "ScanPending", "ok", pdf=True, md=True)
+    paper.verification_deferred_to_ocr = True
+    dq, eq = _RecordingQueue(), _RecordingQueue()
+    counts = _run(reconcile_once(lib, dq, eq))
+    assert counts["extract"] == 1
+    assert eq.added == [(paper.key, 5)]
+    assert dq.added == []
+
+
 def test_tier_skip_events_preserve_reconcile_counters(tmp_path, monkeypatch):
     """Manifest tier skips must not change paper routing or count as downloads."""
     lib = Library(tmp_path)

@@ -52,8 +52,10 @@ from papervault.library.services.intent_parser import parse_intent
 from papervault.library.services.judge import judge_ingest, judge_return
 from papervault.library.services.download_queue import DownloadQueue
 from papervault.library.services.extract_queue import ExtractQueue
+from papervault.library.services.classify import pending_ocr_identity
 from papervault.library.services.registration import (
-    RegistrationQueue, RegistrationService, metadata_is_paper as _metadata_is_paper, normalized_source_identities,  # noqa: F401 - compatibility import
+    RegistrationQueue, RegistrationService, serving_excluded,
+    metadata_is_paper as _metadata_is_paper, normalized_source_identities,  # noqa: F401 - compatibility import
     )
 
 
@@ -166,9 +168,11 @@ def _attach_text_reference(rec: dict, paper: Paper, library: Library) -> None:
     D6 serve-safety contract — the ONE honest output chokepoint (SDD §4.3/§5
     ``_serve_full_text``).
 
-    A record serves a ``text_path`` ONLY if a real, complete extract file is on
-    disk; otherwise it gets an honest ``text_status`` (and the abstract still
-    rides in the record, D6 — never a faked extract). Priority:
+    Current quarantine/exclusion withholds all text, and pending OCR identity
+    verification withholds older extracts. Otherwise a record serves a
+    ``text_path`` ONLY if a real, complete extract file is on disk; otherwise
+    it gets an honest ``text_status`` (and the abstract still rides in the
+    record, D6 — never a faked extract). Priority:
 
       1. md on disk → ``text_path`` (md). md only exists post-gate (D3), so its
          presence already certifies a real, complete extract — disk fact beats
@@ -186,6 +190,13 @@ def _attach_text_reference(rec: dict, paper: Paper, library: Library) -> None:
          the terminal value.
     """
     status = paper.download_status or ""
+    current = library.get(paper.key) or paper
+    if serving_excluded(current):
+        rec["text_status"] = "unavailable"
+        return
+    if pending_ocr_identity(current, library):
+        rec["text_status"] = "pending"
+        return
     if library.has_extract(paper.key, "md"):
         rec["text_path"] = str(library.md_path(paper.key))
         return
@@ -446,7 +457,13 @@ def _resolve_identifier(identifier: str,
     # 1. existing citation key
     paper = library.get(ident)
     if paper is not None:
-        return {"status": "found", "key": ident, "paper": paper}
+        from ..merge_v2 import resolve_alias
+        # Absorbed aliases are quarantined as an execution fence. Only their
+        # canonical destination can supply metadata or evidence.
+        paper = resolve_alias(library, ident)
+        if paper is None or serving_excluded(paper):
+            return {"status": "not_found", "message": "paper is unavailable"}
+        return {"status": "found", "key": paper.key, "paper": paper}
 
     # 2. DOI — normalize the common copy-paste wrappers (``doi:`` / the
     # ``https://doi.org/`` resolver URL) to the bare ``10.xxxx/...`` form
@@ -456,6 +473,8 @@ def _resolve_identifier(identifier: str,
         doi = fetcher.normalize_doi(ident)
         existing = library.find(doi=doi)
         if existing:
+            if serving_excluded(existing):
+                return {"status": "not_found", "message": "paper is unavailable"}
             return {"status": "found", "key": existing.key, "paper": existing}
         return {"status": "fetchable_doi", "doi": doi}
 
@@ -465,6 +484,8 @@ def _resolve_identifier(identifier: str,
     if fetcher.looks_like_arxiv(ident):
         existing = library.find(arxiv_id=ident)
         if existing:
+            if serving_excluded(existing):
+                return {"status": "not_found", "message": "paper is unavailable"}
             return {"status": "found", "key": existing.key, "paper": existing}
         return {"status": "fetchable_arxiv", "arxiv_id": fetcher.normalize_arxiv(ident)}
 
@@ -477,11 +498,14 @@ def _resolve_identifier(identifier: str,
     # misses this exact index and falls through to fuzzy (acceptable).
     exact_title = library.find(title=ident)
     if exact_title is not None:
+        if serving_excluded(exact_title):
+            return {"status": "not_found", "message": "paper is unavailable"}
         return {"status": "found", "key": exact_title.key, "paper": exact_title}
 
     # 5. fuzzy text via resolver (uses LLM rerank)
     candidates = resolver.resolve(ident, top_k=5)
-    in_lib = [c for c in candidates if c.get("in_library")]
+    in_lib = [c for c in candidates if c.get("in_library")
+              and (p := library.get(c.get("key"))) is not None and not serving_excluded(p)]
     if in_lib and _should_auto_resolve(in_lib):
         p = library.get(in_lib[0]["key"])
         if p is not None:
@@ -510,12 +534,10 @@ async def _ensure_paper_in_lib(identifier: str,
                                library: Library,
                                resolver: ResolverService,
                                ctx: Optional[Context]) -> dict:
-    """Resolve identifier → Paper that's at least metadata-in-library.
+    """Read an eligible held record; unknown DOI/arXiv identifiers stay not_found.
 
-    If the identifier resolves to a paper already in library, return it.
-    If it's a DOI/arxiv we don't yet have, fetch metadata and upsert.
-    Returns the same shape as _resolve_identifier but with the new paper
-    promoted to status='found' if metadata fetch succeeded.
+    Resolves canonical identities and aliases without fetching or registering
+    metadata. Discovery and separately admitted registration belong to search.
     """
     await _maybe_progress(ctx, 1, 5, "resolving identifier")
     resolution = await asyncio.to_thread(
@@ -732,7 +754,8 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
                     and (paper.download_status or "") not in DOWNLOAD_STATUS_TERMINAL):
                 if not library.has_pdf(paper.key):
                     download_queue.add(paper.key, priority=concurrency.PRIORITY_URGENT)
-                elif not library.has_extract(paper.key, "md"):
+                elif (not library.has_extract(paper.key, "md")
+                      or pending_ocr_identity(paper, library)):
                     extract_queue.add(paper.key, priority=concurrency.PRIORITY_URGENT)
             rec = _paper_dict(paper, library)
             rec["identifier"] = ident
@@ -969,6 +992,8 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
             # Distinct from the fail-closed "" below: the KEY is absent, not a
             # held paper with no servable text. Mirror library://paper/{key}.
             return json.dumps({"error": "not_found", "key": key})
+        if serving_excluded(paper) or pending_ocr_identity(paper, library):
+            return ""
         if not library.has_extract(key, fmt):
             return ""
         if fmt == "md":

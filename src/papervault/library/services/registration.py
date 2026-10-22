@@ -147,8 +147,63 @@ def _view(library, papers):
     return view
 
 
+def serving_excluded(paper: Paper) -> bool:
+    """Current quarantine and exclusion always fence serving, including old files."""
+    state = paper.acquisition_state
+    return bool(paper.domain_status is not None or state.quarantine or state.policy == Policy.EXCLUDED)
+
+
+def _compatible(paper, candidate):
+    from ..store import _normalize_arxiv, _normalize_doi
+
+    if paper is None:
+        return None
+    left, right = _normalize_doi(paper.doi), _normalize_doi(candidate.get("doi") or "")
+    if left and right:
+        return paper if left == right else None
+    left, right = _normalize_arxiv(paper.arxiv_id), _normalize_arxiv(candidate.get("arxiv_id") or "")
+    if left and right and left != right:
+        return None
+    left_version = re.search(r"v\d+$", paper.arxiv_id, re.I)
+    right_version = re.search(r"v\d+$", candidate.get("arxiv_id") or "", re.I)
+    if (left_version and right_version
+            and left_version.group().lower() != right_version.group().lower()):
+        return None
+    return paper
+
+
 def _find(library, candidate):
-    return library.find(**{name: candidate.get(name) or "" for name in ("doi", "arxiv_id", "title")})
+    """Share preview/registration identity compatibility, including explicit aliases.
+
+    find() may already return a canonical row whose DOI differs from an alias's
+    observation. Validate that observation against the alias before following it.
+    """
+    from ..merge_v2 import resolve_alias
+    from ..store import _normalize_arxiv, _normalize_doi
+
+    aliases = [paper for paper in library._papers.values() if paper.acquisition_state.alias_key]
+    for name, normalize in (("doi", _normalize_doi), ("arxiv_id", _normalize_arxiv),
+                            ("title", normalize_title)):
+        value = candidate.get(name) or ""
+        if not value:
+            continue
+        if name != "title":
+            for alias in aliases:
+                if (normalize(value) == normalize(getattr(alias, name))
+                        and _compatible(alias, candidate) is not None):
+                    # An exact alias identifier can legitimately lead to a
+                    # different canonical DOI, retaining DOI-first precedence.
+                    return resolve_alias(library, alias.key)
+        paper = _compatible(library.find(**{name: value}), candidate)
+        if paper is not None:
+            if paper.acquisition_state.alias_key:
+                paper = _compatible(resolve_alias(library, paper.key), candidate)
+            if paper is not None:
+                return paper
+    paper = _compatible(library._find_preprint_journal_dup(candidate), candidate)
+    if paper is not None and paper.acquisition_state.alias_key:
+        return _compatible(resolve_alias(library, paper.key), candidate)
+    return paper
 
 
 def _fill(paper: Paper, incoming: dict, *, identities=True):
@@ -180,38 +235,23 @@ def _fill(paper: Paper, incoming: dict, *, identities=True):
 
 
 def preview_candidates(library, candidates, *, canonical_keys=None):
-    """Apply the legacy lookup/fill ladder to isolated serving objects only.
+    """Apply version-aware lookup/fill to isolated serving objects only.
 
     The first occurrence keeps its scoring position/snapshot; later aliases may
     enrich its response projection without taking another result slot. Fusion's
     request-local canonical mapping also applies to matches found by preview.
     """
-    from ..store import _normalize_arxiv, _normalize_doi
-
-    def compatible(paper, candidate):
-        if paper is None:
-            return None
-        left, right = _normalize_doi(paper.doi), _normalize_doi(candidate.get("doi") or "")
-        if left and right:
-            return paper if left == right else None
-        left, right = _normalize_arxiv(paper.arxiv_id), _normalize_arxiv(candidate.get("arxiv_id") or "")
-        if left and right and left != right:
-            return None
-        left_version = re.search(r"v\d+$", paper.arxiv_id, re.I)
-        right_version = re.search(r"v\d+$", candidate.get("arxiv_id") or "", re.I)
-        if (left_version and right_version
-                and left_version.group().lower() != right_version.group().lower()):
-            return None
-        return paper
-
     def preview_find(owner, candidate):
         # Title and preprint lookups may find a different explicit version.
         # Serving projections cannot turn that bibliographic match into a merge.
-        paper = (compatible(_find(owner, candidate), candidate)
-                 or compatible(owner._find_preprint_journal_dup(candidate), candidate))
+        paper = _find(owner, candidate)
         if paper is not None and canonical_keys and paper.key in canonical_keys:
-            paper = compatible(owner.get(canonical_keys[paper.key]), candidate)
-        return paper
+            canonical_key = canonical_keys[paper.key]
+            if canonical_key != paper.key:
+                # Bibliographic deduplication is weaker than an explicit alias
+                # identifier and cannot bridge a conflicting DOI or version.
+                paper = _compatible(owner.get(canonical_key), candidate)
+        return paper if paper is not None and not serving_excluded(paper) else None
 
     view, snapshots = _view(library, {}), {}
     for candidate in candidates:
@@ -361,8 +401,8 @@ class RegistrationService:
                 # the identity lock so even a stalled reload cannot block reads.
                 refreshed = set()
                 for candidate in candidates:
-                    existing = _find(view, candidate) or view._find_preprint_journal_dup(candidate)
-                    live = _find(lib, candidate) or lib._find_preprint_journal_dup(candidate)
+                    existing = _find(view, candidate)
+                    live = _find(lib, candidate)
                     existing = existing or (view.get(live.key) if live else None)
                     if existing is None or existing.key in refreshed:
                         continue
@@ -572,10 +612,10 @@ class RegistrationService:
             outcome = {"identity": candidate_identity(candidate), "status": "rejected",
                        "reason": "", "key": None, "download": "not_requested"}
             outcomes.append(outcome)
-            existing = _find(view, candidate) or view._find_preprint_journal_dup(candidate)
+            existing = _find(view, candidate)
             # Current fields + verified-fill reservations (#267), including
             # metadata that workers have not yet saved to the catalog.
-            live = _find(live_view, candidate) or live_view._find_preprint_journal_dup(candidate)
+            live = _find(live_view, candidate)
             rejection = registration_rejection(candidate, known_identity=bool(existing or live))
             if rejection or index >= self.max_candidates:
                 outcome["reason"] = rejection or "registration_budget"
@@ -601,6 +641,12 @@ class RegistrationService:
                        for name in ("doi", "arxiv_id") if candidate.get(name)
                        if (p := lookup.find(**{name: candidate[name]})) is not None}
             if len(matches) > 1:
+                outcome["reason"] = "identity_conflict"
+                continue
+            if existing is None and matches:
+                # The shared arbiter still reserves version-stripped arXiv IDs.
+                # Refuse an incompatible version explicitly; never publish an
+                # identifier-less stub or call the other version a duplicate.
                 outcome["reason"] = "identity_conflict"
                 continue
             if existing and any(

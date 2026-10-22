@@ -278,6 +278,65 @@ async def test_pause_stops_round_before_readmitting_just_deferred_work(knowledge
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("settlement_gap", [False, True])
+async def test_deferred_capacity_reconciles_after_census_and_restart(knowledge, tmp_path, settlement_gap):
+    import json
+
+    from papervault.knowledge.scheduler.catalog import CatalogScheduler
+    from papervault.knowledge.store.build_breaker import BuildPausedError
+    from papervault.store.scheduler_capacity import SchedulerCapacity
+
+    k = knowledge
+    store, job = prepare_fulltext(k, tmp_path)
+    census = {"backend_bytes": 1000, "measured_at": datetime.now(timezone.utc).isoformat()}
+    partial = tmp_path / "private-output"
+    attempts = []
+
+    def capacity():
+        return SchedulerCapacity(tmp_path / "capacity", derivative_roots=(store.root,),
+            estimated_bytes=1000, backend_usage=lambda physical: dict(census), soft_cap=10000)
+
+    def reservation():
+        paths = list((tmp_path / "capacity").glob(".capacity-reservation-*.reserve"))
+        assert len(paths) == 1
+        assert paths[0].stat().st_size == 1000
+        return json.loads(next((tmp_path / "capacity").glob(".scheduler-*.json")).read_text())
+
+    class PausingBackend(_NoBackend):
+        async def submit(self, claim, text, file_path, *, achieved_tier):
+            attempts.append(claim["attempt_id"])
+            partial.write_bytes(b"uncertain private output")
+            raise BuildPausedError("controlled pause after partial execution")
+
+    backend = PausingBackend()
+    scheduler = CatalogScheduler(k, backend, store, breaker=_OpenBuildGate(), capacity_gate=capacity())
+    if settlement_gap:
+        # A process can die after PostgreSQL commits deferral but before the
+        # filesystem reservation is settled. A new gate must recover that gap.
+        scheduler._release_capacity = lambda *args, **kwargs: None
+    first = await scheduler.run_round(only_keys={"A"})
+    assert first["paused"] is True
+    old_attempt = attempts[0]
+    assert k.get_job(job["job_id"])["state"] == "queued"
+    assert reservation()["state"] == ("held" if settlement_gap else "spent")
+    restarted = CatalogScheduler(k, backend, store, breaker=_OpenBuildGate(), capacity_gate=capacity())
+    stale = await restarted.run_round(only_keys={"A"})
+    assert stale["claimed"] == 0
+    assert stale["capacity_blocked"] >= 1
+    assert attempts == [old_attempt]
+    assert reservation()["state"] == "spent"
+    # Only a census begun after settlement can replace the old output budget.
+    census.update(backend_bytes=2000, measured_at=datetime.now(timezone.utc).isoformat())
+    resumed = await restarted.run_round(only_keys={"A"})
+    assert resumed["claimed"] == 1
+    assert len(attempts) == 2 and attempts[0] != attempts[1]
+    assert reservation()["claim"]["attempt_id"] == attempts[1]
+    assert partial.read_bytes() == b"uncertain private output"
+    assert k.get_pin("attempt-pin:" + old_attempt)["kind"] == "recovery"
+    assert k.get_attempt(old_attempt)["cost_state"] == "unknown"
+
+
+@pytest.mark.asyncio
 async def test_pause_after_lease_loss_preserves_unknown_attempt_for_expiry(knowledge, tmp_path):
     from papervault.knowledge.scheduler.catalog import CatalogScheduler
     from papervault.knowledge.store.build_breaker import BuildPausedError

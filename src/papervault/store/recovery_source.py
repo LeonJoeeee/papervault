@@ -186,6 +186,26 @@ def verify_file_dependencies(package, catalog):
     from .knowledge import canonical_recipe
     from .extraction import ExtractionStore
 
+    # A GC intent is permanent reference-admission evidence. A recovery set may
+    # contain either side of its retryable unlink, but cannot excuse a missing
+    # source, selected output, or a different artifact with the same digest.
+    from datetime import datetime, timedelta
+    tables = catalog["tables"]
+    receipts = {row["completion_id"]: row["receipt"] for row in tables["extraction_receipts"]}
+    retention = {row["completion_id"]: row for row in tables.get("extract_retention", [])}
+    disposed = {}
+    for deletion in tables.get("extract_deletions", []):
+        identity = deletion["completion_id"]
+        policy, receipt = retention.get(identity), receipts.get(identity)
+        if (not policy or not policy["disposable"] or not policy["superseded_at"] or not receipt
+                or deletion["state"] not in {"deleting", "deleted"}
+                or deletion["output"] != receipt["output_inventory"][0]
+                or datetime.fromisoformat(policy["superseded_at"]) + timedelta(days=90)
+                   > datetime.fromisoformat(deletion["prepared_at"])
+                or any(h["completion_id"] == identity for h in tables["extraction_heads"])):
+            raise ValueError("invalid recovery extract disposal evidence")
+        disposed[deletion["output"]["path"]] = deletion
+
     def artifact(relative, expected):
         try:
             actual = digest_file(child(package, relative))
@@ -206,7 +226,9 @@ def verify_file_dependencies(package, catalog):
             relative = item["path"]
             if not relative.startswith("extracts/"):
                 raise ValueError("extraction artifact is outside its declared evidence root")
-            artifact("extracts/vault/" + relative.removeprefix("extracts/"), item)
+            location = "extracts/vault/" + relative.removeprefix("extracts/")
+            if relative not in disposed or child(package, location).exists():
+                artifact(location, item)
         retained = child(package, "extracts/vault/versions/" + receipt["completion_id"] + "/completion.json")
         if json.loads(retained.read_bytes()) != receipt:
             raise ValueError("catalog extraction receipt differs from retained completion")
@@ -227,7 +249,9 @@ def verify_file_dependencies(package, catalog):
                 raise ValueError("extraction completion directory identity differs")
             for item in ExtractionStore._validate_evidence(completion):
                 relative = root.relative_to(package).as_posix() + "/" + item["path"].removeprefix("extracts/")
-                artifact(relative, item)
+                if (root != child(package, "extracts/vault") or item["path"] not in disposed
+                        or child(package, relative).exists()):
+                    artifact(relative, item)
     for row in catalog["tables"]["recipes"]:
         if canonical_recipe(row["spec"]) != (row["spec"], row["recipe_digest"]):
             raise ValueError("retained recipe identity differs from catalog")

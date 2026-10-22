@@ -127,6 +127,8 @@ def claim_result(job, attempt):
 
 
 def eligible(k, job, *, current=True):
+    from .extract_lifecycle import admit_input
+    admit_input(k, k.get_input(job["consumed_input_revision"])["manifest"])
     unit = require(k.get_unit(job["unit_id"]), "unit absent")
     require(not unit["quarantine"] and not job["quarantine"], "unit/job quarantined")
     if unit["record_key"]:
@@ -327,6 +329,9 @@ def complete(k, payload, *, publish=False):
 
 
 def dispatch(k, action, operation_id, p):
+    from .extract_lifecycle import ACTIONS, dispatch_lifecycle, admit_input, admit_manifest
+    if action in ACTIONS:
+        return dispatch_lifecycle(k, action, p)
     if action == "register_unit":
         kind = p["kind"]
         require(kind in {"paper", "operator_document", "section"}, "unknown unit kind")
@@ -353,6 +358,7 @@ def dispatch(k, action, operation_id, p):
         if p.get("parent_consumed_input_revision"):
             parent_input = k.get_input(p["parent_consumed_input_revision"])
             require(parent_input and parent_input["unit_id"] == p["parent_unit_id"], "inventory parent input mismatch")
+            admit_input(k, parent_input["manifest"])
         if p["mode"] == "whole":
             require(required == [p["parent_unit_id"]] and not optional, "whole inventory must contain parent exactly once")
         else:
@@ -368,6 +374,8 @@ def dispatch(k, action, operation_id, p):
 
     if action == "set_inventory":
         inventory = require(k.get_inventory(p["parent_unit_id"], p["inventory_revision"]), "inventory missing")
+        if inventory.get("parent_consumed_input_revision"):
+            admit_input(k, k.get_input(inventory["parent_consumed_input_revision"])["manifest"])
         old = k._one("current_inventories", parent_unit_id=p["parent_unit_id"], generation_id=p["generation_id"])
         revision(old, p)
         require(k.get_generation(p["generation_id"])["state"] in {"active", "candidate"}, "generation closed")
@@ -396,6 +404,8 @@ def dispatch(k, action, operation_id, p):
         children.add(p["parent_unit_id"])
         for desired in k._rows("knowledge_requirements", generation_id=p["generation_id"]):
             if desired["unit_id"] in children:
+                if desired["unit_id"] in required:
+                    admit_input(k, k.get_input(desired["consumed_input_revision"])["manifest"])
                 k._update("knowledge_requirements", {"excluded": desired["unit_id"] not in required,
                           "invalidated": desired["invalidated"] or (desired["unit_id"] in required and
                               desired["inventory_revision"] != inventory["inventory_revision"]),
@@ -410,6 +420,7 @@ def dispatch(k, action, operation_id, p):
 
     if action == "register_input":
         validate_input_manifest(p["manifest"])
+        admit_input(k, p["manifest"])
         unit = require(k.get_unit(p["unit_id"]), "unit absent")
         if unit["kind"] == "section":
             mapping_revision = p["manifest"].get("section_definition_revision", p["manifest"].get("section_mapping_revision"))
@@ -453,6 +464,7 @@ def dispatch(k, action, operation_id, p):
         require(source["state"] == "active" and p["expected_manifest_revision"] == source["manifest_revision"] and
                 p["expected_requirements_revision"] == runtime["requirements_revision"], "fork source requirements changed")
         require(not k.get_generation(p["generation_id"]), "fork requires a fresh generation")
+        admit_manifest(k, k.get_manifest(source["generation_id"])["manifest"])
         k._insert("generations", {"generation_id": p["generation_id"], "state": "candidate",
             "requirements_revision": runtime["requirements_revision"], "source_generation_id": source["generation_id"],
             "source_manifest_revision": source["manifest_revision"], "sample": source.get("sample", False)})
@@ -477,6 +489,7 @@ def dispatch(k, action, operation_id, p):
         return {**k.get_generation(p["generation_id"]), "queued_jobs": cursor.rowcount}
 
     if action == "set_requirement":
+        admit_input(k, k.get_input(p["consumed_input_revision"])["manifest"])
         unit = require(k.get_unit(p["unit_id"]), "unit absent")
         generation = require(k.get_generation(p["generation_id"]), "generation absent")
         require(generation["state"] in {"active", "candidate"}, "generation closed")
@@ -515,6 +528,7 @@ def dispatch(k, action, operation_id, p):
         return row
 
     if action == "enqueue":
+        admit_input(k, k.get_input(p["consumed_input_revision"])["manifest"])
         job = k._one("jobs", kind="distill", unit_id=p["unit_id"], consumed_input_revision=p["consumed_input_revision"],
                      recipe_digest=p["recipe_digest"], target_generation=p["generation_id"])
         if job:
@@ -878,6 +892,7 @@ def dispatch(k, action, operation_id, p):
         ttl = p.get("ttl_seconds", 300)
         require(type(ttl) is int and 0 < ttl <= 7200 and bool(p.get("owner")), "reader pin requires owner and bounded TTL")
         manifest = k.get_manifest(p["generation_id"], p["manifest_revision"])
+        admit_manifest(k, manifest["manifest"])
         return k._insert("knowledge_pins", {"pin_id": identifier("reader-pin"), "kind": "reader", "owner": p["owner"],
             "authority_epoch": runtime["authority_epoch"], "namespaces": manifest["manifest"]["aggregate_layers"],
             "generation_id": p["generation_id"], "manifest_revision": p["manifest_revision"],

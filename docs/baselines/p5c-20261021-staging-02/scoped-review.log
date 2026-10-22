@@ -1,0 +1,27 @@
+Reviewer: Codex gpt-6-astra at max, native read-only scoped review.
+Review base: c4ed200cfd3ce5260343bc12228154125a6d2af4 plus the source/test changes bound by validation.json code_sha256.
+
+No remaining Critical or Important findings in the reviewed continuation.
+
+Two Important findings were resolved during review:
+
+- src/papervault/store/scheduler_capacity.py:322: stale owner cache now refreshes after another worker reconciles the reservation, while replacement ownership checks remain.
+- src/papervault/store/extract_lifecycle.py:249: first verified vault binding now establishes a conservative retention clock for migrated absolute-path and symlink selections.
+
+Inspected the fixes and added regressions. Accounting lock order, deferred claim settlement, manifest dependencies, and transactional selection clocks appear consistent with the contract.
+
+Source-review limits: no tests rerun or CI verification. Final captured results and hashes were assessed separately below. Pre-existing recovery-replay capacity wiring remains explicitly outside scope.
+
+Scoped technical assessment only; no merge authorization.
+
+Final read-only evidence assessment by the same reviewer:
+
+No remaining evidence or scope findings.
+
+- Both artifact hash manifests, 27 code hashes, and 30 environment hashes match.
+- Logs support 703 store passes, 3,950 suite passes, stated skips/warnings, and Ruff success.
+- Drill metrics match exactly: 1.295609 s total, 0.034402 s GC, 0.348493 s rebuild, 120 s windows, zero observed manifest-read interruption.
+- Historical measured artifacts remain unchanged. Transient ownership wording is removed.
+- Source diff matches the accepted review.
+
+Read-only evidence assessment; no tests rerun, CI verification, or merge authorization.

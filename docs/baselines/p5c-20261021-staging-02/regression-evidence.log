@@ -1,0 +1,770 @@
+Regression evidence: capacity admission/settlement, deferred attempts, excluded manifest entries and last-selection retention.
+
+Command: .venv/bin/pytest tests/knowledge/test_catalog_capacity.py -k 'census_cannot_race or ordered_settlement' -q
+Exit code: 1
+FF....                                                                   [100%]
+=================================== FAILURES ===================================
+_________ test_admission_census_cannot_race_newer_settlement[acquire] __________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-641/test_admission_census_cannot_r0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f22f1134050>
+kind = 'acquire'
+
+    @pytest.mark.parametrize("kind", ["acquire", "intake"])
+    def test_admission_census_cannot_race_newer_settlement(tmp_path, monkeypatch, kind):
+        """A samples 40; B materializes 40 and settles; A must not fund another 40."""
+        import fcntl
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event, get_ident
+
+        sampled, resume, settlement_progress = Event(), Event(), Event()
+        settlement_thread = []
+        backend = [40]
+        owner = race_gate(tmp_path, lambda physical: backend[0])
+        claim = {"job_id": "old-job", "attempt_id": "old-attempt", "submission_id": "old-submission"}
+        owner.acquire("old-job")
+        owner.bind("old-job", claim)
+        protected = tmp_path / "protected-source"
+        protected.write_bytes(b"source")
+        outputs = tmp_path / "outputs"
+        outputs.mkdir()
+        current = outputs / "current-version"
+        current.write_bytes(b"current")
+
+        def read_old_census(physical):
+            value = backend[0]
+            sampled.set()
+            assert resume.wait(5)
+            return value
+
+        # Observe a real blocking lock without timing sleeps. The old implementation
+        # lets B finish; the fix must block B until A has accounted for its reservation.
+        flock = fcntl.flock
+
+        def observed_lock(fd, operation):
+            if settlement_thread == [get_ident()] and operation == fcntl.LOCK_EX:
+                try:
+                    return flock(fd, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    settlement_progress.set()
+            return flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", observed_lock)
+        contender = race_gate(tmp_path, read_old_census)
+
+        def settle():
+            settlement_thread.append(get_ident())
+            backend[0] = 80
+            try:
+                return owner.release("old-job", claim=claim, reconciled=True)
+            finally:
+                settlement_progress.set()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            admission = pool.submit(attempt_admission, contender, kind)
+            try:
+                assert sampled.wait(5)
+                settlement = pool.submit(settle)
+                assert settlement_progress.wait(5)
+            finally:
+                resume.set()
+            admitted = admission.result(timeout=5)
+            assert settlement.result(timeout=5) is True
+>       assert admitted is False, "stale census admitted backend 80 + new budget 40 over cap 100"
+E       AssertionError: stale census admitted backend 80 + new budget 40 over cap 100
+E       assert True is False
+
+tests/knowledge/test_catalog_capacity.py:143: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  ks.capacity:scheduler_capacity.py:112 derivative capacity 80% alert: projected=80 soft_cap=100 held=0
+WARNING  ks.capacity:scheduler_capacity.py:112 derivative capacity 80% alert: projected=87 soft_cap=100 held=0
+__________ test_admission_census_cannot_race_newer_settlement[intake] __________
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-641/test_admission_census_cannot_r1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x7f22f192fe10>
+kind = 'intake'
+
+    @pytest.mark.parametrize("kind", ["acquire", "intake"])
+    def test_admission_census_cannot_race_newer_settlement(tmp_path, monkeypatch, kind):
+        """A samples 40; B materializes 40 and settles; A must not fund another 40."""
+        import fcntl
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Event, get_ident
+
+        sampled, resume, settlement_progress = Event(), Event(), Event()
+        settlement_thread = []
+        backend = [40]
+        owner = race_gate(tmp_path, lambda physical: backend[0])
+        claim = {"job_id": "old-job", "attempt_id": "old-attempt", "submission_id": "old-submission"}
+        owner.acquire("old-job")
+        owner.bind("old-job", claim)
+        protected = tmp_path / "protected-source"
+        protected.write_bytes(b"source")
+        outputs = tmp_path / "outputs"
+        outputs.mkdir()
+        current = outputs / "current-version"
+        current.write_bytes(b"current")
+
+        def read_old_census(physical):
+            value = backend[0]
+            sampled.set()
+            assert resume.wait(5)
+            return value
+
+        # Observe a real blocking lock without timing sleeps. The old implementation
+        # lets B finish; the fix must block B until A has accounted for its reservation.
+        flock = fcntl.flock
+
+        def observed_lock(fd, operation):
+            if settlement_thread == [get_ident()] and operation == fcntl.LOCK_EX:
+                try:
+                    return flock(fd, operation | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    settlement_progress.set()
+            return flock(fd, operation)
+
+        monkeypatch.setattr(fcntl, "flock", observed_lock)
+        contender = race_gate(tmp_path, read_old_census)
+
+        def settle():
+            settlement_thread.append(get_ident())
+            backend[0] = 80
+            try:
+                return owner.release("old-job", claim=claim, reconciled=True)
+            finally:
+                settlement_progress.set()
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            admission = pool.submit(attempt_admission, contender, kind)
+            try:
+                assert sampled.wait(5)
+                settlement = pool.submit(settle)
+                assert settlement_progress.wait(5)
+            finally:
+                resume.set()
+            admitted = admission.result(timeout=5)
+            assert settlement.result(timeout=5) is True
+>       assert admitted is False, "stale census admitted backend 80 + new budget 40 over cap 100"
+E       AssertionError: stale census admitted backend 80 + new budget 40 over cap 100
+E       assert True is False
+
+tests/knowledge/test_catalog_capacity.py:143: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  ks.capacity:scheduler_capacity.py:112 derivative capacity 80% alert: projected=80 soft_cap=100 held=0
+WARNING  ks.capacity:scheduler_capacity.py:112 derivative capacity 80% alert: projected=87 soft_cap=100 held=0
+=========================== short test summary info ============================
+FAILED tests/knowledge/test_catalog_capacity.py::test_admission_census_cannot_race_newer_settlement[acquire]
+FAILED tests/knowledge/test_catalog_capacity.py::test_admission_census_cannot_race_newer_settlement[intake]
+2 failed, 4 passed, 39 deselected in 0.38s
+
+Command: .venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/store/test_knowledge_deferrals.py -k deferred_capacity -q
+Exit code: 1
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+______ test_deferred_capacity_reconciles_after_census_and_restart[False] _______
+
+knowledge = <papervault.store.knowledge.KnowledgeRepository object at 0x7358e97db770>
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-643/test_deferred_capacity_reconci0')
+settlement_gap = False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("settlement_gap", [False, True])
+    async def test_deferred_capacity_reconciles_after_census_and_restart(knowledge, tmp_path, settlement_gap):
+        import json
+
+        from papervault.knowledge.scheduler.catalog import CatalogScheduler
+        from papervault.knowledge.store.build_breaker import BuildPausedError
+        from papervault.store.scheduler_capacity import SchedulerCapacity
+
+        k = knowledge
+        store, job = prepare_fulltext(k, tmp_path)
+        census = {"backend_bytes": 1000, "measured_at": datetime.now(timezone.utc).isoformat()}
+        partial = tmp_path / "private-output"
+        attempts = []
+
+        def capacity():
+            return SchedulerCapacity(tmp_path / "capacity", derivative_roots=(store.root,),
+                estimated_bytes=1000, backend_usage=lambda physical: dict(census), soft_cap=10000)
+
+        def reservation():
+            paths = list((tmp_path / "capacity").glob(".capacity-reservation-*.reserve"))
+            assert len(paths) == 1
+            assert paths[0].stat().st_size == 1000
+            return json.loads(next((tmp_path / "capacity").glob(".scheduler-*.json")).read_text())
+
+        class PausingBackend(_NoBackend):
+            async def submit(self, claim, text, file_path, *, achieved_tier):
+                attempts.append(claim["attempt_id"])
+                partial.write_bytes(b"uncertain private output")
+                raise BuildPausedError("controlled pause after partial execution")
+
+        backend = PausingBackend()
+        scheduler = CatalogScheduler(k, backend, store, breaker=_OpenBuildGate(), capacity_gate=capacity())
+        if settlement_gap:
+            # A process can die after PostgreSQL commits deferral but before the
+            # filesystem reservation is settled. A new gate must recover that gap.
+            scheduler._release_capacity = lambda *args, **kwargs: None
+        first = await scheduler.run_round(only_keys={"A"})
+        assert first["paused"] is True
+        old_attempt = attempts[0]
+        assert k.get_job(job["job_id"])["state"] == "queued"
+>       assert reservation()["state"] == ("held" if settlement_gap else "spent")
+E       AssertionError: assert 'held' == 'spent'
+E
+E         - spent
+E         + held
+
+tests/store/test_knowledge_deferrals.py:321: AssertionError
+_______ test_deferred_capacity_reconciles_after_census_and_restart[True] _______
+
+knowledge = <papervault.store.knowledge.KnowledgeRepository object at 0x7358e8f96490>
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-643/test_deferred_capacity_reconci1')
+settlement_gap = True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("settlement_gap", [False, True])
+    async def test_deferred_capacity_reconciles_after_census_and_restart(knowledge, tmp_path, settlement_gap):
+        import json
+
+        from papervault.knowledge.scheduler.catalog import CatalogScheduler
+        from papervault.knowledge.store.build_breaker import BuildPausedError
+        from papervault.store.scheduler_capacity import SchedulerCapacity
+
+        k = knowledge
+        store, job = prepare_fulltext(k, tmp_path)
+        census = {"backend_bytes": 1000, "measured_at": datetime.now(timezone.utc).isoformat()}
+        partial = tmp_path / "private-output"
+        attempts = []
+
+        def capacity():
+            return SchedulerCapacity(tmp_path / "capacity", derivative_roots=(store.root,),
+                estimated_bytes=1000, backend_usage=lambda physical: dict(census), soft_cap=10000)
+
+        def reservation():
+            paths = list((tmp_path / "capacity").glob(".capacity-reservation-*.reserve"))
+            assert len(paths) == 1
+            assert paths[0].stat().st_size == 1000
+            return json.loads(next((tmp_path / "capacity").glob(".scheduler-*.json")).read_text())
+
+        class PausingBackend(_NoBackend):
+            async def submit(self, claim, text, file_path, *, achieved_tier):
+                attempts.append(claim["attempt_id"])
+                partial.write_bytes(b"uncertain private output")
+                raise BuildPausedError("controlled pause after partial execution")
+
+        backend = PausingBackend()
+        scheduler = CatalogScheduler(k, backend, store, breaker=_OpenBuildGate(), capacity_gate=capacity())
+        if settlement_gap:
+            # A process can die after PostgreSQL commits deferral but before the
+            # filesystem reservation is settled. A new gate must recover that gap.
+            scheduler._release_capacity = lambda *args, **kwargs: None
+        first = await scheduler.run_round(only_keys={"A"})
+        assert first["paused"] is True
+        old_attempt = attempts[0]
+        assert k.get_job(job["job_id"])["state"] == "queued"
+        assert reservation()["state"] == ("held" if settlement_gap else "spent")
+        restarted = CatalogScheduler(k, backend, store, breaker=_OpenBuildGate(), capacity_gate=capacity())
+        stale = await restarted.run_round(only_keys={"A"})
+        assert stale["claimed"] == 0
+        assert stale["capacity_blocked"] >= 1
+        assert attempts == [old_attempt]
+>       assert reservation()["state"] == "spent"
+E       AssertionError: assert 'held' == 'spent'
+E
+E         - spent
+E         + held
+
+tests/store/test_knowledge_deferrals.py:327: AssertionError
+=========================== short test summary info ============================
+FAILED tests/store/test_knowledge_deferrals.py::test_deferred_capacity_reconciles_after_census_and_restart[False]
+FAILED tests/store/test_knowledge_deferrals.py::test_deferred_capacity_reconciles_after_census_and_restart[True]
+2 failed, 14 deselected in 1.82s
+
+Command: .venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/store/test_extraction_gc_postgres.py -k 'excluded_historical or last_record_selection' -q
+Exit code: 1
+FFFFF                                                                    [100%]
+=================================== FAILURES ===================================
+________ test_excluded_historical_input_gc_does_not_block_valid_reader _________
+
+superseded = (<papervault.store.knowledge.KnowledgeRepository object at 0x726aa8f820d0>, {'schema_version': 1, 'completion_id': 'b3...ey': 'A', 'title': 'Exact source'}}, ...}, PosixPath('/tmp/pytest-of-leon/pytest-645/test_excluded_historical_input0'))
+
+    def test_excluded_historical_input_gc_does_not_block_valid_reader(superseded):
+        k, first, _, vault, lease = ready(superseded)
+        desired = consumer(k, first)
+        command(k, 'create_generation', {'generation_id': 'active', 'candidate': False})
+        command(k, 'set_requirement', {**desired, 'generation_id': 'active', 'excluded': True})
+        command(k, 'register_unit', {'unit_id': 'unrelated', 'kind': 'operator_document', 'identity': 'unrelated'})
+        command(k, 'register_input', {'unit_id': 'unrelated', 'consumed_input_revision': 'unrelated-input',
+            'manifest': {'metadata_revision': 'new', 'artifacts': [], 'upstream_derivation_ids': []}})
+        command(k, 'set_requirement', {**desired, 'unit_id': 'unrelated', 'generation_id': 'active',
+            'consumed_input_revision': 'unrelated-input'})
+        pointer = k.get_serving_manifest()
+        before = command(k, 'pin_manifest', {'owner': 'early-reader', 'generation_id': 'active',
+            'manifest_revision': pointer['manifest_revision'], 'expected_serving_revision': pointer['revision']})
+        assert before['pin_id']
+>       api().collect_extract(k, vault, first['completion_id'], lease)
+
+tests/store/test_extraction_gc_postgres.py:433:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src/papervault/store/extraction_gc.py:108: in collect_extract
+    intent = k.command("prepare_extract_deletion", "gc-prepare:" + uuid4().hex, payload)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/papervault/store/knowledge.py:282: in command
+    result = dispatch(self, action, operation_id, payload)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/papervault/store/knowledge_commands.py:334: in dispatch
+    return dispatch_lifecycle(k, action, p)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+src/papervault/store/extract_lifecycle.py:268: in dispatch_lifecycle
+    require(not reasons, "extract cannot be deleted: " + ", ".join(reasons))
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+value = False, reason = 'extract cannot be deleted: pinned'
+
+    def require(value, reason):
+        if not value:
+>           raise ClaimRejected(reason)
+E           papervault.store.knowledge.ClaimRejected: extract cannot be deleted: pinned
+
+src/papervault/store/knowledge_commands.py:26: ClaimRejected
+____ test_retention_starts_when_last_record_selection_ceases[completion_id] ____
+
+extraction_catalog = <papervault.store.knowledge.KnowledgeRepository object at 0x726aa7e70510>
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-645/test_retention_starts_when_las0')
+selection = 'completion_id'
+
+    @pytest.mark.parametrize('selection', ['completion_id', 'relative_path', 'absolute_path', 'symlink'])
+    def test_retention_starts_when_last_record_selection_ceases(extraction_catalog, tmp_path, selection):
+        k, vault = extraction_catalog, tmp_path
+        first = frozen(k, vault)
+        publish(k, first, vault)
+        output = first['output_inventory'][0]['path']
+        if selection == 'completion_id':
+            fields = {'extraction_completion_id': first['completion_id']}
+        elif selection == 'relative_path':
+            fields = {'md_path': output}
+        elif selection == 'absolute_path':
+            fields = {'md_path': str(vault / output)}
+        else:
+            alias = vault / 'selected.md'
+            alias.symlink_to(vault / output)
+            fields = {'md_path': str(alias)}
+
+        def select(key, value):
+            record = k.repository.get(key)
+            payload = dict(record.payload) if record else {'key': key, 'title': key}
+            for field in ('extraction_completion_id', 'md_path'):
+                payload.pop(field, None)
+            k.repository.upsert(Record.from_payload(key, {**payload, **value}),
+                expected_revision=record.revision if record else 0, audit=AuditEvent('test', 'selection'))
+
+        select('A', fields)
+        select('B', fields)
+        second = frozen(k, vault, previous=first['completion_id'])
+        publish(k, second, vault, expected_head_revision=1)
+        policy(k, first, vault)
+>       assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] is None
+E       AssertionError: assert datetime.datetime(2026, 10, 21, 13, 52, 6, 524574, tzinfo=zoneinfo.ZoneInfo(key='Etc/UTC')) is None
+
+tests/store/test_extraction_gc_postgres.py:473: AssertionError
+____ test_retention_starts_when_last_record_selection_ceases[relative_path] ____
+
+extraction_catalog = <papervault.store.knowledge.KnowledgeRepository object at 0x726aa873a050>
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-645/test_retention_starts_when_las1')
+selection = 'relative_path'
+
+    @pytest.mark.parametrize('selection', ['completion_id', 'relative_path', 'absolute_path', 'symlink'])
+    def test_retention_starts_when_last_record_selection_ceases(extraction_catalog, tmp_path, selection):
+        k, vault = extraction_catalog, tmp_path
+        first = frozen(k, vault)
+        publish(k, first, vault)
+        output = first['output_inventory'][0]['path']
+        if selection == 'completion_id':
+            fields = {'extraction_completion_id': first['completion_id']}
+        elif selection == 'relative_path':
+            fields = {'md_path': output}
+        elif selection == 'absolute_path':
+            fields = {'md_path': str(vault / output)}
+        else:
+            alias = vault / 'selected.md'
+            alias.symlink_to(vault / output)
+            fields = {'md_path': str(alias)}
+
+        def select(key, value):
+            record = k.repository.get(key)
+            payload = dict(record.payload) if record else {'key': key, 'title': key}
+            for field in ('extraction_completion_id', 'md_path'):
+                payload.pop(field, None)
+            k.repository.upsert(Record.from_payload(key, {**payload, **value}),
+                expected_revision=record.revision if record else 0, audit=AuditEvent('test', 'selection'))
+
+        select('A', fields)
+        select('B', fields)
+        second = frozen(k, vault, previous=first['completion_id'])
+        publish(k, second, vault, expected_head_revision=1)
+        policy(k, first, vault)
+>       assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] is None
+E       AssertionError: assert datetime.datetime(2026, 10, 21, 13, 52, 7, 228077, tzinfo=zoneinfo.ZoneInfo(key='Etc/UTC')) is None
+
+tests/store/test_extraction_gc_postgres.py:473: AssertionError
+____ test_retention_starts_when_last_record_selection_ceases[absolute_path] ____
+
+extraction_catalog = <papervault.store.knowledge.KnowledgeRepository object at 0x726aa872cf50>
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-645/test_retention_starts_when_las2')
+selection = 'absolute_path'
+
+    @pytest.mark.parametrize('selection', ['completion_id', 'relative_path', 'absolute_path', 'symlink'])
+    def test_retention_starts_when_last_record_selection_ceases(extraction_catalog, tmp_path, selection):
+        k, vault = extraction_catalog, tmp_path
+        first = frozen(k, vault)
+        publish(k, first, vault)
+        output = first['output_inventory'][0]['path']
+        if selection == 'completion_id':
+            fields = {'extraction_completion_id': first['completion_id']}
+        elif selection == 'relative_path':
+            fields = {'md_path': output}
+        elif selection == 'absolute_path':
+            fields = {'md_path': str(vault / output)}
+        else:
+            alias = vault / 'selected.md'
+            alias.symlink_to(vault / output)
+            fields = {'md_path': str(alias)}
+
+        def select(key, value):
+            record = k.repository.get(key)
+            payload = dict(record.payload) if record else {'key': key, 'title': key}
+            for field in ('extraction_completion_id', 'md_path'):
+                payload.pop(field, None)
+            k.repository.upsert(Record.from_payload(key, {**payload, **value}),
+                expected_revision=record.revision if record else 0, audit=AuditEvent('test', 'selection'))
+
+        select('A', fields)
+        select('B', fields)
+        second = frozen(k, vault, previous=first['completion_id'])
+        publish(k, second, vault, expected_head_revision=1)
+        policy(k, first, vault)
+>       assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] is None
+E       AssertionError: assert datetime.datetime(2026, 10, 21, 13, 52, 7, 956925, tzinfo=zoneinfo.ZoneInfo(key='Etc/UTC')) is None
+
+tests/store/test_extraction_gc_postgres.py:473: AssertionError
+_______ test_retention_starts_when_last_record_selection_ceases[symlink] _______
+
+extraction_catalog = <papervault.store.knowledge.KnowledgeRepository object at 0x726aa8fab770>
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-645/test_retention_starts_when_las3')
+selection = 'symlink'
+
+    @pytest.mark.parametrize('selection', ['completion_id', 'relative_path', 'absolute_path', 'symlink'])
+    def test_retention_starts_when_last_record_selection_ceases(extraction_catalog, tmp_path, selection):
+        k, vault = extraction_catalog, tmp_path
+        first = frozen(k, vault)
+        publish(k, first, vault)
+        output = first['output_inventory'][0]['path']
+        if selection == 'completion_id':
+            fields = {'extraction_completion_id': first['completion_id']}
+        elif selection == 'relative_path':
+            fields = {'md_path': output}
+        elif selection == 'absolute_path':
+            fields = {'md_path': str(vault / output)}
+        else:
+            alias = vault / 'selected.md'
+            alias.symlink_to(vault / output)
+            fields = {'md_path': str(alias)}
+
+        def select(key, value):
+            record = k.repository.get(key)
+            payload = dict(record.payload) if record else {'key': key, 'title': key}
+            for field in ('extraction_completion_id', 'md_path'):
+                payload.pop(field, None)
+            k.repository.upsert(Record.from_payload(key, {**payload, **value}),
+                expected_revision=record.revision if record else 0, audit=AuditEvent('test', 'selection'))
+
+        select('A', fields)
+        select('B', fields)
+        second = frozen(k, vault, previous=first['completion_id'])
+        publish(k, second, vault, expected_head_revision=1)
+        policy(k, first, vault)
+>       assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] is None
+E       AssertionError: assert datetime.datetime(2026, 10, 21, 13, 52, 8, 706046, tzinfo=zoneinfo.ZoneInfo(key='Etc/UTC')) is None
+
+tests/store/test_extraction_gc_postgres.py:473: AssertionError
+=========================== short test summary info ============================
+FAILED tests/store/test_extraction_gc_postgres.py::test_excluded_historical_input_gc_does_not_block_valid_reader
+FAILED tests/store/test_extraction_gc_postgres.py::test_retention_starts_when_last_record_selection_ceases[completion_id]
+FAILED tests/store/test_extraction_gc_postgres.py::test_retention_starts_when_last_record_selection_ceases[relative_path]
+FAILED tests/store/test_extraction_gc_postgres.py::test_retention_starts_when_last_record_selection_ceases[absolute_path]
+FAILED tests/store/test_extraction_gc_postgres.py::test_retention_starts_when_last_record_selection_ceases[symlink]
+5 failed, 37 deselected in 3.91s
+
+Command: .venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/knowledge/test_catalog_capacity.py tests/store/test_derivative_capacity.py tests/store/test_knowledge_deferrals.py -q
+Exit code: 0
+........................................................................ [ 72%]
+............................                                             [100%]
+100 passed in 11.02s
+
+Command: .venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/store/test_extraction_gc_postgres.py tests/store/test_extraction_postgres.py -q
+Exit code: 0
+........................................................................ [ 94%]
+....                                                                     [100%]
+76 passed in 22.89s
+
+Changed test assumptions: the old integer-census test required settlement while admission sampled without serialization; it now finishes admission before settlement and still proves stale censuses keep the budget charged. The new exact race tests independently cover concurrent settlement. Five existing record-reference/alias cases assumed immediate GC after removing a record selection; each now asserts retention refusal and explicitly ages the new clock before checking deletion and late-reference rejection. The excluded-entry reader test now asserts reader admission before/after collection, while re-enabling the tombstoned requirement is still refused.
+
+Command: .venv/bin/pytest tests/knowledge/test_catalog_capacity.py -k owner_can_readmit -q
+Exit code: 1
+FF                                                                       [100%]
+=================================== FAILURES ===================================
+_ test_owner_can_readmit_after_another_worker_reconciles_spent_charge[intake] __
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-648/test_owner_can_readmit_after_a0')
+sweeper = 'intake'
+
+    @pytest.mark.parametrize("sweeper", ["intake", "acquire"])
+    def test_owner_can_readmit_after_another_worker_reconciles_spent_charge(tmp_path, sweeper):
+        owner = make_gate(tmp_path)
+        census = {"backend_bytes": 1000, "measured_at": datetime.now(timezone.utc).isoformat()}
+        owner.backend_usage = lambda physical: dict(census)
+        old = {"job_id": "job", "attempt_id": "old", "submission_id": "old-submission"}
+        owner.acquire("job")
+        owner.bind("job", old)
+        assert owner.release("job", claim=old, reconciled=True) is False
+        assert reserved(owner) == 1000
+        census.update(backend_bytes=2000, measured_at=datetime.now(timezone.utc).isoformat())
+        other = make_gate(tmp_path)
+        other.backend_usage = lambda physical: dict(census)
+        assert attempt_admission(other, sweeper) is True
+        if sweeper == "acquire":
+            assert other.release("new-job") is True
+        assert reserved(owner) == 0
+>       assert owner.acquire("job", reuse=False)["admitted"] is True
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/knowledge/test_catalog_capacity.py:625:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src/papervault/store/scheduler_capacity.py:314: in acquire
+    return self._acquire(job_id, physical=physical, reuse=reuse)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <papervault.store.scheduler_capacity.SchedulerCapacity object at 0x7cc633b981a0>
+job_id = 'job', physical = True, reuse = False
+
+    def _acquire(self, job_id, *, physical, reuse):
+        identity, filename, metadata = self._names(job_id)
+        extra, stamp, metadata_sample = self._usage(physical)
+        self._reconcile_spent(stamp, metadata_sample=metadata_sample)
+        estimate = self.estimated_bytes() if callable(self.estimated_bytes) else self.estimated_bytes
+        _sizes(estimate, extra, self.soft_cap)
+        if job_id in self._held:
+            if not reuse:
+>               raise ValueError("unreconciled scheduler capacity reservation prevents new admission")
+E               ValueError: unreconciled scheduler capacity reservation prevents new admission
+
+src/papervault/store/scheduler_capacity.py:324: ValueError
+_ test_owner_can_readmit_after_another_worker_reconciles_spent_charge[acquire] _
+
+tmp_path = PosixPath('/tmp/pytest-of-leon/pytest-648/test_owner_can_readmit_after_a1')
+sweeper = 'acquire'
+
+    @pytest.mark.parametrize("sweeper", ["intake", "acquire"])
+    def test_owner_can_readmit_after_another_worker_reconciles_spent_charge(tmp_path, sweeper):
+        owner = make_gate(tmp_path)
+        census = {"backend_bytes": 1000, "measured_at": datetime.now(timezone.utc).isoformat()}
+        owner.backend_usage = lambda physical: dict(census)
+        old = {"job_id": "job", "attempt_id": "old", "submission_id": "old-submission"}
+        owner.acquire("job")
+        owner.bind("job", old)
+        assert owner.release("job", claim=old, reconciled=True) is False
+        assert reserved(owner) == 1000
+        census.update(backend_bytes=2000, measured_at=datetime.now(timezone.utc).isoformat())
+        other = make_gate(tmp_path)
+        other.backend_usage = lambda physical: dict(census)
+        assert attempt_admission(other, sweeper) is True
+        if sweeper == "acquire":
+            assert other.release("new-job") is True
+        assert reserved(owner) == 0
+>       assert owner.acquire("job", reuse=False)["admitted"] is True
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/knowledge/test_catalog_capacity.py:625:
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+src/papervault/store/scheduler_capacity.py:314: in acquire
+    return self._acquire(job_id, physical=physical, reuse=reuse)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+self = <papervault.store.scheduler_capacity.SchedulerCapacity object at 0x7cc633b4e0d0>
+job_id = 'job', physical = True, reuse = False
+
+    def _acquire(self, job_id, *, physical, reuse):
+        identity, filename, metadata = self._names(job_id)
+        extra, stamp, metadata_sample = self._usage(physical)
+        self._reconcile_spent(stamp, metadata_sample=metadata_sample)
+        estimate = self.estimated_bytes() if callable(self.estimated_bytes) else self.estimated_bytes
+        _sizes(estimate, extra, self.soft_cap)
+        if job_id in self._held:
+            if not reuse:
+>               raise ValueError("unreconciled scheduler capacity reservation prevents new admission")
+E               ValueError: unreconciled scheduler capacity reservation prevents new admission
+
+src/papervault/store/scheduler_capacity.py:324: ValueError
+=========================== short test summary info ============================
+FAILED tests/knowledge/test_catalog_capacity.py::test_owner_can_readmit_after_another_worker_reconciles_spent_charge[intake]
+FAILED tests/knowledge/test_catalog_capacity.py::test_owner_can_readmit_after_another_worker_reconciles_spent_charge[acquire]
+2 failed, 45 deselected in 0.22s
+
+Command: .venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/store/test_extraction_gc_postgres.py -k first_vault_binding -q
+Exit code: 1
+FFFF                                                                     [100%]
+=================================== FAILURES ===================================
+_ test_first_vault_binding_establishes_conservative_migrated_selection_clock[False-absolute] _
+
+superseded = (<papervault.store.knowledge.KnowledgeRepository object at 0x7af1a699e850>, {'schema_version': 1, 'completion_id': '71...ey': 'A', 'title': 'Exact source'}}, ...}, PosixPath('/tmp/pytest-of-leon/pytest-650/test_first_vault_binding_estab0'))
+alias = 'absolute', still_selected = False
+
+    @pytest.mark.parametrize('alias', ['absolute', 'symlink'])
+    @pytest.mark.parametrize('still_selected', [False, True])
+    def test_first_vault_binding_establishes_conservative_migrated_selection_clock(superseded, alias, still_selected):
+        k, first, _, vault = superseded
+        # P5a migrations have no verified vault binding or reliable selection clock.
+        k.connection.execute(sql.SQL('UPDATE {} SET vault=NULL WHERE completion_id=%s').format(
+            k.repository._table('extract_retention')), (first['completion_id'],))
+        selected = vault / first['output_inventory'][0]['path']
+        if alias == 'symlink':
+            link = vault / 'selected.md'
+            link.symlink_to(selected)
+            selected = link
+        k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'Migrated selection',
+            'md_path': str(selected)}), expected_revision=0, audit=AuditEvent('test', 'migrated_selection'))
+        age(k, first)
+        start = datetime.now(timezone.utc)
+        if not still_selected:
+            k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'New selection'}),
+                expected_revision=1, audit=AuditEvent('test', 'advance'))
+        bound = policy(k, first, vault)
+        if still_selected:
+            assert bound['superseded_at'] is None
+            k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'New selection'}),
+                expected_revision=1, audit=AuditEvent('test', 'advance'))
+>       assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] >= start
+E       AssertionError: assert datetime.datetime(2026, 7, 22, 14, 1, 0, 921248, tzinfo=zoneinfo.ZoneInfo(key='Etc/UTC')) >= datetime.datetime(2026, 10, 21, 14, 1, 0, 922508, tzinfo=datetime.timezone.utc)
+
+tests/store/test_extraction_gc_postgres.py:524: AssertionError
+_ test_first_vault_binding_establishes_conservative_migrated_selection_clock[False-symlink] _
+
+superseded = (<papervault.store.knowledge.KnowledgeRepository object at 0x7af1a6835040>, {'schema_version': 1, 'completion_id': '91...ey': 'A', 'title': 'Exact source'}}, ...}, PosixPath('/tmp/pytest-of-leon/pytest-650/test_first_vault_binding_estab1'))
+alias = 'symlink', still_selected = False
+
+    @pytest.mark.parametrize('alias', ['absolute', 'symlink'])
+    @pytest.mark.parametrize('still_selected', [False, True])
+    def test_first_vault_binding_establishes_conservative_migrated_selection_clock(superseded, alias, still_selected):
+        k, first, _, vault = superseded
+        # P5a migrations have no verified vault binding or reliable selection clock.
+        k.connection.execute(sql.SQL('UPDATE {} SET vault=NULL WHERE completion_id=%s').format(
+            k.repository._table('extract_retention')), (first['completion_id'],))
+        selected = vault / first['output_inventory'][0]['path']
+        if alias == 'symlink':
+            link = vault / 'selected.md'
+            link.symlink_to(selected)
+            selected = link
+        k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'Migrated selection',
+            'md_path': str(selected)}), expected_revision=0, audit=AuditEvent('test', 'migrated_selection'))
+        age(k, first)
+        start = datetime.now(timezone.utc)
+        if not still_selected:
+            k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'New selection'}),
+                expected_revision=1, audit=AuditEvent('test', 'advance'))
+        bound = policy(k, first, vault)
+        if still_selected:
+            assert bound['superseded_at'] is None
+            k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'New selection'}),
+                expected_revision=1, audit=AuditEvent('test', 'advance'))
+>       assert k._one('extract_retention', completion_id=first['completion_id'])['superseded_at'] >= start
+E       AssertionError: assert datetime.datetime(2026, 7, 22, 14, 1, 1, 453505, tzinfo=zoneinfo.ZoneInfo(key='Etc/UTC')) >= datetime.datetime(2026, 10, 21, 14, 1, 1, 454811, tzinfo=datetime.timezone.utc)
+
+tests/store/test_extraction_gc_postgres.py:524: AssertionError
+_ test_first_vault_binding_establishes_conservative_migrated_selection_clock[True-absolute] _
+
+superseded = (<papervault.store.knowledge.KnowledgeRepository object at 0x7af1a68a42f0>, {'schema_version': 1, 'completion_id': '8a...ey': 'A', 'title': 'Exact source'}}, ...}, PosixPath('/tmp/pytest-of-leon/pytest-650/test_first_vault_binding_estab2'))
+alias = 'absolute', still_selected = True
+
+    @pytest.mark.parametrize('alias', ['absolute', 'symlink'])
+    @pytest.mark.parametrize('still_selected', [False, True])
+    def test_first_vault_binding_establishes_conservative_migrated_selection_clock(superseded, alias, still_selected):
+        k, first, _, vault = superseded
+        # P5a migrations have no verified vault binding or reliable selection clock.
+        k.connection.execute(sql.SQL('UPDATE {} SET vault=NULL WHERE completion_id=%s').format(
+            k.repository._table('extract_retention')), (first['completion_id'],))
+        selected = vault / first['output_inventory'][0]['path']
+        if alias == 'symlink':
+            link = vault / 'selected.md'
+            link.symlink_to(selected)
+            selected = link
+        k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'Migrated selection',
+            'md_path': str(selected)}), expected_revision=0, audit=AuditEvent('test', 'migrated_selection'))
+        age(k, first)
+        start = datetime.now(timezone.utc)
+        if not still_selected:
+            k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'New selection'}),
+                expected_revision=1, audit=AuditEvent('test', 'advance'))
+        bound = policy(k, first, vault)
+        if still_selected:
+>           assert bound['superseded_at'] is None
+E           AssertionError: assert '2026-07-22T14:01:01.923856+00:00' is None
+
+tests/store/test_extraction_gc_postgres.py:521: AssertionError
+_ test_first_vault_binding_establishes_conservative_migrated_selection_clock[True-symlink] _
+
+superseded = (<papervault.store.knowledge.KnowledgeRepository object at 0x7af1a687b1d0>, {'schema_version': 1, 'completion_id': 'de...ey': 'A', 'title': 'Exact source'}}, ...}, PosixPath('/tmp/pytest-of-leon/pytest-650/test_first_vault_binding_estab3'))
+alias = 'symlink', still_selected = True
+
+    @pytest.mark.parametrize('alias', ['absolute', 'symlink'])
+    @pytest.mark.parametrize('still_selected', [False, True])
+    def test_first_vault_binding_establishes_conservative_migrated_selection_clock(superseded, alias, still_selected):
+        k, first, _, vault = superseded
+        # P5a migrations have no verified vault binding or reliable selection clock.
+        k.connection.execute(sql.SQL('UPDATE {} SET vault=NULL WHERE completion_id=%s').format(
+            k.repository._table('extract_retention')), (first['completion_id'],))
+        selected = vault / first['output_inventory'][0]['path']
+        if alias == 'symlink':
+            link = vault / 'selected.md'
+            link.symlink_to(selected)
+            selected = link
+        k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'Migrated selection',
+            'md_path': str(selected)}), expected_revision=0, audit=AuditEvent('test', 'migrated_selection'))
+        age(k, first)
+        start = datetime.now(timezone.utc)
+        if not still_selected:
+            k.repository.upsert(Record.from_payload('B', {'key': 'B', 'title': 'New selection'}),
+                expected_revision=1, audit=AuditEvent('test', 'advance'))
+        bound = policy(k, first, vault)
+        if still_selected:
+>           assert bound['superseded_at'] is None
+E           AssertionError: assert '2026-07-22T14:01:02.393779+00:00' is None
+
+tests/store/test_extraction_gc_postgres.py:521: AssertionError
+=========================== short test summary info ============================
+FAILED tests/store/test_extraction_gc_postgres.py::test_first_vault_binding_establishes_conservative_migrated_selection_clock[False-absolute]
+FAILED tests/store/test_extraction_gc_postgres.py::test_first_vault_binding_establishes_conservative_migrated_selection_clock[False-symlink]
+FAILED tests/store/test_extraction_gc_postgres.py::test_first_vault_binding_establishes_conservative_migrated_selection_clock[True-absolute]
+FAILED tests/store/test_extraction_gc_postgres.py::test_first_vault_binding_establishes_conservative_migrated_selection_clock[True-symlink]
+4 failed, 42 deselected in 2.07s
+
+Command: .venv/bin/pytest tests/knowledge/test_catalog_capacity.py tests/store/test_derivative_capacity.py -q
+Exit code: 0
+........................................................................ [ 83%]
+..............                                                           [100%]
+86 passed in 1.94s
+
+Command: .venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/store/test_extraction_gc_postgres.py tests/store/test_extraction_postgres.py tests/store/test_knowledge_deferrals.py tests/knowledge/test_catalog_capacity.py -q
+Exit code: 0
+........................................................................ [ 50%]
+.......................................................................  [100%]
+143 passed in 39.62s
+
+Intentional test-assumption repairs, verified before the final suite:
+Command: .venv/bin/pytest tests/knowledge/test_catalog_capacity.py tests/store/test_derivative_capacity.py -q
+Exit code: 1; 1 failed, 83 passed in 6.36s.
+Failure: test_integer_measurement_uses_start_time_before_concurrent_settlement expected settlement to finish while admission's census was paused. That interleaving is now serialized. The replacement ordered test preserves the output-charge assertions; the exact concurrent regression separately verifies the blocking boundary.
+Command: .venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/store/test_extraction_gc_postgres.py tests/store/test_extraction_postgres.py -q
+Exit code: 1; 5 failed, 71 passed in 38.65s.
+Failures: test_catalog_record_reference_blocks_gc_and_late_reference_is_rejected; test_record_aliases_protect_bytes_and_cannot_reenter_after_tombstone[dot,parent,absolute,symlink]. Each assumed immediate GC after a final record selection ended. Each now requires retention refusal, then ages the new clock before verifying deletion and tombstone admission refusal. Original identity/protection assertions remain.

@@ -209,6 +209,70 @@ CREATE TABLE IF NOT EXISTS catalog.extraction_heads (
  completion_id TEXT NOT NULL REFERENCES catalog.extraction_receipts,
  revision BIGINT NOT NULL DEFAULT 1
 );
+-- P5c: publication establishes protection; disposal is a separate operator act.
+CREATE TABLE IF NOT EXISTS catalog.extract_retention (
+ completion_id TEXT PRIMARY KEY REFERENCES catalog.extraction_receipts,
+ vault TEXT,
+ disposable BOOLEAN NOT NULL DEFAULT FALSE,
+ superseded_at TIMESTAMPTZ,
+ revision BIGINT NOT NULL DEFAULT 1
+);
+-- Historical P5a records have no trustworthy supersession clock. Start their
+-- conservative ninety-day clock at migration, never at artifact creation.
+INSERT INTO catalog.extract_retention(completion_id,superseded_at)
+ SELECT r.completion_id, CASE WHEN h.completion_id IS NULL THEN clock_timestamp() END
+ FROM catalog.extraction_receipts r LEFT JOIN catalog.extraction_heads h USING(completion_id)
+ ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS catalog.maintenance_leases (
+ resource TEXT PRIMARY KEY,
+ lease_id TEXT NOT NULL,
+ owner TEXT NOT NULL,
+ authority_epoch BIGINT NOT NULL,
+ fencing_token BIGINT NOT NULL,
+ window_id TEXT NOT NULL REFERENCES catalog.knowledge_maintenance_windows,
+ expires_at TIMESTAMPTZ NOT NULL
+);
+CREATE TABLE IF NOT EXISTS catalog.extract_pins (
+ pin_id TEXT PRIMARY KEY,
+ completion_id TEXT NOT NULL REFERENCES catalog.extraction_receipts,
+ kind TEXT NOT NULL CHECK(kind IN ('reader','job','recovery')),
+ owner TEXT NOT NULL,
+ expires_at TIMESTAMPTZ,
+ released_at TIMESTAMPTZ,
+ revision BIGINT NOT NULL DEFAULT 1,
+ CHECK((kind='reader') = (expires_at IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS extract_pins_live ON catalog.extract_pins(completion_id) WHERE released_at IS NULL;
+CREATE TABLE IF NOT EXISTS catalog.extract_deletions (
+ completion_id TEXT PRIMARY KEY REFERENCES catalog.extraction_receipts,
+ deletion_id TEXT NOT NULL UNIQUE,
+ vault TEXT NOT NULL,
+ output JSONB NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('deleting','deleted')),
+ prepared_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+ deleted_at TIMESTAMPTZ
+);
+CREATE OR REPLACE FUNCTION catalog.guard_extract_tombstone() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+ IF TG_OP <> 'UPDATE' THEN
+  RAISE EXCEPTION 'extract tombstones are permanent append-only evidence';
+ END IF;
+ IF (to_jsonb(OLD)-ARRAY['state','deleted_at']) IS DISTINCT FROM
+    (to_jsonb(NEW)-ARRAY['state','deleted_at'])
+    OR OLD.state='deleted' AND NEW IS DISTINCT FROM OLD
+    OR NEW.state='deleted' AND NEW.deleted_at IS NULL THEN
+  RAISE EXCEPTION 'immutable extract tombstone cannot be rebound or reopened';
+ END IF;
+ RETURN NEW;
+END $$;
+DO $$ BEGIN
+ IF NOT EXISTS(SELECT FROM pg_trigger WHERE tgrelid='catalog.extract_deletions'::regclass AND tgname='extract_tombstone_guard') THEN
+  CREATE TRIGGER extract_tombstone_guard BEFORE UPDATE OR DELETE ON catalog.extract_deletions
+   FOR EACH ROW EXECUTE FUNCTION catalog.guard_extract_tombstone();
+  CREATE TRIGGER extract_tombstone_truncate_guard BEFORE TRUNCATE ON catalog.extract_deletions
+   FOR EACH STATEMENT EXECUTE FUNCTION catalog.guard_extract_tombstone();
+ END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS catalog.publications (
  publication_id TEXT PRIMARY KEY, derivation_id TEXT NOT NULL REFERENCES catalog.derivations(derivation_id),
  unit_id TEXT NOT NULL REFERENCES catalog.units, generation_id TEXT NOT NULL REFERENCES catalog.generations,

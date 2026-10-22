@@ -265,7 +265,8 @@ def test_inventory_selection_invalidates_stale_included_requirements_before_snap
 
     class Repository:
         desired = {"unit_id": "S", "inventory_revision": old_inventory, "invalidated": invalidated,
-                   "excluded": False, "enqueue_mode": "active", "revision": 1}
+                   "excluded": False, "enqueue_mode": "active", "revision": 1,
+                   "consumed_input_revision": "section-input"}
         repository = None
         def __init__(self):
             self.repository = self
@@ -277,6 +278,9 @@ def test_inventory_selection_invalidates_stale_included_requirements_before_snap
             return {"state": "active"}
         def get_unit(self, unit):
             return {"record_key": None}
+        def get_input(self, identity):
+            assert identity == "section-input"
+            return {"manifest": {"artifacts": [], "upstream_derivation_ids": []}}
         def _rows(self, table, **keys):
             return [{"unit_id": "S"}] if table == "section_mappings" else [dict(self.desired)]
         def _update(self, table, values, **keys):

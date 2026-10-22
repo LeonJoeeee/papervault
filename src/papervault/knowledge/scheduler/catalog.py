@@ -68,7 +68,7 @@ def metadata_receipt(claim, manifest, input_store):
 
 class CatalogScheduler:
     def __init__(self, repository, adapter, input_store, *, max_admissions=1,
-                 lease_seconds=300, reserved_cost=1, breaker=None):
+                 lease_seconds=300, reserved_cost=1, breaker=None, capacity_gate=None):
         self.repository = repository
         self.adapter = adapter
         self.input_store = input_store
@@ -76,8 +76,88 @@ class CatalogScheduler:
         self.lease_seconds = lease_seconds
         self.reserved_cost = reserved_cost
         self.breaker = breaker
+        self.capacity_gate = capacity_gate
         self._input_observation_cache = {}
         self._collected_outputs = {}
+
+    def _candidate_allowed(self, job):
+        generation = self.repository.get_generation(job["generation_id"])
+        return generation["state"] != "candidate" or bool(self.repository.get_active_maintenance_window())
+
+    def _reserve_job(self, job, summary, *, claim=None, admission=False):
+        if self.capacity_gate is None:
+            return True  # Explicit injection seam; production always wires a gate.
+        manifest = self.repository.get_input(job["consumed_input_revision"])["manifest"]
+        physical = manifest.get("tier", "fulltext") != "metadata"
+        if not physical:
+            retired = claim.get("retired_receipt_ids", []) if claim else []
+            if not claim:
+                selection = self.repository.get_selection(job["unit_id"], job["generation_id"])
+                derivation = self.repository.get_derivation(selection["derivation_id"]) if selection else None
+                retired = [derivation["receipt_id"]] if derivation else []
+            physical = any(self.repository.get_receipt(identity)["achieved_tier"] != "metadata"
+                           for identity in retired)
+        try:
+            plan = self.capacity_gate.acquire(job["job_id"], physical=physical, reuse=not admission)
+            if claim is not None:
+                self.capacity_gate.bind(job["job_id"], claim)
+            if plan.get("alert"):
+                summary["capacity_alert"] = True
+                summary["capacity"] = dict(plan)
+        except ValueError as exc:
+            summary["capacity_blocked"] = summary.get("capacity_blocked", 0) + 1
+            summary["capacity_reason"] = str(exc)
+            return False
+        return True
+
+    def _release_capacity(self, job_id, summary, *, claim=None, reconciled=False):
+        if self.capacity_gate is None:
+            return
+        try:
+            self.capacity_gate.release(job_id, claim=claim, reconciled=reconciled)
+        except ValueError as exc:
+            # Bad ownership metadata must preserve bytes, but cannot prevent a
+            # valid sealed receipt from completing/publication at exhaustion.
+            summary["capacity_reconciliation_blocked"] = str(exc)
+
+    def _unknown_capacity(self, claim, summary):
+        if self.capacity_gate is None:
+            return
+        try:
+            self.capacity_gate.mark_unknown(claim["job_id"], claim)
+        except ValueError as exc:
+            summary["capacity_reconciliation_blocked"] = str(exc)
+
+    async def _await_execution(self, awaitable, claim):
+        generation = self.repository.get_generation(claim["generation_id"])
+        execution = asyncio.create_task(awaitable)
+
+        def consume(task):
+            if not task.cancelled():
+                task.exception()
+
+        try:
+            if generation["state"] != "candidate":
+                return await asyncio.shield(execution)
+            while True:
+                window = self.repository.get_active_maintenance_window()
+                if not window:
+                    raise TimeoutError("candidate execution maintenance window expired")
+                attempt = self.repository.get_attempt(claim["attempt_id"])
+                deadlines = [datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                             for value in (window["ends_at"], attempt["lease_expires_at"])]
+                remaining = (min(deadlines) - datetime.now(timezone.utc)).total_seconds()
+                if remaining <= 0:
+                    raise TimeoutError("candidate execution claim/window deadline expired")
+                done, _ = await asyncio.wait({execution}, timeout=remaining)
+                if done:
+                    return execution.result()
+                # A heartbeat can extend the execution lease, never the window.
+        except BaseException:
+            if not execution.done():
+                execution.cancel()
+                execution.add_done_callback(consume)
+            raise
 
     def _build_allowed(self):
         if self.breaker is None:
@@ -236,6 +316,15 @@ class CatalogScheduler:
         recipe = self.repository.get_recipe(job["recipe_digest"])
         try:
             validate_receipt(receipt, claim, recipe)
+            if self.capacity_gate is not None:
+                sealed_attempt = self.repository.get_attempt(claim["attempt_id"])
+                registered = self.repository.get_receipt(receipt["receipt_id"])
+                if (sealed_attempt.get("sealed") is True
+                        and sealed_attempt.get("receipt_id") == receipt["receipt_id"]
+                        and registered == receipt):
+                    # Catalog-sealed exact outputs settle physical ownership even
+                    # when expired completion leases or a stale base need rebase.
+                    self._release_capacity(job["job_id"], summary, claim=claim, reconciled=True)
             if job["state"] == "running":
                 self._command_once("complete", "complete:" + receipt["receipt_id"],
                     {**claim, "expected_revision": job["revision"], "receipt": receipt})
@@ -314,6 +403,10 @@ class CatalogScheduler:
                     "authority_epoch": self.repository.get_authority_state()["authority_epoch"]})
                 return False
             if not receipt:
+                if self.capacity_gate is not None and not self._candidate_allowed(job):
+                    return False
+                if not self._reserve_job(job, summary, claim=claim):
+                    return False
                 manifest = self.repository.get_input(claim["consumed_input_revision"])["manifest"]
                 data = [self.input_store.read(a) for a in manifest["artifacts"]]
                 evidence = [{"path": str(self.input_store.root / artifact["sha256"]),
@@ -333,7 +426,8 @@ class CatalogScheduler:
                                 self._discrepancy("metadata_downgrade_requires_cow_removal", claim)
                                 summary["discrepancies"] += 1
                                 return
-                            receipt = await submit_metadata(claim, manifest, self.input_store)
+                            receipt = await self._await_execution(
+                                submit_metadata(claim, manifest, self.input_store), claim)
                         else:
                             self._command_once("accept_submission", "accept:" + claim["submission_id"], {"claim": claim})
                             receipt = metadata_receipt(claim, manifest, self.input_store)
@@ -343,7 +437,8 @@ class CatalogScheduler:
                         unit = self.repository.get_unit(claim["unit_id"])
                         text = execution_text(unit, tier, data[0])
                         source = citation_file_path(unit, manifest)
-                        receipt = await self.adapter.submit(claim, text, source, achieved_tier=tier)
+                        receipt = await self._await_execution(
+                            self.adapter.submit(claim, text, source, achieved_tier=tier), claim)
                     if errors:
                         raise ClaimRejected("heartbeat could not retain completion claim")
                 finally:
@@ -357,6 +452,9 @@ class CatalogScheduler:
             # particular, a stale aggregate base must leave room to admit its
             # rebased attempt instead of consuming the only delivery slot.
             return not recovered
+        except asyncio.CancelledError:
+            self._unknown_capacity(claim, summary)
+            raise
         except BuildPausedError:
             latest = self.repository.get_job(claim["job_id"])
             current = self._current_claim(latest)
@@ -364,6 +462,7 @@ class CatalogScheduler:
                 try:
                     self._command_once("defer_attempt", "defer:" + claim["attempt_id"], {**current,
                         "expected_revision": latest["revision"], "reason": {"kind": "BuildPausedError"}})
+                    self._release_capacity(claim["job_id"], summary, claim=current, reconciled=True)
                 except ClaimRejected:
                     self._discrepancy("pause_deferral_claim_rejected", claim)
                     summary["discrepancies"] += 1
@@ -400,6 +499,7 @@ class CatalogScheduler:
                 try:
                     self._command_once("fail", "fail:"+claim["attempt_id"], {**current,
                         "expected_revision": latest["revision"], "error": {"kind": type(exc).__name__, "outcome": "known_failure"}})
+                    self._release_capacity(job["job_id"], summary, claim=current, reconciled=True)
                     self._command_once("acknowledge_outbox", "ack:"+row["outbox_id"], {"outbox_id": row["outbox_id"]})
                 except ClaimRejected:
                     pass
@@ -409,6 +509,7 @@ class CatalogScheduler:
         except Exception as exc:
             # Submission may already have been accepted. Preserve its attempt,
             # reserved charge and outbox, then look it up on the next delivery.
+            self._unknown_capacity(claim, summary)
             self._discrepancy("submission_outcome_unknown", claim, {"error_type": type(exc).__name__})
             summary["discrepancies"] += 1
             return True
@@ -464,6 +565,7 @@ class CatalogScheduler:
     async def run_round(self, only_keys=None):
         summary = dict.fromkeys(("observations", "discrepancies", "completed", "published", "claimed", "delivered", "repairs"), 0)
         summary["paused"] = False
+        summary["capacity_blocked"] = 0
         if self.repository.get_authority_state()["authority"] != "catalog":
             return {**summary, "paused": True, "reason": "catalog_authority_not_committed"}
         scope = None if only_keys is None else set(only_keys)
@@ -511,14 +613,31 @@ class CatalogScheduler:
                 not self.repository.get_operation("publish:" + str(attempt.get("receipt_id"))))
             if job["state"] not in {"queued", "failed"} and not (job["state"] == "running" and expired) and not rebase:
                 continue
+            if self.capacity_gate is not None and not self._candidate_allowed(job):
+                continue
+            if job["state"] == "queued" and attempt and attempt["outcome"] == "deferred":
+                # Recover a crash between catalog deferral and capacity settlement.
+                # Partial bytes stay charged until a census begun after settlement;
+                # the exact old claim cannot release another attempt's reservation.
+                deferred = self._current_claim(job)
+                if deferred:
+                    self._release_capacity(job["job_id"], summary, claim=deferred, reconciled=True)
+            if not self._reserve_job(job, summary, admission=True):
+                continue
             try:
                 admitted = self.repository.command("claim", "claim:" + job["job_id"] + ":" + str(job["revision"]),
                     {"job_id": job["job_id"], "expected_revision": job["revision"],
                      "authority_epoch": self.repository.get_authority_state()["authority_epoch"],
                      "lease_seconds": self.lease_seconds, "reserved_cost": self.reserved_cost, "rebase": rebase})
             except ClaimRejected:
+                self._release_capacity(job["job_id"], summary)
                 continue
-            summary["claimed"] += bool(admitted.get("attempt_id"))
+            if admitted.get("attempt_id"):
+                if self.capacity_gate is not None:
+                    self.capacity_gate.bind(job["job_id"], admitted)
+                summary["claimed"] += 1
+            else:
+                self._release_capacity(job["job_id"], summary)
         for row in self.repository.list_outbox(kind="submission"):
             if row["outbox_id"] not in handled and row["kind"] == "submission" and included(row["payload"]) and delivered < self.max_admissions:
                 delivered += bool(await self._deliver(row, summary))

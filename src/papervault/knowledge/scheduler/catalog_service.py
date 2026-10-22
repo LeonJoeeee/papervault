@@ -4,12 +4,35 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import replace
+from contextlib import nullcontext
 from pathlib import Path
 
 from papervault.store.repository import Record, payload_hash
 
 log = logging.getLogger("ks.scheduler.catalog")
+
+
+async def _funded_thread(function, *args, **kwargs):
+    """Keep the enclosing reservation until an uncancellable thread has stopped."""
+    operation = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    interrupted = False
+    while True:
+        try:
+            result = await asyncio.shield(operation)
+            break
+        except asyncio.CancelledError:
+            if operation.done():
+                raise
+            interrupted = True
+        except Exception:
+            if interrupted:
+                raise asyncio.CancelledError from None
+            raise
+    if interrupted:
+        raise asyncio.CancelledError
+    return result
 
 
 class CatalogService:
@@ -127,9 +150,24 @@ class CatalogService:
         return recovered
 
     async def run_round(self, only_keys=None):
-        intake = await asyncio.to_thread(self.intake.scan, only_keys=only_keys)
-        recovered = await asyncio.to_thread(self.recover_intake, only_keys)
+        from papervault.store.scheduler_capacity import CapacityAdmissionError
+
+        gate = getattr(self.scheduler, "capacity_gate", None)
+        intake_plan = None
+        if gate is None:
+            intake = await _funded_thread(self.intake.scan, only_keys=only_keys)
+            recovered = await _funded_thread(self.recover_intake, only_keys)
+        else:
+            try:
+                with gate.intake() as intake_plan:
+                    intake = await _funded_thread(self.intake.scan, only_keys=only_keys)
+                    recovered = await _funded_thread(self.recover_intake, only_keys)
+            except CapacityAdmissionError as exc:
+                intake = {"captured": 0, "capacity_blocked": True, "reason": str(exc)}
+                recovered = 0
         result = await self.scheduler.run_round(only_keys=only_keys)
+        if intake_plan and intake_plan.get("alert"):
+            result.update(capacity_alert=True, capacity=dict(intake_plan))
         return {**result, "intake": intake, "recovered_intake": recovered}
 
 
@@ -155,7 +193,27 @@ def get_catalog_service():
         inputs = ImmutableInputStore(working_dir / "catalog_inputs")
         intake = CatalogIntake(repository, inputs, config.VAULT_PATH)
         adapter = CatalogLightRAGAdapter(repository, working_dir=str(working_dir), input_store=inputs)
-        _service = CatalogService(repository, intake, CatalogScheduler(repository, adapter, inputs))
+        from papervault.store.scheduler_capacity import (
+            DEFAULT_EXECUTION_BYTES, SchedulerCapacity, measured_backend_usage,
+        )
+
+        def backend_usage(physical):
+            external = measured_backend_usage(os.getenv("PAPERVAULT_DERIVATIVE_USAGE_FILE"),
+                vault_root=config.VAULT_PATH, knowledge_root=working_dir)
+            # Metadata writes share the same global derivative budget. Fresh
+            # backend accounting is required even when this job creates no graph.
+            row = repository.connection.execute(
+                "SELECT COALESCE(sum(pg_total_relation_size(c.oid)),0) AS bytes FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relkind='r'",
+                (repository.repository.schema,)).fetchone()
+            return {**external, "backend_bytes": external["backend_bytes"] + int(row["bytes"])}
+
+        capacity = SchedulerCapacity(working_dir / "maintenance" / "capacity",
+            derivative_roots=(Path(config.VAULT_PATH) / "extracts", working_dir),
+            estimated_bytes=lambda: int(os.getenv("PAPERVAULT_CATALOG_EXECUTION_BYTES", str(DEFAULT_EXECUTION_BYTES))),
+            backend_usage=backend_usage)
+        _service = CatalogService(repository, intake,
+            CatalogScheduler(repository, adapter, inputs, capacity_gate=capacity))
     return _service
 
 
@@ -167,20 +225,35 @@ async def run_catalog_round(only_keys=None):
 async def capture_operator_document(kind, key, path, *, force=False, tokenizer=None,
                                     max_tokens=None, read_text=None):
     service = await asyncio.to_thread(get_catalog_service)
-    return await asyncio.to_thread(service.intake.capture_document, kind, key, path,
-        force=force, tokenizer=tokenizer, max_tokens=max_tokens, read_text=read_text)
+    from papervault.store.scheduler_capacity import CapacityAdmissionError
+    from papervault.knowledge.store.build_breaker import BuildPausedError
+
+    gate = getattr(service.scheduler, "capacity_gate", None)
+    try:
+        with gate.intake() if gate is not None else nullcontext():
+            return await _funded_thread(service.intake.capture_document, kind, key, path,
+                force=force, tokenizer=tokenizer, max_tokens=max_tokens, read_text=read_text)
+    except CapacityAdmissionError as exc:
+        # Pickup already treats BuildPausedError as retryable and leaves the
+        # operator source in pending rather than marking an unfunded job failed.
+        raise BuildPausedError("operator input capacity admission unavailable") from exc
 
 
 async def run_catalog_loop(*, interval=60):
     service = await asyncio.to_thread(get_catalog_service)
     from papervault.knowledge.scheduler.opdoc_pickup import drain_pending
     from papervault.knowledge.store.build_breaker import get_breaker
+    from papervault.store.scheduler_capacity import CapacityAdmissionError
 
     while True:
         try:
             await service.run_round()
             if get_breaker().allows():
-                await drain_pending(None)
+                gate = getattr(service.scheduler, "capacity_gate", None)
+                with gate.intake() if gate is not None else nullcontext():
+                    await drain_pending(None)
+        except CapacityAdmissionError:
+            log.info("operator pickup paused for capacity; pending sources retained")
         except asyncio.CancelledError:
             raise
         except Exception:

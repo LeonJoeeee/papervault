@@ -1,0 +1,75 @@
+{
+  "algorithm": "sha256",
+  "files": [
+    {
+      "byte_length": 16755,
+      "path": "actions.json",
+      "sha256": "cb6b5ca7ab4a9ddd8684167dcb7d71446bc10d847d5ef6e9598b50949fd8a8f3"
+    },
+    {
+      "byte_length": 843,
+      "path": "dedicated-store.log",
+      "sha256": "cc8a1554c3d9ce874789504988fdee1426a5397edb429a459e77e01a5c17fcae"
+    },
+    {
+      "byte_length": 4294,
+      "path": "environment.json",
+      "sha256": "6906ef6a9a1415419f333f8590d8a06690a623458895a2791e647a7a6731f54e"
+    },
+    {
+      "byte_length": 666,
+      "path": "fixture-disposition.json",
+      "sha256": "a29cc0dc6cef1b88f8bc217fcb5438935a62d3d87364f65290781aa816b1ca68"
+    },
+    {
+      "byte_length": 4916,
+      "path": "gc.json",
+      "sha256": "f16e535d75eacc7de6eefa4920454edb6123cd6a33ec3850a7700fee79487358"
+    },
+    {
+      "byte_length": 750,
+      "path": "hashes.json",
+      "sha256": "cecf41641238068feb9d05236c818f5c714773097698361457fca36605e045bc"
+    },
+    {
+      "byte_length": 39061,
+      "path": "rebuild.json",
+      "sha256": "24795d41acb1690f2e9edcc7b641c65e905ab7cdf1423bc2d5dd16d77e38aac1"
+    },
+    {
+      "byte_length": 1007,
+      "path": "regression-evidence.log",
+      "sha256": "a931e40b021f70c166920681e8882558cd22da10bf6fd42ddb3f05d871b9adfd"
+    },
+    {
+      "byte_length": 580,
+      "path": "results.json",
+      "sha256": "45eeb8b735c86bbc2a7951846a7a50c2bbd291c885983b4be5488d7e35a37fa7"
+    },
+    {
+      "byte_length": 19,
+      "path": "ruff.log",
+      "sha256": "82b3e6a6c090a57601d22943bd23fca9218d1031dbe5a7b754092f9a156b4f18"
+    },
+    {
+      "byte_length": 1996,
+      "path": "scoped-review.log",
+      "sha256": "80881cc7eb928c214dab084aade6cc99de7c1a4a290b81db5b29ac9e2e7fdff3"
+    },
+    {
+      "byte_length": 6901,
+      "path": "suite.log",
+      "sha256": "90160ad8abbf89abfc42574a16669b9131514263b57f4a4c5d29bd896de507d0"
+    },
+    {
+      "byte_length": 6273,
+      "path": "validation.json",
+      "sha256": "2304aa6fec20b98b3374e87edeb54bd83024d88d1dec05952b0056ddc79f4108"
+    },
+    {
+      "byte_length": 390,
+      "path": "verification.log",
+      "sha256": "dbf7d4dc6c4844017071b6e237be2292ca94b18d5168227969cec162e6815c4c"
+    }
+  ]
+}

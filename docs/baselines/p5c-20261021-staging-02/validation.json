@@ -1,0 +1,132 @@
+{
+  "base": "3e3897eb4c55176a2e00b332751aade2ce32bd49",
+  "baseline_check": {
+    "command": ".venv/bin/pytest -m 'not integration' -q",
+    "exit_code": 0,
+    "result": "3557 passed, 377 skipped, 167 deselected, 4 warnings in 128.58s; dedicated DSN not supplied"
+  },
+  "checks": [
+    {
+      "command": ".venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest tests/store -q --basetemp=/tmp/p5c-continuation-ny0oHU/verified-store",
+      "exit_code": 0,
+      "log": "dedicated-store.log",
+      "name": "dedicated PostgreSQL/store tests",
+      "result": "703 passed, 4 skipped in 170.46s (0:02:50)",
+      "skips": "four existing integration cases in test_recovery_neo4j.py; endpoints not supplied"
+    },
+    {
+      "command": ".venv/bin/python /tmp/p5c-test-env.py .venv/bin/pytest -m 'not integration' -q --basetemp=/tmp/p5c-continuation-ny0oHU/verified-suite",
+      "exit_code": 0,
+      "log": "suite.log",
+      "name": "repository non-integration suite",
+      "result": "3950 passed, 2 skipped, 167 deselected, 4 warnings in 316.03s (0:05:16)"
+    },
+    {
+      "command": ".venv/bin/ruff check src tests scripts/maintain_derivatives.py scripts/drill_derivative_maintenance.py scripts/measure_derivative_usage.py",
+      "exit_code": 0,
+      "log": "ruff.log",
+      "name": "Ruff",
+      "result": "All checks passed!"
+    },
+    {
+      "command": "P5C_DRILL_DSN='host=127.0.0.1 port=32788 dbname=p5c_drill user=p5c_drill' .venv/bin/python scripts/drill_derivative_maintenance.py --dsn-env P5C_DRILL_DSN --root /tmp/p5c-continuation-ny0oHU/drill-final/source --evidence /tmp/p5c-continuation-ny0oHU/drill-final/evidence --drill-id p5c-20261021-staging-02 --disposable",
+      "exit_code": 0,
+      "name": "isolated maintenance rehearsal",
+      "result": {
+        "drill_id": "p5c-20261021-staging-02",
+        "elapsed_seconds": 1.2956088290084153,
+        "external_model_calls": 0,
+        "extraction_receipts_preserved": 4,
+        "fulltext_build": false,
+        "gc_window_elapsed_seconds": 0.03440212900750339,
+        "gpu_calls": 0,
+        "host_failure_recovery": false,
+        "metadata_parents": 3,
+        "observed_serving_downtime_seconds": 0,
+        "production_rto": false,
+        "rebuild_window_elapsed_seconds": 0.34849303000373766,
+        "schemas": {
+          "extract": "catalog_recovery_0735b205b37b90dbcd7a_extract",
+          "rebuild": "catalog_recovery_0735b205b37b90dbcd7a_rebuild"
+        },
+        "source_hashes_preserved": true,
+        "success": true,
+        "window_seconds": 120
+      },
+      "result_artifact": "results.json"
+    },
+    {
+      "command": "git diff --check",
+      "exit_code": 0,
+      "name": "diff whitespace",
+      "result": "no errors"
+    }
+  ],
+  "code_sha256": {
+    ".claude-plugin/marketplace.json": "7021c6f997ab63f3ed4912bc6a9a1a9b4bac96e53880497554c2887bfc12d532",
+    "plugin/.claude-plugin/plugin.json": "7949d4ac6f813198cc731826b551e45eb2ed3615c35f897149225ae8a1e1b0b2",
+    "pyproject.toml": "e935bba8242445d0a9ba9aeb228e5a010ad2d57f08bc559e2793599ae1bd552b",
+    "scripts/drill_derivative_maintenance.py": "e50b204f70b587ac01121d654cfa3866301e5414635538629a2fd16aba87563e",
+    "scripts/maintain_derivatives.py": "48950c4465d987196820ed7130dff7b3f3f874d61fce7527a2189d65d4a5a809",
+    "scripts/measure_derivative_usage.py": "b5411e805824f0bb42e71c50dcc3d45e9adad45cd219e0814bf8b6469bcb116f",
+    "src/papervault/knowledge/scheduler/catalog.py": "a205345007aa61a59b93db0a2db69b1c37fc408289f3d8fc6579045cb24db893",
+    "src/papervault/knowledge/scheduler/catalog_service.py": "0caab0f816729e28ca462a371f2094a088e8899c5f188a824c9ef5bd60bee95f",
+    "src/papervault/store/derivative_capacity.py": "b45fc1d76c7d68630a689110177709be2ecbce4fc1975dff764d761787981846",
+    "src/papervault/store/derivative_maintenance.py": "d8ec519fc4472bd6957a2ce4f4d11964eb956d3cdc4ac9b0daa15f1d2d6e3da1",
+    "src/papervault/store/extract_lifecycle.py": "1f9d3230da8b5315a631e22cfbe34e1720aba131b9d13090304e50d526260275",
+    "src/papervault/store/extraction_commands.py": "028042e007abc268a7f27d270849cdd6a41b49875ed1bbaff71908fb404c8807",
+    "src/papervault/store/extraction_gc.py": "533b5086fa104d477b973ac2b6d0c4a6e2cc68bce9174d323e80533f0ef15441",
+    "src/papervault/store/knowledge.py": "e626163490fdc44ffd9e2c0a50f64193c3a4dae60be12bb2d9982f21e01d61e7",
+    "src/papervault/store/knowledge_commands.py": "4b0689f54ce083dfb0a36c68d0af1266d6a3c6f680a6b3e7ba526953e2f1e2ca",
+    "src/papervault/store/knowledge_schema.sql": "a0c734253c0b7c50ae7b318d25dd716fd47b916973b3206c04bc9470cf5ae3dc",
+    "src/papervault/store/recovery_source.py": "cf287eb0082f73001f2cf31954c3aab7cef2577e4fa5741d3c4f55c3c84f13f5",
+    "src/papervault/store/repository.py": "a572c77511b1f7580d3278df6d2fb6c92aa92d6cef9a88b769549dfd2132f4e4",
+    "src/papervault/store/scheduler_capacity.py": "d7f3e28a90aa6056b2ea2b38edd5d63f3853f6425a7412e3c0398a98b0576a94",
+    "tests/knowledge/test_catalog_capacity.py": "be1344c0610976b26d54c63038ac70744782664d6f92bf8c1950401b9661c779",
+    "tests/store/test_derivative_capacity.py": "42798b33c0a18d8b2088028af6a960308ce67e5e321350427b245cbb6d9d9070",
+    "tests/store/test_derivative_maintenance_postgres.py": "5e637fa917db77660f3217ad2a3273233cfc3f6da1c8e54f3cf35f512dc2a8ce",
+    "tests/store/test_derivative_usage.py": "530a535ea9f28de9062f603a16229479bb9f0639013c1e0f8f08df66f0f90399",
+    "tests/store/test_extraction_gc_postgres.py": "492d9241388cb316fc6d577573110de5a34000a56e2e77e7921583d84d8d0f3a",
+    "tests/store/test_knowledge_commands.py": "7c613c76f4e8cd1004fc6bc544e4dd17d4b400daace8eac8d69851e0425ece5c",
+    "tests/store/test_knowledge_deferrals.py": "dd3f09ca4ccf9777ffd1114e26aedc3634639e2defe7e0809d83a85738a0f46f",
+    "uv.lock": "8eb91bc3ffbdf3c30828b2f2fa27abc35153852df98f9670c1e0b3c546c705d7"
+  },
+  "independent_task_local_review": {
+    "is_integration_verdict": false,
+    "limits": "source and captured-evidence review; reviewer did not rerun tests or check CI",
+    "record": "scoped-review.log",
+    "result": "no remaining Critical or Important source findings; no remaining evidence or scope findings",
+    "reviewer": "Codex gpt-6-astra at max; native read-only"
+  },
+  "issue": "https://github.com/LeonJoeeee/papervault/issues/284",
+  "limits": [
+    "synthetic metadata rehearsal; not a production monthly drill",
+    "no fulltext/graph/vector rebuild sizing, production RTO or host-failure claim",
+    "backend sizes and execution budgets remain estimates",
+    "unknown outcomes retain charges; deferred physical bytes require a census begun after settlement",
+    "migrated unbound histories use a conservative clock at first verified vault binding",
+    "pre-existing P5b recovery_replay.py constructs CatalogScheduler without runtime capacity_gate; separate replay limitation",
+    "defaults remain PAPERVAULT_KNOWLEDGE_JOBS=legacy; no live activation"
+  ],
+  "recorded_at": "2026-10-21T14:09:58.242108+00:00",
+  "regressions": {
+    "changed_assumptions": "unserialized census overlap and immediate GC after final record deselection replaced with serialized accounting and renewed retention assertions",
+    "failing_first": [
+      "2 admission versus newer settlement cases",
+      "2 deferred reservation/restart cases",
+      "5 excluded-reader and last-selection cases",
+      "2 original-owner/foreign-reconciliation cases",
+      "4 migrated vault-binding cases"
+    ],
+    "final_focused": "143 passed in 39.62s; exit 0",
+    "record": "regression-evidence.log"
+  },
+  "semver": "minor: P5c additive maintenance and capacity admission; corrections remain within the same 0.10.0 change",
+  "test_environment": {
+    "dedicated_database": "p5c_catalog_test",
+    "dedicated_user": "p5c_test",
+    "dsn_provider": "/tmp/p5c-test-env.py",
+    "isolation": "new disposable catalog_test_* schemas and per-test filesystem roots; no live catalog, service dotenv or live stores"
+  },
+  "version": "0.10.0"
+}

@@ -25,6 +25,7 @@ from pathlib import Path
 
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))
+from papervault.eval._paths import eval_path
 from papervault.eval import headline as HL  # noqa: E402
 from papervault.eval import judge_aggregate as JA  # noqa: E402
 from papervault.eval import stats as ST  # noqa: E402
@@ -52,9 +53,9 @@ def _mean_tables(per_run: list[dict]) -> dict:
 def _side(tags: list[str]) -> tuple[dict, float]:
     bb, jj, traps = [], [], []
     for tag in tags:
-        bb.append(ST.per_question_scalars(EVAL / "results" / f"{tag}.jsonl", GOLD))
-        jj.append(JA.per_question_scalars(EVAL / "judge", GOLD, tag=tag, n_seeds=1))
-        tr = JA.trap_correct_refusal_rate(EVAL / "judge", GOLD, tag=tag, n_seeds=1)
+        bb.append(ST.per_question_scalars(eval_path(f"{tag}.jsonl"), GOLD))
+        jj.append(JA.per_question_scalars(eval_path("judge"), GOLD, tag=tag, n_seeds=1))
+        tr = JA.trap_correct_refusal_rate(eval_path("judge"), GOLD, tag=tag, n_seeds=1)
         if tr.get("trap_correct_refusal_rate") is not None:
             traps.append(tr["trap_correct_refusal_rate"])
     return ({"backbone": _mean_tables(bb), "judge": _mean_tables(jj)},

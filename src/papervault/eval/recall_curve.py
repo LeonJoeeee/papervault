@@ -21,6 +21,7 @@ from pathlib import Path
 
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))
+from papervault.eval._paths import eval_path
 from papervault.eval import backbone as BB  # noqa: E402
 from papervault.eval import judge_aggregate as JA  # noqa: E402
 
@@ -45,7 +46,7 @@ def _recall_at(data: dict, gk: set, k):
 
 
 def _one_tag(tag: str, gold: dict) -> dict | None:
-    p = EVAL / "results" / f"{tag}.jsonl"
+    p = eval_path(f"{tag}.jsonl")
     if not p.exists():
         return None
     res = {json.loads(l)["qid"]: json.loads(l) for l in p.read_text().splitlines() if l.strip()}
@@ -72,11 +73,11 @@ def _nugget_trap(tags: list[str], gold: dict):
     nrs, traps = [], []
     for t in tags:
         try:
-            jj = JA.per_question_scalars(EVAL / "judge", GOLD, tag=t, n_seeds=1)
+            jj = JA.per_question_scalars(eval_path("judge"), GOLD, tag=t, n_seeds=1)
             nr = jj.get("nugget_recall", {})
             if nr:
                 nrs.append(sum(nr.values()) / len(nr))
-            tr = JA.trap_correct_refusal_rate(EVAL / "judge", GOLD, tag=t, n_seeds=1)
+            tr = JA.trap_correct_refusal_rate(eval_path("judge"), GOLD, tag=t, n_seeds=1)
             if tr.get("trap_correct_refusal_rate") is not None:
                 traps.append(tr["trap_correct_refusal_rate"])
         except Exception:
@@ -89,7 +90,7 @@ def main():
     if not args:
         raise SystemExit("usage: recall_curve.py <prefix> | <tag...>")
     groups: dict[str, list[str]] = {}
-    if len(args) == 1 and not (EVAL / "results" / f"{args[0]}.jsonl").exists():
+    if len(args) == 1 and not (eval_path(f"{args[0]}.jsonl")).exists():
         pfx = args[0]
         groups[pfx] = [f"{pfx}_r{k}" for k in (1, 2, 3)]
     else:

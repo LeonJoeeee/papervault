@@ -30,6 +30,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from papervault.eval._paths import eval_path
 
 EVAL = Path(__file__).resolve().parent
 if str(EVAL) not in sys.path:
@@ -74,14 +75,14 @@ def fill_precision_prompt(rec: dict, c: dict, ordinal: int) -> str:
 
 
 def build_precision(tag: str) -> int:
-    results = _load_jsonl(EVAL / "results" / f"{tag}.jsonl")
-    outdir = EVAL / "judge" / tag
+    results = _load_jsonl(eval_path(f"{tag}.jsonl"))
+    outdir = eval_path("judge", tag)
     outdir.mkdir(parents=True, exist_ok=True)
     n = 0
     for qid, rec in results.items():
         for ordinal, c in enumerate(_chunks(rec)):
             cid = chunk_id(c.get("paper_key"), ordinal)
-            (outdir / f"{qid}.{safe_stem(cid)}.prompt.txt").write_text(
+            eval_path("judge", tag, f"{qid}.{safe_stem(cid)}.prompt.txt").write_text(
                 fill_precision_prompt(rec, c, ordinal)
             )
             n += 1
@@ -110,9 +111,9 @@ def fill_pairwise_prompt(qid: str, intent: str, a_chunks: list[dict], b_chunks: 
 
 
 def build_pairwise(baseline_tag: str, variant_tag: str) -> int:
-    base = _load_jsonl(EVAL / "results" / f"{baseline_tag}.jsonl")
-    var = _load_jsonl(EVAL / "results" / f"{variant_tag}.jsonl")
-    outdir = EVAL / "judge" / f"{variant_tag}__vs__{baseline_tag}"
+    base = _load_jsonl(eval_path(f"{baseline_tag}.jsonl"))
+    var = _load_jsonl(eval_path(f"{variant_tag}.jsonl"))
+    outdir = eval_path("judge", f"{variant_tag}__vs__{baseline_tag}")
     outdir.mkdir(parents=True, exist_ok=True)
     n = 0
     skipped = []
@@ -122,7 +123,7 @@ def build_pairwise(baseline_tag: str, variant_tag: str) -> int:
             skipped.append(qid)
             continue
         intent = vrec.get("intent") or brec.get("intent") or ""
-        (outdir / f"{qid}.prompt.txt").write_text(
+        eval_path("judge", f"{variant_tag}__vs__{baseline_tag}", f"{qid}.prompt.txt").write_text(
             fill_pairwise_prompt(qid, intent, _chunks(brec), _chunks(vrec))
         )
         n += 1

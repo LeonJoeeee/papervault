@@ -17,6 +17,7 @@ Usage:  python -m papervault.eval._fast_backbone <tag> [gold_fast.jsonl]
 import json, statistics, sys
 import re
 from pathlib import Path
+from papervault.eval._paths import eval_path
 
 EVAL = Path(__file__).resolve().parent
 
@@ -74,7 +75,7 @@ def main():
     tag = sys.argv[1]
     gold_name = sys.argv[2] if len(sys.argv) > 2 else "gold_fast.jsonl"
     gold = _load(EVAL / gold_name)
-    recs = _load(EVAL / "results" / f"{tag}.jsonl")
+    recs = _load(eval_path(f"{tag}.jsonl"))
     served_recall, gcr, hallu = [], [], []
     n_ans = 0
     prose_checked = 0

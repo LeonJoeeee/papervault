@@ -16,6 +16,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from papervault.eval._paths import eval_path
 
 EVAL = Path(__file__).resolve().parent
 _TEMPLATE = (EVAL / "judge_prompt.md").read_text()
@@ -62,9 +63,9 @@ def main() -> None:
         raise SystemExit("usage: build_judge_prompts.py <tag>")
     tag = sys.argv[1]
     gold_name = sys.argv[2] if len(sys.argv) > 2 else "gold.jsonl"  # optional gold override (e.g. gold_v2.jsonl)
-    results = _load_jsonl(EVAL / "results" / f"{tag}.jsonl")
+    results = _load_jsonl(eval_path(f"{tag}.jsonl"))
     gold = _load_jsonl(EVAL / (gold_name if "/" in gold_name else gold_name))
-    outdir = EVAL / "judge" / tag
+    outdir = eval_path("judge", tag)
     outdir.mkdir(parents=True, exist_ok=True)
     n = 0
     skipped = []
@@ -73,7 +74,7 @@ def main() -> None:
         if rec is None:
             skipped.append(qid)
             continue
-        (outdir / f"{qid}.prompt.txt").write_text(fill_prompt(rec, g))
+        eval_path("judge", tag, f"{qid}.prompt.txt").write_text(fill_prompt(rec, g))
         n += 1
     print(f"wrote {n} judge prompts -> {outdir}" + (f" | skipped (no result): {skipped}" if skipped else ""))
 

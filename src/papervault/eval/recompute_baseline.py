@@ -9,6 +9,7 @@ from __future__ import annotations
 import statistics
 from pathlib import Path
 
+from papervault.eval._paths import eval_path
 from papervault.eval import headline as HL
 from papervault.eval import judge_aggregate as JA
 from papervault.eval import stats as ST
@@ -27,10 +28,10 @@ def _hl(rec_table, nug_table):
 def main() -> None:
     per_run = {}
     for tag in TAGS:
-        bbq = ST.per_question_scalars(EVAL / "results" / f"{tag}.jsonl", gold_path)
-        jq = JA.per_question_scalars(EVAL / "judge", gold_path, tag=tag, n_seeds=1)
+        bbq = ST.per_question_scalars(eval_path(f"{tag}.jsonl"), gold_path)
+        jq = JA.per_question_scalars(eval_path("judge"), gold_path, tag=tag, n_seeds=1)
         summ = HL.run_summary(bbq, jq)
-        trap = JA.trap_correct_refusal_rate(EVAL / "judge", gold_path, tag=tag, n_seeds=1)
+        trap = JA.trap_correct_refusal_rate(eval_path("judge"), gold_path, tag=tag, n_seeds=1)
         nug = jq.get("nugget_recall", {})
         hl_distinct = _hl(bbq.get("paper_recall_at_12_distinct", {}), nug)
         hl_chunk = _hl(bbq.get("paper_recall_at_12", {}), nug)

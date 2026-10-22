@@ -1642,14 +1642,13 @@ async def test_all_resource_descriptions_are_nonempty(server):
         assert "serve-safe" in d or "serve-safety" in d  # the moved prose
 
 
-def test_search_papers_docstring_documents_intent_parsed_observability():
+def test_search_papers_docstring_documents_intent_parsed_observability(tmp_path):
     """Boundary fix #6: the search_papers docstring Returns section must document
     the full intent_parsed payload — the observability signals a caller needs to
     detect silent recall loss / backend outages, not just 'search terms'."""
     from papervault.library.mcp.server import build_server
     from papervault.library import Library
-    import tempfile
-    srv = build_server(library=Library(tempfile.mkdtemp()))
+    srv = build_server(library=Library(tmp_path))
     # FastMCP stores the tool's description (derived from the docstring).
     tool = srv._tool_manager.get_tool("search_papers")
     doc = tool.description or ""

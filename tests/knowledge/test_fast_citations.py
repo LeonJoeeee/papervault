@@ -71,10 +71,9 @@ def test_fast_arm_scores_prose_including_traps_and_distinguishes_absent_answers(
         ("trap", "[Dst Index entity]"), ("no-synth", None),
     ]]
     (tmp_path / "gold.jsonl").write_text("\n".join(map(json.dumps, gold)))
-    (tmp_path / "results").mkdir()
-    (tmp_path / "results" / "fixture.jsonl").write_text("\n".join(map(json.dumps, records)))
-    monkeypatch.setattr(fast, "EVAL", tmp_path)
-    monkeypatch.setattr("sys.argv", ["_fast_backbone", "fixture", "gold.jsonl"])
+    (tmp_path / "fixture.jsonl").write_text("\n".join(map(json.dumps, records)))
+    monkeypatch.setenv("PAPERVAULT_EVAL_DIR", str(tmp_path))
+    monkeypatch.setattr("sys.argv", ["_fast_backbone", "fixture", str(tmp_path / "gold.jsonl")])
     fast.main()
     report = json.loads(capsys.readouterr().out)
     assert report["prose_citation_answers_checked"] == 3

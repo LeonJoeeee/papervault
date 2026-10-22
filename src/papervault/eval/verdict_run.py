@@ -22,6 +22,7 @@ from pathlib import Path
 
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))
+from papervault.eval._paths import eval_path
 from papervault.eval import headline as HL  # noqa: E402
 from papervault.eval import judge_aggregate as JA  # noqa: E402
 from papervault.eval import stats as ST  # noqa: E402
@@ -47,9 +48,9 @@ def _side(results_fmt: str, judge_tag_fmt: str) -> tuple[dict, float]:
     """Build a {'backbone':..,'judge':..} mean-table side + mean trap_correct_refusal_rate."""
     bb_runs, j_runs, traps = [], [], []
     for k in RUNS:
-        bb_runs.append(ST.per_question_scalars(EVAL / "results" / results_fmt.format(k=k), GOLD))
-        j_runs.append(JA.per_question_scalars(EVAL / "judge", GOLD, tag=judge_tag_fmt.format(k=k), n_seeds=1))
-        tr = JA.trap_correct_refusal_rate(EVAL / "judge", GOLD, tag=judge_tag_fmt.format(k=k), n_seeds=1)
+        bb_runs.append(ST.per_question_scalars(eval_path(results_fmt.format(k=k)), GOLD))
+        j_runs.append(JA.per_question_scalars(eval_path("judge"), GOLD, tag=judge_tag_fmt.format(k=k), n_seeds=1))
+        tr = JA.trap_correct_refusal_rate(eval_path("judge"), GOLD, tag=judge_tag_fmt.format(k=k), n_seeds=1)
         if tr.get("trap_correct_refusal_rate") is not None:
             traps.append(tr["trap_correct_refusal_rate"])
     return {"backbone": _mean_tables(bb_runs), "judge": _mean_tables(j_runs)}, (statistics.mean(traps) if traps else 0.0)
@@ -60,17 +61,18 @@ def _build_mqfull_judge_dirs() -> dict[int, int]:
     the variant's judge/mq_r{k} seeds. Returns {k: n_fused}."""
     nfused = {}
     for k in RUNS:
-        recs = [json.loads(l) for l in (EVAL / "results" / f"mq_r{k}.jsonl").read_text().splitlines() if l.strip()]
+        recs = [json.loads(l) for l in (eval_path(f"mq_r{k}.jsonl")).read_text().splitlines() if l.strip()]
         fused = {r["qid"] for r in recs if r["meta"].get("fused_applied")}
-        dst = EVAL / "judge" / f"mqfull_r{k}"
+        dst = eval_path("judge", f"mqfull_r{k}")
         dst.mkdir(parents=True, exist_ok=True)
-        for sf in (EVAL / "judge" / f"full_r{k}").glob("*.seed0.json"):
-            shutil.copy(sf, dst / sf.name)
+        for sf in (eval_path("judge", f"full_r{k}")).glob("*.seed0.json"):
+            shutil.copy(eval_path("judge", f"full_r{k}", sf.name),
+                        eval_path("judge", f"mqfull_r{k}", sf.name))
         applied = 0
         for q in fused:
-            src = EVAL / "judge" / f"mq_r{k}" / f"{q}.seed0.json"
+            src = eval_path("judge", f"mq_r{k}", f"{q}.seed0.json")
             if src.exists():
-                shutil.copy(src, dst / f"{q}.seed0.json")
+                shutil.copy(src, eval_path("judge", f"mqfull_r{k}", f"{q}.seed0.json"))
                 applied += 1
         nfused[k] = applied
     return nfused

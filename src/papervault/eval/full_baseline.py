@@ -16,6 +16,7 @@ from pathlib import Path
 
 EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))
+from papervault.eval._paths import eval_path
 from papervault.eval import headline as HL  # noqa: E402
 from papervault.eval import judge_aggregate as JA  # noqa: E402
 from papervault.eval import stats as ST  # noqa: E402
@@ -61,31 +62,31 @@ def main() -> None:
         for r in res:
             tag, qid, j = r["tag"], r["qid"], _recompute(dict(r["judge"]))
             j.setdefault("qid", qid)
-            d = EVAL / "judge" / tag
+            d = eval_path("judge", tag)
             d.mkdir(parents=True, exist_ok=True)
-            (d / f"{qid}.seed0.json").write_text(json.dumps(j, ensure_ascii=False))
+            eval_path("judge", tag, f"{qid}.seed0.json").write_text(json.dumps(j, ensure_ascii=False))
             wrote += 1
     print(f"wrote {wrote} newq judge seed files (from {len(sys.argv) - 1} output file(s))")
 
     per_run = {}
     for k in RUNS:
         # merge results: existing-25 (baseline_rk) + new-24 (newq_rk) -> full_rk
-        full_res = EVAL / "results" / f"full_r{k}.jsonl"
+        full_res = eval_path(f"full_r{k}.jsonl")
         with full_res.open("w") as f:
             for tag in (f"baseline_r{k}", f"newq_r{k}"):
-                p = EVAL / "results" / f"{tag}.jsonl"
+                p = eval_path(f"{tag}.jsonl")
                 if p.exists():
                     f.write(p.read_text())
         # merge judge dirs
-        fulljd = EVAL / "judge" / f"full_r{k}"
+        fulljd = eval_path("judge", f"full_r{k}")
         fulljd.mkdir(parents=True, exist_ok=True)
         for tag in (f"baseline_r{k}", f"newq_r{k}"):
-            for sf in (EVAL / "judge" / tag).glob("*.seed0.json"):
-                shutil.copy(sf, fulljd / sf.name)
+            for sf in (eval_path("judge", tag)).glob("*.seed0.json"):
+                shutil.copy(eval_path("judge", tag, sf.name), eval_path("judge", f"full_r{k}", sf.name))
         bbq = ST.per_question_scalars(full_res, GOLD)
-        jq = JA.per_question_scalars(EVAL / "judge", GOLD, tag=f"full_r{k}", n_seeds=1)
+        jq = JA.per_question_scalars(eval_path("judge"), GOLD, tag=f"full_r{k}", n_seeds=1)
         summ = HL.run_summary(bbq, jq)
-        trap = JA.trap_correct_refusal_rate(EVAL / "judge", GOLD, tag=f"full_r{k}", n_seeds=1)
+        trap = JA.trap_correct_refusal_rate(eval_path("judge"), GOLD, tag=f"full_r{k}", n_seeds=1)
         per_run[k] = {"summary": summ, "trap": trap, "hl_table": HL.headline_table(bbq, jq)}
 
     headlines = [per_run[k]["summary"]["headline"] for k in RUNS]

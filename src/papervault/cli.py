@@ -46,6 +46,11 @@ class _Report:
 
 def _check_config(r: _Report) -> None:
     click.echo(click.style("config", bold=True))
+    repo_root = Path(__file__).resolve().parents[2]
+    if any(repo_root.glob(".env.bak*")):
+        r.warn("[WARN] .env backups in repository root",
+               "move .env.bak* to /home/leon/backups/papervault-env/ "
+               "(directory mode 700, files mode 600)")
     if config.ENV_FILE:
         r.ok(".env", str(config.ENV_FILE))
     else:

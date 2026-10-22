@@ -1,10 +1,14 @@
 """F0 baseline snapshot (read-only): catalog counts, v2 state, identity, R2 coverage, DB counts."""
-import json, os, sys, time
+import argparse
+import json, os, time
 from collections import Counter
 from pathlib import Path
 
 ROOT = Path("/data/paper-vault")
-OUT = Path("/home/leon/.claude/jobs/ac15ab17/tmp/f0-snapshot-2026-10-18.json")
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("--output", type=Path, default=ROOT / "snapshots/catalog-snapshot.json",
+                    help="snapshot destination (default: /data/paper-vault/snapshots/catalog-snapshot.json)")
+OUT = parser.parse_args().output.expanduser().resolve()
 
 # STRICTLY READ-ONLY: parse index.json directly; never construct Library (its __init__
 # creates vault directories / touches manifest state).
@@ -129,6 +133,7 @@ for pool in pools:
     r2["per_pool"].append({"qid": pool.get("qid"), "n": len(entries),
                             "matched": len(matched), "readable": len(rd), "indexed": len(ix)})
 snap["r2_coverage"] = r2
+OUT.parent.mkdir(parents=True, exist_ok=True)
 OUT.write_text(json.dumps(snap, indent=1, ensure_ascii=False))
 print("wrote", OUT)
 print("records:", snap["records"], "| status:", snap["download_status"])

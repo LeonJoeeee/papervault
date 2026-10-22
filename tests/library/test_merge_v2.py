@@ -454,7 +454,7 @@ async def test_restrictions_union_and_no_one_sided_grant(pair, left_policy, righ
     assert await coordinator(pair).merge_records(left.key, right.key) is left
     assert left.acquisition_state.policy == want
     assert left.acquisition_state.policy_reasons == ("off_domain", "non_paper")
-    assert left.acquisition_state.required_revision == 7
+    assert left.acquisition_state.required_revision == 9
     assert left.acquisition_state.override is None
     assert not effective_policy(left.acquisition_state, key=left.key)
 
@@ -549,6 +549,22 @@ async def test_doi_collision_routes_to_alias_without_purging_artifacts(pair):
     assert (outcome, detail) == ("collision", left.key)
     assert artifact.read_bytes() == b"retained preprint artifact"
     assert lib.get(right.key).acquisition_state.merge == Merge.ALIAS
+
+
+@pytest.mark.parametrize("field,metadata", [("arxiv_id", None), ("doi", None),
+                                          ("arxiv_id", {"arxiv_id": "2101.99999v2"})])
+async def test_catalog_merge_refuses_distinct_occupied_identity_axes_before_quiescence(pair, field, metadata):
+    lib, left, right, _, _ = pair
+    if metadata is None:
+        setattr(left, field, "10.1234/left" if field == "doi" else "2101.99999v1")
+        setattr(right, field, "10.1234/right" if field == "doi" else "2101.99999v2")
+    lib._catalog_backend = object()  # Admission guard only; no database IO is allowed.
+    before = [p.model_dump() for p in (left, right)]
+    with pytest.raises(ValueError, match="conflicting resolved"):
+        from papervault.library.services import concurrency
+        async with concurrency.lib_write_lock:
+            coordinator(pair)._merge_records(left.key, right.key, metadata=metadata)
+    assert [p.model_dump() for p in (left, right)] == before
 
 
 async def test_doi_collision_does_not_mutate_identity_while_active(pair):

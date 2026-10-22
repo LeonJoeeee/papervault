@@ -252,3 +252,60 @@ def test_plain_readd_does_not_clobber_terminal_status(lib, monkeypatch):
     assert "terminal" in out["message"].lower()
     reloaded = Library(lib.root)
     assert reloaded.get(p.key).download_status == "failed"
+
+
+def test_force_refresh_records_operator_evidence_and_preserves_unknown_policy(lib):
+    from papervault.library.state_v2 import Policy, Retrieval, TerminalState
+
+    paper, _ = lib.upsert({"title": "Force refresh preserves unknown acquisition policy",
+                           "authors": ["Curie"], "doi": "10.5000/guarded-refresh"})
+    paper.download_status = "failed"
+    paper.terminal_state = TerminalState(retrieval=Retrieval.EXHAUSTED, policy=Policy.UNKNOWN,
+                                        quarantine=True)
+    paper.extract_attempts = 4
+    lib.save()
+    result = AddService(lib).add(paper.key, force_refresh=True,
+                                 reason="owner verified missing output", actor="leon")
+    assert result["status"] == "queued"
+    reloaded = Library(lib.root)
+    persisted = reloaded.get(paper.key)
+    assert persisted.acquisition_state.policy == Policy.UNKNOWN
+    assert persisted.acquisition_state.quarantine is True
+    assert persisted.acquisition_state.retrieval == Retrieval.ELIGIBLE
+    assert persisted.extract_attempts == 0
+    row = reloaded.corrections.read()["operator_events"][-1]
+    assert row["action"] == "reopen_download"
+    assert row["keys"] == [paper.key]
+    assert row["reason"] == "owner verified missing output"
+    assert row["actor"] == "leon"
+
+
+def test_force_refresh_preserves_selected_version_hunt_stamp(lib):
+    paper, _ = lib.upsert({"title": "Selected extraction retains immutable bundle provenance",
+                           "authors": ["Curie"], "doi": "10.5000/versioned-refresh"})
+    paper.download_status = "failed"
+    paper.extraction_completion_id = "a" * 32
+    paper.firecrawl_pdf_hunt_exhausted = True
+    lib.save()
+    result = AddService(lib).add(paper.key, force_refresh=True)
+    assert result["status"] == "queued"
+    persisted = Library(lib.root).get(paper.key)
+    assert persisted.extraction_completion_id == "a" * 32
+    assert persisted.firecrawl_pdf_hunt_exhausted is True
+    row = lib.corrections.read()["operator_events"][-1]
+    assert row["reason"] == "add: force-refresh"
+    assert row["actor"] == "operator"
+
+
+def test_force_refresh_fuzzy_library_match_uses_audited_reopen(lib):
+    paper, _ = lib.upsert({"title": "Fuzzy force refresh must reopen the resolved record",
+                           "authors": ["Curie"], "doi": "10.5000/fuzzy-refresh"})
+    paper.download_status = "failed"
+    lib.save()
+    service = AddService(lib)
+    _stub_resolver(service, [{"key": paper.key, "score": 0.9, "in_library": True}])
+    result = service.add("fuzzy force refresh paper", force_refresh=True)
+    assert result["status"] == "queued"
+    persisted = Library(lib.root).get(paper.key)
+    assert persisted.download_status == "pending"
+    assert lib.corrections.read()["operator_events"][-1]["keys"] == [paper.key]

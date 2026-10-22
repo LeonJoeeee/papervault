@@ -190,13 +190,20 @@ def retain_observed_restrictions(current, observed) -> TerminalState:
     """
     if not isinstance(current, TerminalState) or not isinstance(observed, TerminalState):
         return TerminalState()
+    left, right = current.override, observed.override
+    required_revision = max([0, *(s.required_revision for s in (current, observed)
+                                 if type(s.required_revision) is int)])
+    # A discarded grant's revision remains spent, including legacy grants whose
+    # writer did not advance required_revision when installing the override.
+    dropped_revision = max([required_revision, *(g.revision for g in (left, right)
+        if isinstance(g, PolicyOverride) and type(g.revision) is int and g.revision > 0)])
     if (not _valid_scope(current.policy_reasons) or not _valid_scope(observed.policy_reasons)
             or type(current.required_revision) is not int or type(observed.required_revision) is not int
             or current.policy not in tuple(Policy) or observed.policy not in tuple(Policy)):
-        return replace(current, policy=Policy.UNKNOWN, override=None)
+        return replace(current, policy=Policy.UNKNOWN, override=None,
+                       required_revision=dropped_revision)
     reasons = tuple(dict.fromkeys((*current.policy_reasons, *observed.policy_reasons)))
     grant = None
-    left, right = current.override, observed.override
     if (current.policy == observed.policy == Policy.OVERRIDE
             and isinstance(left, PolicyOverride) and isinstance(right, PolicyOverride)
             and left.key and left.key == right.key
@@ -216,7 +223,7 @@ def retain_observed_restrictions(current, observed) -> TerminalState:
     else:
         policy = Policy.EXCLUDED if reasons else Policy.CLEAR
     return replace(current, policy=policy, policy_reasons=reasons, override=grant,
-                   required_revision=max(current.required_revision, observed.required_revision),
+                   required_revision=dropped_revision if grant is None else required_revision,
                    quarantine=current.quarantine or observed.quarantine,
                    merge=(Merge.ALIAS if Merge.ALIAS in (current.merge, observed.merge) else current.merge),
                    alias_key=current.alias_key or observed.alias_key,

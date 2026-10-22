@@ -128,9 +128,10 @@ python -m papervault.library.cli reopen-campaign --cap 20 --json
 python -m papervault.library.cli reopen-campaign --keys approved.keys --cap 50 --dry-run --json
 ```
 
-The selector takes exhausted retrieval with allowed policy, canonical resolved
+The selector takes exhausted retrieval (or an explicitly ruled eligible terminal)
+with allowed policy, canonical resolved
 identity and no quarantine. It changes only retrieval eligibility; unknown or
-excluded policy needs a separate ruling. Dry-run reads the index and validates
+excluded policy needs a separate ruling. Dry-run reads the current catalog authority and validates
 authorization without creating files or sending requests. Apply claims and
 enqueues the selected cohort through the existing download queue, waits for its
 results, and refuses a live service, unavailable service probe, or active campaign.
@@ -142,29 +143,52 @@ including those after the cap: missing keys, records refused by `reopenable()`,
 exhausted budgets, and eligible keys deferred by the cap appear in the accounting.
 An empty key file selects nothing.
 
-For the owner-approved ADS recovery in [#245](https://github.com/LeonJoeeee/papervault/issues/245),
-resolve UNKNOWN policy with an explicit ruling before the scoped campaign:
+Scoped policy rulings apply to explicit citation keys across all source cohorts:
 
 ```bash
-python -m papervault.library.cli policy-ruling --keys approved.keys --action acquire --reason 'Owner approved ADS recovery #245'
+python -m papervault.library.cli policy-ruling --keys approved.keys --action acquire --reason 'Owner approved recovery' --actor owner
 # In a maintenance window with papervault.service stopped:
-python -m papervault.library.cli policy-ruling --keys approved.keys --action acquire --reason 'Owner approved ADS recovery #245' --apply
+python -m papervault.library.cli policy-ruling --keys approved.keys --action acquire --reason 'Owner approved recovery' --actor owner --apply
 ```
 
-The default is a read-only JSON report of matched keys and current policies;
-missing keys and cohort mismatches are counted and cause exit 2. Apply refuses
-the entire request if any key is invalid. The cohort requires source `ads`, no
-stored DOI/arXiv ID, an ADS abstract URL agreeing with `paper_id`, and exhausted
-`metadata_only` retrieval. Existing exclusions, quarantine, aliases, merge intents,
-and unsettled claims cannot be cleared by this ruling. UNKNOWN remains deny by
-default everywhere else.
+The default is a read-only report of matched keys and current policies. Missing
+keys, quarantine, aliases, merge intents and unsettled claims refuse the whole
+request. `acquire` (`override`) creates a key-bound acquisition grant covering
+current policy reasons and makes failed/metadata-only/pending retrieval eligible.
+`exclude` (`restrict`) sets excluded policy and metadata-only status; `clear`
+clears the stored ruling. Separate domain exclusions still apply. These acts
+preserve artifacts and never release quarantine. UNKNOWN continues to deny
+acquisition without an applicable ruling.
 
-Apply appends one ruling (UTC timestamp, action, reason, keys, revision) to
-`correction-ledger.json` before durably saving grants. Each grant covers only
-`acquire`, has an empty reason set, is bound to its citation key, and meets the
-selected records' required revisions. Retrieval and download status stay intact;
-the campaign owns the subsequent re-open. Repeating a recorded key/action/revision
-does not add evidence rows, including recovery after an interrupted index save.
+Rulings carry UTC time, action, scope, reason, actor, keys and revision. Repeating
+the same ruling reuses its evidence; a different action or reason advances the
+revision. Grants apply only to acquisition on their original key and remain until
+superseded by a later ruling/revision. Under PostgreSQL, record changes, ruling,
+audit and pending work commit atomically; stale decisions refuse. The JSON
+correction ledger is a compatibility copy after commit. In JSON mode intent is
+saved before state with an explicit record snapshot. Only the latest intent for
+each key can recover an interrupted index save, and only while that snapshot and
+its covered policy reasons still match. Legacy rows without recovery metadata
+are completed history. Replaying a spent or superseded grant never reopens it;
+reconsideration requires a new ruling reason. Merges retain the revision barrier
+of every dropped grant.
+
+Download audit retries and `add --force-refresh` record an `operator_reopen` act
+and set retrieval eligible without granting policy permission. Audit accepts
+`--reason` and `--actor` (default reason names the retry action). Extraction
+retries retain the existing status/attempt/defer reset contract. The legacy
+background janitor no longer purges terminal records.
+
+Recovery commands require an explicit reason and actor, and refuse a running
+service. `claim-recover KEY [--lease-id ID]` refunds only proven-unsent work;
+dispatched attempts require `--executor-proof`. `release-quarantine KEY
+[--lease-id ID]` records a human disposition and fences the old generation without
+refunding it. `campaign-halt ID` stops new dispatch; `--drained` additionally
+finishes only after outstanding reservations and record claims settle.
+`merge-consolidate CANONICAL ABSORBED` and `merge-restart CANONICAL` retain alias
+records and artifacts, respect drain barriers, and require merge V2. All five
+commands accept `--reason REASON --actor ACTOR`.
+
 Rulings and standalone campaigns share the writer lock and refuse a running
 service or unavailable service probe. The orchestrator owns live application.
 
@@ -381,8 +405,8 @@ batch manifests, adjudications, route findings, scheduling and monthly aggregate
 The library manifest records every pass and monthly report. Merge/enrichment and
 verified-identity claim hooks stage conflicting fields with both original sides and
 provenance; they retain existing fill-blanks behavior. The backfill still never
-merges or purges a collision (the older title-based DOI resolver keeps its existing
-merge behavior, with field conflicts staged before merging).
+merges or purges a collision. The title-based DOI resolver uses non-destructive
+V2 alias consolidation; with merge V2 disabled it leaves the collision waiting.
 
 At ten distinct pending subject papers, one atomic ledger write emits and assigns
 a manifest for an **orchestrator-dispatched Codex CLI `gpt-6-luna` / `max`** agent.
@@ -639,6 +663,14 @@ eligibility reasons. Supply a JSON payload for every other action:
 # Apply only in the explicitly recorded window; one batch names at most 100 completions.
 .venv/bin/python scripts/maintain_derivatives.py gc --dsn-env MAINTENANCE_CATALOG_DSN --catalog-schema <schema> --vault <vault> --payload gc.json --operation-id gc-batch --owner <operator> --window-id <window> --apply
 ```
+
+The module CLI also exposes `extract-retention`, `extract-pin`,
+`release-extract-pin` and `extract-gc`, with the same explicit `--dsn-env`,
+`--catalog-schema`, `--vault`, `--operation-id` and optional `--apply` boundary.
+Use each command's `--help` for exact revision, nonce, owner and disposition
+arguments. `extract-gc --completion-id ID` accepts repeated explicit identities;
+apply requires the recorded window and lease owner. These commands reuse the
+same reducers, protections and bounded maintenance coordinator as the script.
 
 | Action | Required JSON payload |
 | --- | --- |

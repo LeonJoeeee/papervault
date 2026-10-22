@@ -60,7 +60,8 @@ class AddService:
             self._resolver = ResolverService(self.library, llm=self._llm)
         return self._resolver
 
-    def add(self, identifier: str, *, force_refresh: bool = False) -> dict:
+    def add(self, identifier: str, *, force_refresh: bool = False,
+            reason: str = "add: force-refresh", actor: str = "operator") -> dict:
         """Idempotent paper add. See module docstring for the spec.
 
         Returns a dict matching the MCP `add_paper` AddResult schema.
@@ -108,7 +109,9 @@ class AddService:
             if len(in_lib) == 1 and in_lib[0]["score"] >= 0.85:
                 p = self.library.get(in_lib[0]["key"])
                 if p:
-                    return self._exists_response(p)
+                    if not force_refresh:
+                        return self._exists_response(p)
+                    existing = p
             if len(in_lib) > 1:
                 return {
                     "status": "ambiguous",
@@ -120,13 +123,14 @@ class AddService:
                 }
             # no library hit → no further auto-fetch (would need broader external search,
             # let the caller use search.search_all explicitly).
-            return {
-                "status": "not_found",
-                "key": None,
-                "metadata": None,
-                "candidates": None,
-                "message": "no library match and identifier is not a recognizable DOI/arxiv id",
-            }
+            if existing is None:
+                return {
+                    "status": "not_found",
+                    "key": None,
+                    "metadata": None,
+                    "candidates": None,
+                    "message": "no library match and identifier is not a recognizable DOI/arxiv id",
+                }
 
         if metadata is None and existing is None:
             return {
@@ -177,9 +181,8 @@ class AddService:
         # gives the (re-)download a fresh run rather than tripping a stale
         # ``extract_attempts`` ceiling left from a prior pass.
         if force_refresh:
-            paper.download_status = DOWNLOAD_STATUS_PENDING
-            paper.extract_attempts = 0
-            paper.firecrawl_pdf_hunt_exhausted = False
+            from .operator_actions import reopen_records
+            reopen_records(self.library, [paper], reason=reason, actor=actor, force_refresh=True)
         elif (paper.download_status or "") in DOWNLOAD_STATUS_TERMINAL:
             # Plain (non-force) re-add of an existing TERMINAL card
             # (failed / extract_failed / metadata_only). classify() returns

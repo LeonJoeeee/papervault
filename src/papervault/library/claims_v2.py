@@ -57,6 +57,15 @@ class BudgetLedger:
         except FileNotFoundError:
             # Absence is initial zero only for a vault with no durable history.
             # A removed ledger must never reset budgets or weekly authorization.
+            if os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json") == "postgres":
+                from .services.identity_backfill import read_identity_records
+                try:
+                    if any(p.reopen_claim is not None or p.merge_budget is not None
+                           for p in read_identity_records(self.path.parent)):
+                        raise LedgerError("budget ledger missing for persisted claims")
+                except (OSError, ValueError, RuntimeError) as exc:
+                    raise LedgerError(f"budget ledger missing; cannot establish initial accounting: {exc}") from exc
+                return []
             for name in ("index.json", "index.json.bak"):
                 try:
                     check_index_readable(self.path.parent)
@@ -402,7 +411,9 @@ def _outstanding(rows, keys) -> list[ReopenClaim]:
 
 def reopenable(paper) -> bool:
     state = paper.acquisition_state
-    return (paper.merge_intent is None and state.retrieval == Retrieval.EXHAUSTED and not state.quarantine
+    retryable = (state.retrieval == Retrieval.EXHAUSTED or
+                 (state.retrieval == Retrieval.ELIGIBLE and paper.download_status in {"metadata_only", "failed"}))
+    return (paper.merge_intent is None and retryable and not state.quarantine
             and state.merge == Merge.CANONICAL and not state.alias_key
             and effective_policy(state, key=paper.key) and resolved_identity(paper)
             and (paper.reopen_claim is None or paper.reopen_claim.phase in {"completed", "not_sent", "released"}))
@@ -514,7 +525,11 @@ class ClaimStore:
 
     def _not_sent(self, paper, token: ReopenClaim) -> bool:
         check_index_readable(self.library.root)
-        if not self.ledger.refund_if_not_sent(token, proven_not_sent=True):
+        if paper.reopen_claim.phase not in {"queued", "dispatched"}:
+            return False
+        refunded = (self.ledger.phase(token) == "refund"
+                    and token.generation == self.ledger.latest_generation(token.key))
+        if not refunded and not self.ledger.refund_if_not_sent(token, proven_not_sent=True):
             return False
         paper.reopen_claim = paper.reopen_claim.model_copy(update={"phase": "not_sent"})
         if (paper.download_status == "pending"
@@ -529,16 +544,20 @@ class ClaimStore:
             paper = self.current(token)
             if paper is None:
                 return False
-            if not executor_proof and (paper.reopen_claim.phase != "queued" or self.ledger.phase(token) != "reserve"):
+            phase = self.ledger.phase(token)
+            # A durable refund is already validated unsent evidence. Reconcile
+            # its interrupted record write without refunding the budget twice.
+            if not executor_proof and phase != "refund" and (paper.reopen_claim.phase != "queued" or phase != "reserve"):
                 return False
             return self._not_sent(paper, token) if paper else False
 
     async def release_quarantine(self, key: str, *, drained_lease_id: str = "",
-                                 human_reason: str = "") -> bool:
+                                 human_reason: str = "", expected_lease_id: str = "") -> bool:
         async with self.lock:
             check_index_readable(self.library.root)
             paper = self.library.get(key)
             if (paper is None or paper.reopen_claim is None or not paper.acquisition_state.quarantine
+                    or (expected_lease_id and paper.reopen_claim.lease_id != expected_lease_id)
                     or not (human_reason.strip() or drained_lease_id == paper.reopen_claim.lease_id)):
                 return False
             token = paper.reopen_claim.model_copy(update={"generation": paper.reopen_claim.generation + 1,

@@ -191,3 +191,28 @@ def test_domain_projection_preserves_and_checks_scoped_override(v2, monkeypatch,
     assert projected.override == grant
     assert projected.policy_reasons == ("off_domain",)
     assert v2.admission(projected, identity_resolved=True, key="K") is allowed
+
+
+@pytest.mark.parametrize("side", ["current", "observed"])
+@pytest.mark.parametrize("policy", ["clear", "excluded", "unknown"])
+def test_dropped_override_revision_remains_spent_on_either_merge_side(v2, side, policy):
+    legacy = v2.TerminalState(policy=v2.Policy.OVERRIDE, retrieval=v2.Retrieval.EXHAUSTED,
+        override=v2.PolicyOverride(scope=("acquire",), revision=9, key="K"))
+    other = v2.TerminalState(policy=v2.Policy(policy), required_revision=3)
+    current, observed = (legacy, other) if side == "current" else (other, legacy)
+    merged = v2.retain_observed_restrictions(current, observed)
+    assert merged.override is None
+    assert merged.required_revision == 9
+    assert merged.retrieval == current.retrieval
+    assert not v2.effective_policy(merged, key="K")
+    # A stale copy of the grant cannot cross the revision barrier.
+    assert not v2.effective_policy(replace(merged, policy=v2.Policy.OVERRIDE,
+        override=replace(legacy.override, revision=8)), key="K")
+
+
+def test_fail_closed_merge_also_spends_a_dropped_override(v2):
+    legacy = v2.TerminalState(policy=v2.Policy.OVERRIDE, policy_reasons=None,
+        override=v2.PolicyOverride(scope=("acquire",), revision=9, key="K"))
+    merged = v2.retain_observed_restrictions(legacy, v2.TerminalState())
+    assert merged.policy == v2.Policy.UNKNOWN and merged.override is None
+    assert merged.required_revision == 9

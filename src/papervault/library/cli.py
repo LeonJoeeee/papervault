@@ -33,7 +33,82 @@ def _json(obj) -> None:
     print(json.dumps(obj, ensure_ascii=False, indent=2, default=str))
 
 
+def _standalone_writer_lock():
+    from filelock import FileLock
+    from papervault import config
+    root = Path(os.path.expanduser(os.environ.get("PAPERVAULT_VAULT")
+                or os.environ.get("PAPER_LIBRARY_PATH") or str(config.VAULT_PATH)))
+    return FileLock(str(root / ".reopen-campaign.lock"), timeout=0)
+
+
 # ------------------------------- handlers ----------------------------------
+
+
+def cmd_lifecycle_operator(args) -> int:
+    """Stopped-service recovery; domain guards still decide every transition."""
+    import asyncio
+    from papervault.ops_guards import active_service_units
+    from .services.lifecycle_recovery import operate
+
+    library, lock = None, None
+    try:
+        if active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES, strict=True):
+            raise ValueError("papervault.service is running; stop and drain it before recovery")
+        lock = _standalone_writer_lock()
+        lock.acquire()
+        library = Library()
+        result = asyncio.run(operate(library, action=args.command,
+            key=getattr(args, "key", None), campaign_id=getattr(args, "campaign_id", None),
+            reason=args.reason, actor=args.actor,
+            executor_proof=getattr(args, "executor_proof", False),
+            drained=getattr(args, "drained", False), lease_id=getattr(args, "lease_id", "")))
+        _json(result)
+        return 0 if result["changed"] else 2
+    except (OSError, ValueError, RuntimeError) as exc:
+        _err(str(exc))
+        return 2
+    finally:
+        if library:
+            library.close()
+        if lock:
+            lock.release()
+
+
+def cmd_merge_operator(args) -> int:
+    import asyncio
+    from papervault.ops_guards import active_service_units
+    from .merge_v2 import MergeStore
+    library, lock = None, None
+    try:
+        if not args.reason.strip() or not args.actor.strip():
+            raise ValueError("merge requires nonempty actor and reason")
+        if active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES, strict=True):
+            raise ValueError("papervault.service is running; stop and drain it before merging")
+        lock = _standalone_writer_lock()
+        lock.acquire()
+        library = Library()
+        store = MergeStore(library, actor=args.actor, reason=args.reason)
+        canonical = library.get(args.canonical_key)
+        if canonical is None:
+            raise ValueError("canonical record not found")
+        if args.command == "merge-restart":
+            result = asyncio.run(store.restart(canonical.merge_intent, wait_seconds=args.wait_seconds))
+        else:
+            if library.get(args.absorbed_key) is None:
+                raise ValueError("absorbed record not found")
+            result = asyncio.run(store.merge_records(args.canonical_key, args.absorbed_key,
+                                                    wait_seconds=args.wait_seconds))
+        _json({"action": args.command, "changed": result is not None,
+               "canonical_key": args.canonical_key})
+        return 0 if result is not None else 2
+    except (OSError, ValueError, RuntimeError) as exc:
+        _err(str(exc))
+        return 2
+    finally:
+        if library:
+            library.close()
+        if lock:
+            lock.release()
 
 
 def cmd_policy_ruling(args) -> int:
@@ -49,7 +124,8 @@ def cmd_policy_ruling(args) -> int:
             if active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES, strict=True):
                 raise ValueError("papervault.service is running and would overwrite this ruling; stop it first")
         operation = apply_ruling if args.apply else inspect_ruling
-        result = operation(root, keys=keys, action=args.action, reason=args.reason)
+        result = operation(root, keys=keys, action=args.action, reason=args.reason,
+                           **({"actor": args.actor} if args.apply else {}))
     except (OSError, ValueError, RuntimeError) as exc:
         _err(str(exc))
         return 2
@@ -590,14 +666,14 @@ def _read_key_file(path: str) -> list[str]:
     return keys
 
 
-def _retry_extract_keys(lib, keys: list[str], *, dry_run: bool) -> dict:
+def _retry_extract_keys(lib, keys: list[str], *, dry_run: bool,
+                        reason="audit: retry-extract-keys", actor="operator") -> dict:
     """Reset the listed keys that are ``extract_failed`` with a PDF on disk and no
     md (issue #134): ``download_status=ok``, ``extract_attempts=0``, transport-defer
     stamp cleared, so the extract queue's recovery scan re-runs them at the next
     service start. Every other listed key is reported under the reason it was
     skipped; unlisted papers are never touched. Writes only when not ``dry_run``."""
-    from .models import DOWNLOAD_STATUS_EXTRACT_FAILED, DOWNLOAD_STATUS_OK
-    from .services.extract_defer import clear_extract_deferred
+    from .models import DOWNLOAD_STATUS_EXTRACT_FAILED
 
     unique = list(dict.fromkeys(keys))
     skipped: dict[str, list[str]] = {
@@ -616,11 +692,8 @@ def _retry_extract_keys(lib, keys: list[str], *, dry_run: bool) -> dict:
         else:
             eligible.append(p)
     if not dry_run and eligible:
-        for p in eligible:
-            p.download_status = DOWNLOAD_STATUS_OK
-            p.extract_attempts = 0
-            clear_extract_deferred(p)
-        lib.save(force=True)
+        from .services.operator_actions import reopen_records
+        reopen_records(lib, eligible, extraction=True, reason=reason, actor=actor)
     return {
         "dry_run": dry_run,
         "listed": len(keys),
@@ -670,8 +743,6 @@ def cmd_audit(args) -> int:
         DOWNLOAD_STATUS_EXTRACT_FAILED,
         DOWNLOAD_STATUS_FAILED,
         DOWNLOAD_STATUS_METADATA_ONLY,
-        DOWNLOAD_STATUS_OK,
-        DOWNLOAD_STATUS_PENDING,
     )
 
     # ---- retry-extract-keys pre-flight (issue #134), BEFORE the library loads:
@@ -695,6 +766,11 @@ def cmd_audit(args) -> int:
                      "(systemctl --user stop papervault.service), then re-run.")
                 return 2
 
+    from .services.operator_actions import reopen_records
+    actor = args.actor
+    def reopen(papers, action, *, extraction=False):
+        reopen_records(lib, papers, extraction=extraction,
+                       reason=args.reason or f"audit: {action}", actor=actor)
     lib = Library()
     payload: dict = {}
     do_drift_scan = args.fix or not (
@@ -714,20 +790,17 @@ def cmd_audit(args) -> int:
                       f"{row['availability']} — {row['reason']}")
 
     if retry_keys is not None:
-        result = _retry_extract_keys(lib, retry_keys, dry_run=args.dry_run)
+        result = _retry_extract_keys(lib, retry_keys, dry_run=args.dry_run,
+                                    reason=args.reason or "audit: retry-extract-keys", actor=actor)
         payload["retry_extract_keys"] = result
         if not args.json:
             _print_retry_extract_keys(result)
 
     # ---- retry-failed: mutate first so --queue picks up the new pending count.
     if args.retry_failed:
-        reset_count = 0
-        for p in lib.all_papers():
-            if (p.download_status or "") == DOWNLOAD_STATUS_FAILED:
-                p.download_status = DOWNLOAD_STATUS_PENDING
-                reset_count += 1
-        if reset_count:
-            lib.save()
+        matched = [p for p in lib.all_papers() if p.download_status == DOWNLOAD_STATUS_FAILED]
+        reopen(matched, "retry-failed")
+        reset_count = len(matched)
         payload["reset_count"] = reset_count
         if not args.json:
             if args.retry_extract_keys:
@@ -743,15 +816,10 @@ def cmd_audit(args) -> int:
     # name is kept for back-compat; the old ``extract_low_quality`` ghost
     # state no longer exists post-migration.
     if args.retry_low_quality:
-        reset_count = 0
-        for p in lib.all_papers():
-            if ((p.download_status or "") == DOWNLOAD_STATUS_EXTRACT_FAILED
-                    and lib.has_pdf(p.key)):
-                p.download_status = DOWNLOAD_STATUS_OK
-                p.extract_attempts = 0
-                reset_count += 1
-        if reset_count:
-            lib.save()
+        matched = [p for p in lib.all_papers() if p.download_status == DOWNLOAD_STATUS_EXTRACT_FAILED
+                   and lib.has_pdf(p.key)]
+        reopen(matched, "retry-low-quality", extraction=True)
+        reset_count = len(matched)
         payload["retry_low_quality_count"] = reset_count
         if not args.json:
             if args.retry_failed or args.retry_extract_keys:
@@ -787,10 +855,7 @@ def cmd_audit(args) -> int:
             matched = [p for p in candidates
                        if _metadata_only_filter_match(p, spec)]
 
-        for p in matched:
-            p.download_status = DOWNLOAD_STATUS_PENDING
-        if matched:
-            lib.save()
+        reopen(matched, "retry-metadata-only")
 
         reset_keys = [p.key for p in matched]
         payload["retry_metadata_only_count"] = len(matched)
@@ -1206,9 +1271,10 @@ def build_parser() -> argparse.ArgumentParser:
     pib.add_argument("--json", action="store_true", help="emit the recorded JSON accounting")
     pib.set_defaults(func=cmd_identity_backfill)
 
-    ppr = sp.add_parser("policy-ruling", help="record a scoped acquire ruling for the ADS metadata-only cohort")
+    ppr = sp.add_parser("policy-ruling", help="record a scoped, revisioned policy ruling")
     ppr.add_argument("--keys", metavar="FILE", required=True, help="citation keys, one per line; # comments allowed")
-    ppr.add_argument("--action", choices=("acquire",), required=True)
+    ppr.add_argument("--action", choices=("acquire", "override", "exclude", "restrict", "clear"), required=True)
+    ppr.add_argument("--actor", default="operator", help="operator identity recorded in the audit")
     ppr.add_argument("--reason", required=True, help="owner/orchestrator rationale for the ruling")
     ppr.add_argument("--apply", action="store_true", help="persist the ruling and grants (default: read-only)")
     ppr.set_defaults(func=cmd_policy_ruling)
@@ -1219,6 +1285,30 @@ def build_parser() -> argparse.ArgumentParser:
     prc.add_argument("--dry-run", action="store_true", help="select and validate without writes or requests")
     prc.add_argument("--json", action="store_true", help="emit campaign accounting as JSON")
     prc.set_defaults(func=cmd_reopen_campaign)
+
+    for name in ("claim-recover", "release-quarantine", "campaign-halt"):
+        command = sp.add_parser(name, help="ledgered campaign/claim recovery")
+        command.add_argument("campaign_id" if name == "campaign-halt" else "key")
+        command.add_argument("--reason", required=True)
+        command.add_argument("--actor", required=True)
+        if name != "campaign-halt":
+            command.add_argument("--lease-id", default="", help="refuse if the current lease differs")
+        if name == "claim-recover":
+            command.add_argument("--executor-proof", action="store_true",
+                                 help="attest the dispatched executor did not send a request")
+        if name == "campaign-halt":
+            command.add_argument("--drained", action="store_true",
+                                 help="finish only after verified drain and settled claims")
+        command.set_defaults(func=cmd_lifecycle_operator)
+    for name in ("merge-consolidate", "merge-restart"):
+        command = sp.add_parser(name, help="non-destructive identity consolidation")
+        command.add_argument("canonical_key")
+        if name == "merge-consolidate":
+            command.add_argument("absorbed_key")
+        command.add_argument("--reason", required=True)
+        command.add_argument("--actor", required=True)
+        command.add_argument("--wait-seconds", type=float, default=60)
+        command.set_defaults(func=cmd_merge_operator)
 
     from .services.correction_pipeline import COHORTS, DEFAULT_COHORT_CAP, MAX_SWEEP_CAP, TRIGGERS
     pe = sp.add_parser("correction-event", help="notify a bounded cohort of a correction trigger")
@@ -1251,6 +1341,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     # audit
     pau = sp.add_parser("audit", help="check / fix index ↔ disk consistency")
+    pau.add_argument("--reason", help="operator rationale (default: structured audit action)")
+    pau.add_argument("--actor", default="operator", help="operator identity recorded in the audit")
     pau.add_argument("--fix", action="store_true",
                      help="backfill index fields when files exist but the index is missing them")
     pau.add_argument("--queue", action="store_true",

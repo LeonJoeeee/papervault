@@ -29,7 +29,9 @@ def test_mapping_retains_explicit_v2_axes_and_versioned_identity():
         "terminal_state": {"retrieval": "exhausted", "policy": "excluded",
                            "merge": "alias", "quarantine": True, "alias_key": "A"},
     })
-    assert (record.doi, record.arxiv_id) == ("10.1/abc", "1234.5678v2")
+    assert record.doi is record.arxiv_id is None
+    assert record.payload["doi"] == " 10.1/ABC "
+    assert record.payload["arxiv_id"] == " 1234.5678v2 "
     assert (record.retrieval, record.policy, record.merge, record.quarantine) == (
         "exhausted", "excluded", "alias", True,
     )

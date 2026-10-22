@@ -215,12 +215,13 @@ class Library:
     """A directory holding library.bib + index.json + pdfs/ + extracts/."""
 
     def __init__(self, root: Optional[str | Path] = None, *, authority: str | None = None,
-                 _handoff_token: str | None = None):
+                 _handoff_token: str | None = None, read_only: bool = False):
         import threading
         import weakref
         authority = authority or os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json")
         if authority not in {"json", "postgres"}:
             raise ValueError("PAPERVAULT_CATALOG_AUTHORITY must be json or postgres")
+        self.read_only = read_only
         self._catalog_backend = None
         if authority == "postgres":
             from papervault.store.persistence import PostgresPersistence
@@ -242,7 +243,7 @@ class Library:
         from filelock import FileLock
         self._catalog_save_lock = FileLock(str(self.root / ".write.lock")) if self._catalog_backend else None
         from papervault.store.fencing import writer_lease
-        lease = writer_lease(self.root, authority, handoff_token=_handoff_token)
+        lease = None if read_only else writer_lease(self.root, authority, handoff_token=_handoff_token)
         self._writer_finalizer = weakref.finalize(self, lease.close) if lease else None
         self._writer_closed = False
         self.bib_path = self.root / "library.bib"
@@ -255,8 +256,9 @@ class Library:
         self.txt_dir = self.root / "extracts" / "txt"
         self.manifest_path = self.root / "manifest.log"
 
-        for d in (self.topics_dir, self.pdfs_dir, self.md_dir, self.txt_dir):
-            d.mkdir(parents=True, exist_ok=True)
+        if not read_only:
+            for d in (self.topics_dir, self.pdfs_dir, self.md_dir, self.txt_dir):
+                d.mkdir(parents=True, exist_ok=True)
 
         self._papers: dict[str, Paper] = {}
         # Compact in-process fingerprints detect touches, including nested edits.
@@ -288,6 +290,8 @@ class Library:
         self._writer_closed = True
 
     def _check_writer(self):
+        if self.read_only:
+            raise PermissionError("Library is read-only")
         if self._writer_closed:
             from papervault.store.fencing import WriterFenced
             raise WriterFenced("Library is closed; reopen under the current catalog authority")
@@ -299,6 +303,20 @@ class Library:
             self._papers = self._catalog_backend.load()
             for paper in self._papers.values():
                 self._state_v2_fingerprints[paper.key] = hash(paper.model_dump_json())
+                self._reindex(paper)
+            return
+        if self.read_only:
+            from .state_v2 import check_index_readable
+            check_index_readable(self.root)
+            data = self._read_index_file(self.index_path) or self._read_index_file(self.index_bak_path)
+            if data is None or not isinstance(data.get("papers"), dict):
+                raise ValueError(f"no readable library index at {self.root}")
+            # Inspection must refuse malformed records, never omit one silently.
+            for key, raw in data["papers"].items():
+                paper = Paper.model_validate(raw)
+                if paper.key != key:
+                    raise ValueError("library index key differs from record")
+                self._papers[key] = paper
                 self._reindex(paper)
             return
         if not self.index_path.exists():
@@ -440,11 +458,13 @@ class Library:
         # materialize read-derived state; ingress/status writers record actual
         # acquisition changes before this persistence boundary.
         try:
-            self._catalog_backend.save(self._papers)
+            rulings = self._catalog_backend.save(self._papers)
         except CatalogConflict as exc:
             self._index_dirty = True
             self.log({"event": "catalog_conflict", "keys": list(exc.keys)})
             raise
+        from .services.operator_actions import mirror_events
+        mirror_events(self, rulings)
         self._by_doi.clear()
         self._by_arxiv.clear()
         self._by_title.clear()
@@ -594,6 +614,7 @@ class Library:
         """Mark (or clear) a paper's domain membership. ``status=None`` clears the
         quarantine (back to in-domain). Append-only-safe: updates metadata only,
         never deletes. Does NOT call ``save()`` — caller batches saves."""
+        self._check_writer()
         p = self._papers.get(key)
         if p is None:
             return False
@@ -648,6 +669,7 @@ class Library:
         Already-existing papers (merge path) skip validation — they were
         validated at first ingress (or grandfathered before validation existed).
         """
+        self._check_writer()
         existing = self.find(
             doi=paper_data.get("doi", "") or "",
             arxiv_id=paper_data.get("arxiv_id", "") or "",
@@ -848,6 +870,7 @@ class Library:
         True iff a locator blank was filled. Does NOT save() — caller batches the
         save under ``lib_write_lock``/the file lock.
         """
+        self._check_writer()
         p = self._papers.get(key)
         if p is None:
             return False
@@ -879,7 +902,7 @@ class Library:
                               corrupt ``_by_doi``); we route the stub through
                               the existing preprint↔journal merge semantics:
                               the DOI-holder absorbs the stub's blank-fill
-                              fields and the stub is purged. ``detail`` is the
+                              fields and retains the stub as an alias. ``detail`` is the
                               surviving DOI-holder's key.
           * ``"has_doi"``   — the row already carries a non-empty DOI; NEVER
                               overwritten. ``detail`` is the existing DOI.
@@ -895,6 +918,7 @@ class Library:
         the ``_try_arxiv_by_title`` precedent's raw ``paper.arxiv_id = ...``
         assignment (which left its index stale).
         """
+        self._check_writer()
         p = self._papers.get(key)
         if p is None:
             return ("no_paper", "")
@@ -907,9 +931,6 @@ class Library:
             holder = self.find(doi=(doi or "").strip())
             if (merge_v2_enabled() and holder is not None
                     and holder.key in {intent.canonical_key, intent.absorbed_key}):
-                if self._catalog_backend is not None:
-                    from papervault.store.repository import DeletionRefused
-                    raise DeletionRefused("PG identity collision merge is refused in P2")
                 from .merge_v2 import MergeStore, write_locked
                 merged = write_locked(lambda: MergeStore(self)._merge_records(
                     intent.canonical_key, intent.absorbed_key))
@@ -929,33 +950,12 @@ class Library:
                 return ("merge_waiting", holder_key)
             holder_key = holder.key
         if holder_key is not None and holder_key != key:
-            if self._catalog_backend is not None:
-                from papervault.store.repository import DeletionRefused
-                raise DeletionRefused("PG identity collision merge is refused in P2")
-            # A twin already owns this DOI. Merge the stub's blank-fill fields
-            # into the holder (journal-DOI side wins identity), then purge the
-            # stub. We DO NOT write the duplicate DOI onto the stub — that would
-            # leave _by_doi[doi] still pointing at the holder while a second row
-            # silently carries the same DOI.
             holder = self._papers.get(holder_key)
-            if holder is not None and holder.merge_intent:
+            if not merge_v2_enabled() or (holder is not None and holder.merge_intent):
                 return ("merge_waiting", holder_key)
-            if holder is not None and merge_v2_enabled():
-                from .merge_v2 import MergeStore, write_locked
-                merged = write_locked(lambda: MergeStore(self)._merge_records(holder_key, key))
-                return ("collision" if merged is not None else "merge_waiting", holder_key)
-            if holder is not None:
-                merged = self._merge(holder, p.model_dump())
-                self._papers[holder_key] = merged
-                self._reindex(merged)
-            self.log({
-                "event": "doi_resolve_collision_merged",
-                "stub_key": key,
-                "holder_key": holder_key,
-                "doi": doi,
-            })
-            self.purge(key, reason="doi_resolve_twin_merged")
-            return ("collision", holder_key)
+            from .merge_v2 import MergeStore, write_locked
+            merged = write_locked(lambda: MergeStore(self)._merge_records(holder_key, key))
+            return ("collision" if merged is not None else "merge_waiting", holder_key)
 
         # No collision — claim the DOI and re-index.
         p.doi = doi
@@ -974,6 +974,7 @@ class Library:
         The backfill caller owns verification and the normal save boundary.
         Collisions never purge another record or broaden the acquisition set.
         """
+        self._check_writer()
         paper = self.get(key)
         if paper is None:
             return "no_paper"
@@ -1010,6 +1011,7 @@ class Library:
         selects or purges another row. The normal caller still batches save().
         A merge-intent or absorbed alias refuses all fills.
         """
+        self._check_writer()
         paper = self.get(key)
         if paper is None:
             return {}
@@ -1051,6 +1053,7 @@ class Library:
         registration reservation. The caller still owns its normal save boundary.
         Each supplied axis returns an adoption or an explicit refusal reason.
         """
+        self._check_writer()
         from .claims_v2 import same_attempt
         from .merge_v2 import blocked
         from .state_v2 import Merge
@@ -1147,6 +1150,7 @@ class Library:
         both sides' field writes land. Fill-blanks semantics are unchanged:
         non-empty incoming only fills a blank existing field (numeric upgrade for
         citation_count, latch is_review)."""
+        self._check_writer()
         self.corrections.stage_fields(existing, incoming, provenance=provenance)
         for field, value in merge_inspire_fields(existing.model_dump(), incoming).items():
             setattr(existing, field, value)
@@ -1253,6 +1257,7 @@ class Library:
 
     def write_topic(self, slug: str, payload: dict) -> Path:
         """Persist a topic record (which keys belong to a search)."""
+        self._check_writer()
         path = self.topics_dir / f"{slug}.json"
         _atomic_write(path, json.dumps(payload, ensure_ascii=False, indent=2))
         return path
@@ -1267,6 +1272,7 @@ class Library:
         for an unmet prerequisite, without a network attempt. Reconcile
         counts paper routes from status/disk facts, not these tier events.
         """
+        self._check_writer()
         from papervault.config import stoprules_v2_enabled
         if stoprules_v2_enabled() and hasattr(self, "_telemetry_live"):
             # Preserve staged observations in the live manifest, with an

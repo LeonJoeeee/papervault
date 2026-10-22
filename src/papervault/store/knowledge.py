@@ -262,12 +262,29 @@ class KnowledgeRepository:
     def command(self, action: str, operation_id: str, payload: dict) -> dict:
         from contextlib import nullcontext
         from .knowledge_commands import dispatch
+        from .extract_lifecycle import ACTIONS as EXTRACT_ACTIONS
         if not isinstance(operation_id, str) or not operation_id.strip():
             raise ValueError("stable operation_id required")
         if not isinstance(payload, dict):
             raise ValueError("command payload must be an object")
         digest = payload_hash(payload)
-        audit = AuditEvent("knowledge", action, {"operation_id": operation_id})
+        actor, detail = "knowledge", {"operation_id": operation_id}
+        if action in EXTRACT_ACTIONS:
+            actor = payload.get("actor", "knowledge")
+            if not isinstance(actor, str):
+                raise ValueError("audit requires a nonempty actor")
+            # Reducer rows intentionally omit request evidence. Retain reviewed
+            # dispositions in the same audit commit, without copying arbitrary
+            # provider payloads or credentials into the durable event.
+            fields = ("completion_id", "pin_id", "owner", "kind", "reason", "operator_nonce",
+                      "disposition", "expected_revision", "disposable", "vault", "resource",
+                      "window_id", "ttl_seconds", "lease_seconds", "deletion_id")
+            detail.update({field: payload[field] for field in fields if field in payload})
+            if isinstance(payload.get("lease"), dict):
+                lease_fields = ("resource", "owner", "lease_id", "fencing_token", "authority_epoch", "window_id")
+                detail["lease"] = {field: payload["lease"][field] for field in lease_fields
+                                   if field in payload["lease"]}
+        audit = AuditEvent(actor, action, detail)
         # Namespace first, writer second: a sealing caller may already own the
         # namespace guard across external IO. Reversing these locks deadlocks.
         namespace = payload.get("claim", payload).get("namespace") if action in {

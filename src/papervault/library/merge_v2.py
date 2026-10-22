@@ -187,13 +187,21 @@ def write_locked(call):
 
 
 class MergeStore:
-    def __init__(self, library, *, ledger=None, clock=time.time):
+    def __init__(self, library, *, ledger=None, clock=time.time,
+                 actor="identity_merge", reason="identity consolidation"):
         from .claims_v2 import BudgetLedger
         from .services import concurrency
         self.library, self.clock = library, clock
         check_index_readable(library.root)
         self.ledger = ledger or BudgetLedger(library.root, clock=clock)
         self.lock = concurrency.lib_write_lock
+        self.actor, self.reason = actor, reason
+
+    def _save(self, action, papers):
+        from .services.operator_actions import stage_operator
+        stage_operator(self.library, action=action, keys=[p.key for p in papers],
+                       reason=self.reason + ": " + action, actor=self.actor, event=action)
+        self.library.save(force=True, durable=True)
 
     def _require_writer(self):
         if not merge_v2_enabled():
@@ -250,6 +258,16 @@ class MergeStore:
         left, right = (self._can_quiesce(key) for key in (canonical_key, absorbed_key))
         if left is None or right is None:
             return None
+        if self.library._catalog_backend is not None:
+            from papervault.store.repository import normalized_identity
+            observations = [left.model_dump(), right.model_dump(), metadata or {},
+                            left.merge_intent.metadata if left.merge_intent else {}]
+            for field in ("doi", "arxiv_id"):
+                identities = {normalized_identity(row.get(field)) for row in observations} - {None}
+                if len(identities) > 1:
+                    # A scalar owner cannot represent two distinct work/version
+                    # identities. Keep both records for explicit adjudication.
+                    raise ValueError(f"conflicting resolved {field} identities; adjudication required")
         if left.merge_intent or right.merge_intent:
             intent = left.merge_intent
             if not (intent and intent.canonical_key == canonical_key
@@ -258,7 +276,7 @@ class MergeStore:
             updated = self._observe(left, intent, metadata)
             if metadata:
                 left.merge_intent = right.merge_intent = updated
-                self.library.save(force=True, durable=True)
+                self._save("merge_observation", (left, right))
             return updated
         intent = MergeIntent(merge_id=uuid.uuid4().hex, canonical_key=canonical_key,
                              absorbed_key=absorbed_key, started_at=float(self.clock()),
@@ -271,7 +289,7 @@ class MergeStore:
                 # The intent projects an admission quarantine; do not mark
                 # existing dispatched execution as uncertain before it settles.
                 paper.merge_intent = intent
-            self.library.save(force=True, durable=True)
+            self._save("merge_quiesce", (left, right))
         return intent
 
     async def quiesce(self, canonical_key, absorbed_key, *, wait_seconds=60):
@@ -299,7 +317,7 @@ class MergeStore:
                                                   "started_at": now, "deadline": now + wait_seconds})
                 for paper in papers:
                     paper.merge_intent = fresh
-                self.library.save(force=True, durable=True)
+                self._save("merge_restart", papers)
                 self.library.log({"event": "merge_intent_restarted", "previous_merge_id": intent.merge_id,
                                   "merge_id": fresh.merge_id, "canonical_key": fresh.canonical_key,
                                   "absorbed_key": fresh.absorbed_key})
@@ -317,7 +335,7 @@ class MergeStore:
             expired = current.model_copy(update={"status": "expired"})
             for paper in papers:
                 paper.merge_intent = expired
-            self.library.save(force=True, durable=True)
+            self._save("merge_expired", papers)
             return False
         keys = (current.canonical_key, current.absorbed_key)
         if (self.ledger.merged_into(keys[0]) or self.ledger.merged_into(keys[1])
@@ -388,7 +406,7 @@ class MergeStore:
                     if key == absorbed_key:
                         index[value] = canonical_key
             try:
-                self.library.save(force=True, durable=True)
+                self._save("identity_merge", (left, right))
             except Exception:
                 uncertain = intent.model_copy(update={"status": "uncertain"})
                 for paper in (left, right):

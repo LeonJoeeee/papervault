@@ -54,10 +54,26 @@ be treated as successful publication. P5a now adds immutable extraction bundles 
 atomic derivation/receipt/outbox registration to this guarded completion transaction;
 see [knowledge publication](DRAFT-catalog-knowledge-publication.md#extraction-registration-p5a).
 
-In PG mode, purge and DOI-resolution collision merges refuse before changing the
-working set or unlinking files, including before dispatch to the V2 merge path.
-Missing keys in a save also refuse.
+In PG mode, purge and missing keys in a save refuse before record deletion or
+artifact unlink. Lifecycle completion (#253) routes DOI collisions through the
+V2 drain barrier, retaining the absorbed record as an alias. Its payload retains
+historical identifiers while resolved-owner columns belong only to canonical rows;
+alias ownership is released before canonical identifier transfer in one audited
+revision-guarded batch. PG consolidation refuses distinct occupied DOI/arXiv
+axes, including pending observations, before quiescence; each retained identifier
+must transfer to or match the canonical owner. With merge V2 disabled, collisions
+remain waiting.
+Merge budget evidence still precedes the catalog commit; a failed or uncertain
+commit retains the conservative ledger fence and requires explicit recovery.
 Coordinated snapshots/restore and GC/retirement remain deferred to P5b/P5c; record deletion remains refused.
+
+Scoped policy and recovery operators stage named rulings in the same transaction
+as their record delta, audit and pending jobs. A stale operator snapshot refuses
+without a ruling commit or automatic metadata merge. PostgreSQL ruling history
+is authoritative; `correction-ledger.json` receives a compatibility copy after
+commit. In JSON mode intent is durable before record save and can be replayed
+after interruption. Rulings are key-bound and revisioned; a later explicit action
+supersedes the prior grant without editing its history.
 
 JSON load/save/rotation/BibTeX behavior stays in its existing path. PG save never writes
 `index.json` or its backup. `scripts/export_catalog.py --output <path> --verify` reads

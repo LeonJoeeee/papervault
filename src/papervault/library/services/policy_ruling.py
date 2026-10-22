@@ -1,20 +1,22 @@
-"""Explicit ADS UNKNOWN-policy rulings, recorded before scoped grants persist."""
+"""Scoped, revisioned policy acts over the current catalog authority."""
 
 from __future__ import annotations
 
-import re
+import os
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from filelock import FileLock
 
-from ..download_sources.ads import _ads_bibcode
 from ..state_v2 import Merge, Policy, PolicyOverride, Retrieval, check_index_readable
 from ..store import Library
 from .correction_ledger import CorrectionLedger, utc_now
 from .identity_backfill import read_identity_records
+from .operator_actions import stage_operator
+
+ACTIONS = {"acquire": "acquire", "override": "acquire", "exclude": "exclude",
+           "restrict": "exclude", "clear": "clear"}
 
 
 def _rulings(state: dict) -> list[dict]:
@@ -22,7 +24,7 @@ def _rulings(state: dict) -> list[dict]:
     if not isinstance(rows, list):
         raise ValueError("invalid policy ruling ledger")
     for row in rows:
-        if (not isinstance(row, dict) or row.get("action") != "acquire"
+        if (not isinstance(row, dict) or row.get("action") not in ACTIONS
                 or not isinstance(row.get("reason"), str) or not row["reason"].strip()
                 or type(row.get("revision")) is not int or row["revision"] < 1
                 or not isinstance(row.get("keys"), list) or not row["keys"]
@@ -34,103 +36,169 @@ def _rulings(state: dict) -> list[dict]:
     return rows
 
 
+def _history(root, library=None):
+    if os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json") == "postgres":
+        owned = library is None
+        library = library or Library(root, read_only=True)
+        try:
+            with library._catalog_backend.repository() as repository:
+                return [r for r in repository.list_rulings() if r["action"] in ACTIONS]
+        finally:
+            if owned:
+                library.close()
+    return _rulings(CorrectionLedger(root).read())
+
+
 def _mismatch(paper) -> str:
     state = paper.acquisition_state
-    if paper.source != "ads" or paper.doi or paper.arxiv_id:
-        return "outside_ads_identifier_cohort"
-    if (not paper.url or not paper.paper_id or _ads_bibcode(paper) != paper.paper_id
-            or not re.fullmatch(r"/abs/[^/]+/abstract/?", urlsplit(paper.url).path)):
-        return "ads_identity_mismatch"
-    if paper.download_status != "metadata_only" or state.retrieval != Retrieval.EXHAUSTED:
-        return "not_metadata_only_exhausted"
-    if (paper.domain_status is not None or state.policy_reasons
-            or state.policy not in {Policy.UNKNOWN, Policy.OVERRIDE}):
-        return "policy_restriction"
     if (state.merge != Merge.CANONICAL or state.alias_key or state.quarantine
             or paper.merge_intent is not None
             or (paper.reopen_claim and paper.reopen_claim.phase not in {"completed", "not_sent", "released"})):
         return "unsafe_merge_or_claim_state"
     if type(state.required_revision) is not int or state.required_revision < 0:
         return "invalid_required_revision"
-    if state.policy == Policy.OVERRIDE:
-        grant = state.override
-        if (not isinstance(grant, PolicyOverride) or grant.key != paper.key
-                or grant.scope != ("acquire",) or grant.reasons
-                or type(grant.revision) is not int or grant.revision < 1):
-            return "different_override_scope"
     return ""
 
 
-def inspect_ruling(root: Path, *, keys: list[str], action: str, reason: str) -> dict:
-    """Inspect complete records without constructing a writable Library or lock."""
-    if action != "acquire" or not isinstance(reason, str) or not reason.strip():
-        raise ValueError("policy ruling requires action acquire and a nonempty reason")
+def _inspect(papers, rows, *, keys, action, reason):
+    if action not in ACTIONS or not isinstance(reason, str) or not reason.strip():
+        raise ValueError("policy ruling requires a supported action and a nonempty reason")
     if not keys or any(not isinstance(k, str) or not k.strip() for k in keys):
         raise ValueError("policy ruling requires nonempty citation keys")
-    check_index_readable(root)
-    papers = {p.key: p for p in read_identity_records(Path(root))}
-    rows = _rulings(CorrectionLedger(root).read())
+    action = ACTIONS[action]
     matched, missing, mismatches, records = [], [], [], []
-    revision = 1
+    revisions = {}
     for key in dict.fromkeys(keys):
         paper = papers.get(key)
         if paper is None:
             missing.append(key)
             records.append({"key": key, "policy": None, "outcome": "missing"})
             continue
-        state = paper.acquisition_state
+        current = paper.acquisition_state
         mismatch = _mismatch(paper)
-        records.append({"key": key, "policy": state.policy.value,
-                        "required_revision": state.required_revision,
+        records.append({"key": key, "policy": current.policy.value,
+                        "required_revision": current.required_revision,
                         "outcome": "mismatch" if mismatch else "matched"})
         if mismatch:
             mismatches.append({"key": key, "reason": mismatch})
             continue
         matched.append(key)
-        revision = max(revision, state.required_revision,
-                       state.override.revision if state.override else 0)
-    revision = max([revision, *(r["revision"] for r in rows if any(k in matched for k in r["keys"]))])
-    return {"dry_run": True, "action": action, "reason": reason, "revision": revision,
+        history = [r for r in rows if key in r["keys"]]
+        prior = history[-1] if history else None
+        # Historical identity prevents an old reason from becoming a new grant.
+        # It does not establish that the intent is eligible for crash recovery.
+        replay = next((r for r in reversed(history)
+                       if ACTIONS[r["action"]] == action and r["reason"] == reason), None)
+        if replay:
+            revisions[key] = replay["revision"]
+        else:
+            revisions[key] = max(1, current.required_revision + 1,
+                                 current.override.revision + 1 if current.override else 1,
+                                 prior["revision"] + 1 if prior else 1)
+    # The legacy summary is informational; every mutation uses a per-key revision.
+    return {"dry_run": True, "action": action, "reason": reason,
+            "revision": max(revisions.values(), default=1), "revisions": revisions,
             "requested": len(dict.fromkeys(keys)), "matched_keys": matched, "matched_count": len(matched),
             "missing_keys": missing, "missing_count": len(missing),
             "mismatches": mismatches, "mismatch_count": len(mismatches), "records": records,
             "applied": 0, "rulings_added": 0}
 
 
-def apply_ruling(root: Path, *, keys: list[str], action: str, reason: str) -> dict:
-    """Append evidence first; interrupted index writes can replay without new rows.
+def inspect_ruling(root: Path, *, keys: list[str], action: str, reason: str) -> dict:
+    """Inspect authority without creating locks, projections, or directories."""
+    if os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json") != "postgres":
+        check_index_readable(Path(root))
+    papers = {p.key: p for p in read_identity_records(Path(root))}
+    return _inspect(papers, _history(root), keys=keys, action=action, reason=reason)
 
-    The CLI owns the stopped-service preflight. Standalone campaigns and rulings
-    share one writer lock; no invalid request can partially grant permission.
+
+def apply_ruling(root: Path, *, keys: list[str], action: str, reason: str, actor="operator") -> dict:
+    """Commit a whole explicit selection, ruling, audit and pending work together.
+
+    JSON compatibility retains intent before state, allowing interrupted saves to
+    reuse that exact evidence. PG rulings are authoritative in the transaction;
+    the file ledger is a compatibility projection written only after commit.
     """
     report = inspect_ruling(root, keys=keys, action=action, reason=reason)
     report["dry_run"] = False
     if report["missing_count"] or report["mismatch_count"]:
         return report
+    if not isinstance(actor, str) or not actor.strip():
+        raise ValueError("policy ruling requires a nonempty actor")
     with FileLock(str(Path(root) / ".reopen-campaign.lock"), timeout=0):
-        report = inspect_ruling(root, keys=keys, action=action, reason=reason)
-        report["dry_run"] = False
-        if report["missing_count"] or report["mismatch_count"]:
-            return report
         library = Library(root)
-        revision = report["revision"]
-        with library.corrections.transaction(durable=True) as state:
-            rows = _rulings(state)
-            recorded = {(k, row["action"], row["revision"]) for row in rows for k in row["keys"]}
-            new_keys = [k for k in report["matched_keys"] if (k, action, revision) not in recorded]
-            if new_keys:
-                state.setdefault("policy_rulings", []).append({
-                    "timestamp": utc_now(), "action": action, "reason": reason,
-                    "keys": new_keys, "revision": revision})
-                report["rulings_added"] = 1
-        for key in report["matched_keys"]:
-            paper = library.get(key)
-            current = paper.acquisition_state
-            desired = replace(current, policy=Policy.OVERRIDE,
-                              override=PolicyOverride(scope=(action,), revision=revision, key=key))
-            if current != desired:
-                paper.terminal_state = desired
-                report["applied"] += 1
-        if report["applied"]:
-            library.save(force=True, durable=True)
-    return report
+        try:
+            rows = _history(root, library)
+            report = _inspect(library._papers, rows, keys=keys, action=action, reason=reason)
+            report["dry_run"] = False
+            if report["missing_count"] or report["mismatch_count"]:
+                return report
+            action = report["action"]
+            intents, new_by_revision = {}, {}
+            for key in report["matched_keys"]:
+                history = [r for r in rows if key in r["keys"]]
+                prior = history[-1] if history else None
+                replay = next((r for r in reversed(history)
+                    if ACTIONS[r["action"]] == action and r["reason"] == reason), None)
+                if replay is None:
+                    new_by_revision.setdefault(report["revisions"][key], []).append(key)
+                    continue
+                # Only the latest explicit JSON intent can be unfinished.
+                # Legacy, superseded and spent rows remain immutable history.
+                paper = library.get(key)
+                pre_states = replay.get("crash_recovery_pre_state")
+                covered_reasons = replay.get("covered_policy_reasons")
+                if (library._catalog_backend is not None or replay is not prior
+                        or not isinstance(pre_states, dict) or key not in pre_states
+                        or not isinstance(covered_reasons, dict) or key not in covered_reasons
+                        or paper.acquisition_state.required_revision >= replay["revision"]):
+                    continue
+                if (pre_states[key] != paper.model_dump(mode="json")
+                        or covered_reasons[key] != list(paper.acquisition_state.policy_reasons)):
+                    raise ValueError("policy restrictions changed or record state changed since intent; "
+                                     "record a new ruling reason")
+                intents[key] = replay
+            # Validate every recovery before staging any new compatibility rows.
+            for revision, selected in new_by_revision.items():
+                row = {"timestamp": utc_now(), "action": action, "scope": "acquire" if action == "acquire" else "policy",
+                       "reason": reason, "keys": selected, "revision": revision,
+                       "covered_policy_reasons": {k: list(library.get(k).acquisition_state.policy_reasons)
+                                                  for k in selected},
+                       "actor": actor, "event": "policy_ruling"}
+                if library._catalog_backend is None:
+                    row["crash_recovery_pre_state"] = {
+                        k: library.get(k).model_dump(mode="json") for k in selected}
+                stage_operator(library, action=action, keys=selected, reason=reason, actor=actor,
+                               event="policy_ruling", row=row)
+                report["rulings_added"] += 1
+                intents.update((key, row) for key in selected)
+            for key, intent in intents.items():
+                paper = library.get(key)
+                current = paper.acquisition_state
+                revision = intent["revision"]
+                covered = tuple(intent["covered_policy_reasons"][key])
+                if action == "acquire":
+                    grant = PolicyOverride(scope=("acquire",), reasons=covered,
+                                           revision=revision, key=key)
+                    fresh_grant = current.policy != Policy.OVERRIDE or current.override != grant
+                    desired = replace(current, policy=Policy.OVERRIDE,
+                        retrieval=(Retrieval.ELIGIBLE if fresh_grant and paper.download_status in {"metadata_only", "failed", "pending"}
+                                   else current.retrieval), required_revision=revision,
+                        override=grant)
+                else:
+                    if action == "exclude" and paper.download_status != "metadata_only":
+                        paper.download_status = "metadata_only"
+                    desired = replace(paper.acquisition_state,
+                        policy=Policy.EXCLUDED if action == "exclude" else Policy.CLEAR,
+                        policy_reasons=current.policy_reasons if action == "exclude" else (),
+                        override=None, required_revision=revision)
+                if paper.terminal_state != desired:
+                    paper.terminal_state = desired
+                    report["applied"] += 1
+            if report["applied"] or report["rulings_added"]:
+                # On JSON replay the intent already exists. PG never has a
+                # committed ruling without its state; stale snapshots fail CAS.
+                library.save(force=True, durable=True)
+            return report
+        finally:
+            library.close()

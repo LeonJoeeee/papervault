@@ -76,6 +76,7 @@ class PostgresPersistence:
         self.fence_id = None
         self.audit_detail = {}
         self._working = None
+        self.operator_rulings = []
 
     @staticmethod
     def from_environment():
@@ -134,7 +135,7 @@ class PostgresPersistence:
             self.persisted[record.key] = record
             self.normalized[record.key] = paper.model_dump(mode="json")
 
-    def save(self, papers: dict[str, Paper]) -> None:
+    def save(self, papers: dict[str, Paper]) -> list[dict]:
         persisted, normalized = self._working if self._working is not None else (self.persisted, self.normalized)
         removed = persisted.keys() - papers.keys()
         if removed:
@@ -148,17 +149,33 @@ class PostgresPersistence:
                 continue
             raw = _overlay(persisted[key].payload, before, current) if before else current
             records.append(Record.from_payload(key, raw))
-        if not records:
-            return
+        rulings = list(self.operator_rulings)
+        if not records and not rulings:
+            return []
         revisions = {r.key: persisted[r.key].revision if r.key in persisted else 0
                      for r in records}
         with self._repository() as repository:
             for retry in range(2):
                 try:
-                    event = AuditEvent(self.actor, "state_flush", self.audit_detail,
+                    operator = rulings[-1] if rulings else None
+                    event = AuditEvent(operator["actor"] if operator else self.actor,
+                                       operator["event"] if operator else "state_flush",
+                                       {**self.audit_detail, **(operator or {})},
                                        pending_jobs=self._jobs(records, revisions))
                     with repository._write(event):
+                        # Rulings are decisions about this exact working snapshot,
+                        # including keys whose desired state is already present.
+                        for ruling in rulings:
+                            for key in ruling["keys"]:
+                                expected = persisted.get(key)
+                                current = repository.get(key)
+                                if (expected.revision if expected else 0) != (current.revision if current else 0):
+                                    raise StaleWrite(key, expected.revision if expected else 0,
+                                                     current.revision if current else None)
                         result = repository.flush(records, expected_revisions=revisions, audit=event)
+                        for ruling in rulings:
+                            repository.import_ruling(ruling, audit=AuditEvent(
+                                ruling["actor"], ruling["event"], ruling))
                         for record in records:
                             previous = persisted.get(record.key)
                             old = previous.payload.get("reopen_claim") if previous else None
@@ -173,7 +190,7 @@ class PostgresPersistence:
                                     audit=AuditEvent(self.actor, "job_completion", {"lease_id": new["lease_id"]}))
                     break
                 except StaleWrite as exc:
-                    if retry or self._completion is not None:
+                    if retry or self._completion is not None or rulings:
                         raise CatalogConflict([exc.key]) from exc
                     merged, conflicts = [], []
                     for record in records:
@@ -192,6 +209,7 @@ class PostgresPersistence:
                     records = merged
         if self._completion is None:
             self._accept(records, result, papers, captured)
+            del self.operator_rulings[:len(rulings)]
         else:
             for record in records:
                 persisted[record.key] = replace(record, revision=result[record.key])
@@ -201,6 +219,7 @@ class PostgresPersistence:
             previous_capture = self._deferred[3] if self._deferred else {}
             previous_capture.update({r.key: captured[r.key] for r in records})
             self._deferred = (list(deferred.values()), {k: persisted[k].revision for k in deferred}, papers, previous_capture)
+        return rulings
 
     def dirty(self, papers):
         return (self.persisted.keys() != papers.keys() or any(

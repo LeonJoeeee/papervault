@@ -12,6 +12,9 @@ class Cursor:
     def fetchone(self):
         return self.row
 
+    def __iter__(self):
+        return iter([] if self.row is None else [self.row])
+
 
 class TransactionConnection:
     """Model commit/rollback only; SQL semantics are covered by opt-in PG tests."""

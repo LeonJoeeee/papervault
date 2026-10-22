@@ -551,6 +551,22 @@ async def test_doi_collision_routes_to_alias_without_purging_artifacts(pair):
     assert lib.get(right.key).acquisition_state.merge == Merge.ALIAS
 
 
+@pytest.mark.parametrize("field,metadata", [("arxiv_id", None), ("doi", None),
+                                          ("arxiv_id", {"arxiv_id": "2101.99999v2"})])
+async def test_catalog_merge_refuses_distinct_occupied_identity_axes_before_quiescence(pair, field, metadata):
+    lib, left, right, _, _ = pair
+    if metadata is None:
+        setattr(left, field, "10.1234/left" if field == "doi" else "2101.99999v1")
+        setattr(right, field, "10.1234/right" if field == "doi" else "2101.99999v2")
+    lib._catalog_backend = object()  # Admission guard only; no database IO is allowed.
+    before = [p.model_dump() for p in (left, right)]
+    with pytest.raises(ValueError, match="conflicting resolved"):
+        from papervault.library.services import concurrency
+        async with concurrency.lib_write_lock:
+            coordinator(pair)._merge_records(left.key, right.key, metadata=metadata)
+    assert [p.model_dump() for p in (left, right)] == before
+
+
 async def test_doi_collision_does_not_mutate_identity_while_active(pair):
     from papervault.library.services import concurrency
     lib, left, right, _, _ = pair

@@ -71,8 +71,8 @@ class Record:
             derive_legacy(paper, include_domain=True)
         )
         return cls(
-            key=key, doi=normalized_identity(paper.doi),
-            arxiv_id=normalized_identity(paper.arxiv_id),
+            key=key, doi=normalized_identity(paper.doi) if state.merge.value == "canonical" else None,
+            arxiv_id=normalized_identity(paper.arxiv_id) if state.merge.value == "canonical" else None,
             download_status=paper.download_status, retrieval=state.retrieval.value,
             policy=state.policy.value, merge=state.merge.value,
             quarantine=state.quarantine or paper.merge_intent is not None,
@@ -83,6 +83,13 @@ class Record:
     @property
     def payload_sha256(self) -> str:
         return payload_hash(self.payload)
+
+
+def _check_alias_ownership(alias: Record, canonical: Record):
+    for field in ("doi", "arxiv_id"):
+        value = normalized_identity(alias.payload.get(field))
+        if value and value not in {getattr(alias, field), getattr(canonical, field)}:
+            raise ValueError(f"alias would release retained identifier {field}; adjudication required")
 
 
 @dataclass(frozen=True)
@@ -356,6 +363,8 @@ class PostgresCatalogRepository:
                 self._sync_aliases([record])
                 if not changed and before != self.all_aliases().get(record.key):
                     self._finish(record.key, audit)
+            else:
+                self._validate_alias_ownership()
             return changed
 
     def flush(self, records, *, expected_revisions: dict[str, int], audit: AuditEvent) -> dict[str, int]:
@@ -363,7 +372,9 @@ class PostgresCatalogRepository:
         records = list(records)
         revisions = {}
         with self._write(audit):
-            for record in records:
+            # Release absorbed resolved ownership before transferring an ID to
+            # its canonical row. Payloads keep the historical observations.
+            for record in sorted(records, key=lambda r: r.merge != "alias"):
                 event = replace(audit, detail={**audit.detail, "payload_sha256": record.payload_sha256},
                                 pending_jobs=tuple(j for j in audit.pending_jobs if j.key == record.key))
                 changed = self._upsert(record, event, expected_revisions[record.key])
@@ -385,6 +396,20 @@ class PostgresCatalogRepository:
                 self.connection.execute(sql.SQL(
                     "INSERT INTO {} (alias_key, canonical_key) VALUES (%s, %s)"
                 ).format(self._table("aliases")), (record.key, target))
+        self._validate_alias_ownership()
+
+    def _validate_alias_ownership(self):
+        # Imports and metadata edits also pass here. Never release an older
+        # alias's unique identity reservation without a matching canonical
+        # owner, even when that alias predates MergeStore's admission guard.
+        aliases = self.connection.execute(sql.SQL("SELECT {} FROM {} WHERE merge='alias'").format(
+            sql.SQL(", ").join(map(sql.Identifier, (*_RECORD_COLUMNS, "revision"))), self._table("records")))
+        for row in aliases:
+            alias = Record(**row)
+            canonical = self.get(self.resolve_alias(alias.key))
+            if canonical is None or canonical.merge != "canonical":
+                raise ValueError("alias canonical record absent")
+            _check_alias_ownership(alias, canonical)
 
     def set_status(self, key: str, status: str, *, audit: AuditEvent, expected_revision: int) -> bool:
         with self._write(audit):
@@ -409,7 +434,7 @@ class PostgresCatalogRepository:
                 payload["terminal_state"].update({name: state[name] for name in ("retrieval", "cause")})
             else:
                 payload["terminal_state"] = state
-            return self._upsert(Record.from_payload(key, payload), audit, expected_revision)
+            return self.upsert(Record.from_payload(key, payload), audit=audit, expected_revision=expected_revision)
 
     def check_completion(self, job_id: str, *, attempt: int, lease_id: str):
         row = self.connection.execute(sql.SQL("SELECT * FROM {} WHERE id = %s").format(
@@ -475,6 +500,7 @@ class PostgresCatalogRepository:
                 "WHERE existing.canonical_key <> EXCLUDED.canonical_key RETURNING alias_key"
             ).format(self._table("aliases")), (alias, canonical)).fetchone()
             if changed:
+                self._validate_alias_ownership()
                 self._finish(alias, audit)
             return bool(changed)
 
@@ -533,6 +559,16 @@ class PostgresCatalogRepository:
             if changed:
                 self._finish(None, audit)
             return bool(changed)
+
+    def list_rulings(self) -> list[dict]:
+        """Authoritative append-only ruling history, in commit order."""
+        return [{"timestamp": row["at"].isoformat(), "action": row["action"],
+                 "scope": row["scope"], "reasons": row["reasons"],
+                 "reason": row["reasons"][0] if row["reasons"] else "",
+                 "keys": row["keys"], "revision": row["revision"]}
+                for row in self.connection.execute(sql.SQL(
+                    "SELECT at, action, scope, reasons, keys, revision FROM {} ORDER BY id"
+                ).format(self._table("rulings")))]
 
     def finalize_identity_indexes(self, *, audit: AuditEvent) -> dict:
         """Classify the ENTIRE target before creating each partial unique index.

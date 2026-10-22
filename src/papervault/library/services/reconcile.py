@@ -232,10 +232,9 @@ async def _enrich_sweep(library: Library, *, cap: int) -> int:
     return filled
 
 
-# ── abstract backfill + janitor (consistency invariant: every kept row must
+# ── abstract backfill (consistency invariant: every kept row must
 #    carry an abstract; see docs/history/2026-06-03-consistency-mechanism.md, repo root).
-#    ACTIVE sweep only ADDS an abstract (never overwrites). The janitor PURGES
-#    and is dormant-by-default. ────────────────────────────────────────────────
+#    The sweep only ADDS an abstract (never overwrites). ────────────────────────
 _ABSTRACT_CAP = 100
 _abstract_sem = asyncio.Semaphore(3)
 _ABSTRACT_FLOOR = 40
@@ -382,26 +381,6 @@ async def _path_backfill_sweep(library: Library) -> int:
     return n
 
 
-async def _janitor_sweep(library: Library) -> int:
-    """Purge rows that can NEVER satisfy the invariant: a TERMINAL download
-    state, no usable abstract, AND no extract on disk. DORMANT by default
-    (auto-purge is destructive) — enable with env PAPER_PIPELINE_JANITOR_PURGE=1
-    after validating the candidate set."""
-    from ..models import DOWNLOAD_STATUS_TERMINAL
-    victims = [p.key for p in library.all_papers()
-               if p.download_status in DOWNLOAD_STATUS_TERMINAL
-               and _needs_abstract(p)
-               and not ((p.md_path or "").strip() or (p.txt_path or "").strip())]
-    if not victims:
-        return 0
-    async with concurrency.lib_write_lock:
-        for key in victims:
-            library.purge(key, reason="consistency-janitor: terminal, no abstract, no extract")
-        library.save()
-    log.info("reconcile: janitor purged %d", len(victims))
-    return len(victims)
-
-
 async def reconcile_once(
     library: Library,
     download_queue,
@@ -533,15 +512,6 @@ async def reconcile_once(
         counts["path_backfilled"] = await _path_backfill_sweep(library)
     except Exception:
         log.exception("reconcile path-backfill pass failed; continuing")
-
-    # Janitor — purge rows that can never carry an abstract (terminal, no
-    # abstract, no extract). DORMANT by default (destructive); enable with
-    #   env PAPER_PIPELINE_JANITOR_PURGE=1
-    if os.environ.get("PAPER_PIPELINE_JANITOR_PURGE", "").strip().lower() in {"1", "true", "yes"}:
-        try:
-            counts["janitor_purged"] = await _janitor_sweep(library)
-        except Exception:
-            log.exception("reconcile janitor pass failed; continuing")
 
     library.log({"event": "reconcile_once_done", **counts})
     log.info(

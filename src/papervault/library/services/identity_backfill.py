@@ -32,6 +32,12 @@ _DOI_HOSTS = {"doi.org", "dx.doi.org", "onlinelibrary.wiley.com", "link.springer
 
 def read_identity_records(root: Path) -> list[Paper]:
     """Use the store's last-good snapshot rules without its writable constructor."""
+    if os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json") == "postgres":
+        library = Library(root, read_only=True)
+        try:
+            return library.all_papers(include_quarantined=True)
+        finally:
+            library.close()
     data = (Library._read_index_file(root / "index.json")
             or Library._read_index_file(root / "index.json.bak"))
     if data is None or not isinstance(data.get("papers"), dict):

@@ -65,14 +65,14 @@ def test_apply_appends_one_ruling_and_scoped_revision_aware_grants(ruling_vault,
     rows = lib.corrections.read()["policy_rulings"]
     assert len(rows) == 1
     assert rows[0]["keys"] == ["B", "A"] and rows[0]["action"] == "acquire"
-    assert rows[0]["reason"] == "Owner approved ADS recovery #245" and rows[0]["revision"] == 4
+    assert rows[0]["reason"] == "Owner approved ADS recovery #245" and rows[0]["revision"] == 5
     assert datetime.fromisoformat(rows[0]["timestamp"]).tzinfo is not None
     for key in ("A", "B"):
         paper = lib.get(key)
         state = paper.acquisition_state
         assert state.policy == state_v2.Policy.OVERRIDE
-        assert state.retrieval == state_v2.Retrieval.EXHAUSTED and paper.download_status == "metadata_only"
-        assert state.override == state_v2.PolicyOverride(scope=("acquire",), revision=4, key=key)
+        assert state.retrieval == state_v2.Retrieval.ELIGIBLE and paper.download_status == "metadata_only"
+        assert state.override == state_v2.PolicyOverride(scope=("acquire",), revision=5, key=key)
         assert state_v2.effective_policy(state, key=key)
         assert not state_v2.effective_policy(state, key="Other")
         assert not state_v2.effective_policy(state, key=key, action="serve")
@@ -104,32 +104,14 @@ def test_unknown_key_refuses_the_whole_request_with_accounting(ruling_vault, cap
     assert tree_bytes(root) == before
 
 
-@pytest.mark.parametrize("mutation", ["source", "doi", "arxiv", "identity", "landing", "malformed_url", "status",
-                                      "excluded", "reason", "domain", "alias", "quarantine"])
-def test_outside_cohort_or_protected_state_is_reported_and_never_granted(ruling_vault, capsys, mutation):
+@pytest.mark.parametrize("mutation", ["alias", "quarantine"])
+def test_protected_state_is_reported_and_never_granted(ruling_vault, capsys, mutation):
     root, keys = ruling_vault
     lib = Library(root)
     paper = lib.get("A")
-    if mutation == "source":
-        paper.source = "other"
-    elif mutation in {"doi", "arxiv"}:
-        setattr(paper, "doi" if mutation == "doi" else "arxiv_id", "existing")
-    elif mutation == "identity":
-        paper.paper_id = "2021ApJ...900....1A"
-    elif mutation == "landing":
-        paper.url = "https://example.org/2020ApJ...900....1A/abstract"
-    elif mutation == "malformed_url":
-        paper.url = "https://["
-    elif mutation == "status":
-        paper.download_status = "ok"
-    elif mutation == "domain":
-        paper.domain_status = "off_domain"
-    else:
-        change = {"excluded": {"policy": state_v2.Policy.EXCLUDED},
-                  "reason": {"policy_reasons": ("owner_exclusion",)},
-                  "alias": {"merge": state_v2.Merge.ALIAS, "alias_key": "Unlisted"},
-                  "quarantine": {"quarantine": True}}[mutation]
-        paper.terminal_state = replace(paper.acquisition_state, **change)
+    change = {"alias": {"merge": state_v2.Merge.ALIAS, "alias_key": "Unlisted"},
+              "quarantine": {"quarantine": True}}[mutation]
+    paper.terminal_state = replace(paper.acquisition_state, **change)
     lib.save()
     before = tree_bytes(root)
     assert cli.main(command(keys, "--apply")) == 2
@@ -182,3 +164,96 @@ def test_interrupted_index_save_reuses_durable_ruling_on_retry(ruling_vault, mon
     assert report["applied"] == 2 and report["rulings_added"] == 0
     assert Library(root).corrections.read()["policy_rulings"] == rows
     assert state_v2.effective_policy(Library(root).get("A").acquisition_state, key="A")
+
+
+@pytest.mark.parametrize("action,policy", [("acquire", "override"), ("override", "override"),
+    ("exclude", "excluded"), ("restrict", "excluded"), ("clear", "clear")])
+def test_rulings_cover_any_cohort_and_are_revisioned(ruling_vault, capsys, action, policy):
+    root, keys = ruling_vault
+    lib = Library(root)
+    paper = lib.get("A")
+    paper.source = "inspire"
+    paper.doi = "10.1234/arbitrary"
+    paper.domain_status = "off_domain"
+    paper.terminal_state = replace(paper.acquisition_state, policy_reasons=("owner_exclusion",))
+    lib.save()
+    args = command(keys, "--apply")
+    args[args.index("--action") + 1] = action
+    assert cli.main(args) == 0
+    capsys.readouterr()
+    lib = Library(root)
+    paper = lib.get("A")
+    state = paper.acquisition_state
+    assert paper.terminal_state.policy.value == policy
+    if action == "clear":
+        # Clearing a ruling does not silently remove a separate domain exclusion.
+        assert not state_v2.effective_policy(state, key="A")
+    if policy == "override":
+        assert state_v2.effective_policy(state, key="A")
+        assert not state_v2.effective_policy(state, key="B")
+    if policy == "excluded":
+        assert lib.get("A").download_status == "metadata_only"
+    old = lib.corrections.read()["policy_rulings"]
+    assert cli.main(args) == 0
+    capsys.readouterr()
+    assert Library(root).corrections.read()["policy_rulings"] == old
+    args[args.index("--action") + 1] = "clear" if policy != "clear" else "exclude"
+    assert cli.main(args) == 0
+    capsys.readouterr()
+    later = Library(root).corrections.read()["policy_rulings"]
+    assert later[:-1] == old and later[-1]["revision"] > old[-1]["revision"]
+
+
+def test_replaying_acquire_does_not_reopen_a_later_failed_attempt(ruling_vault, capsys):
+    root, keys = ruling_vault
+    assert cli.main(command(keys, "--apply")) == 0
+    capsys.readouterr()
+    lib = Library(root)
+    lib.get("A").download_status = "failed"
+    lib.save()
+    before = tree_bytes(root)
+    assert cli.main(command(keys, "--apply")) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["applied"] == report["rulings_added"] == 0
+    assert tree_bytes(root) == before
+    assert Library(root).get("A").acquisition_state.retrieval == state_v2.Retrieval.EXHAUSTED
+
+
+@pytest.mark.parametrize("action", ["acquire", "clear"])
+def test_replay_cannot_authorize_a_later_policy_restriction(ruling_vault, capsys, action):
+    root, keys = ruling_vault
+    args = command(keys, "--apply")
+    args[args.index("--action") + 1] = action
+    assert cli.main(args) == 0
+    capsys.readouterr()
+    lib = Library(root)
+    current = lib.get("A").acquisition_state
+    lib.get("A").terminal_state = replace(current, policy_reasons=("later exclusion",))
+    lib.save()
+    before = tree_bytes(root)
+    assert not state_v2.effective_policy(lib.get("A").acquisition_state, key="A")
+    assert cli.main(args) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["applied"] == report["rulings_added"] == 0
+    assert not state_v2.effective_policy(Library(root).get("A").acquisition_state, key="A")
+    assert tree_bytes(root) == before
+
+
+def test_interrupted_clear_replay_refuses_restrictions_outside_original_scope(ruling_vault, monkeypatch, capsys):
+    root, keys = ruling_vault
+    args = command(keys, "--apply")
+    args[args.index("--action") + 1] = "clear"
+    with monkeypatch.context() as patch:
+        def fail(*a, **kw):
+            raise OSError("interrupted clear")
+        patch.setattr(Library, "save", fail)
+        assert cli.main(args) == 2
+    capsys.readouterr()
+    lib = Library(root)
+    lib.get("A").terminal_state = replace(lib.get("A").acquisition_state,
+                                          policy_reasons=("later exclusion",))
+    lib.save()
+    before = tree_bytes(root)
+    assert cli.main(args) == 2
+    assert "restrictions changed" in capsys.readouterr().err
+    assert tree_bytes(root) == before

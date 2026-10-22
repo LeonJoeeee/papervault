@@ -5,7 +5,7 @@ stubs). Covers:
     match, REJECT the wrong-paper top-hit (the live-probe failure mode),
     abstain on weak/ambiguous/short-title/year-mismatch.
   * Library.set_resolved_doi — re-indexes _by_doi, never overwrites a real
-    DOI, routes a DOI collision to merge+purge (no stale index).
+    DOI, routes a DOI collision to retained alias consolidation (no stale index).
   * cli `audit --resolve-stub-dois` — --dry-run writes nothing (default),
     --no-dry-run writes via the store method; uses a TEMP library, never the
     real vault.
@@ -290,9 +290,10 @@ def test_set_resolved_doi_never_overwrites_existing(tmp_path):
     assert lib.find(doi="10.1234/different") is None
 
 
-def test_set_resolved_doi_collision_merges_and_purges(tmp_path):
+def test_set_resolved_doi_collision_retains_alias_and_artifacts(tmp_path, monkeypatch):
     """If the resolved DOI already belongs to ANOTHER row, the stub is merged
-    into the holder + purged — never a duplicate DOI in two rows."""
+    into the holder with its original identity retained as an alias."""
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
     lib = Library(tmp_path)
     lib.upsert({"title": "Cosmic ray transport in the outer heliosphere",
                 "authors": ["Strauss"], "year": 2012, "doi": "10.1234/twin",
@@ -307,8 +308,8 @@ def test_set_resolved_doi_collision_merges_and_purges(tmp_path):
     outcome, detail = lib.set_resolved_doi(stub_key, "10.1234/twin")
     assert outcome == "collision"
     assert detail == holder_key
-    # Stub purged; DOI still maps to exactly the holder.
-    assert lib.get(stub_key) is None
+    # Retain the stub; DOI still resolves to exactly the holder.
+    assert lib.get(stub_key).acquisition_state.alias_key == holder_key
     assert lib.find(doi="10.1234/twin").key == holder_key
     # Holder absorbed the stub's blank-fill field (venue).
     assert lib.get(holder_key).venue == "JGR"

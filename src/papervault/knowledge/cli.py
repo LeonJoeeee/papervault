@@ -9,15 +9,18 @@ the MCP surface:
     python -m papervault.knowledge.cli get paper:Reames2023         # by-id LightRAG doc_status row
     python -m papervault.knowledge.cli rollback-abstracts           # #144 undo, dry-run by default
 
-All reads are workspace-gated via assert_safe_workspace() (SDD §6.0): hitting prod 'l0'
+Legacy knowledge reads are workspace-gated via assert_safe_workspace() (SDD §6.0): hitting prod 'l0'
 without KS_ALLOW_PROD_WORKSPACE=1 refuses to run = explicit failure, never a silent
-cross-workspace read. The only writer is `rollback-abstracts --apply`, which refuses while
-papervault.service is running (the live scheduler writes the same ledger + graph).
+cross-workspace read. `rollback-abstracts --apply` refuses while papervault.service
+is running (the live scheduler writes the same ledger + graph). Extract maintenance
+requires an explicit catalog DSN environment name, schema and vault, defaults to
+read-only plans, and applies only through the catalog reducers and fenced collector.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 import sys
 
 import click
@@ -280,6 +283,119 @@ def rollback_abstracts(apply: bool, json_out: bool) -> None:
     click.echo("Set KS_ABSTRACT_DOCS=0 in the service env before restarting papervault.service, "
                "or the scheduler re-ingests these papers as abstract docs."
                + ("" if result["abstract_docs_enabled"] else " (KS_ABSTRACT_DOCS=0 is set here.)"))
+
+
+def _extract_target_options(function):
+    """Explicit targets match scripts/maintain_derivatives.py; never infer settings."""
+    for decorator in (
+        click.option("--dsn-env", required=True, help="Environment variable containing the catalog DSN"),
+        click.option("--catalog-schema", required=True),
+        click.option("--vault", required=True, type=click.Path(path_type=Path)),
+        click.option("--operation-id", required=True, help="Reuse this ID and exact inputs after response loss"),
+        click.option("--apply", is_flag=True, help="Apply the command (default: read-only plan)"),
+    ):
+        function = decorator(function)
+    return function
+
+
+def _run_extract_operator(action, payload, *, dsn_env, catalog_schema, vault,
+                          operation_id, apply, **maintenance):
+    """Open only the named catalog; construction never installs schema."""
+    import os
+
+    # Set before imports that could discover an ambient service dotenv.
+    os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+    dsn = os.environ.get(dsn_env)
+    if not dsn or not dsn.strip():
+        raise click.ClickException(f"Explicit DSN environment variable {dsn_env!r} is unset or empty")
+    if not operation_id.strip():
+        raise click.BadParameter("must be nonempty", param_hint="--operation-id")
+
+    import psycopg
+    from papervault.store.derivative_maintenance import maintain
+    from papervault.store.knowledge import ClaimRejected, KnowledgeRepository
+    from papervault.store.recovery import checked_path
+    from papervault.store.repository import PostgresCatalogRepository
+
+    try:
+        root = checked_path(vault)
+        with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as connection:
+            repo = PostgresCatalogRepository(connection, schema=catalog_schema, read_only=not apply)
+            knowledge = KnowledgeRepository(repo)
+            if action in {"set_extract_retention", "gc"}:
+                result = maintain(knowledge, "disposition" if action == "set_extract_retention" else action,
+                    payload, vault=root, operation_id=operation_id, apply=apply, **maintenance)
+            elif apply:
+                result = {"action": action, "apply": True,
+                          "result": knowledge.command(action, operation_id, payload)}
+            else:
+                result = {"action": action, "apply": False, "payload": payload,
+                          "vault": str(root), "operation_id": operation_id}
+    except (ValueError, ClaimRejected) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(result, indent=2, default=str, ensure_ascii=False))
+
+
+@cli.command("extract-retention")
+@click.argument("completion_id")
+@click.option("--disposable/--protected", default=None, required=True,
+              help="Mark the markdown output disposable or restore protection")
+@click.option("--expected-revision", required=True, type=click.IntRange(min=0))
+@click.option("--reason", required=True)
+@click.option("--operator-nonce", required=True)
+@click.option("--actor", required=True, help="Operator identity retained in the command payload")
+@_extract_target_options
+def extract_retention(completion_id, disposable, expected_revision, reason, operator_nonce, actor, **target):
+    """Plan or apply an exact, reviewed extract retention decision."""
+    _run_extract_operator("set_extract_retention", {
+        "completion_id": completion_id, "disposable": disposable,
+        "expected_revision": expected_revision, "reason": reason,
+        "operator_nonce": operator_nonce, "actor": actor,
+    }, **target)
+
+
+@cli.command("extract-pin")
+@click.argument("completion_id")
+@click.option("--kind", required=True, type=click.Choice(("reader", "job", "recovery")))
+@click.option("--owner", required=True)
+@click.option("--ttl-seconds", default=300, show_default=True, type=click.IntRange(1, 7200),
+              help="Reader pin lifetime; job/recovery pins remain until reviewed release")
+@click.option("--actor", required=True)
+@_extract_target_options
+def extract_pin(completion_id, kind, owner, ttl_seconds, actor, **target):
+    """Plan or acquire a reader, job or recovery protection pin."""
+    _run_extract_operator("pin_extract", {"completion_id": completion_id, "kind": kind,
+        "owner": owner, "ttl_seconds": ttl_seconds, "actor": actor}, **target)
+
+
+@cli.command("release-extract-pin")
+@click.argument("pin_id")
+@click.option("--owner", required=True)
+@click.option("--expected-revision", required=True, type=click.IntRange(min=0))
+@click.option("--disposition", type=click.Choice(("reviewed_recovery_disposition",)))
+@click.option("--reason")
+@click.option("--operator-nonce")
+@click.option("--actor", required=True)
+@_extract_target_options
+def release_extract_pin(pin_id, owner, expected_revision, disposition, reason, operator_nonce, actor, **target):
+    """Release an owned pin; job/recovery releases require reviewed disposition."""
+    payload = {"pin_id": pin_id, "owner": owner, "expected_revision": expected_revision, "actor": actor}
+    payload.update({key: value for key, value in {"disposition": disposition, "reason": reason,
+        "operator_nonce": operator_nonce}.items() if value is not None})
+    _run_extract_operator("release_extract_pin", payload, **target)
+
+
+@cli.command("extract-gc")
+@click.option("--completion-id", "completion_ids", multiple=True, required=True,
+              help="Explicit completion to collect; repeat for a bounded batch of at most 100")
+@click.option("--owner", help="Required on apply: maintenance lease owner")
+@click.option("--window-id", help="Required on apply: recorded active maintenance window")
+@click.option("--lease-seconds", default=300, show_default=True, type=click.IntRange(1, 7200))
+@_extract_target_options
+def extract_gc(completion_ids, owner, window_id, lease_seconds, **target):
+    """Plan or collect disposable outputs through the fenced maintenance coordinator."""
+    _run_extract_operator("gc", {"completion_ids": list(completion_ids)},
+        owner=owner, window_id=window_id, lease_seconds=lease_seconds, **target)
 
 
 def main() -> None:

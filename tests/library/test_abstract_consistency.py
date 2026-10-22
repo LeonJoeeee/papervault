@@ -1,5 +1,5 @@
 """Tests for the forward abstract-consistency mechanism:
-fetch_abstract_by_doi, the reconcile abstract-backfill sweep, and the janitor.
+fetch_abstract_by_doi, abstract backfill, and retention during reconciliation.
 """
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ def test_abstract_sweep_fills_no_abstract_row_from_its_extract(tmp_path):
     assert len((lib.get(p.key).abstract or "").strip()) >= 60
 
 
-def test_janitor_purges_only_terminal_no_abstract_no_extract(tmp_path):
+def test_reconcile_retains_terminal_records_even_with_legacy_janitor_flag(tmp_path, monkeypatch):
     lib = Library(tmp_path)
     # victim: terminal, no abstract, no extract
     v, _ = lib.upsert({"title": "Ghost stub paper title here", "authors": ["A"],
@@ -111,8 +111,11 @@ def test_janitor_purges_only_terminal_no_abstract_no_extract(tmp_path):
     k2.abstract = "x" * 80
     k2.download_status = "metadata_only"
     lib.save()
-    n = _run(reconcile._janitor_sweep(lib))
-    assert n == 1
-    assert lib.get(v.key) is None
+    from unittest.mock import AsyncMock, Mock
+    monkeypatch.setenv("PAPER_PIPELINE_JANITOR_PURGE", "1")
+    monkeypatch.setattr(reconcile, "_abstract_sweep", AsyncMock(return_value=0))
+    monkeypatch.setattr(reconcile, "_enrich_sweep", AsyncMock(return_value=0))
+    _run(reconcile.reconcile_once(lib, Mock(), Mock()))
+    assert lib.get(v.key) is not None
     assert lib.get(k1.key) is not None
     assert lib.get(k2.key) is not None

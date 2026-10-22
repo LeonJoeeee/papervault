@@ -259,11 +259,7 @@ MCP server):
 /plugin install papervault        # installs ONLY plugin/ (manifest + MCP registration), not the repo
 ```
 
-**Any other MCP client** — register the streamable-http endpoint
-`http://127.0.0.1:8080/mcp` (or your host/port) as an MCP server. The three tools
-(`search_papers`, `get_paper`, `query`) appear automatically.
-
-The plugin defaults to `http://127.0.0.1:8080/mcp`. To use a different address,
+The Claude Code plugin defaults to `http://127.0.0.1:8080/mcp`. To use a different address,
 set `PAPERVAULT_MCP_URL` in the **client's environment before starting Claude Code**:
 
 ```bash
@@ -277,6 +273,51 @@ the loopback default. The URL is not derived from the server's `serve` config or
 `.env`; if you change its host/port, update the client environment and any direct
 MCP registrations to match. Start a new Claude Code session after changing it.
 
+**Antigravity (`agy`) CLI/IDE** — install the native plugin shell after starting
+the papervault server. From the repository root (commands checked with AGY 1.4.5):
+
+```bash
+agy plugin validate ./plugin --json
+agy plugin install ./plugin
+agy plugin list
+```
+
+AGY reads `plugin/plugin.json` and `plugin/mcp_config.json`; the latter registers
+`papervault` at `http://127.0.0.1:8080/mcp` using `serverUrl`. Start a new CLI or
+IDE session after installation. In the IDE, open **Additional Options (...) >
+MCP Servers** and confirm the three tools (`search_papers`, `get_paper`, `query`)
+are available. The plugin contains client wiring; the server runs separately.
+
+**AGY direct MCP connection** — as an alternative to the plugin, register the
+HTTP endpoint directly. Use this route for a different host/port: the native
+plugin has a fixed URL, and `PAPERVAULT_MCP_URL` only configures Claude Code.
+
+```bash
+agy mcp add papervault http://127.0.0.1:8080/mcp
+agy mcp list
+```
+
+For IDE setup through JSON, merge this entry into
+`~/.gemini/config/mcp_config.json`, preserving any existing `mcpServers` entries:
+
+```json
+{
+  "mcpServers": {
+    "papervault": {
+      "serverUrl": "http://127.0.0.1:8080/mcp"
+    }
+  }
+}
+```
+
+Replace the URL with your server's full endpoint, including `/mcp`, and start a
+new Antigravity session after changing the configuration. Choose either plugin
+installation or direct MCP registration to avoid duplicate connections.
+
+**Any other MCP client** — register the streamable-http endpoint
+`http://127.0.0.1:8080/mcp` (or your host/port) as an MCP server. The three tools
+(`search_papers`, `get_paper`, `query`) appear automatically.
+
 > **Bind loopback only (or set a token).** `papervault serve` binds `127.0.0.1`
 > by default and has no auth unless you set one — passing `--host 0.0.0.0` (or any
 > non-loopback host) with no token exposes all three tools unauthenticated. Keep it
@@ -285,7 +326,7 @@ MCP registrations to match. Start a new Claude Code session after changing it.
 > without `Authorization: Bearer <secret>` (401 JSON). Unset ⇒ current behavior,
 > unchanged; the `--stdio` transport is unaffected either way.
 
-### From another device on your tailnet (Claude Code, Codex CLI, Codex app)
+### From another device on your tailnet (Claude Code, Antigravity, Codex CLI, Codex app)
 
 On the **server box**, leave papervault listening on `127.0.0.1:8080` and
 run [Tailscale Serve](https://tailscale.com/docs/reference/tailscale-cli/serve):
@@ -337,6 +378,18 @@ its per-call timeout is `MCP_TOOL_TIMEOUT`. The lab registration works with the
 defaults; adjust these only if needed. See the
 [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
 
+**Antigravity (`agy`) CLI/IDE** — register the tailnet endpoint directly instead
+of using the plugin's loopback default:
+
+```bash
+agy mcp add papervault https://<node>.<tailnet>.ts.net:8080/mcp
+agy mcp list
+```
+
+For IDE JSON setup, use this HTTPS URL as `mcpServers.papervault.serverUrl` in
+`~/.gemini/config/mcp_config.json` (see the local example above). Start a new
+session and inspect **Additional Options (...) > MCP Servers** for the tools.
+
 **Codex CLI** — add this block to `~/.codex/config.toml` on the client device
 (configuration used with codex-cli 0.153.4):
 
@@ -381,7 +434,7 @@ even when the server is bound to `0.0.0.0`. With the variable, papervault still 
 **no authentication unless `PAPERVAULT_MCP_TOKEN` is set**, so the tailnet's device
 identity is the whole perimeter. `PAPERVAULT_MCP_TOKEN` gates **every** HTTP
 request, including loopback ones: enabling it means reconfiguring every local
-client too (Claude Code, Codex reviewers, and any script).
+client too (Claude Code, Antigravity, Codex reviewers, and any script).
 
 ## Choosing a domain
 

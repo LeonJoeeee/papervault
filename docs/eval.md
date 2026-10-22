@@ -34,6 +34,17 @@ corpus, so the harness splits into what CI can prove and what only reference har
   `main` shipped in `.env.example`) is **not** accepted, so set the eval workspace explicitly as
   above and populate it with the corpus you want scored.
 
+`eval/run_eval.py` shares production's post-retrieval synthesis and response assembly
+in `knowledge/query/aquery.py` (`synthesize_outfeed` and the pure `build_outfeed`).
+Synthesized results separate `retrieved_papers` from `cited_papers`: the latter
+contains only exact inline `[paper_key]` citations verified against retrieved evidence.
+In FAST `--no-synth` mode, `cited_papers` explicitly falls back to `retrieved_papers`
+for recall scoring. Raw retrieved chunks and references remain in eval output even
+when coverage is empty or the answer cites only a subset. Empty coverage skips
+synthesis; exclusively `abstract_only` evidence is capped at `"weak"`. The shared
+`query_receipt` records the generation (when catalog-pinned), variant, coverage,
+retrieved/cited counts and synthesis observations.
+
 ## Gold sets
 
 The bundled gold sets (`gold_fast.jsonl` = FAST arm, `gold_v4.jsonl` = FULL arm, plus trap
@@ -101,14 +112,14 @@ the shipped values.
 | `KS_MQ_ENABLE_RERANK` | `true` | Rerank the fused chunk set on the GPU. |
 | `KS_RERANK_POOL_CAP` | `120` | Prefix-cap the candidate pool fed to the cross-encoder (`0` = off; never caps below the requested top_n). Arbitrated 2026-07-18: 120 is recall-neutral at 1.90× retrieval speed (issue #21). |
 | `KS_MQ_MAX_CHUNKS_PER_PAPER` | `0` | Per-paper chunk cap (`0` = no cap; raise to diversify served papers). |
-| `KS_MQ_MIN_COVERAGE` | `thin` | Coverage-gate floor before synthesis. |
+| `KS_MQ_MIN_COVERAGE` | `thin` | Minimum anchor coverage required for multi-query fusion; below it, retain anchor evidence. Empty coverage always skips synthesis. |
 | `KS_MQ_CITATION_PRIOR` | `0` | Citation-count prior on fused ranking (`0` = off). |
 | `KS_MQ_CITATION_LAMBDA` | `0.5` | Weight of the citation prior when it is on. |
 | `KS_MQ_FANOUT` | `1` | Adaptive fan-out on/off (`KS_MQ_FANOUT_MAX`=100, `KS_MQ_FANOUT_SLOPE`=7 shape it). |
 | `KS_SYNTH_STRICT_REFUSAL` | `1` | Refuse to answer on thin/absent evidence (`0` = permissive). |
 | `KS_SYNTH_COVERAGE` | `0` | Coverage-oriented synthesis variant (`1` = on). |
-| `PAPERVAULT_SEARCH_AUTHORITY_PRIOR` | `0` | `search_papers` return ordering: soft RRF rank-blend of relevance with an age-normalized citation **authority** rank (`0` = off). **Arbitration pending (issue #46/#37) — default stays off until the paired coverage+precision run clears the noise floor** (P@served must hold the 0.9111 floor; must-find recall should rise). RANK-based, pool-only, never raw counts. |
-| `PAPERVAULT_SEARCH_AUTHORITY_LAMBDA` | `0.5` | Weight λ of the authority prior when it is on (parsed defensively: non-numeric → 0.5, out-of-range → clamped to `[0,1]`, both with a warning). Arbitration runs must record the flag+λ per arm MANUALLY — the `pl` search path has no auto meta-stamp. |
+| `PAPERVAULT_SEARCH_AUTHORITY_PRIOR` | `1` | `search_papers` return ordering: gentle RRF rank-blend of relevance with age-normalized citation **authority**, enabled by default in `by_relevance` mode; set `0` to disable. Rank-based and pool-only: it cannot admit gate-rejected papers. Explicit recency/importance hints bypass the blend. |
+| `PAPERVAULT_SEARCH_AUTHORITY_LAMBDA` | `0.25` | Weight λ of the enabled search authority prior (non-numeric → `0.25`, out-of-range → clamped to `[0,1]`, both with a warning). Record the flag and λ explicitly for each arbitration arm. |
 
 Changing any of these is a retrieval-affecting change: it must clear the eval noise floor before
 you flip the default.

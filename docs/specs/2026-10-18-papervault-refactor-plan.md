@@ -1,6 +1,24 @@
 # papervault refactor plan v0.3 (strangler → three-layer constitution)
 
-Status: revised after joint review and confirmation (constitution ACCEPT AS-IS; plan amendments 1–5 applied; §5 aligned with the P1/P2 handoff protocol). This plan executes constitution v2.1-rc2; where they disagree, the constitution wins.
+Status (2026-10-22): **P0–P8 implemented, reviewed and merged on `main`**: F0,
+F1/P1–P5 (including P5a–P5c), S1 search plane
+[#251](https://github.com/LeonJoeeee/papervault/issues/251), S2 query plane
+[#252](https://github.com/LeonJoeeee/papervault/issues/252), S3 lifecycle completion
+[#253](https://github.com/LeonJoeeee/papervault/issues/253), and S5 hygiene
+[#255](https://github.com/LeonJoeeee/papervault/issues/255). Umbrella
+[#249](https://github.com/LeonJoeeee/papervault/issues/249) is closed; the AGY plugin
+adaptation [#290](https://github.com/LeonJoeeee/papervault/issues/290) is also merged.
+
+The phase descriptions and acceptance gates below retain the ratified plan's design
+requirements. Implementation completion does not activate every operational surface:
+deployment #1's library catalog is live on PostgreSQL, while catalog-owned knowledge
+jobs/publication require their separate authority handoff and recovery/maintenance
+tools retain their explicit operator gates. Current behavior and operational limits
+are described in [architecture](../architecture.md).
+
+Review history: constitution ACCEPT AS-IS; plan amendments 1–5 applied; §5 aligned
+with the P1/P2 handoff protocol. This plan executes constitution v2.1-rc2; where they
+disagree, the constitution wins.
 
 ## 1. Scope: what stays, what is replaced
 

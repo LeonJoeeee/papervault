@@ -57,8 +57,8 @@ docker volume create ks-pgdata      # external volumes hold the production data 
 docker volume create ks-neo4jdata
 docker compose --env-file .env -f deploy/docker-compose.yml up -d   # Neo4j + Postgres
 uv venv && uv pip install -e ".[grey]"              # core HTTP OCR client + grey download tiers
-papervault doctor             # verify GPU, databases, LLM config
-papervault-mcp                # start the MCP server (== papervault serve)
+.venv/bin/papervault doctor   # verify GPU, databases, LLM config
+.venv/bin/papervault serve    # start the MCP server
 ```
 
 Provision the standalone `mineru-service` separately at `http://127.0.0.1:30000`
@@ -72,6 +72,11 @@ remains valid without installing `mineru` or `torchvision` in the caller's envir
 Then register the server with your agent. Claude Code and Antigravity (`agy`) can install
 the bundled `plugin/` shell; Codex CLI and other clients connect directly to the MCP
 endpoint — see [Connecting an agent](docs/INSTALL.md#connecting-an-agent).
+
+Knowledge auto-ingest is opt-in: `.env.example` sets `KS_AUTO_INGEST_ENABLED=false`.
+Set it to `true` after configuring and populating the vault to enable the background
+search-to-queryable loop; installing and serving alone does not start distillation.
+Sci-Hub and the other grey download tiers remain off until explicitly enabled.
 
 For Antigravity CLI/IDE, validate and install the native plugin from the repo root:
 
@@ -763,9 +768,15 @@ PostgreSQL fixture and small isolated filesystem roots. The recorded P5c rehears
 in [baseline evidence](docs/baselines.md) covers deletion retries, preserved source
 hashes, capacity refusal, isolated candidate publication and guarded promotion.
 Its metadata-only timings do not qualify full-text rebuilds or production RTO.
-The pre-existing P5b isolated recovery-replay caller constructs its scheduler without
-the runtime capacity gate. Its staging reservation does not establish P5c admission
-accounting for replay jobs; this remains a separate recovery-replay limitation.
+Isolated recovery replay uses the same capacity gate for input import, backend
+preparation and claim-bound execution/reconciliation. It measures the target files
+and catalog relation sizes, keeping reservation state under
+`<target>/knowledge/maintenance/capacity`. Physical replay additionally requires a
+fresh protected `PAPERVAULT_DERIVATIVE_USAGE_FILE` census scoped to
+`vault_root=<target>/vault` and `knowledge_root=<target>/knowledge`; a metadata-only
+sample cannot fund it. Metadata-only replay measures its local files and catalog
+synchronously without an external census. `PAPERVAULT_CATALOG_EXECUTION_BYTES`
+sets the positive per-job estimate (default 1 GiB).
 
 ## Releases
 

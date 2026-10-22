@@ -414,8 +414,8 @@ async def _assert_not_already_ingested(ingest_source: str, base_sid: str, key: s
 
     Matches the doc's single row (`base_sid`) or its multi-section rows (`base_sid#s<N>`),
     in ANY status — an errored or half-done prior push still counts, so a re-run can't
-    silently double-insert / orphan graph docs. Clearing + re-ingest (`--force`/supersede)
-    is deliberately future work; an operator must clear the old rows by hand for now.
+    silently double-insert / orphan graph docs. Force replacement must first confirm
+    deletion of every old section; any retained row continues to block replacement.
     Prefix-safe: only an exact `base_sid` or a `base_sid#s...` section id matches (a sibling
     key like `<base_sid>b` does not)."""
     existing = await ledger.load(ingest_source)  # {source_id: LedgerRecord}, workspace-scoped
@@ -424,7 +424,7 @@ async def _assert_not_already_ingested(ingest_source: str, base_sid: str, key: s
         raise AlreadyIngestedError(
             f"{key} is already ingested ({len(hits)} ledger section(s)) — v1 is push-once. "
             "Re-ingesting an existing key is REFUSED to avoid duplicate / orphaned graph docs; "
-            "clearing the old sections + re-ingest (--force / supersede) is future work."
+            "--force requires successful deletion of every old section before replacement."
         )
 
 
@@ -439,10 +439,9 @@ async def _purge_sections(rag, ingest_source: str, base_sid: str, key: str) -> d
     LightRAG doc by its stored doc_id FIRST (rag.adelete_by_doc_id, the same primitive
     distill.remove_one uses; a not_found doc is benign — the ledger row is still cleared), then
     the ledger row (ledger.delete, the ingest_source-agnostic primitive). Idempotent: a key
-    with no rows is a clean no-op. Best-effort on the graph side — a delete that raises / returns
-    an unexpected status is logged LOUD and counted, but the ledger row is still cleared so the
-    wedge is always broken (a fresh re-ingest reuses the SAME doc_ids, so a surviving orphan is
-    then overwritten by the re-insert)."""
+    with no rows is a clean no-op. A failed or refused graph deletion retains its ledger row,
+    preventing force replacement from overwriting an unresolved old contribution. Other
+    successfully deleted sections may clear their rows independently."""
     await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, "legacy")
     existing = await ledger.load(ingest_source)  # {source_id: LedgerRecord}, workspace-scoped
     victims = [
@@ -462,9 +461,11 @@ async def _purge_sections(rag, ingest_source: str, base_sid: str, key: str) -> d
             else:
                 counts["docs_failed"] += 1
                 log.warning("purge %s: adelete_by_doc_id(%s) unexpected status=%s", key, did, status)
-        except Exception as e:  # noqa: BLE001 — never let one doc block clearing the wedge
+                continue
+        except Exception as e:  # noqa: BLE001 — retain this row and continue other sections
             counts["docs_failed"] += 1
             log.warning("purge %s: adelete_by_doc_id(%s) raised: %r", key, did, e)
+            continue
         await ledger.delete(ingest_source, getattr(rec, "source_id"))
         counts["ledger_rows_deleted"] += 1
     if victims:

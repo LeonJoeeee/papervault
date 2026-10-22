@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..claims_v2 import BudgetLedger, ClaimStore, LedgerError
+from ..claims_v2 import BudgetLedger, ClaimStore, LedgerError, same_attempt
 from .operator_actions import stage_operator
 
 
@@ -24,6 +24,7 @@ async def operate(library, *, action, key=None, campaign_id=None, reason, actor,
         raise ValueError("lease identity must be a string")
 
     ledger = BudgetLedger(library.root)
+    store = ClaimStore(library, ledger=ledger)
     if action == "campaign-halt":
         start = next((row for row in ledger.events()
                       if row["event"] == "campaign_start" and row["campaign_id"] == campaign_id), None)
@@ -36,7 +37,7 @@ async def operate(library, *, action, key=None, campaign_id=None, reason, actor,
         paper = library.get(key) if key else None
         if paper is None:
             raise ValueError("existing record key required")
-        token = paper.reopen_claim
+        token = store.recovery_claim(key)
         if token is None:
             raise ValueError("record has no recovery claim")
         if lease_id and lease_id != token.lease_id:
@@ -54,6 +55,18 @@ async def operate(library, *, action, key=None, campaign_id=None, reason, actor,
             already_halted = ledger.campaign_halted(campaign_id)
             ledger.halt_campaign(campaign_id, reason)
             if drained:
+                # Reconcile only crash gaps here. Existing queued/dispatched
+                # record work still requires its explicit recovery disposition.
+                # Include refunded orphan reservations too: a prior interrupted
+                # save may have settled accounting without recording generation.
+                for selected_key in keys:
+                    claim = store.recovery_claim(selected_key)
+                    if claim is None or claim.campaign_id != campaign_id:
+                        continue
+                    paper = library.get(claim.key)
+                    if (paper is not None and (not same_attempt(paper.reopen_claim, claim)
+                            or paper.reopen_claim.phase == "completed")):
+                        await store.recover(claim)
                 if any(token.campaign_id == campaign_id for token in ledger.outstanding(keys)):
                     raise LedgerError("campaign has outstanding reservations")
                 if any(paper.reopen_claim is not None
@@ -64,9 +77,8 @@ async def operate(library, *, action, key=None, campaign_id=None, reason, actor,
                 ledger.finish_campaign(campaign_id, drained=True)
             return {"action": action, "campaign_id": campaign_id,
                     "changed": not already_halted or drained, "finished": drained}
-        store = ClaimStore(library, ledger=ledger)
         if action == "claim-recover":
-            changed = await store.not_sent(token, executor_proof=executor_proof)
+            changed = await store.recover(token, executor_proof=executor_proof)
         else:
             changed = await store.release_quarantine(key, human_reason=reason, expected_lease_id=token.lease_id)
         return {"action": action, "key": key, "changed": changed}

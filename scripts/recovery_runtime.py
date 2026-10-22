@@ -44,11 +44,12 @@ def physical_replay_factory(config, targets, package, root):
     from psycopg import sql
     from psycopg.rows import dict_row
     from psycopg.types.json import Jsonb
-    from papervault.store.recovery import child, digest_file, verify_recovery_set
+    from papervault.store.recovery import checked_path, child, digest_file, verify_recovery_set
     from papervault.store.recovery_backends import _graph_endpoint, validate_postgres_target
     from papervault.store.repository import payload_hash
     from prepare_knowledge_backend import preparation_plan
 
+    package, root = checked_path(package), checked_path(root)
     verify_recovery_set(package)
     pg, graph = targets["postgres"], targets["neo4j"]
     exported_pg = json.loads(child(package, "postgres/data.json").read_bytes())

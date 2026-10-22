@@ -151,3 +151,27 @@ def test_catalog_epoch_rejects_json_library_configuration(monkeypatch):
     monkeypatch.setattr(runtime, "get_knowledge_repository", lambda: Repository())
     with pytest.raises(runtime.KnowledgeAuthorityError, match="postgres"):
         runtime.assert_knowledge_authority("catalog")
+
+
+def test_capacity_census_owns_connection_and_uses_configured_schema(monkeypatch):
+    from types import SimpleNamespace
+    from papervault.store.knowledge_runtime import KnowledgeRepositoryProxy
+
+    connections = []
+
+    class CensusConnection(Connection):
+        def execute(self, query, params):
+            assert not self.closed
+            assert params == ("catalog_isolated",)
+            return SimpleNamespace(fetchone=lambda: {"bytes": 137})
+
+    def connect(*args, **kwargs):
+        connection = CensusConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr("psycopg.connect", connect)
+    proxy = KnowledgeRepositoryProxy("postgresql://test.invalid/task_test", schema="catalog_isolated")
+    assert proxy.catalog_relation_bytes() == 137
+    assert len(connections) == 1
+    assert connections[0].closed

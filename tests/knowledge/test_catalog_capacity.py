@@ -454,12 +454,8 @@ async def test_unrecognized_capacity_metadata_preserves_charge_without_blocking_
 
 
 def test_runtime_metadata_counts_fresh_global_census_and_catalog_relations(tmp_path, monkeypatch):
-    class Connection:
-        def execute(self, query, parameters):
-            assert parameters == ("catalog_fixture",)
-            return SimpleNamespace(fetchone=lambda: {"bytes": 17})
-
-    repository = SimpleNamespace(connection=Connection(), repository=SimpleNamespace(schema="catalog_fixture"))
+    # The runtime proxy owns its census connection; the service consumes its measured result.
+    repository = SimpleNamespace(catalog_relation_bytes=lambda: 17)
     service = runtime_service(tmp_path, monkeypatch, repository)
     monkeypatch.setenv("PAPERVAULT_DERIVATIVE_USAGE_FILE", str(write_census(tmp_path)))
     monkeypatch.setenv("PAPERVAULT_CATALOG_EXECUTION_BYTES", "1000")

@@ -350,8 +350,8 @@ def fake_ledger(monkeypatch):
 def _vault_with_new_paper(monkeypatch, fake_ledger):
     from lightrag.base import DocStatus
 
-    monkeypatch.setattr(rnd, "load_clean_index", lambda *a, **k: {"NEW": _rec("NEW")})
-    monkeypatch.setattr(rnd, "fingerprint", lambda rec: "fNEW")
+    monkeypatch.setattr(rnd, "load_clean_index", lambda *a, **k: {"NEW": _rec("NEW"), "DONE": _rec("DONE")})
+    monkeypatch.setattr(rnd, "fingerprint", lambda rec: "f" if rec.key == "DONE" else "fNEW")
     monkeypatch.setattr(distill, "read_extract_raw", lambda rec, *a, **k: "body of NEW")
     fake_ledger.rows = {
         "DONE": LedgerRecord("l0_probe", "paper", "DONE", "f", "paper:DONE", "processing"),

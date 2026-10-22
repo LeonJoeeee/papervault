@@ -56,7 +56,12 @@ def _check_config(r: _Report) -> None:
     else:
         r.warn(".env", "no .env found — relying on process environment")
     has_pool = config.LLM_KEYS_FILE.exists()
-    if has_pool:
+    if config.USE_GATEWAY:
+        if config.GATEWAY_KEY:
+            r.ok("LLM gateway key", "PAPERVAULT_LLM_GATEWAY_KEY set")
+        else:
+            r.fail("LLM gateway credentials", "set PAPERVAULT_LLM_GATEWAY_KEY")
+    elif has_pool:
         r.ok("LLM key-pool file", str(config.LLM_KEYS_FILE))
     elif config.LLM_API_KEY:
         r.ok("LLM single key", "PAPERVAULT_LLM_API_KEY set")
@@ -67,7 +72,7 @@ def _check_config(r: _Report) -> None:
         r.ok("LLM levels", levels)
     except ValueError as exc:
         r.fail("LLM levels", str(exc))
-    if not config.LLM_BASE_URL and not has_pool:
+    if not config.USE_GATEWAY and not config.LLM_BASE_URL and not has_pool:
         r.warn("LLM base URL", "PAPERVAULT_LLM_BASE_URL empty (ok if the key-pool file sets base_url)")
 
 
@@ -102,6 +107,7 @@ def _check_gpu(r: _Report) -> None:
 
 def _check_databases(r: _Report) -> None:
     click.echo(click.style("databases", bold=True))
+    _check_catalog(r)
     # Postgres — resolve the DSN through the SAME PostgresConfig the ledger + LightRAG
     # store use (knowledge.config), so doctor can never pass against a different database
     # than the runtime targets. One resolution, no divergence.
@@ -140,6 +146,50 @@ def _check_databases(r: _Report) -> None:
             drv.close()
     except Exception as e:  # noqa: BLE001
         r.fail("neo4j", str(e).splitlines()[0] if str(e) else type(e).__name__)
+
+
+def _check_catalog(r: _Report) -> None:
+    """Probe the configured catalog without installing or changing its schema."""
+    authority = os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json")
+    if authority == "json":
+        return
+    if authority != "postgres":
+        r.fail("catalog", "PAPERVAULT_CATALOG_AUTHORITY must be json or postgres")
+        return
+    try:
+        import psycopg
+        from psycopg import sql
+        from papervault.store.persistence import PostgresPersistence
+        from papervault.store.repository import PostgresCatalogRepository
+
+        settings = PostgresPersistence.from_environment()
+        with psycopg.connect(settings.dsn, autocommit=True, connect_timeout=5,
+                             options="-c default_transaction_read_only=on") as connection:
+            repository = PostgresCatalogRepository(connection, schema=settings.schema,
+                                                  read_only=True)
+            versions = connection.execute(sql.SQL("SELECT version FROM {}").format(
+                repository._table("schema_version"))).fetchall()
+            if not {1, 2} <= {row["version"] for row in versions}:
+                r.fail("catalog", f"{settings.schema}: P2 schema versions 1 and 2 required")
+                return
+            # A marker alone is insufficient: verify the runtime's base read/write
+            # relations and P2 columns exist, without reading research records.
+            for table, columns in (
+                ("records", "key, revision, payload"),
+                ("aliases", "alias_key, canonical_key"),
+                ("writer_fence", "fence_id"),
+                ("audit", "actor, event, key, detail"),
+                ("rulings", "import_id, revision"),
+                ("jobs", "id, attempts, lease_id"),
+                ("derivations", "key, artifact_inputs, recipe"),
+            ):
+                connection.execute(sql.SQL("SELECT {} FROM {} LIMIT 0").format(
+                    sql.SQL(columns), repository._table(table)))
+        r.ok("catalog", f"{settings.schema}: postgres connected; P2 schema ready")
+    except Exception as exc:  # noqa: BLE001
+        # Driver diagnostics can contain connection credentials; report no DSN/body.
+        r.fail("catalog", f"connection or schema not ready ({type(exc).__name__}); "
+                          "verify PAPERVAULT_CATALOG_DSN and PAPERVAULT_CATALOG_SCHEMA")
 
 
 def _check_domain(r: _Report) -> None:
@@ -340,6 +390,14 @@ async def _smoke_server_phase(full: bool) -> list[tuple[bool, str]]:
             child_env["PAPERVAULT_VAULT"] = vault
             child_env["PAPERVAULT_STORAGE"] = str(Path(tmp) / "knowledge_store")
             child_env.pop("PAPER_LIBRARY_PATH", None)   # legacy real-vault fallback
+            child_env["PAPERVAULT_CATALOG_AUTHORITY"] = "json"
+            child_env.pop("PAPERVAULT_CATALOG_DSN", None)
+            child_env["PAPERVAULT_KNOWLEDGE_JOBS"] = "legacy"
+            # Config loads .env again in the child. Choose an empty existing file
+            # so it cannot restore the operator's DSN after the removal above.
+            smoke_env = Path(tmp) / ".env"
+            smoke_env.touch()
+            child_env["PAPERVAULT_ENV"] = str(smoke_env)
             # Isolate the GRAPH STORE too, not just the filesystem vault (review F1): the
             # smoke child must never run a second scheduler against the host's live
             # Neo4j/PG workspace. The tool phase needs no scheduler and no graph.

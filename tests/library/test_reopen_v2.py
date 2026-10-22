@@ -830,3 +830,67 @@ async def test_staged_trusted_scan_preserves_deferred_identity_through_writeback
     assert persisted.download_source == 'ads_scan'
     assert persisted.verification_deferred_to_ocr
     assert lib.pdf_path(paper.key).read_bytes() == b'%PDF trusted scanned artifact'
+
+
+async def test_staged_verified_inspire_blank_fill_is_adopted(vault):
+    from papervault.library.reopen_v2 import StagedAttempt
+
+    lib, paper = vault
+    claims, token = await prepare(vault)
+    assert await claims.pre_dispatch(token)
+    stage = StagedAttempt(lib, token)
+    result = stage.library.get(paper.key)
+    result.inspire_record_id = "123456"
+    result.inspire_document_urls = ["https://inspirehep.net/files/verified.pdf"]
+    result.download_status = "ok"
+    stage.path("pdf").write_bytes(b"verified INSPIRE PDF")
+    try:
+        assert await stage.writeback(claims)
+        persisted = Library(lib.root).get(paper.key)
+        assert persisted.inspire_record_id == "123456"
+        assert persisted.inspire_document_urls == ["https://inspirehep.net/files/verified.pdf"]
+        assert lib.pdf_path(paper.key).read_bytes() == b"verified INSPIRE PDF"
+    finally:
+        stage.cleanup()
+
+
+@pytest.mark.parametrize("change", ["adopted", "collision"])
+async def test_staged_inspire_fill_never_replaces_or_collides_with_adopted_identity(vault, change):
+    from papervault.library.reopen_v2 import StagedAttempt
+
+    lib, paper = vault
+    if change == "adopted":
+        paper.inspire_record_id = "111111"
+    claims, token = await prepare(vault)
+    assert await claims.pre_dispatch(token)
+    stage = StagedAttempt(lib, token)
+    result = stage.library.get(paper.key)
+    result.inspire_record_id = "222222"
+    result.download_status = "ok"
+    stage.path("pdf").write_bytes(b"refused INSPIRE PDF")
+    if change == "collision":
+        twin = Paper(key="Other2026", title="Another adopted INSPIRE publication", inspire_record_id="222222")
+        lib._papers[twin.key] = twin
+        lib._reindex(twin)
+        lib.save(force=True, durable=True)
+    try:
+        assert not await stage.writeback(claims)
+        assert paper.inspire_record_id == ("111111" if change == "adopted" else "")
+        assert not lib.has_pdf(paper.key)
+    finally:
+        stage.cleanup()
+
+
+async def test_staged_reopen_preserves_insight_invalidation_result(vault):
+    from papervault.library.reopen_v2 import StagedAttempt
+
+    lib, paper = vault
+    claims, token = await prepare(vault)
+    assert await claims.pre_dispatch(token)
+    stage = StagedAttempt(lib, token)
+    stage.library.get(paper.key).insight_invalid_reason = "reacquired extract invalidates old insight"
+    try:
+        assert await stage.writeback(claims)
+        assert Library(lib.root).get(paper.key).insight_invalid_reason == "reacquired extract invalidates old insight"
+    finally:
+        stage.cleanup()

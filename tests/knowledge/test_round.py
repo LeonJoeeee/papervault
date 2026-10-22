@@ -889,3 +889,18 @@ async def test_hashless_operator_rejection_needs_current_content_evidence(fake_l
     result = await reconcile_library(rag, {})
     assert result['duplicates'] == 0
     assert fake_ledger.rows['B'].duplicate_of is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["processing", "error", "error_parked"])
+async def test_paused_round_does_not_reconcile_papers_excluded_from_clean_index(fake_ledger, monkeypatch, status):
+    from types import SimpleNamespace
+
+    fake_ledger.rows["blocked"] = LedgerRecord("l0_probe", "paper", "blocked", "fp", "paper:blocked", status, 2)
+    monkeypatch.setattr(rnd, "load_clean_index", lambda: {})
+    monkeypatch.setattr(rnd, "get_breaker", lambda: SimpleNamespace(allows=lambda: False))
+    rag = FakeRag(doc_statuses={"paper:blocked": "processed"})
+    result = await rnd.run_round(rag)
+    assert result["paused"] is True
+    assert fake_ledger.rows["blocked"].status == status
+    assert not [call for call in rag.calls if call[0] == "get_docs_by_ids"]

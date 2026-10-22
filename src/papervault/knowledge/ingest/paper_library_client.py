@@ -17,6 +17,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
@@ -33,6 +34,14 @@ DEFAULT_VAULT = _pv_config.VAULT_PATH
 
 # paper-library writes index.json as {"version": 1, "papers": {...}}.
 _EXPECTED_INDEX_VERSION = 1
+
+
+@lru_cache(maxsize=1)
+def _terminal_state_adapter():
+    from pydantic import TypeAdapter
+    from papervault.library.state_v2 import TerminalState
+
+    return TypeAdapter(TerminalState)
 
 
 @dataclass
@@ -69,6 +78,24 @@ class PaperRecord:
     # Library terminal acquisition status (#144, #148): metadata_only / extract_failed / failed
     # can supply an abstract-only graph doc without an extract. Empty on legacy entries.
     download_status: str = ""
+    terminal_state: Optional[dict[str, Any]] = None
+    merge_intent: Optional[dict[str, Any]] = None
+
+    @property
+    def eligible(self) -> bool:
+        if self.domain_status is not None or self.merge_intent is not None:
+            return False
+        if self.terminal_state is None:
+            return True
+        from pydantic import ValidationError
+        from papervault.library.state_v2 import Merge, effective_policy
+
+        try:
+            state = _terminal_state_adapter().validate_python(self.terminal_state)
+        except ValidationError:
+            return False
+        return (not state.quarantine and state.merge == Merge.CANONICAL
+                and not state.alias_key and effective_policy(state, key=self.key))
 
     @classmethod
     def from_index_entry(cls, entry: dict[str, Any]) -> "PaperRecord":
@@ -94,6 +121,8 @@ class PaperRecord:
             source_type=entry.get("source_type", "research_paper"),
             domain_status=entry.get("domain_status"),
             download_status=entry.get("download_status") or "",
+            terminal_state=entry.get("terminal_state"),
+            merge_intent=entry.get("merge_intent"),
         )
 
     @property
@@ -144,7 +173,8 @@ def load_vault_index(
 
     By DEFAULT returns the library's clean view — papers domain-quarantined at the
     source (``domain_status`` set: off_domain / non_paper / bad_extract, per
-    paper-library Phase 32) are excluded, so the KS graph build never ingests
+    paper-library Phase 32), terminal policy exclusions, quarantines, merge
+    aliases and pending merges are excluded, so the KS graph build never ingests
     off-domain contamination and no KS-side domain classifier is needed. Pass
     ``include_quarantined=True`` for audits.
 
@@ -167,7 +197,7 @@ def load_vault_index(
     recs = {key: PaperRecord.from_index_entry(entry) for key, entry in papers.items()}
     if include_quarantined:
         return recs
-    return {k: r for k, r in recs.items() if r.domain_status is None}
+    return {k: r for k, r in recs.items() if r.eligible}
 
 
 def iter_distilled(vault_path: Path = DEFAULT_VAULT) -> Iterator[PaperRecord]:
@@ -200,12 +230,24 @@ def _strip_references(text: str) -> str:
     return text
 
 
+def resolve_extract_path(vault_path: Path, relative: str) -> Path:
+    """Reject malformed legacy locators before opening any artifact."""
+    root = vault_path.resolve()
+    path = Path(relative)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("extract path must be relative and strictly inside the vault")
+    resolved = (root / path).resolve()
+    if resolved == root or not resolved.is_relative_to(root):
+        raise ValueError("extract path must resolve strictly inside the vault")
+    return resolved
+
+
 def read_paper_text(paper: PaperRecord, vault_path: Path = DEFAULT_VAULT) -> Optional[str]:
     """Read paper's extracted text from disk (markdown preferred), references section
     stripped (junk-entity source for the knowledge-graph build)."""
     for rel in (paper.md_path, paper.txt_path):
         if rel:
-            full = vault_path / rel
+            full = resolve_extract_path(vault_path, rel)
             if full.exists():
                 return _strip_references(full.read_text(encoding="utf-8", errors="replace"))
     return None

@@ -215,3 +215,117 @@ async def test_isolated_replay_records_unit_quarantine_reset(package, target_cat
         {"unit_id": unit["unit_id"], "source_revision": unit["revision"] + 1, "source_reason": reason}]}
     assert source.get_unit(unit["unit_id"])["quarantine"] is True
     assert KnowledgeRepository(PostgresCatalogRepository(connection, schema=schema)).get_unit(unit["unit_id"])["quarantine"] is False
+
+
+def test_replay_default_capacity_counts_catalog_and_requires_physical_census(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from papervault.store import recovery_replay
+    from papervault.store.scheduler_capacity import CapacityAdmissionError
+
+    monkeypatch.delenv("PAPERVAULT_DERIVATIVE_USAGE_FILE", raising=False)
+    monkeypatch.setenv("PAPERVAULT_CATALOG_EXECUTION_BYTES", "1024")
+    connection = SimpleNamespace(execute=lambda *args: SimpleNamespace(fetchone=lambda: {"bytes": 91}))
+    gate = recovery_replay.replay_capacity(tmp_path / "target", connection, "catalog_test", physical=False)
+    with gate.intake() as plan:
+        assert plan["used_bytes"] >= 91
+    physical = recovery_replay.replay_capacity(tmp_path / "physical", connection, "catalog_test", physical=True)
+    with pytest.raises(CapacityAdmissionError):
+        with physical.intake():
+            pytest.fail("physical replay must have a fresh scoped backend census")
+
+
+@pytest.mark.asyncio
+async def test_replay_capacity_denial_precedes_copies_catalog_import_and_backend_factory(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from papervault.store import recovery_replay
+    from papervault.store.scheduler_capacity import CapacityAdmissionError
+
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "manifest.json").write_text("{}")
+    manifest = {"source_roots": []}
+    catalog = {"tables": {"generations": []}}
+    plan = {"physical": True, "inputs": [{"manifest": {"artifacts": [{"sha256": "abc", "byte_length": 1}]}}]}
+    monkeypatch.setattr(recovery_replay, "replay_plan", lambda *args, **kwargs: (manifest, catalog, plan))
+    monkeypatch.setattr(recovery_replay, "validate_catalog_target", lambda *args: None)
+    monkeypatch.setattr(recovery_replay, "copy_verified_file", lambda *args: pytest.fail("unfunded input copy"))
+    monkeypatch.setattr(recovery_replay, "_initialize", lambda *args: pytest.fail("unfunded catalog initialize"))
+    monkeypatch.setattr(recovery_replay, "_import_inputs", lambda *args: pytest.fail("unfunded import"))
+
+    class Denied:
+        @contextmanager
+        def intake(self):
+            raise CapacityAdmissionError("capacity exhausted")
+            yield
+
+    connection = SimpleNamespace(info=SimpleNamespace(dsn="dbname=isolated_test user=test host=127.0.0.1"),
+        execute=lambda *args: SimpleNamespace(fetchone=lambda: (None,)))
+    with pytest.raises(CapacityAdmissionError):
+        await recovery_replay.replay_recovery_set(package, tmp_path / "target", source_generation="old",
+            target_generation="new", catalog_connection=connection, catalog_schema="catalog_test", apply=True,
+            adapter_factory=lambda *args, **kwargs: pytest.fail("unfunded backend preparation"),
+            backend_identity={"isolated": True}, capacity_gate=Denied())
+
+
+@pytest.mark.asyncio
+async def test_replay_shares_intake_gate_with_scheduler_and_backend_preparation(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from papervault.store import recovery_replay
+
+    package = tmp_path / "package"
+    package.mkdir()
+    (package / "manifest.json").write_text("{}")
+    manifest = {"source_roots": []}
+    catalog = {"tables": {"generations": []}}
+    plan = {"physical": True, "inputs": [{"manifest": {"artifacts": [{"sha256": "abc", "byte_length": 1}]}}],
+        "requirements": [{"unit_id": "unit", "excluded": False}]}
+    monkeypatch.setattr(recovery_replay, "replay_plan", lambda *args, **kwargs: (manifest, catalog, plan))
+    monkeypatch.setattr(recovery_replay, "validate_catalog_target", lambda *args: None)
+    events = []
+
+    class Gate:
+        active = False
+
+        @contextmanager
+        def intake(self):
+            self.active = True
+            try:
+                yield {}
+            finally:
+                self.active = False
+
+    gate = Gate()
+
+    def funded(name):
+        assert gate.active, name + " escaped capacity reservation"
+        events.append(name)
+
+    def initialize(*args):
+        funded("catalog")
+        return SimpleNamespace(get_selection=lambda *args: {"derivation_id": "selected"})
+
+    def adapter(*args, **kwargs):
+        funded("backend")
+        return object()
+
+    class StopAtScheduler(RuntimeError):
+        pass
+
+    class Scheduler:
+        def __init__(self, *args, **kwargs):
+            assert kwargs.get("capacity_gate") is gate
+            assert events == ["copy", "catalog", "import", "backend"]
+            raise StopAtScheduler
+
+    monkeypatch.setattr(recovery_replay, "copy_verified_file", lambda *args: funded("copy"))
+    monkeypatch.setattr(recovery_replay, "_initialize", initialize)
+    monkeypatch.setattr(recovery_replay, "_import_inputs", lambda *args: funded("import"))
+    monkeypatch.setattr("papervault.knowledge.scheduler.catalog.CatalogScheduler", Scheduler)
+    connection = SimpleNamespace(info=SimpleNamespace(dsn="dbname=isolated_test user=test host=127.0.0.1"),
+        execute=lambda *args: SimpleNamespace(fetchone=lambda: (None,)))
+    with pytest.raises(StopAtScheduler):
+        await recovery_replay.replay_recovery_set(package, tmp_path / "target", source_generation="old",
+            target_generation="new", catalog_connection=connection, catalog_schema="catalog_test", apply=True,
+            adapter_factory=adapter, backend_identity={"isolated": True}, capacity_gate=gate)

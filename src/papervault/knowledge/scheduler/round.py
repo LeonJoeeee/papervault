@@ -148,7 +148,8 @@ async def reconcile_terminal(
 _FAILED_LEDGER_STATUSES = ("error", "error_parked")
 
 
-async def reconcile_healed(rag, *, only_keys: Optional[Iterable[str]] = None) -> dict:
+async def reconcile_healed(rag, *, only_keys: Optional[Iterable[str]] = None,
+                           eligible_paper_keys: Optional[Iterable[str]] = None) -> dict:
     """#131: an `error` / `error_parked` ledger row whose LightRAG doc is PROCESSED → `done`.
 
     LightRAG resets FAILED-with-content docs to PENDING on every pipeline pass, so a build that
@@ -168,6 +169,9 @@ async def reconcile_healed(rag, *, only_keys: Optional[Iterable[str]] = None) ->
     if only_keys is not None:
         ks = set(only_keys)
         rows = [r for r in rows if r.ingest_source == PAPER and r.source_id in ks]
+    if eligible_paper_keys is not None:
+        eligible = set(eligible_paper_keys)
+        rows = [r for r in rows if r.ingest_source != PAPER or r.source_id in eligible]
     counters = {"healed": 0}
     if not rows:
         return counters
@@ -213,10 +217,11 @@ async def run_round(
     library = await reconcile_library(rag, idx, only_keys=only)
 
     # 阶段0(b):先收口上一轮/重启遗留的 processing(subset 时只扫 subset 行)。
-    term = await reconcile_terminal(rag, stuck_limit=stuck_limit, only_keys=only)
+    eligible = set(idx) if only is None else set(idx) & only
+    term = await reconcile_terminal(rag, stuck_limit=stuck_limit, only_keys=eligible)
     # #131:失败行(error/error_parked)的 doc 已被 LightRAG 自愈为 PROCESSED → done(先于 diff,
     # 免得 error 行被 redistill 删掉好 doc)。
-    healed = await reconcile_healed(rag, only_keys=only)
+    healed = await reconcile_healed(rag, only_keys=only, eligible_paper_keys=eligible)
 
     # #143/#209: upstream failure or peak window → start no build work this round (the gate
     # already logged the transition; the reconcile writes above needed no LLM).

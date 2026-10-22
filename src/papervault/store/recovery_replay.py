@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import json
+import os
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -24,6 +25,35 @@ from .recovery_postgres import validate_catalog_state, validate_catalog_target
 from .recovery_restore import copy_verified_file
 from .recovery_source import verify_file_dependencies
 from .repository import AuditEvent, PostgresCatalogRepository, Record, canonical_json, payload_hash
+
+
+def replay_capacity(target, connection, schema, *, physical):
+    """Fund isolated replay with the same durable gate used by catalog scheduling.
+
+    Metadata-only replay measures its sole backend synchronously. Physical replay
+    additionally requires a protected fresh census of the isolated graph/KV stores
+    and other retained derivatives, scoped to target/vault and target/knowledge.
+    """
+    from .scheduler_capacity import DEFAULT_EXECUTION_BYTES, SchedulerCapacity, measured_backend_usage
+
+    def backend_usage(_physical):
+        row = connection.execute(
+            "SELECT COALESCE(sum(pg_total_relation_size(c.oid)),0) AS bytes FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=%s AND c.relkind='r'",
+            (schema,),
+        ).fetchone()
+        size = int(row["bytes"] if isinstance(row, dict) else row[0])
+        if not physical:
+            return size
+        external = measured_backend_usage(os.getenv("PAPERVAULT_DERIVATIVE_USAGE_FILE"),
+            vault_root=target / "vault", knowledge_root=target / "knowledge")
+        if external.get("metadata_sample"):
+            raise ValueError("metadata-only census cannot fund physical replay")
+        return {**external, "backend_bytes": external["backend_bytes"] + size}
+
+    return SchedulerCapacity(target / "knowledge/maintenance/capacity", derivative_roots=(target,),
+        estimated_bytes=lambda: int(os.getenv("PAPERVAULT_CATALOG_EXECUTION_BYTES", str(DEFAULT_EXECUTION_BYTES))),
+        backend_usage=backend_usage)
 
 
 def replay_plan(package, *, source_generation, parent_ids=None):
@@ -148,7 +178,7 @@ def _import_inputs(k, plan, catalog, generation, operation):
 
 async def replay_recovery_set(package, target, *, source_generation, target_generation, parent_ids=None,
                               catalog_connection=None, catalog_schema=None, apply=False,
-                              adapter_factory=None, backend_identity=None):
+                              adapter_factory=None, backend_identity=None, capacity_gate=None):
     execution_deadline = time.monotonic() + MAX_WINDOW_SECONDS
     package, target = checked_path(package), checked_path(target)
     manifest, catalog, plan = replay_plan(package, source_generation=source_generation, parent_ids=parent_ids)
@@ -196,13 +226,16 @@ async def replay_recovery_set(package, target, *, source_generation, target_gene
             from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
             from papervault.knowledge.store.build_breaker import BuildBreaker, BuildSchedule
 
-            for row in plan["inputs"]:
-                for artifact in row["manifest"]["artifacts"]:
-                    relative = "catalog_inputs/" + artifact["sha256"]
-                    copy_verified_file(child(package, "inputs/" + relative), child(target, "knowledge/" + relative),
-                        {key: artifact[key] for key in ("sha256", "byte_length")})
-            k = _initialize(catalog_connection, catalog_schema, state, catalog)
-            _import_inputs(k, plan, catalog, target_generation, state["operation_id"])
+            capacity = capacity_gate if capacity_gate is not None else replay_capacity(
+                target, catalog_connection, catalog_schema, physical=plan["physical"])
+            with capacity.intake():
+                for row in plan["inputs"]:
+                    for artifact in row["manifest"]["artifacts"]:
+                        relative = "catalog_inputs/" + artifact["sha256"]
+                        copy_verified_file(child(package, "inputs/" + relative), child(target, "knowledge/" + relative),
+                            {key: artifact[key] for key in ("sha256", "byte_length")})
+                k = _initialize(catalog_connection, catalog_schema, state, catalog)
+                _import_inputs(k, plan, catalog, target_generation, state["operation_id"])
             op = state["operation_id"]
             expected = [row for row in plan["requirements"] if not row["excluded"]]
             sessions = state.setdefault("sessions", [{"window_id": op, "starts_at": state["started_at"],
@@ -224,8 +257,10 @@ async def replay_recovery_set(package, target, *, source_generation, target_gene
                     "operator_nonce": session["window_id"]})
             inputs = ImmutableInputStore(target / "knowledge/catalog_inputs")
             factory = adapter_factory or CatalogLightRAGAdapter
-            adapter = factory(k, working_dir=str(target / "knowledge"), input_store=inputs)
+            with capacity.intake():
+                adapter = factory(k, working_dir=str(target / "knowledge"), input_store=inputs)
             scheduler = CatalogScheduler(k, adapter, inputs, max_admissions=1, reserved_cost=0 if not plan["physical"] else 1,
+                capacity_gate=capacity,
                 breaker=BuildBreaker(threshold=0, schedule=BuildSchedule(enabled=False)) if not plan["physical"] else None)
             started = time.monotonic()
             while True:

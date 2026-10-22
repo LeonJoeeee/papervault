@@ -367,3 +367,46 @@ def test_first_claim_commits_new_blocking_legacy_checkpoint_without_execution(mo
     assert result["claimed"] is False and result["attempt_id"] is None and result["revision"] == 2
     assert result[blocked_by] is True
     assert repository.job["state"] == "queued"
+
+
+@pytest.mark.parametrize("change,allowed", [
+    ({}, True), ({"override": None}, False),
+    ({"override": {"key": "B"}}, False),
+    ({"override": {"reasons": ["other"]}}, False),
+    ({"override": {"scope": ["other"]}}, False),
+    ({"required_revision": 3}, False),
+    ({"policy": "clear"}, False),
+])
+@pytest.mark.parametrize("unit_kind", ["paper", "section"])
+def test_knowledge_admission_checks_full_scoped_policy(change, allowed, unit_kind):
+    from types import SimpleNamespace
+    from papervault.library.models import Paper
+    from papervault.store.knowledge import ClaimRejected
+    from papervault.store.knowledge_commands import eligible
+    from papervault.store.repository import Record
+
+    state = {"policy": "override", "policy_reasons": ["off_domain"], "required_revision": 2,
+             "override": {"key": "A", "scope": ["acquire"], "reasons": ["off_domain"], "revision": 2}}
+    if isinstance(change.get("override"), dict):
+        state["override"].update(change["override"])
+    else:
+        state.update(change)
+    record = Record.from_payload("A", Paper(key="A", title="Policy fixture", terminal_state=state).model_dump(mode="json"))
+    desired = {"invalidated": False, "excluded": False, "enqueue_mode": "active",
+               "consumed_input_revision": "I", "recipe_digest": "R", "inventory_revision": "v1"}
+    source = {"kind": "paper", "unit_id": "paper:A", "record_key": "A", "quarantine": False}
+    section = {"kind": "section", "unit_id": "section:S", "record_key": None, "quarantine": False}
+    repository = SimpleNamespace(repository=SimpleNamespace(get=lambda key: record),
+        get_input=lambda revision: {"manifest": {"section_definition_revision": 1}},
+        get_unit=lambda unit: section if unit == "section:S" else source,
+        get_section=lambda *args: {"parent_unit_id": "paper:A"},
+        get_current_inventory=lambda *args: {"inventory_revision": "v1", "invalidated": False},
+        get_generation=lambda generation: {"state": "active"}, get_requirement=lambda *args: desired)
+    job = {"unit_id": "section:S" if unit_kind == "section" else "paper:A",
+           "quarantine": False, "target_generation": "G",
+           "consumed_input_revision": "I", "recipe_digest": "R"}
+    if allowed:
+        assert eligible(repository, job) == desired
+    else:
+        with pytest.raises(ClaimRejected, match="record policy"):
+            eligible(repository, job)

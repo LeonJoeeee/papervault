@@ -37,3 +37,4 @@ eval/judge/
 src/papervault/eval/results/
 src/papervault/eval/judge/
 /.claude/worktrees/
+/.agents/worktrees/

@@ -1,7 +1,7 @@
 # papervault
 
 A self-hosted **literature + knowledge layer for coding agents**, delivered as one MCP
-server. Point any MCP-capable agent (Claude Code, and others) at it and the agent gains
+server. Point any MCP-capable agent (Claude Code, Codex CLI, Antigravity CLI/IDE, and others) at it and the agent gains
 three tools:
 
 - **`search_papers`** — discover literature by describing your research intent in prose;
@@ -53,8 +53,21 @@ The service owns model preload and GPU unloading after 20 idle minutes. papervau
 remains valid without installing `mineru` or `torchvision` in the caller's environment.
 `papervault doctor` checks the configured endpoint's `/health`.
 
-Then register the server with your agent (Claude Code: install the bundled plugin; other
-clients: point them at the MCP endpoint — see `docs/INSTALL.md`).
+Then register the server with your agent. Claude Code and Antigravity (`agy`) can install
+the bundled `plugin/` shell; Codex CLI and other clients connect directly to the MCP
+endpoint — see [Connecting an agent](docs/INSTALL.md#connecting-an-agent).
+
+For Antigravity CLI/IDE, validate and install the native plugin from the repo root:
+
+```bash
+agy plugin validate ./plugin --json
+agy plugin install ./plugin
+```
+
+Start a new Antigravity session to load the tools from `http://127.0.0.1:8080/mcp`.
+For direct MCP registration instead of the plugin, use
+`agy mcp add papervault http://127.0.0.1:8080/mcp`; replace the URL for a custom endpoint.
+The install guide also covers IDE MCP configuration and remote tailnet connections.
 
 ## Domain
 
@@ -707,7 +720,7 @@ papervault is consumed **by pin** (ADR-0001): deployments track an annotated git
 The repo carries **one version**, and every change PR bumps it per the semver call stated in
 its description. The declared version fields move together in that PR: `pyproject.toml`
 `[project].version` plus the `papervault` entry in `uv.lock` (refresh with `uv lock`),
-`plugin/.claude-plugin/plugin.json` `version`, and the `papervault` entry's `version` in
+`plugin/.claude-plugin/plugin.json` and `plugin/plugin.json` `version`, and the `papervault` entry's `version` in
 `.claude-plugin/marketplace.json`; `tests/test_plugin_version_sync.py` fails when they drift.
 
 A release IS a tag — CI's build job produces the wheel/sdist for every commit, so tagging is

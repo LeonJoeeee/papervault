@@ -1,6 +1,6 @@
 """Release discipline guard: the repo carries one version (README "Releases").
 
-The plugin manifest, its marketplace entry, and the Python package version (pyproject.toml
+The plugin manifests, their marketplace entry, and the Python package version (pyproject.toml
 plus its uv.lock entry) move together in every change PR; this test fails the moment any of
 them drifts.
 """
@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def _versions() -> dict[str, str]:
     plugin = json.loads((ROOT / "plugin/.claude-plugin/plugin.json").read_text())
+    agy_plugin = json.loads((ROOT / "plugin/plugin.json").read_text())
     market = json.loads((ROOT / ".claude-plugin/marketplace.json").read_text())
     entry = next(p for p in market["plugins"] if p["name"] == "papervault")
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
@@ -23,6 +24,7 @@ def _versions() -> dict[str, str]:
         ".claude-plugin/marketplace.json": entry["version"],
         "pyproject.toml": project["version"],
         "uv.lock": locked["version"],
+        "plugin/plugin.json": agy_plugin["version"],
     }
 
 

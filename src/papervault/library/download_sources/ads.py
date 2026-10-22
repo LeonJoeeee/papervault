@@ -21,7 +21,7 @@ _API = "https://api.adsabs.harvard.edu/v1/search/query"
 _FIELDS = "bibcode,title,author,doi,identifier,doctype,pub,esources"
 _BIBCODE = re.compile(r"[0-9]{4}[A-Za-z0-9&.]{14}[A-Za-z.]")
 _ADS_HOSTS = {"ui.adsabs.harvard.edu", "adsabs.harvard.edu"}
-_PDF_SOURCES = {"EPRINT_PDF", "PUB_PDF", "ADS_PDF", "AUTHOR_PDF"}
+_PDF_SOURCES = {"EPRINT_PDF", "PUB_PDF", "ADS_PDF", "ADS_SCAN", "AUTHOR_PDF"}
 _MAX_PDF_BYTES = 32 * 1024 * 1024
 _MAX_PAGES = 300
 
@@ -163,6 +163,10 @@ def _inspect_ads_document(data: bytes, paper: Paper) -> ADSDocumentEvidence:
         evidence.outcome = "invalid_pdf"
         evidence.reason = "pdf_parse_error"
         return evidence
+    if _unverifiable_scan_text(pages[:2]):
+        evidence.document_kind = "scanned_full_text"
+        evidence.reason = "identity_unverifiable_scanned"
+        return evidence
     cover = _normalized("\n".join(pages[:2]))
     anthology = bool(re.search(r"(?im)^\s*(?:abstracts?\s+book|book\s+of\s+abstracts)\s*$",
                               "\n".join(pages[:2])))
@@ -240,6 +244,35 @@ def _inspect_ads_document(data: bytes, paper: Paper) -> ADSDocumentEvidence:
             evidence.document_kind = "full_text"
             evidence.reason = "matching_work_with_body_sections"
     return evidence
+
+
+def _unverifiable_scan_text(pages: list[str]) -> bool:
+    """Absent text or custom-font noise cannot provide an identity verdict."""
+    if len("\n".join(pages).strip()) < 50:
+        return True
+    # Every nonempty inspected page must be noise. A garbled cover cannot
+    # excuse a readable title/author mismatch on the following page.
+    return all(not page.strip() or (
+        len(page) >= 200 and sum(c.isalpha() for c in page) / len(page) < 0.55
+        and sum(page.lower().count(word) for word in
+                ("the ", " of ", " and ", " for ", " with ", " in ", " we ")) < 3)
+        for page in pages)
+
+
+def _trusted_ads_scan(paper: Paper, data: bytes) -> bool:
+    """Bind scan deferral to inspected bytes on an official matched ADS route."""
+    digest = hashlib.sha256(data).hexdigest()
+    code = quote(paper.ads_availability.bibcode, safe="")
+    if not code or paper.ads_availability.reason == "metadata_identity_mismatch":
+        return False
+    routes = {f"https://ui.adsabs.harvard.edu/link_gateway/{code}/{kind}"
+              for kind in ("ADS_PDF", "ADS_SCAN")}
+    routes.add(f"https://articles.adsabs.harvard.edu/pdf/{code}")
+    return any(document.sha256 == digest and document.url in routes
+               and document.outcome == "pdf" and not document.identity_rejected
+               and document.document_kind == "scanned_full_text"
+               and document.reason == "identity_unverifiable_scanned"
+               for document in paper.ads_availability.documents)
 
 
 def _sections(text: str) -> set[str]:
@@ -350,6 +383,12 @@ def _try_ads(paper: Paper) -> Optional[bytes]:
     for url in urls:
         data, observation = _fetch_ads_document(url, paper)
         observations.append(observation)
+        # Publisher/author routes cannot grant the official ADS scan exception.
+        # Keep looking for an ADS-hosted route instead of accepting unverifiable bytes.
+        code_route = (url.endswith(("/ADS_PDF", "/ADS_SCAN"))
+                      or url.startswith("https://articles.adsabs.harvard.edu/pdf/"))
+        if observation.document_kind == "scanned_full_text" and not code_route:
+            continue
         if (data and observation.document_kind not in {"meeting_abstract", "abstract_anthology"}
                 and observation.reason != "abstract_book_entry_unconfirmed"):
             candidate = data
@@ -371,6 +410,7 @@ def _record_ads_verification(paper: Paper, data: bytes, ok: bool) -> None:
         if document.sha256 == digest and not ok:
             document.identity_match = False
             document.identity_rejected = True
+            document.reason = "document_identity_mismatch"
             rejected = True
     if rejected:
         result.availability = "unknown"

@@ -243,6 +243,22 @@ def _title(value) -> str:
     return re.sub(r"[^a-z0-9]+", " ", _text(value).lower()).strip()
 
 
+def serving_bibliographic_key(record) -> tuple[str, str, int] | None:
+    """Conservative read-only signature for an identifier-poor serving duplicate.
+
+    This grants no catalog merge. A caller may suppress an identifier-poor row
+    only when this signature has exactly one identified representative. Distinct
+    identified versions and ambiguous signatures retain separate identities.
+    """
+    title = re.sub(r"^the ", "", _title(_field(record, "title")))
+    authors = _values(_field(record, "authors"))
+    author = _title(authors[0]) if authors else ""
+    year = _field(record, "year")
+    if len(title) < MIN_NORMALIZED_TITLE_LENGTH or not author or type(year) is not int:
+        return None
+    return title, author, year
+
+
 def _surnames(values) -> list[str]:
     result = []
     for value in _values(values):

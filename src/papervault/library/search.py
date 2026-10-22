@@ -21,6 +21,7 @@ import logging
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from typing import Optional
 
 import requests
@@ -35,10 +36,40 @@ from .sources.inspire import search_inspire  # noqa: F401
 from .sources.inspire import retained_inspire_fields
 from .sources.ads import search_ads  # noqa: F401
 from .sources.core import search_core  # noqa: F401
-from .sources.exceptions import BackendDegraded
+from .sources.exceptions import (
+    BackendDegraded, SourceGateOutcome, backend_degraded, source_errors, source_results,
+)
 from .sources.identity import normalized_source_identities, source_identity
 
 logger = logging.getLogger(__name__)
+
+
+_SOURCE_OBSERVER = contextvars.ContextVar("source_gate_observer", default=None)
+
+
+@contextmanager
+def observe_source_gates(callback):
+    """Observe this request's backend/term outcomes without changing fetch results.
+
+    ContextVar propagation isolates concurrent requests and restores nested
+    observers. The callback runs on the event-loop thread, once per pair.
+    """
+    token = _SOURCE_OBSERVER.set(callback)
+    try:
+        yield
+    finally:
+        _SOURCE_OBSERVER.reset(token)
+
+
+def _observe_source(outcome: SourceGateOutcome) -> None:
+    callback = _SOURCE_OBSERVER.get()
+    if callback is not None:
+        try:
+            callback(outcome)
+        except Exception:
+            # Observation cannot turn a source success into failure; do not log
+            # callback exception text, which can contain provider credentials.
+            logger.warning("search: source observation callback failed")
 
 
 _SS_BASE = "https://api.semanticscholar.org/graph/v1/paper"
@@ -111,6 +142,7 @@ def fetch_references(paper_id_or_doi: str, *, limit: int = 200) -> list[dict]:
     return out
 
 
+@source_errors
 def search_openalex(query: str, *, max_results: int = 30,
                     mailto: Optional[str] = None) -> list[dict]:
     """Search OpenAlex (250M+ academic works, free, no key needed)."""
@@ -136,10 +168,11 @@ def search_openalex(query: str, *, max_results: int = 30,
             time.sleep(5.0)
             r = polite_get(requests.get, url, params=params, timeout=30, headers=oa_headers)
         r.raise_for_status()
-    except Exception:
-        return []
+    except requests.RequestException as error:
+        raise backend_degraded(error) from error
+    works = source_results(r.json(), "results")
     out: list[dict] = []
-    for w in r.json().get("results", []) or []:
+    for w in works:
         title = (w.get("title") or "").strip()
         if not title:
             continue
@@ -592,69 +625,72 @@ async def _fetch_one_backend(
     feeds the breaker: any of the three failure classes counts one consecutive
     degrade, a completed fetch resets the counter.
     """
+    started = time.monotonic()
+
+    def observe(status, *, hit_count=0, error=None):
+        _observe_source(SourceGateOutcome(
+            backend=backend_name, term=query, term_idx=term_idx, status=status,
+            hit_count=hit_count, latency_ms=max(0.0, (time.monotonic() - started) * 1000),
+            code=error.code if error else None, scope=error.scope if error else None,
+            retryability=error.retryability if error else None,
+            retry_after_s=error.retry_after_s if error else None,
+        ))
+
     if _breaker_is_open(backend_name):
-        # Skipped, not tried. Still one DEGRADED pair: §8 derives
-        # ``sources_degraded`` from ``degraded_map[b] == T``, so the skip must
-        # keep counting or the dead backend drops out of the health report.
-        # Deliberately NOT logged per pair — the fan-out logs the open circuits
-        # once (see ``search_external_async``).
         if degraded_map is not None:
             degraded_map[backend_name] += 1
+        observe("skipped", error=BackendDegraded(
+            "Source circuit open", code="circuit_open",
+            retry_after_s=max(0.0, _BREAKER_OPEN_UNTIL[backend_name] - _breaker_now()),
+        ))
         return []
-    backend_fn = globals()[f"search_{backend_name}"]   # call-time (monkeypatch-friendly)
-    # arXiv is the ONLY backend that takes a sort-hint (no citations → never an
-    # importance sort); thread the recency hint only to it, keeping the uniform
-    # ``(query, max_results=)`` call for the others.
+    backend_fn = globals()[f"search_{backend_name}"]
     fn_kwargs = {"max_results": max_n}
     if backend_name == "arxiv":
         fn_kwargs["sort_by_recency"] = sort_by_recency
-    await _pace(backend_name, _interval_for(backend_name))   # PACING FIRST — outside wait_for
+    await _pace(backend_name, _interval_for(backend_name))
     try:
         raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
-    except BackendDegraded as e:
-        logger.warning(
-            "search: backend %s DEGRADED for query %r: %s", backend_name, query, e,
-        )
-        if degraded_map is not None:
-            degraded_map[backend_name] += 1   # increment on the LOOP thread (R3-F5)
-        _breaker_record_degraded(backend_name)
-        return []
-    except FetchQueueTimeout as e:
-        # Pool starvation, not this backend's failure: DEGRADED for this run, but
-        # it was never called, so the breaker is not fed (see the pool notes).
-        logger.warning(
-            "search: backend %s skipped for query %r: %s", backend_name, query, e,
-        )
+        if not isinstance(raw, list) or any(not isinstance(paper, dict) for paper in raw):
+            raise backend_degraded(ValueError("invalid backend results"))
+        results = [_normalize_paper(p, backend_name) for p in raw]
+    except FetchQueueTimeout:
+        # Pool starvation means this source was never contacted; preserve the
+        # historical degraded count without blaming the backend's breaker.
+        logger.warning("search: backend %s skipped: no search-fetch thread free", backend_name)
         if degraded_map is not None:
             degraded_map[backend_name] += 1
+        observe("skipped", error=BackendDegraded(
+            "Source fetch queue timeout", code="fetch_queue_timeout",
+        ))
         return []
-    except asyncio.TimeoutError:
-        logger.warning(
-            "search: backend %s timeout (>%ds) for query %r",
-            backend_name, int(timeout), query,
-        )
+    except Exception as error:
+        failure = backend_degraded(error)
+        logger.warning("search: backend %s DEGRADED: %s", backend_name, failure.code)
         if degraded_map is not None:
             degraded_map[backend_name] += 1
         _breaker_record_degraded(backend_name)
+        observe("degraded", error=failure)
         return []
-    except Exception as e:
-        logger.warning(
-            "search: backend %s failed for query %r: %s",
-            backend_name, query, e,
-        )
-        if degraded_map is not None:
-            degraded_map[backend_name] += 1   # also a raw non-429 HTTPError
-        _breaker_record_degraded(backend_name)
-        return []
-    # The fetch completed (a genuine 0-hit included): the backend is alive, so
-    # the CONSECUTIVE-degrade counter resets and an open circuit closes.
     _breaker_record_success(backend_name)
-    results = [_normalize_paper(p, backend_name) for p in raw]   # year int|None (int 0→None already)
-    for i, d in enumerate(results):                              # _source_origin + NATIVE rank, FIRST
+    # Direct adapters retain their historical [] for missing configuration.
+    # Mark these no-HTTP outcomes explicitly, while allowing injected backends
+    # (whose module differs) to report their own genuine zero-hit success.
+    unconfigured = (
+        ((backend_name == "ads" and not os.environ.get("ADS_API_TOKEN"))
+         or (backend_name == "core" and not os.environ.get("CORE_API_KEY", "").strip()))
+        and getattr(backend_fn, "__module__", None) == f"papervault.library.sources.{backend_name}"
+    )
+    if unconfigured:
+        observe("skipped", error=BackendDegraded(
+            "Source unconfigured", code="unconfigured", retryability="permanent",
+        ))
+    else:
+        observe("success", hit_count=len(raw))
+    for i, d in enumerate(results):
         d["_source_origin"] = "external"
         d["term_idx"] = term_idx
-        d["rank"] = i                          # TRUE native position (pre-year)
-    # Post-fetch year cut, AFTER stamping (native-rank fidelity preserved).
+        d["rank"] = i
     return [d for d in results if not _year_drop(d, year_min, year_max)]
 
 

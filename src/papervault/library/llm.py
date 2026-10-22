@@ -24,6 +24,7 @@ import random
 import threading
 import time
 from concurrent.futures import Future, InvalidStateError
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,6 +41,56 @@ logger = logging.getLogger(__name__)
 _FIRST_CHUNK_S = float(os.getenv("PAPERVAULT_LIB_FIRST_CHUNK_S", "100"))
 _RETRY_BUDGET_S = float(os.getenv("PAPERVAULT_LIB_RETRY_BUDGET_S", "480"))
 _CLIENT_TIMEOUT_S = 900.0
+
+
+@dataclass(frozen=True)
+class CallObservation:
+    """Response disclosure, never a reconstruction from requested routing."""
+
+    model: str
+    provider: str
+    latency_ms: float
+    degraded: bool
+    code: str | None = None
+
+
+_call_observer = contextvars.ContextVar("library_llm_call_observer", default=None)
+
+
+@contextlib.contextmanager
+def observe_llm_calls(callback):
+    """Observe calls in this execution context, including copied worker contexts."""
+    token = _call_observer.set(callback)
+    try:
+        yield
+    finally:
+        _call_observer.reset(token)
+
+
+def _disclosed(value):
+    return value.strip()[:256] if isinstance(value, str) and value.strip() else "unknown"
+
+
+class _DisclosureStream:
+    """Read response fields before LiteLLM replaces model with a routing label."""
+
+    def __init__(self, source, disclosure):
+        self.source = source
+        self.disclosure = disclosure
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        chunk = next(self.source)
+        for name in ("model", "provider"):
+            value = chunk.get(name) if isinstance(chunk, dict) else getattr(chunk, name, None)
+            if _disclosed(value) != "unknown":
+                self.disclosure[name] = _disclosed(value)
+        return chunk
+
+    def __getattr__(self, name):
+        return getattr(self.source, name)
 
 
 class StreamTruncated(RuntimeError):
@@ -71,6 +122,15 @@ def _open_stream(kwargs):
         stream = None
         try:
             stream = litellm.completion(**kwargs)
+            if hasattr(stream, "completion_stream"):
+                # CustomStreamWrapper synthesizes chunk.model from the requested
+                # route and custom_llm_provider from transport configuration.
+                # Neither field proves what the endpoint actually served.
+                disclosure = {}
+                stream._papervault_response_disclosure = disclosure
+                source = stream.completion_stream
+                if source is not None and hasattr(source, "__next__"):
+                    stream.completion_stream = _DisclosureStream(source, disclosure)
             iterator = iter(stream)
             first = next(iterator, None)
         except BaseException as exc:
@@ -110,8 +170,15 @@ def _create_completion(**kwargs):
     parts = []
     usage = None
     finish = None
+    model = provider = "unknown"
+    disclosure = getattr(stream, "_papervault_response_disclosure", None)
     try:
         while chunk is not None:
+            if disclosure is None:
+                if _disclosed(getattr(chunk, "model", None)) != "unknown":
+                    model = _disclosed(chunk.model)
+                if _disclosed(getattr(chunk, "provider", None)) != "unknown":
+                    provider = _disclosed(chunk.provider)
             if getattr(chunk, "usage", None) is not None:
                 usage = chunk.usage
             for choice in getattr(chunk, "choices", None) or []:
@@ -140,9 +207,13 @@ def _create_completion(**kwargs):
         _close_stream(stream)
     if finish is None:
         raise StreamTruncated(f"stream ended without a provider finish after {len(parts)} pieces")
+    if disclosure is not None:
+        model = disclosure.get("model", "unknown")
+        provider = disclosure.get("provider", "unknown")
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="".join(parts)),
                                  finish_reason=finish)], usage=usage,
+        model=model, provider=provider,
     )
 
 
@@ -191,6 +262,28 @@ class LLM:
         self.num_retries = num_retries
 
     def call(self, messages, **_ignored):
+        started = time.monotonic()
+        response = None
+        degraded = True
+        try:
+            response, degraded = self._call(messages)
+            return response.choices[0].message.content or ""
+        finally:
+            callback = _call_observer.get()
+            if callback is not None:
+                observation = CallObservation(
+                    model=_disclosed(getattr(response, "model", None)),
+                    provider=_disclosed(getattr(response, "provider", None)),
+                    latency_ms=(time.monotonic() - started) * 1000,
+                    degraded=degraded,
+                    code="llm_call_failed" if response is None else None,
+                )
+                try:
+                    callback(observation)
+                except Exception:
+                    logger.warning("LLM call observation unavailable")
+
+    def _call(self, messages):
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
         t0 = time.monotonic()
@@ -214,7 +307,7 @@ class LLM:
         # Bare model name (strip the litellm provider prefix) so pl and ks lines
         # aggregate under one label in per-model roll-ups.
         log_usage(logger, "pl", self.model.rsplit("/", 1)[-1], time.monotonic() - t0, resp)
-        return resp.choices[0].message.content or ""
+        return resp, attempt > 0
 
 # Default well above litellm's small default so a long generation isn't truncated.
 _DEFAULT_MAX_TOKENS = int(os.environ.get("PAPERVAULT_LIB_MAX_TOKENS", "32000"))

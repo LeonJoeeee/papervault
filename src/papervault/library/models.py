@@ -105,7 +105,7 @@ class ADSDocumentEvidence(BaseModel):
         "pdf", "blocked", "stale", "html", "http_error", "transport_error",
         "incomplete", "invalid_pdf",
     ] = "invalid_pdf"
-    document_kind: Literal["unknown", "full_text", "meeting_abstract", "abstract_anthology"] = "unknown"
+    document_kind: Literal["unknown", "full_text", "scanned_full_text", "meeting_abstract", "abstract_anthology"] = "unknown"
     identity_match: bool = False
     identity_rejected: bool = False
     pages: Optional[int] = None
@@ -489,6 +489,7 @@ class Paper(BaseModel):
     insight_invalid_reason: Optional[str] = None
 
     download_source: str = ""         # which strategy succeeded (provenance, D7)
+    verification_deferred_to_ocr: bool = False  # trusted ADS scan awaits OCR identity verification
     download_source_member: str = ""  # winning member of a concurrent aggregator tier
 
     # D9: real on-card extraction attempts. Persisted (survives restart) so

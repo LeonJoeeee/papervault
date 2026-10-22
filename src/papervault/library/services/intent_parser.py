@@ -18,7 +18,11 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Optional, TypedDict
+import time
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
+from typing import NotRequired, Optional, TypedDict
 
 from papervault.domain import get_domain
 
@@ -56,6 +60,12 @@ _NEXT_MEASUREMENT_NOUN = {
 # Fold ASCII case only for the dictionary keys; retain Unicode word boundaries.
 _MEASUREMENT_NOUN = re.compile(r"\b(?ai:" + "|".join(_NEXT_MEASUREMENT_NOUN) + r")\b")
 _FORBIDDEN_SIBLING_NOUN = re.compile(r"\b(?:features?|excess(?:es)?|hints?)\b", re.I)
+_EXPERIMENT_ALIASES = {
+    "pamela": ["PAMELA", "Payload for Antimatter Matter Exploration and Light-nuclei Astrophysics"],
+    "ams02": ["AMS-02", "AMS02", "AMS 02", "Alpha Magnetic Spectrometer"],
+    "auger": ["Pierre Auger", "Pierre Auger Observatory"],
+    "telescope_array": ["Telescope Array"],
+}
 
 
 class SearchPlan(TypedDict):
@@ -64,6 +74,56 @@ class SearchPlan(TypedDict):
     limit_suggested: Optional[int]
     ranking_hint: str
     reasoning: str
+    named_entities: NotRequired[list[str]]
+
+
+def _named_entity_match(name: str, query: str):
+    return re.search(r"(?<!\w)" + re.escape(name) + r"(?!\w)", query, re.I)
+
+
+def named_entity_groups(query: str, plan: SearchPlan) -> list[list[str]]:
+    """Explicit instruments with aliases for per-need serving reservations.
+
+    Known names work with older planners; held-out names come from the planner
+    and must occur in the user query. These groups do not rewrite search terms.
+    """
+    found = []
+    for aliases in _EXPERIMENT_ALIASES.values():
+        matches = [match for alias in aliases if (match := _named_entity_match(alias, query))]
+        if matches:
+            found.append((min(match.start() for match in matches), aliases))
+    for name in plan.get("named_entities", []):
+        if not isinstance(name, str) or not (match := _named_entity_match(name, query)):
+            continue
+        known = next((aliases for aliases in _EXPERIMENT_ALIASES.values()
+                      if name.casefold() in {alias.casefold() for alias in aliases}), None)
+        found.append((match.start(), known or [name]))
+    groups = {}
+    for _, aliases in sorted(found, key=lambda item: item[0]):
+        groups.setdefault(aliases[0].casefold(), list(aliases))
+    return list(groups.values())
+
+
+@dataclass(frozen=True)
+class IntentObservation:
+    model: str
+    provider: str
+    latency_ms: float
+    degraded: bool
+    code: str | None = None
+
+
+_intent_observer = ContextVar("intent_observer", default=None)
+
+
+@contextmanager
+def observe_intent(callback):
+    """Emit one bounded receipt per parse without changing SearchPlan payloads."""
+    token = _intent_observer.set(callback)
+    try:
+        yield
+    finally:
+        _intent_observer.reset(token)
 
 
 _SYSTEM_PROMPT = """You are a search planner for a research librarian working on
@@ -133,6 +193,11 @@ The downstream pipeline takes:
 
   Each term should be 2-6 words, except when retaining a full instrument name
   requires more. Don't include single common words.
+- named_entities: experiment/instrument/mission names explicitly written in the
+  user's intent, copied using the user's spelling. Include held-out instruments
+  such as Voyager 1 or ACE when named. Do not include methods or phenomena such
+  as PINN, MHD or SEP, and do not invent instruments absent from the intent.
+  This list tracks distinct requested needs independently of search expansion.
 - filters: optional constraints derived from the intent. Two of them are
   SOFT HINTS — gentle ranking nudges, NEVER a hard cut:
     * citation_pref: an int when the intent wants well-cited / high-impact
@@ -163,6 +228,7 @@ Prefer generous windows over narrow ones (a narrow window can over-exclude).
 Output ONLY JSON:
 {
   "search_terms": ["...", "...", ...],
+  "named_entities": ["<explicit experiment or instrument name>", ...],
   "filters": {
     "year_min": <int|null>,
     "year_max": <int|null>,
@@ -357,16 +423,41 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
     Raises:
         ValueError: LLM response not parseable as JSON (caller may retry).
     """
-    if llm is None:
-        from ..llm import get_llm
-        llm = get_llm()
+    from ..llm import get_llm, observe_llm_calls
 
-    user_prompt = f"Intent: {query}\nOutput:"
+    started = time.monotonic()
+    calls = []
+    code = "intent_call_failed"
+    try:
+        with observe_llm_calls(calls.append):
+            if llm is None:
+                llm = get_llm()
+            raw = llm.call([
+                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "user", "content": f"Intent: {query}\nOutput:"},
+            ])
+        code = "intent_response_invalid"
+        plan = _parse_response(query, raw)
+        code = None
+        return plan
+    finally:
+        callback = _intent_observer.get()
+        if callback is not None:
+            served = calls[-1] if calls else None
+            observation = IntentObservation(
+                model=served.model if served else "unknown",
+                provider=served.provider if served else "unknown",
+                latency_ms=(time.monotonic() - started) * 1000,
+                degraded=code is not None or any(call.degraded for call in calls),
+                code=code,
+            )
+            try:
+                callback(observation)
+            except Exception:
+                logger.warning("intent observation unavailable")
 
-    raw = llm.call([
-        {"role": "system", "content": _SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
-    ])
+
+def _parse_response(query: str, raw: str) -> SearchPlan:
 
     # Extract JSON object from response (handles wrapping prose if LLM
     # ignores the "ONLY JSON" instruction)
@@ -450,10 +541,19 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
         query, search_terms, filters, limit_suggested, ranking_hint,
     )
 
-    return {
+    plan: SearchPlan = {
         "search_terms": search_terms,
         "filters": filters,
         "limit_suggested": limit_suggested,
         "ranking_hint": ranking_hint,
         "reasoning": reasoning,
     }
+    entities = parsed.get("named_entities")
+    if isinstance(entities, list):
+        names = list(dict.fromkeys(
+            name.strip() for name in entities if isinstance(name, str) and name.strip()
+            and len(name.strip()) <= 256 and _named_entity_match(name.strip(), query)
+        ))[:MAX_SEARCH_TERMS]
+        if names:
+            plan["named_entities"] = names
+    return plan

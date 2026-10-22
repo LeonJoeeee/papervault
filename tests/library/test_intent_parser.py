@@ -7,6 +7,91 @@ import pytest
 from papervault.library.services.intent_parser import parse_intent
 
 
+def test_intent_observation_marks_undisclosed_serving_metadata_unknown():
+    from papervault.library.services.intent_parser import observe_intent
+
+    observations = []
+    client = FakeLLM(["cosmic ray transport"])
+    client.model = "configured-model-is-not-evidence"
+    client.provider = "configured-provider-is-not-evidence"
+    with observe_intent(observations.append):
+        plan = parse_intent("Find cosmic ray transport", client)
+
+    assert set(plan) == {"search_terms", "filters", "limit_suggested", "ranking_hint", "reasoning"}
+    assert len(observations) == 1
+    receipt = observations[0]
+    assert receipt.model == receipt.provider == "unknown"
+    assert receipt.latency_ms >= 0
+    assert receipt.degraded is False
+    assert receipt.code is None
+
+
+@pytest.mark.parametrize("failure,code", [
+    (RuntimeError("secret credential and response body"), "intent_call_failed"),
+    ("private provider response without JSON", "intent_response_invalid"),
+])
+def test_intent_observation_records_errors_without_sensitive_bodies(failure, code):
+    from dataclasses import asdict
+    from papervault.library.services.intent_parser import observe_intent
+
+    class BrokenLLM:
+        def call(self, messages):
+            if isinstance(failure, Exception):
+                raise failure
+            return failure
+
+    observations = []
+    with observe_intent(observations.append), pytest.raises((RuntimeError, ValueError)):
+        parse_intent("a private research question", BrokenLLM())
+
+    assert len(observations) == 1
+    receipt = observations[0]
+    assert receipt.degraded is True
+    assert receipt.code == code
+    assert receipt.model == receipt.provider == "unknown"
+    assert "secret" not in str(asdict(receipt))
+    assert "private" not in str(asdict(receipt))
+
+
+def test_named_entity_groups_preserve_instrument_aliases_and_held_out_names():
+    from papervault.library.services.intent_parser import named_entity_groups
+
+    class NamedLLM:
+        def call(self, messages):
+            return json.dumps({
+                "search_terms": ["cosmic ray measurements"], "filters": {},
+                "named_entities": ["Voyager 1", "AMS-02", "not actually requested"],
+            })
+
+    query = "Compare Voyager 1 and AMS-02 cosmic ray measurements"
+    plan = parse_intent(query, NamedLLM())
+    assert plan["named_entities"] == ["Voyager 1", "AMS-02"]
+    groups = named_entity_groups(query, plan)
+    assert ["AMS-02", "AMS02", "AMS 02", "Alpha Magnetic Spectrometer"] in groups
+    assert ["Voyager 1"] in groups
+    assert len(groups) == 2
+
+
+def test_named_entity_groups_fall_back_to_known_query_experiments():
+    from papervault.library.services.intent_parser import named_entity_groups
+
+    query = "PAMELA and Alpha Magnetic Spectrometer positron spectra with PINN and MHD"
+    plan = parse_intent(query, FakeLLM(["positron spectra"]))
+    groups = named_entity_groups(query, plan)
+    assert len(groups) == 2
+    assert groups[0][0] == "PAMELA"
+    assert groups[1][0] == "AMS-02"
+
+
+def test_named_entities_malformed_response_does_not_change_existing_plan():
+    class NamedLLM:
+        def call(self, messages):
+            return json.dumps({"search_terms": ["solar wind"], "named_entities": "ACE"})
+
+    plan = parse_intent("ACE solar wind", NamedLLM())
+    assert "named_entities" not in plan
+
+
 class FakeLLM:
     def __init__(self, terms):
         self.terms = terms

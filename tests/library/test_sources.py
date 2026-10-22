@@ -279,9 +279,11 @@ def test_search_inspire_empty_query_returns_empty():
 
 
 @responses.activate
-def test_search_inspire_http_500_returns_empty():
+def test_search_inspire_http_500_raises_degraded():
     responses.add(responses.GET, "https://inspirehep.net/api/literature", status=500)
-    assert search_inspire("anything") == []
+    with pytest.raises(BackendDegraded) as caught:
+        search_inspire("anything")
+    assert caught.value.code == "provider_unavailable"
 
 
 @responses.activate

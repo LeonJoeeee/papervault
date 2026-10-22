@@ -93,9 +93,11 @@ def test_openalex_empty_query_returns_empty():
 
 
 @responses.activate
-def test_openalex_http_error_returns_empty():
+def test_openalex_http_error_raises_degraded():
     responses.add(responses.GET, "https://api.openalex.org/works", status=500)
-    assert search.search_openalex("x") == []
+    with pytest.raises(BackendDegraded) as caught:
+        search.search_openalex("x")
+    assert caught.value.code == "provider_unavailable"
 
 
 # ----------- fetch_references / fetch_citations ----------------------------

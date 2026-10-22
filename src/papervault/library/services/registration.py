@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import logging
+import re
 import threading
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import replace
@@ -120,6 +121,19 @@ class ServingTrace:
         except Exception:
             logger.warning("serving trace unavailable (%s)", stage)
 
+    def record_intent(self, observation):
+        self.record("intent", **{name: getattr(observation, name) for name in (
+            "model", "provider", "latency_ms", "degraded", "code",
+        )})
+
+    def record_backend(self, outcome):
+        self.record("retrieval", arm="external", **{
+            name: getattr(outcome, name) for name in (
+                "backend", "term_idx", "status", "hit_count", "latency_ms", "code",
+                "scope", "retryability", "retry_after_s",
+            )
+        })
+
 
 def _view(library, papers):
     """Reuse #267's current-field lookup without sharing mutable paper/index state."""
@@ -165,17 +179,45 @@ def _fill(paper: Paper, incoming: dict, *, identities=True):
             setattr(paper, name, copy.deepcopy(value))
 
 
-def preview_candidates(library, candidates):
+def preview_candidates(library, candidates, *, canonical_keys=None):
     """Apply the legacy lookup/fill ladder to isolated serving objects only.
 
     The first occurrence keeps its scoring position/snapshot; later aliases may
-    enrich its response projection without taking another result slot.
+    enrich its response projection without taking another result slot. Fusion's
+    request-local canonical mapping also applies to matches found by preview.
     """
+    from ..store import _normalize_arxiv, _normalize_doi
+
+    def compatible(paper, candidate):
+        if paper is None:
+            return None
+        left, right = _normalize_doi(paper.doi), _normalize_doi(candidate.get("doi") or "")
+        if left and right:
+            return paper if left == right else None
+        left, right = _normalize_arxiv(paper.arxiv_id), _normalize_arxiv(candidate.get("arxiv_id") or "")
+        if left and right and left != right:
+            return None
+        left_version = re.search(r"v\d+$", paper.arxiv_id, re.I)
+        right_version = re.search(r"v\d+$", candidate.get("arxiv_id") or "", re.I)
+        if (left_version and right_version
+                and left_version.group().lower() != right_version.group().lower()):
+            return None
+        return paper
+
+    def preview_find(owner, candidate):
+        # Title and preprint lookups may find a different explicit version.
+        # Serving projections cannot turn that bibliographic match into a merge.
+        paper = (compatible(_find(owner, candidate), candidate)
+                 or compatible(owner._find_preprint_journal_dup(candidate), candidate))
+        if paper is not None and canonical_keys and paper.key in canonical_keys:
+            paper = compatible(owner.get(canonical_keys[paper.key]), candidate)
+        return paper
+
     view, snapshots = _view(library, {}), {}
     for candidate in candidates:
-        live = _find(library, candidate) or library._find_preprint_journal_dup(candidate)
+        live = preview_find(library, candidate)
         paper = view.get(live.key) if live else None
-        paper = paper or _find(view, candidate) or view._find_preprint_journal_dup(candidate)
+        paper = paper or preview_find(view, candidate)
         incoming = {k: copy.deepcopy(v) for k, v in candidate.items() if k in _METADATA}
         incoming["source_identities"] = normalized_source_identities(candidate, candidate.get("source") or "")
         if paper is None:
@@ -191,6 +233,15 @@ def preview_candidates(library, candidates):
         if paper.key not in snapshots:
             snapshots[paper.key] = dict(paper_to_dict(paper), source=paper.source, paper_id=paper.paper_id,
                                        _source_origin="library" if library.get(paper.key) else "external")
+        if "external_rrf_score" in candidate:
+            # Rank evidence belongs to this serving request, never to Paper or
+            # registration. Aggregate before identity enrichment changes lookup.
+            snapshot = snapshots[paper.key]
+            snapshot["external_rrf_score"] = snapshot.get("external_rrf_score", 0) + candidate["external_rrf_score"]
+            rank = candidate["best_external_rank"]
+            snapshot["best_external_rank"] = min(snapshot.get("best_external_rank", rank), rank)
+            if snapshot["_source_origin"] == "library":
+                snapshot["folded_vouch"] = snapshot.get("folded_vouch", 0) + candidate.get("_external_hit_count", 1)
     return list(snapshots.values()), view._papers
 
 

@@ -8,7 +8,7 @@ import requests
 
 from ..polite_http import polite_get
 
-from .exceptions import BackendDegraded
+from .exceptions import BackendDegraded, backend_degraded, source_errors, source_results
 from .identity import semantic_scholar_identity
 
 API_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
@@ -16,6 +16,7 @@ FIELDS = ("title,authors,year,abstract,citationCount,externalIds,"
           "publicationTypes,venue,publicationVenue,url")
 
 
+@source_errors
 def search_semantic_scholar(query: str, max_results: int = 30) -> list[dict[str, Any]]:
     """Search Semantic Scholar and return structured paper metadata.
 
@@ -34,31 +35,29 @@ def search_semantic_scholar(query: str, max_results: int = 30) -> list[dict[str,
         "fields": FIELDS,
     }
 
-    resp = None
+    failure = BackendDegraded("S2 no response")
     for attempt in range(3):
         try:
             resp = polite_get(requests.get, API_URL, params=params, timeout=30)
             if resp.status_code == 429:
+                failure = backend_degraded(response=resp)
                 time.sleep(min(2.0, 0.5 * (attempt + 1)) + random.random() * 0.5)
                 continue
             resp.raise_for_status()
             break
-        except (requests.exceptions.ConnectionError, requests.exceptions.SSLError):
+        except requests.ConnectionError as error:
+            failure = backend_degraded(error)
             time.sleep(0.5 * (attempt + 1))
-            continue
-        except requests.exceptions.HTTPError as e:
-            raise BackendDegraded(
-                f"S2 HTTP {getattr(e.response, 'status_code', '?')}"
-            ) from e
+        except requests.HTTPError as error:
+            raise backend_degraded(error) from error
     else:
-        raise BackendDegraded("S2 429 exhausted")
-    if resp is None:
-        raise BackendDegraded("S2 no response")
+        raise failure
 
     data = resp.json()
+    records = source_results(data, "data")
 
     papers = []
-    for paper in data.get("data", []):
+    for paper in records:
         authors = [a.get("name", "") for a in paper.get("authors", [])]
         ext_ids = paper.get("externalIds") or {}
         doi = ext_ids.get("DOI", "")

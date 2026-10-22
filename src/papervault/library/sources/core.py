@@ -20,7 +20,7 @@ from typing import Any
 
 import requests
 
-from .exceptions import BackendDegraded
+from .exceptions import BackendDegraded, backend_degraded, source_errors, source_results
 from .identity import identity_values, source_identity
 
 API_URL = "https://api.core.ac.uk/v3/search/works/"
@@ -29,6 +29,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5.0
 
 
+@source_errors
 def search_core(query: str, max_results: int = 30) -> list[dict[str, Any]]:
     """Search CORE and return paper metadata in the shared search-result shape.
 
@@ -51,33 +52,29 @@ def search_core(query: str, max_results: int = 30) -> list[dict[str, Any]]:
     # On a non-ok response or retry-exhaustion we RAISE ``BackendDegraded`` (a
     # transient failure must NOT masquerade as an authoritative 0-hit). A genuine
     # empty result set is an EMPTY ``data["results"]`` → returns [].
-    resp = None
+    failure = BackendDegraded("CORE no response")
     for _attempt in range(MAX_RETRIES):
         try:
             resp = requests.get(API_URL, params=params, headers=headers,
                                 timeout=TIMEOUT, allow_redirects=True)
-            # CORE returns 429 when over rate limit
             if resp.status_code == 429:
+                failure = backend_degraded(response=resp)
                 time.sleep(RETRY_DELAY)
                 continue
             if not resp.ok:
-                raise BackendDegraded(f"CORE HTTP {resp.status_code}")
+                raise backend_degraded(response=resp)
             break
-        except (requests.exceptions.ConnectionError,
-                requests.exceptions.SSLError,
-                requests.exceptions.Timeout):
+        except (requests.ConnectionError, requests.Timeout) as error:
+            failure = backend_degraded(error)
             time.sleep(RETRY_DELAY)
-            continue
-    if resp is None or not resp.ok:
-        raise BackendDegraded("CORE retry exhausted")
+    else:
+        raise failure
 
-    try:
-        data = resp.json()
-    except Exception:
-        raise BackendDegraded("CORE non-JSON response")
+    data = resp.json()
+    works = source_results(data, "results")
 
     out: list[dict[str, Any]] = []
-    for work in data.get("results") or []:
+    for work in works:
         # CORE authors: list of {"name": "Last, F."} dicts
         authors_raw = work.get("authors") or []
         authors = [a.get("name", "") for a in authors_raw if isinstance(a, dict)]

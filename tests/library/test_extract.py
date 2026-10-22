@@ -994,3 +994,109 @@ def test_client_submission_unavailable_defers_without_charging(tmp_path, monkeyp
     reason = "invalid_api_json" if failure == "invalid_api_json" else "synthetic submission refused"
     assert any(e.get("event") == "extract_md_transport_retry" and reason in e["error"] for e in events)
     assert not any(e.get("event") == "extract_md_engine_failed" for e in events)
+
+
+@pytest.mark.parametrize('marker', ['source', 'deferred', 'evidence'])
+@pytest.mark.parametrize('reply', [
+    '{"match": false, "reason": "different title and author"}',
+    'invalid response',
+    '{"match": "false"}',
+    '{"match": "true"}',
+    '{"match": 1}',
+])
+def test_scan_ocr_unverified_identity_quarantines_before_publication(tmp_path, monkeypatch, marker, reply):
+    import hashlib
+    from papervault.library.models import ADSDocumentEvidence
+    lib, p = _pdf_paper(tmp_path)
+    original = lib.pdf_path(p.key).read_bytes()
+    if marker == 'source':
+        p.download_source = 'ads_scan'
+    elif marker == 'deferred':
+        p.verification_deferred_to_ocr = True
+    else:
+        p.ads_availability.documents = [ADSDocumentEvidence(
+            outcome='pdf', document_kind='scanned_full_text', sha256=hashlib.sha256(original).hexdigest())]
+    body = '# Different work\nAnother Author\n' + 'Unrelated readable research prose. ' * 50
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, returns=body)
+    monkeypatch.setattr(extract, 'review_extract', lambda *_, **__: pytest.fail('identity must precede clarity'))
+    llm = _GateLLM(reply)
+    assert asyncio.run(extract.extract_md(p, lib, llm=llm)) is None
+    assert p.domain_status == 'identity_mismatch'
+    from papervault.library.services.classify import classify
+    assert classify(p, lib) == 'TERMINAL'
+    assert p.extraction_completion_id is None
+    assert not lib.has_extract(p.key, 'md')
+    assert lib.pdf_path(p.key).read_bytes() == original
+    assert not list((lib.root / 'extracts' / 'versions').glob('*/completion.json'))
+    assert body.encode() in [path.read_bytes() for path in (lib.root / 'extracts' / 'rejected').glob('*.md')]
+    assert Library(lib.root).get(p.key).domain_status == 'identity_mismatch'
+
+
+def test_scan_ocr_verified_identity_clears_deferred_marker_durably(tmp_path, monkeypatch):
+    lib, p = _pdf_paper(tmp_path)
+    p.download_source = 'ads_scan'
+    p.verification_deferred_to_ocr = True
+    body = '# Gate spine paper\nA\n' + 'The requested work contains readable research prose. ' * 50
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, returns=body)
+    _stub_judges_pass(monkeypatch)
+    assert asyncio.run(extract.extract_md(p, lib, llm=_GateLLM('{"match": true, "reason": "same work"}'))) == body
+    assert not p.verification_deferred_to_ocr
+    assert not Library(lib.root).get(p.key).verification_deferred_to_ocr
+    assert lib.has_extract(p.key, 'md')
+    assert p.extraction_completion_id
+
+
+def test_deferred_scan_with_existing_markdown_still_checks_ocr_identity(tmp_path, monkeypatch):
+    lib, p = _pdf_paper(tmp_path)
+    p.verification_deferred_to_ocr = True
+    p.download_source = 'ads_scan'
+    previous = b'Previously retained text must survive failed verification.'
+    lib.md_path(p.key).write_bytes(previous)
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, returns='Another title and other authors. ' * 30)
+    assert asyncio.run(extract.extract_md(p, lib, llm=_GateLLM('{"match": false}'))) is None
+    assert p.domain_status == 'identity_mismatch'
+    assert lib.md_path(p.key).read_bytes() == previous
+    assert p.verification_deferred_to_ocr
+
+
+def test_repeated_scan_identity_rejects_preserve_each_attempt_without_publication(tmp_path, monkeypatch):
+    lib, p = _pdf_paper(tmp_path)
+    p.verification_deferred_to_ocr = True
+    _stub_good_probe(monkeypatch)
+    body = 'Another title and unrelated authors. ' * 40
+    _stub_mineru(monkeypatch, returns=body)
+    for _ in range(2):
+        assert asyncio.run(extract.extract_md(p, lib, llm=_GateLLM('{"match": false}'))) is None
+    assert len(list((lib.root / 'extracts' / 'rejected').glob('*.json'))) == 2
+    assert not lib.has_extract(p.key, 'md')
+
+
+def test_forced_ads_scan_reextraction_verifies_identity_again(tmp_path, monkeypatch):
+    lib, p = _pdf_paper(tmp_path)
+    p.download_source = 'ads_scan'
+    _stub_good_probe(monkeypatch)
+    _stub_judges_pass(monkeypatch)
+    body = '# Gate spine paper\nA\n' + 'Readable research text. ' * 50
+    _stub_mineru(monkeypatch, returns=body)
+    assert asyncio.run(extract.extract_md(p, lib, llm=_GateLLM('{"match": true}'))) == body
+    completion = p.extraction_completion_id
+    _stub_mineru(monkeypatch, returns='Wrong paper and authors. ' * 50)
+    assert asyncio.run(extract.extract_md(p, lib, force=True, llm=_GateLLM('{"match": false}'))) is None
+    assert p.domain_status == 'identity_mismatch'
+    assert p.extraction_completion_id == completion
+    assert lib.md_path(p.key).read_text() == body
+
+
+def test_ads_scan_with_prior_completion_still_verifies_new_ocr_output(tmp_path, monkeypatch):
+    lib, p = _pdf_paper(tmp_path)
+    p.download_source = 'ads_scan'
+    p.extraction_completion_id = 'historical-completion-without-available-output'
+    _stub_good_probe(monkeypatch)
+    _stub_judges_pass(monkeypatch)
+    _stub_mineru(monkeypatch, returns='Other work with unrelated authors. ' * 40)
+    assert asyncio.run(extract.extract_md(p, lib, llm=_GateLLM('{"match": false}'))) is None
+    assert p.domain_status == 'identity_mismatch'
+    assert not lib.has_extract(p.key, 'md')

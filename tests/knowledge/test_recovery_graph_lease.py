@@ -61,6 +61,7 @@ def test_immutable_capture_obeys_the_knowledge_root_barrier(tmp_path):
 
 @pytest.mark.parametrize("failure", ["exception", "pending"])
 async def test_upstream_swallowed_flush_failure_keeps_recovery_fenced(tmp_path, monkeypatch, failure):
+    import threading
     from lightrag.lightrag import LightRAG, StoragesStatus
     from papervault.knowledge.store import graph
 
@@ -71,9 +72,10 @@ async def test_upstream_swallowed_flush_failure_keeps_recovery_fenced(tmp_path, 
     store = SimpleNamespace(finalize=fail, _pending_vector_docs={"unfinished": {}}, _pending_vector_deletes=set())
     names = ("full_docs", "text_chunks", "full_entities", "full_relations", "entity_chunks", "relation_chunks",
         "entities_vdb", "relationships_vdb", "chunks_vdb", "chunk_entity_relation_graph", "llm_response_cache", "doc_status")
-    rag = SimpleNamespace(**dict.fromkeys(names), _storages_status=StoragesStatus.INITIALIZED)
+    rag = object.__new__(LightRAG)
+    rag.__dict__.update(dict.fromkeys(names), _storages_status=StoragesStatus.INITIALIZED,
+                        _parser_shutdown_event=threading.Event(), _parser_executor=None)
     rag.entities_vdb = store
-    rag.finalize_storages = lambda: LightRAG.finalize_storages(rag)
 
     async def construct(**kwargs):
         return rag

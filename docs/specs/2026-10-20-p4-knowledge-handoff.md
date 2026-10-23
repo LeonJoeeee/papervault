@@ -95,7 +95,7 @@ Review the exact fixture schema plan without any connection or write:
 .venv/bin/python scripts/prepare_knowledge_backend.py --embedding-dim 3 --embedding-model-name pv_acceptance_fixture
 ```
 
-Expected stdout is JSON with `dependency: lightrag-hku==1.5.4`, `embedding_dim: 3`,
+Expected stdout is JSON with `dependency: lightrag-hku==1.5.7`, `embedding_dim: 3`,
 the `postgres`/`neo4j` additive statements and vector tables ending in
 `_pv_acceptance_fixture_3d`. Exit **0** only establishes that the plan was generated.
 The harness prepares this plan itself; no separate `--execute` command is required.

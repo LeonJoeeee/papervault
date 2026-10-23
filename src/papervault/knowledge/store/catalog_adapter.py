@@ -73,12 +73,13 @@ class _RetirementRebuild:
             roles["extract"] = observed
             config["role_llm_funcs"] = roles
         bound["config"] = config
-        await self.original(*args, **{**kwargs, "global_config": config})
+        result = await self.original(*args, **{**kwargs, "global_config": config})
         if bound["pause"] is not None:
             # Also stop deletion before it removes the document's retry state.
             raise bound["pause"]
         if bound["error"] is not None:
             raise bound["error"]
+        return result
 
     @staticmethod
     async def _validate(kwargs):
@@ -90,6 +91,8 @@ class _RetirementRebuild:
             return
         cached = await operate._get_cached_extraction_results(kwargs["llm_response_cache"], required,
             text_chunks_storage=kwargs["text_chunks_storage"])
+        if isinstance(cached, tuple):
+            cached, _chunk_data_by_id = cached
         if set(cached) != required:
             raise RuntimeError("retirement rebuild requires cached extraction for every remaining chunk; "
                                "isolated rebuild required")
@@ -363,11 +366,11 @@ class CatalogLightRAGAdapter:
             except Exception as exc:
                 raise RetirementFailure(retired_id, old_doc, result.status, messages,
                                         {"history_error": str(exc)}) from exc
-            # LightRAG 1.5.4 catches individual rebuild/parse failures and can
-            # return success with a clean final result message. Its operation
-            # history is the reporting route for failed counts and no-cache exits.
+            # LightRAG 1.5.7 propagates top-level rebuild exceptions, but best-effort
+            # per-target failures and no-cache exits can still accompany success.
+            # Validate operation history before accepting retirement.
             if any(re.search(r"^Failed to\b|\bFailed:\s*\d+\s+entities\b|"
-                             r"^No cached extraction results found, cannot rebuild", message, re.IGNORECASE)
+                             r"^No cached extraction results found\b", message, re.IGNORECASE)
                    for message in messages):
                 raise RetirementFailure(retired_id, old_doc, result.status, messages)
             try:

@@ -3,6 +3,7 @@ import asyncio
 import importlib.metadata
 import tomllib
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -17,16 +18,50 @@ from papervault.knowledge.store.build_breaker import BuildBreaker, BuildPausedEr
 def test_private_pipeline_pin_moves_only_with_an_explicit_port():
     lock = tomllib.loads(Path('uv.lock').read_text())
     pinned = next(p['version'] for p in lock['package'] if p['name'] == 'lightrag-hku')
-    assert pinned == importlib.metadata.version('lightrag-hku') == '1.5.4'
+    assert pinned == importlib.metadata.version('lightrag-hku') == '1.5.7'
 
 
 def test_pipeline_guard_rejects_unsupported_dependency_before_io(monkeypatch, tmp_path):
     from papervault.knowledge.store.build_pipeline import BuildAwareLightRAG
 
-    monkeypatch.setattr(importlib.metadata, 'version', lambda _: '1.5.5')
-    with pytest.raises(RuntimeError, match='1.5.4'):
+    monkeypatch.setattr(importlib.metadata, 'version', lambda _: '1.5.8')
+    with pytest.raises(RuntimeError, match='1.5.7'):
         BuildAwareLightRAG(working_dir=str(tmp_path / 'must-not-exist'))
     assert not (tmp_path / 'must-not-exist').exists()
+
+
+@pytest.mark.parametrize('stage', ['before-extract', 'failure'])
+@pytest.mark.parametrize('owner', ['current-run', 'replacement-run'])
+async def test_deferral_preserves_run_ownership(stage, owner, monkeypatch):
+    from lightrag.base import DocProcessingStatus, DocStatus
+    from papervault.knowledge.store.build_pipeline import BuildAwareLightRAG
+
+    breaker = BuildBreaker(threshold=1)
+    breaker.record_failure()
+    monkeypatch.setattr(build_breaker, '_BREAKER', breaker)
+    row = {'status': DocStatus.PROCESSING, 'chunks_list': ['saved'], 'chunks_count': 1,
+           'error_msg': 'current owner state'}
+
+    async def upsert(rows):
+        row.update(rows['doc'])
+
+    # Exercise the real owner-checked transition without constructing external stores.
+    rag = object.__new__(BuildAwareLightRAG)
+    rag.doc_status = SimpleNamespace(upsert=upsert)
+    ctx = SimpleNamespace(run_owner_token='current-run',
+        pipeline_status={'busy_owner': {'token': owner}}, pipeline_status_lock=asyncio.Lock())
+    status_doc = DocProcessingStatus(content_summary='body', content_length=4, file_path='one',
+        status=DocStatus.PROCESSING, created_at='2026-10-23T00:00:00+00:00',
+        updated_at='2026-10-23T00:00:00+00:00', chunks_list=['saved'], chunks_count=1)
+    if stage == 'before-extract':
+        await rag.process_single_document(doc_id='doc', status_doc=status_doc, parsed_data=None, ctx=ctx)
+    else:
+        await rag._finalize_doc_failure(doc_id='doc', status_doc=status_doc, file_path='one',
+            error=BuildPausedError('paused'), pending_tasks=[], failed_chunks_snapshot=(['saved'], 1),
+            pipeline_status=ctx.pipeline_status, pipeline_status_lock=ctx.pipeline_status_lock, ctx=ctx)
+    assert row['chunks_list'] == ['saved'] and row['chunks_count'] == 1
+    assert row['status'] == (DocStatus.PENDING if owner == 'current-run' else DocStatus.PROCESSING)
+    assert row['error_msg'] == ('' if owner == 'current-run' else 'current owner state')
 
 
 @pytest.mark.parametrize('adapter', [False, True])
@@ -64,7 +99,7 @@ async def test_paused_pipeline_keeps_queue_and_never_writes_failed(adapter, stag
     monkeypatch.setattr(rag.doc_status, 'upsert', record)
     attempts = 0
 
-    async def paused_extract(*args):
+    async def paused_extract(*args, **kwargs):
         nonlocal attempts
         attempts += 1
         breaker.record_failure()
@@ -74,7 +109,7 @@ async def test_paused_pipeline_keeps_queue_and_never_writes_failed(adapter, stag
             raise APIConnectionError(request=httpx.Request('POST', 'https://fixture.invalid'))
         raise BuildPausedError('fixture pause')
 
-    async def extracted(*args):
+    async def extracted(*args, **kwargs):
         return []
 
     import lightrag.pipeline as pipeline
@@ -100,7 +135,7 @@ async def test_paused_pipeline_keeps_queue_and_never_writes_failed(adapter, stag
             # The same parsed bodies resume after cooldown, without deleting/re-enqueueing.
             now[0] = 601
 
-            async def recovered_extract(*args):
+            async def recovered_extract(*args, **kwargs):
                 breaker.record_success()
                 return []
 

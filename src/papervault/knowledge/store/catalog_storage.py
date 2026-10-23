@@ -1,4 +1,4 @@
-"""Explicit LightRAG 1.5.4 workspaces with durable catalog write fencing.
+"""Explicit LightRAG 1.5.7 workspaces with durable catalog write fencing.
 
 No environment variable is changed. Each backend operation holds the repository's
 namespace lock until external IO completes; sealing takes that same lock.
@@ -14,9 +14,10 @@ import re
 
 
 from lightrag.kg.neo4j_impl import Neo4JStorage
+from lightrag.exceptions import StorageRecordNotFoundError
 from lightrag.kg.postgres_impl import (
     ClientManager, NAMESPACE_TABLE_MAP, PGDocStatusStorage, PGKVStorage, PGVectorStorage, PostgreSQLDB,
-    namespace_to_table_name,
+    _DOC_STATUS_UPDATABLE_COLUMNS, namespace_to_table_name,
 )
 from lightrag.kg.shared_storage import get_namespace_lock
 from lightrag.utils import validate_workspace
@@ -151,7 +152,28 @@ class CatalogPGKVStorage(_PostgresStorage, PGKVStorage):
 
 
 class CatalogPGDocStatusStorage(_PostgresStorage, PGDocStatusStorage):
-    pass
+    async def update_doc_status_fields(self, doc_id, fields, *, missing_ok=False):
+        # The native UPDATE cannot see an inherited row. Materialize the logical
+        # record in this attempt's delta under the same fence as other writes.
+        if "created_at" in fields:
+            raise ValueError("created_at is an immutable scheduling sort key")
+        unknown = set(fields) - _DOC_STATUS_UPDATABLE_COLUMNS
+        if unknown:
+            raise ValueError(f"unknown doc_status columns: {sorted(unknown)}")
+        existing = await self.get_by_id(doc_id)
+        if existing is None:
+            if missing_ok:
+                return
+            raise StorageRecordNotFoundError(doc_id)
+        if fields:
+            merged = {**existing, **fields}
+            merged.pop("_id", None)
+            await self.upsert({doc_id: merged})
+
+    async def repair_source_conflict(self, *args, **kwargs):
+        # Upstream repairs a raw workspace in one transaction, bypassing the
+        # pinned aggregate. Catalog selection owns conflict resolution instead.
+        raise RuntimeError("catalog source conflicts require an isolated rebuild")
 
 
 class CatalogPGVectorStorage(_PostgresStorage, PGVectorStorage):
@@ -241,6 +263,7 @@ def _guard_method(method):
 # stale process able to flush a buffer after another process seals the receipt.
 _MUTATORS = {
     "upsert", "delete", "drop", "index_done_callback", "drop_pending_index_ops",
+    "update_doc_status_fields", "repair_source_conflict",
     "_flush_pending_vector_ops", "delete_entity", "delete_entity_relation",
     "upsert_node", "upsert_edge", "upsert_nodes_batch", "upsert_edges_batch",
     "delete_node", "remove_nodes", "remove_edges",
@@ -308,6 +331,10 @@ class LayeredPostgresDB:
         return getattr(self.raw, name)
 
     async def query(self, sql, params=None, multirows=False, **kwargs):
+        # 1.5.7 wraps its single-status keyset page in one pair of parentheses.
+        sql = sql.strip()
+        if sql.startswith("(") and sql.endswith(")"):
+            sql = sql[1:-1].strip()
         params = list(params or [])
         workspace = re.search(r"\bworkspace\s*=\s*\$(\d+)", sql, re.I)
         tables = list(_PG_TABLE_READ.finditer(sql))

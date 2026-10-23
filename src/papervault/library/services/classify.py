@@ -48,7 +48,8 @@ hit, so each paper lands in exactly one Action (SDD §5 ``post``):
 With PAPERVAULT_TERMINAL_V2 enabled, an existing DOWNLOAD decision must also
 pass the single v2 admission predicate. download_paper asks this router again
 immediately before dispatch. EXTRACT is a separate axis; neither routing nor
-admission mutates policy. With the flag off, these rules are unchanged.
+admission mutates policy. Deterministic metadata exclusions block DOWNLOAD
+regardless of feature flags, while preserving the existing extraction routing.
 """
 
 from __future__ import annotations
@@ -99,9 +100,12 @@ def classify(paper: Paper, library, *, identity_provider=resolved_identity,
     The router never changes policy or any other persisted dimension.
     """
     from ..merge_v2 import blocked
+    from .registration import deterministic_garbage_reason
     if blocked(paper):
         return TERMINAL
     action = _classify_legacy(paper, library)
+    if action == DOWNLOAD and deterministic_garbage_reason(paper):
+        return TERMINAL
     if action == DOWNLOAD and (terminal_v2_enabled() or reopen_v2_enabled() or merge_v2_enabled()
                                or paper.reopen_claim is not None or paper.merge_budget is not None):
         budget_ok = (admitted_budget(paper, library=library) if budget_provider is admitted_budget

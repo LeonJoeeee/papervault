@@ -8,7 +8,8 @@ import pytest
 
 from papervault.library import Library
 from papervault.library.mcp.server import build_server
-from papervault.library.services.registration import registration_rejection
+from papervault.library.models import Paper
+from papervault.library.services.registration import registration_rejection, serving_excluded
 
 
 def candidate(**fields):
@@ -71,6 +72,131 @@ async def test_search_does_not_write_catalog_or_enqueue_downloads(tmp_path, monk
 
 def admitted(**fields):
     return candidate(_registration={"ingest_ok": True, "llm_is_paper": True, "tier": "1A"}, **fields)
+
+
+LEGACY_GARBAGE_FIELDS = [
+    pytest.param({"venue": venue}, id=venue) for venue in [
+        "AGU Fall Meeting Abstracts", "AGU Spring Meeting", "Meeting Abstracts",
+        "Conference Abstracts", "COSPAR Scientific Assembly", "EGU General Assembly Abstracts",
+        "AAS Meeting Abstracts", "APS Division of Plasma Physics Meeting Abstracts",
+        "APS April Meeting Abstracts", "Bulletin of the American Astronomical Society",
+        "Bulletin of the American Physical Society", "  aGu   Fall Meeting Abstracts  ",
+    ]
+] + [
+    pytest.param({"doi": "10.5194/egusphere-egu26-123"}, id="egu-doi"),
+    pytest.param({"doi": "10.5194/EGUSPHERE-EGU26-123"}, id="uppercase-egu-doi"),
+    pytest.param({"publication_types": ["dataset"]}, id="dataset"),
+    pytest.param({"publication_types": ["JournalArticle", " DATASET "]}, id="mixed-types"),
+] + [pytest.param({"authors": [author]}, id=author)
+     for author in ["Anon", " AnOn. ", "ANONYMOUS", "unknown"]]
+
+
+@pytest.mark.parametrize("fields", LEGACY_GARBAGE_FIELDS)
+def test_serving_excludes_deterministic_legacy_garbage(fields):
+    paper = Paper(key="Legacy", title="Detector measurements", **fields)
+    before = paper.model_dump()
+    assert serving_excluded(paper) is True
+    assert paper.model_dump() == before
+
+
+@pytest.mark.parametrize("fields", [
+    {}, {"authors": [], "doi": "10.1234/collaboration"},
+    {"authors": ["Collaboration", "Anon"]}, {"authors": ["Unknown, A."]},
+    {"publication_types": ["unclassified"]}, {"venue": "International Cosmic Ray Conference"},
+    {"doi": "10.5194/egusphere-2026-123"}, {"doi": "10.5194/egusphere-egux"},
+])
+def test_serving_preserves_valid_legacy_records(fields):
+    assert serving_excluded(Paper(key="Anon2010", title="Test Paper", **fields)) is False
+
+
+@pytest.mark.parametrize("fields", LEGACY_GARBAGE_FIELDS)
+def test_preview_drops_external_observations_of_legacy_garbage(tmp_path, fields):
+    from papervault.library.services.registration import preview_candidates
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Legacy", **{k: v for k, v in candidate(**fields).items() if k in Paper.model_fields})
+    lib._papers[paper.key] = paper
+    lib._reindex(paper)
+    # The source omits the disqualifying metadata; the catalog still governs.
+    incoming = candidate(doi=paper.doi)
+    before = paper.model_dump()
+    nodes, projections = preview_candidates(lib, [incoming])
+    assert nodes == []
+    assert projections == {}
+    assert paper.model_dump() == before
+    assert lib.find(doi=paper.doi) is paper
+
+
+@pytest.mark.parametrize("fields", [{"venue": "AGU Fall Meeting Abstracts"},
+                                    {"publication_types": ["dataset"]}, {"authors": ["Anon"]}])
+async def test_registration_retains_excluded_legacy_identity_without_download(tmp_path, fields):
+    from papervault.library.services.registration import RegistrationService
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Legacy", **{k: v for k, v in candidate(**fields).items() if k in Paper.model_fields})
+    lib._papers[paper.key] = paper
+    lib._reindex(paper)
+    downloads = []
+    outcomes = await RegistrationService(lib, SimpleNamespace(add=downloads.append)).register_candidates(
+        [admitted()], actor="test", reason="legacy-identity")
+    assert outcomes[0]["status"] == "duplicate"
+    assert outcomes[0]["key"] == "Legacy"
+    assert outcomes[0]["download"] == "not_requested"
+    assert lib.keys() == ["Legacy"]
+    assert lib.find(doi=paper.doi).key == "Legacy"
+    assert downloads == []
+
+
+@pytest.mark.parametrize("fields", [{"venue": "AGU Fall Meeting Abstracts"},
+                                    {"publication_types": ["dataset"]}, {"authors": ["unknown"]}])
+@pytest.mark.parametrize("entrypoint", ["explicit", "recovery"])
+async def test_download_queue_excludes_legacy_garbage(tmp_path, fields, entrypoint):
+    from papervault.library.services.download_queue import DownloadQueue
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Legacy", title="Detector measurements", doi="10.1234/legacy", **fields)
+    lib._papers[paper.key] = paper
+    lib._reindex(paper)
+    before = paper.model_dump()
+    queue = DownloadQueue(lib, num_workers=0)
+    try:
+        if entrypoint == "recovery":
+            await queue.start()
+        else:
+            queue.add(paper.key)
+        assert queue.qsize() == 0
+        assert paper.model_dump() == before
+        assert lib.find(doi=paper.doi) is paper
+    finally:
+        await queue.stop()
+
+
+async def test_download_worker_rechecks_garbage_after_enqueue(tmp_path, monkeypatch):
+    from papervault.library.services import download_queue
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Legacy", title="Detector measurements", doi="10.1234/legacy")
+    lib._papers[paper.key] = paper
+    queue = download_queue.DownloadQueue(lib, num_workers=0)
+    queue.add(paper.key)
+    assert queue.qsize() == 1
+    paper.publication_types = ["dataset"]
+    monkeypatch.setattr(download_queue, "download_paper", lambda *a: pytest.fail("excluded download dispatched"))
+    await queue._process_one(paper.key)
+
+
+@pytest.mark.parametrize("fields", [{"venue": "AGU Fall Meeting Abstracts"},
+                                    {"publication_types": ["dataset"]}, {"authors": ["unknown"]}])
+def test_download_dispatch_excludes_legacy_garbage_with_flags_off(tmp_path, monkeypatch, fields):
+    from papervault.library import download
+    from papervault.library.services.classify import TERMINAL, classify
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Legacy", title="Detector measurements", doi="10.1234/legacy", **fields)
+    lib._papers[paper.key] = paper
+    monkeypatch.setattr(download, "_settle_arxiv_withdrawal", lambda *a: pytest.fail("excluded acquisition started"))
+    assert download.download_paper(paper, lib) is False
+    assert classify(paper, lib) == TERMINAL
 
 
 @pytest.mark.parametrize("venue", [

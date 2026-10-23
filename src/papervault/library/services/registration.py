@@ -66,6 +66,20 @@ def metadata_is_paper(publication_types) -> bool | None:
     return True if types & _PAPER_TYPES else None
 
 
+def deterministic_garbage_reason(paper: Paper) -> str:
+    """Positive metadata exclusions only; missing legacy metadata is not evidence."""
+    doi = paper.doi.lower()
+    venue = " ".join(paper.venue.lower().split())
+    if ((doi.startswith("10.5194/egusphere-egu") and doi[21:22].isdigit())
+            or _CONFERENCE_ABSTRACT_VENUE.search(venue)):
+        return "conference_abstract"
+    if metadata_is_paper(paper.publication_types) is False:
+        return "non_paper"
+    if paper.authors and str(paper.authors[0]).strip().lower() in {"anon", "anon.", "anonymous", "unknown"}:
+        return "anonymous_author"
+    return ""
+
+
 def registration_rejection(candidate: dict, *, known_identity: bool = False) -> str:
     """Pure eligibility, shared by serving's existing gate and command admission."""
     if candidate.get("_registration_known_key"):
@@ -159,9 +173,10 @@ def _view(library, papers):
 
 
 def serving_excluded(paper: Paper) -> bool:
-    """Current quarantine and exclusion always fence serving, including old files."""
+    """Policy and deterministic metadata exclusions also fence legacy records."""
     state = paper.acquisition_state
-    return bool(paper.domain_status is not None or state.quarantine or state.policy == Policy.EXCLUDED)
+    return bool(paper.domain_status is not None or state.quarantine or state.policy == Policy.EXCLUDED
+                or deterministic_garbage_reason(paper))
 
 
 def _compatible(paper, candidate):
@@ -262,13 +277,17 @@ def preview_candidates(library, candidates, *, canonical_keys=None):
                 # Bibliographic deduplication is weaker than an explicit alias
                 # identifier and cannot bridge a conflicting DOI or version.
                 paper = _compatible(owner.get(canonical_key), candidate)
-        return paper if paper is not None and not serving_excluded(paper) else None
+        return paper
 
     view, snapshots = _view(library, {}), {}
     for candidate in candidates:
         live = preview_find(library, candidate)
+        if live is not None and serving_excluded(live):
+            continue
         paper = view.get(live.key) if live else None
         paper = paper or preview_find(view, candidate)
+        if paper is not None and serving_excluded(paper):
+            continue
         incoming = {k: copy.deepcopy(v) for k, v in candidate.items() if k in _METADATA}
         incoming["source_identities"] = normalized_source_identities(candidate, candidate.get("source") or "")
         if paper is None:

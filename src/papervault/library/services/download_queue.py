@@ -246,7 +246,9 @@ class DownloadQueue:
 
     def _enqueue(self, key: str, priority: int, *, claim=None) -> None:
         from ..merge_v2 import blocked
-        if blocked(self.library.get(key)):
+        from .registration import deterministic_garbage_reason
+        paper = self.library.get(key)
+        if blocked(paper) or (paper is not None and deterministic_garbage_reason(paper)):
             return
         # In-flight dedup (F7), priority-aware (R1): a key already waiting in the
         # queue is deduped ONLY for a same-or-lower-priority re-add (lower
@@ -255,7 +257,6 @@ class DownloadQueue:
         # the stale lower-prio tuple it leaves behind is dropped at pop time
         # (T1: the worker only processes the first tuple to claim _pending[key]).
         queued = self._pending.get(key)
-        paper = self.library.get(key)
         if claim is None and paper and paper.reopen_claim is not None:
             return
         same_claim = claim is None or self._pending_claims.get(key) == claim.lease_id
@@ -365,6 +366,9 @@ class DownloadQueue:
         paper = self.library.get(key)
         if paper is None:
             log.warning("download queue: %s not in library, dropping", key)
+            return
+        from .registration import deterministic_garbage_reason
+        if deterministic_garbage_reason(paper):
             return
         if paper.reopen_claim is not None:
             from ..claims_v2 import same_attempt

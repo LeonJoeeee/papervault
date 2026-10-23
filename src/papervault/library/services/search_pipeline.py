@@ -30,7 +30,9 @@ from .bm25_search import (
     reorder_ranklists_by_rrf, round_robin, rrf_fuse,
 )
 from .intent_parser import named_entity_groups, observe_intent
-from .registration import ServingTrace, preview_candidates, registration_rejection, serving_excluded
+from .registration import (
+    ServingTrace, _find, _view, preview_candidates, registration_rejection, serving_excluded,
+)
 
 logger = logging.getLogger(__name__)
 RETURN_THRESHOLD = 0.4
@@ -363,6 +365,7 @@ class SearchPipeline:
 
     def fusion(self, plan, retrieved, trace):
         seen, local_by_key, canonical_keys = {}, {}, {}
+        excluded_identities = {}
         bibliography = collections.defaultdict(list)
         snapshot = {p.key: p for p in retrieved.local}
         # Register identified versions first so an identifier-poor observation
@@ -374,8 +377,13 @@ class SearchPipeline:
                 canonical = snapshot.get(canonical.acquisition_state.alias_key)
                 if canonical is None:
                     break
-            if canonical is None or canonical.key in path or serving_excluded(canonical):
+            if canonical is None or canonical.key in path:
                 trace.record("fusion", key=paper.key, decision="dropped", reason="unresolved_alias")
+                continue
+            if serving_excluded(canonical):
+                excluded_identities[_identity_key(paper_to_dict(paper))] = canonical.key
+                excluded_identities[_identity_key(paper_to_dict(canonical))] = canonical.key
+                trace.record("fusion", key=paper.key, decision="dropped", reason="serving_excluded")
                 continue
             node = paper_to_dict(canonical)
             identity = _identity_key(node)
@@ -401,8 +409,20 @@ class SearchPipeline:
         corpus = [node for node in local_by_key.values() if plan.year_eligible(node)]
         local_ranks = bm25_per_term_ranklists(corpus, plan.terms)
         buckets = collections.defaultdict(list)
+        # Secondary identifiers/title and explicit aliases use preview's
+        # version-compatible lookup, bound to this request's catalog snapshot.
+        exclusion_view = _view(self.library, snapshot) if excluded_identities and retrieved.external else None
         for node in retrieved.external:
             identity, term, rank = _identity_key(node), node.get("term_idx", 0), node.get("rank", 0)
+            excluded_key = excluded_identities.get(identity)
+            if not excluded_key and exclusion_view is not None:
+                matched = _find(exclusion_view, node)
+                if matched is not None and serving_excluded(matched):
+                    excluded_key = matched.key
+            if excluded_key:
+                trace.record("fusion", candidate=node, key=excluded_key, arm="external",
+                             decision="dropped", reason="serving_excluded")
+                continue
             hit = seen.get(identity)
             if hit is None:
                 seen[identity] = hit = node

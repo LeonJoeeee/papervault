@@ -38,6 +38,7 @@ async def run_search(monkeypatch, lib, nodes, *, query="detector measurements",
         return nodes, {}
 
     async def ingest(cands, **kw):
+        seen["ingest_pool"] = cands
         return {i: dict(ingest_ok=True, llm_is_paper=True, tier="1A")
                 for i in range(len(cands))}, 0
 
@@ -54,6 +55,120 @@ async def run_search(monkeypatch, lib, nodes, *, query="detector measurements",
     result = json.loads("\n".join(c.text for c in reply))
     events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
     return result, seen, [e for e in events if e.get("event") == "serving_trace"]
+
+
+def fuse_library(lib, external):
+    from papervault.library.services.search_pipeline import PlannedSearch, RetrievedSearch, SearchPipeline
+    from papervault.library.services.registration import ServingTrace
+
+    searcher = SearchPipeline(
+        library=lib, registration_queue=None, llm_factory=None, parse=None,
+        retrieve=None, judge_ingest=None, judge_return=None, project=None,
+        reframe_hint=None, progress=None, authority_enabled=False)
+    plan = PlannedSearch({}, ["detector measurements"], {}, 10, "by_relevance")
+    retrieved = RetrievedSearch(external, [p.model_copy(deep=True) for p in lib.all_papers(include_quarantined=True)], {})
+    return searcher.fusion(plan, retrieved, ServingTrace(lib))
+
+
+@pytest.mark.parametrize("fields", [
+    {"venue": "AGU Fall Meeting Abstracts"}, {"venue": "EGU General Assembly Abstracts"},
+    {"venue": "AAS Meeting Abstracts"}, {"venue": "APS April Meeting Abstracts"},
+    {"venue": "COSPAR Scientific Assembly"}, {"doi": "10.5194/egusphere-egu26-123"},
+    {"publication_types": ["dataset"]}, {"authors": ["Anon"]}, {"authors": ["unknown"]},
+])
+@pytest.mark.parametrize("external_hit", [False, True])
+def test_fusion_excludes_legacy_garbage_from_all_candidate_pools(tmp_path, fields, external_hit):
+    lib = Library(tmp_path)
+    incoming = node("Legacy", "Detector measurements of cosmic particles")
+    paper = add_record(lib, **dict(incoming, **fields))
+    incoming["doi"] = paper.doi
+    for i in range(5):
+        add_record(lib, **dict(node(f"Other{i}", f"Unrelated astrophysical topic {i}"), abstract="Stellar spectra."))
+    before = paper.model_dump()
+    fused = fuse_library(lib, [incoming] if external_hit else [])
+    assert fused.local == []
+    assert fused.external == []
+    assert fused.vouched == []
+    assert "Legacy" not in fused.canonical_keys
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    assert any(e.get("key") == "Legacy" and e.get("reason") == "serving_excluded"
+               and e.get("decision") == "dropped" for e in events)
+    assert not any(e.get("reason") == "unresolved_alias" for e in events)
+    assert paper.model_dump() == before
+    assert lib.find(doi=paper.doi) is paper
+
+
+@pytest.mark.parametrize("match", ["arxiv", "title", "alias"])
+def test_fusion_blocks_secondary_matches_to_excluded_canonical_records(tmp_path, match):
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    lib = Library(tmp_path)
+    incoming = node("Legacy", "Detector measurements of cosmic particles")
+    paper = add_record(lib, **dict(incoming, arxiv_id="2401.12345", venue="AGU Fall Meeting Abstracts"))
+    if match == "arxiv":
+        incoming.update(doi="", arxiv_id=paper.arxiv_id, title="A different source title")
+    elif match == "title":
+        incoming.update(doi="", arxiv_id="")
+    else:
+        alias = add_record(lib, **node("Alias", "Other detector measurements"))
+        alias.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key=paper.key, quarantine=True)
+        incoming = node("Alias", alias.title)
+    fused = fuse_library(lib, [incoming])
+    assert fused.external == []
+    assert fused.vouched == []
+    assert all(n["key"] != paper.key for n in fused.local)
+
+
+def test_fusion_distinguishes_unresolved_alias_from_serving_exclusion(tmp_path):
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    lib = Library(tmp_path)
+    alias = add_record(lib, **node("Alias", "Detector measurements"))
+    alias.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key="Missing", quarantine=True)
+    assert fuse_library(lib, []).local == []
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    assert any(e.get("key") == "Alias" and e.get("reason") == "unresolved_alias" for e in events)
+
+
+@pytest.mark.parametrize("different", ["doi", "arxiv_version"])
+def test_fusion_does_not_exclude_distinct_versions_of_a_blocked_title(tmp_path, different):
+    lib = Library(tmp_path)
+    incoming = node("Allowed", "Detector measurements of cosmic particles")
+    fields = {"doi": "10.1234/blocked"}
+    if different == "arxiv_version":
+        fields = {"doi": "", "arxiv_id": "2401.12345v1"}
+        incoming.update(doi="", arxiv_id="2401.12345v2")
+    add_record(lib, key="Blocked", title=incoming["title"], venue="AGU Fall Meeting Abstracts", **fields)
+    fused = fuse_library(lib, [incoming])
+    assert [n["key"] for n in fused.external] == ["Allowed"]
+
+
+@pytest.mark.parametrize("fields", [{"venue": "AGU Fall Meeting Abstracts"},
+                                    {"publication_types": ["dataset"]}, {"authors": ["Anon"]}])
+async def test_search_does_not_judge_or_register_excluded_legacy_matches(tmp_path, monkeypatch, fields):
+    lib = Library(tmp_path)
+    incoming = node("Legacy", "Detector measurements of cosmic particles")
+    paper = add_record(lib, **dict(incoming, **fields))
+    before = paper.model_dump()
+    index_before = lib.index_path.read_bytes()
+    result, seen, events = await run_search(monkeypatch, lib, [incoming])
+    assert result["results"] == []
+    assert seen["ingest_pool"] == []
+    assert seen["pool"] == []
+    assert not any(e["stage"] == "registration" and e.get("decision") == "submitted" for e in events)
+    assert lib.keys() == ["Legacy"]
+    assert paper.model_dump() == before
+    assert lib.index_path.read_bytes() == index_before
+
+
+@pytest.mark.parametrize("fields", [{}, {"authors": [], "doi": "10.1234/collaboration"}])
+async def test_search_preserves_valid_minimal_legacy_papers(tmp_path, monkeypatch, fields):
+    lib = Library(tmp_path)
+    add_record(lib, key="Anon2010", title="Detector measurements of cosmic particles", **fields)
+    for i in range(5):
+        add_record(lib, **dict(node(f"Other{i}", f"Unrelated astrophysical topic {i}"), abstract="Stellar spectra."))
+    result, _, _ = await run_search(monkeypatch, lib, [])
+    assert [n["key"] for n in result["results"]] == ["Anon2010"]
 
 
 async def test_fold_retains_external_rank_for_served_ties(tmp_path, monkeypatch):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..claims_v2 import BudgetLedger, ClaimStore, LedgerError, same_attempt
+from ..state_v2 import Merge
 from .operator_actions import stage_operator
 
 
@@ -25,6 +26,7 @@ async def operate(library, *, action, key=None, campaign_id=None, reason, actor,
 
     ledger = BudgetLedger(library.root)
     store = ClaimStore(library, ledger=ledger)
+    token = None
     if action == "campaign-halt":
         start = next((row for row in ledger.events()
                       if row["event"] == "campaign_start" and row["campaign_id"] == campaign_id), None)
@@ -39,16 +41,21 @@ async def operate(library, *, action, key=None, campaign_id=None, reason, actor,
             raise ValueError("existing record key required")
         token = store.recovery_claim(key)
         if token is None:
-            raise ValueError("record has no recovery claim")
-        if lease_id and lease_id != token.lease_id:
-            raise ValueError("claim lease changed")
-        if campaign_id is not None and campaign_id != token.campaign_id:
-            raise ValueError("claim campaign changed")
+            state = paper.acquisition_state
+            if (action != "release-quarantine" or lease_id or campaign_id is not None
+                    or not state.quarantine or state.merge != Merge.CANONICAL
+                    or state.alias_key or paper.merge_intent is not None):
+                raise ValueError("record has no recovery claim")
+        else:
+            if lease_id and lease_id != token.lease_id:
+                raise ValueError("claim lease changed")
+            if campaign_id is not None and campaign_id != token.campaign_id:
+                raise ValueError("claim campaign changed")
         keys = [key]
 
     stage_operator(library, action=action, keys=keys, reason=reason, actor=actor,
-                   event=action.replace("-", "_"), detail={"campaign_id": campaign_id if action == "campaign-halt" else token.campaign_id,
-                       "lease_id": lease_id or (token.lease_id if action != "campaign-halt" else ""),
+                   event=action.replace("-", "_"), detail={"campaign_id": token.campaign_id if token else campaign_id,
+                       "lease_id": lease_id or (token.lease_id if token else ""),
                        "executor_proof": executor_proof, "drained": drained})
     try:
         if action == "campaign-halt":
@@ -80,7 +87,8 @@ async def operate(library, *, action, key=None, campaign_id=None, reason, actor,
         if action == "claim-recover":
             changed = await store.recover(token, executor_proof=executor_proof)
         else:
-            changed = await store.release_quarantine(key, human_reason=reason, expected_lease_id=token.lease_id)
+            changed = await store.release_quarantine(key, human_reason=reason,
+                                                    expected_lease_id=token.lease_id if token else "")
         return {"action": action, "key": key, "changed": changed}
     finally:
         # Ledger-only mutations and safe refusal intents must commit their

@@ -88,14 +88,22 @@ class PaperRecord:
         if self.terminal_state is None:
             return True
         from pydantic import ValidationError
-        from papervault.library.state_v2 import Merge, effective_policy
+        from papervault.library.state_v2 import Merge, Policy, Retrieval, effective_policy
 
         try:
             state = _terminal_state_adapter().validate_python(self.terminal_state)
         except ValidationError:
             return False
+        policy_eligible = effective_policy(state, key=self.key)
+        if state.policy == Policy.UNKNOWN:
+            # Cause-unrecorded legacy terminals may supply existing evidence;
+            # the stricter acquisition gate still controls new downloads.
+            policy_eligible = (not state.policy_reasons and state.override is None
+                and state.required_revision == 0
+                and (state.retrieval in {Retrieval.VERIFIED, Retrieval.ACQUIRED, Retrieval.EXHAUSTED}
+                     or self.download_status in {"ok", "extract_failed", "metadata_only", "failed"}))
         return (not state.quarantine and state.merge == Merge.CANONICAL
-                and not state.alias_key and effective_policy(state, key=self.key))
+                and not state.alias_key and policy_eligible)
 
     @classmethod
     def from_index_entry(cls, entry: dict[str, Any]) -> "PaperRecord":

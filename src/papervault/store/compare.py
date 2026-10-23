@@ -23,6 +23,13 @@ def record_differences(left: Record | None, right: Record | None, *,
     else:
         fields = {field: {"json": getattr(left, field), "postgres": getattr(right, field)}
                   for field in COMPARISON_FIELDS if getattr(left, field) != getattr(right, field)}
+        if left.merge == right.merge == "alias" and left.payload_sha256 == right.payload_sha256:
+            # Legacy SQL columns may still own historical identifiers until
+            # explicit transfer; snapshot readers project aliases without them.
+            for field in ("doi", "arxiv_id"):
+                if (getattr(left, field) is None
+                        and getattr(right, field) == normalized_identity(right.payload.get(field))):
+                    fields.pop(field, None)
     if json_alias != postgres_alias:
         fields["alias"] = {"json": json_alias, "postgres": postgres_alias}
     return fields

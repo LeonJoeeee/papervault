@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from papervault.library.claims_v2 import BudgetLedger, ClaimStore, LedgerError
-from papervault.library.state_v2 import Policy, Retrieval, TerminalState
+from papervault.library.state_v2 import Merge, Policy, Retrieval, TerminalState
 from papervault.library.store import Library
 
 
@@ -112,6 +112,90 @@ async def test_quarantine_human_disposition_fences_without_refund_or_policy_gran
     assert ledger.events()[-1]["event"] == "fence"
     assert ledger.events()[-1]["evidence"] == "owner verified executor disposition"
     assert operator_event(library)["event"] == "release_quarantine"
+
+
+@pytest.mark.parametrize("entrypoint", ["store", "service"])
+async def test_claimless_canonical_quarantine_release_is_durable(recovery, entrypoint):
+    library, paper, ledger, store = recovery
+    paper.terminal_state = replace(paper.acquisition_state, quarantine=True,
+                                   policy=Policy.UNKNOWN, policy_reasons=("off_domain",),
+                                   required_revision=3)
+    library.save(force=True, durable=True)
+    before = paper.acquisition_state
+    assert store.recovery_claim(paper.key) is None
+    if entrypoint == "store":
+        assert await store.release_quarantine(paper.key, human_reason="owner reviewed quarantine")
+    else:
+        result = await operate(library, action="release-quarantine", key=paper.key)
+        assert result == {"action": "release-quarantine", "key": paper.key, "changed": True}
+        ruling = operator_event(library)
+        assert ruling["action"] == "release-quarantine"
+        assert ruling["event"] == "release_quarantine"
+        assert ruling["actor"] == "leon"
+        assert ruling["reason"] == "owner verified executor disposition"
+        assert ruling["keys"] == [paper.key]
+        assert ruling["detail"]["campaign_id"] is None
+        assert ruling["detail"]["lease_id"] == ""
+    persisted = Library(library.root).get(paper.key)
+    assert persisted.acquisition_state == replace(before, quarantine=False)
+    assert persisted.reopen_claim is None
+    assert persisted.merge_intent is None
+    assert not ledger.events()
+
+
+@pytest.mark.parametrize("entrypoint", ["store", "service"])
+@pytest.mark.parametrize("barrier", ["not_quarantined", "alias", "alias_key", "merge_intent", "missing"])
+async def test_claimless_release_refuses_noncanonical_or_merging_records(recovery, entrypoint, barrier):
+    from papervault.library.merge_v2 import MergeIntent
+
+    library, paper, ledger, store = recovery
+    paper.terminal_state = replace(paper.acquisition_state, quarantine=barrier != "not_quarantined",
+        merge=Merge.ALIAS if barrier == "alias" else Merge.CANONICAL,
+        alias_key="canonical" if barrier in {"alias", "alias_key"} else "")
+    if barrier == "merge_intent":
+        paper.merge_intent = MergeIntent(merge_id="pending", canonical_key=paper.key,
+            absorbed_key="other", started_at=1.0, deadline=2.0)
+    library.save(force=True, durable=True)
+    before = paper.model_dump(mode="json")
+    key = "missing" if barrier == "missing" else paper.key
+    if entrypoint == "store":
+        assert not await store.release_quarantine(key, human_reason="reviewed")
+    else:
+        with pytest.raises(ValueError):
+            await operate(library, action="release-quarantine", key=key)
+    assert paper.model_dump(mode="json") == before
+    assert Library(library.root).get(paper.key).model_dump(mode="json") == before
+    assert not ledger.events()
+
+
+@pytest.mark.parametrize("filters", [{"lease_id": "stale"}, {"campaign_id": "stale"}, {"campaign_id": ""}])
+async def test_claimless_operator_release_refuses_attempt_filters(recovery, filters):
+    library, paper, ledger, _ = recovery
+    paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
+    library.save(force=True, durable=True)
+    with pytest.raises(ValueError):
+        await operate(library, action="release-quarantine", key=paper.key, **filters)
+    assert Library(library.root).get(paper.key).acquisition_state.quarantine
+    assert not ledger.events()
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"human_reason": " "},
+    {"human_reason": "reviewed", "expected_lease_id": "stale"},
+    {"human_reason": "reviewed", "drained_lease_id": "stale"}])
+async def test_claimless_store_release_requires_reason_and_no_lease(recovery, kwargs):
+    library, paper, ledger, store = recovery
+    paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
+    library.save(force=True, durable=True)
+    assert not await store.release_quarantine(paper.key, **kwargs)
+    assert Library(library.root).get(paper.key).acquisition_state.quarantine
+    assert not ledger.events()
+
+
+async def test_claimless_record_cannot_use_claim_recover(recovery):
+    library, paper, _, _ = recovery
+    paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
+    with pytest.raises(ValueError, match="recovery claim"):
+        await operate(library, action="claim-recover", key=paper.key)
 
 
 async def test_campaign_halt_denies_new_work_without_refund_or_finish(recovery):

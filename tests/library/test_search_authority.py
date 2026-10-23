@@ -277,3 +277,17 @@ def test_tier_defaults_and_identifier_exemptions(cand, multiplier):
 @pytest.mark.parametrize("year", [None, 0, "2016", 2026, 2027])
 def test_venue_multiplier_preserves_missing_or_future_year_fallback(year):
     assert _authority_value(dict(venue="PRL", citation_count=40, year=year), 2026) == 60.0
+
+
+@pytest.mark.parametrize("venue,doi,multiplier", [
+    ("Reviews of Geophysics", "10.1029/RG020i002p00335", 1.5),
+    ("Physical Review D", "10.1103/PhysRevLett.116.241105", 1.5),
+    ("EGU General Assembly", "10.1126/science.123", 0.5),
+    ("Nature", "10.5194/egusphere-egu26-123", 0.5),
+])
+def test_overlapping_venue_and_doi_tiers(venue, doi, multiplier):
+    from papervault.library.services.search_pipeline import _venue_tier_multiplier
+
+    cand = dict(venue=venue, doi=doi, citation_count=40, year=2016)
+    assert _venue_tier_multiplier(cand) == multiplier
+    assert _authority_value(cand, 2026) == 4 * multiplier

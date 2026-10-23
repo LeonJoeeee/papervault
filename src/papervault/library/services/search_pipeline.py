@@ -131,11 +131,11 @@ def _venue_tier_multiplier(cand: dict) -> float:
     venue_multiplier = _venue_name_multiplier(venue)
     if doi.startswith("10.5194/egusphere-egu") or venue_multiplier == 0.5:
         return 0.5
+    # A broad publisher DOI (e.g. 10.1029/) must not demote an explicitly
+    # recognized S-tier journal such as Reviews of Geophysics.
     for multiplier, prefixes, _ in _VENUE_TIERS:
-        if doi.startswith(prefixes):
+        if doi.startswith(prefixes) or venue_multiplier == multiplier:
             return multiplier
-    if venue_multiplier is not None:
-        return venue_multiplier
     if (venue.strip() and not (doi or cand.get("arxiv_id") or cand.get("inspire_record_id"))
             and (cand.get("citation_count") or 0) < 5):
         return 0.5

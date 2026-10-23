@@ -366,9 +366,9 @@ class CatalogLightRAGAdapter:
             except Exception as exc:
                 raise RetirementFailure(retired_id, old_doc, result.status, messages,
                                         {"history_error": str(exc)}) from exc
-            # LightRAG 1.5.7 reports operational rebuild failures through deletion,
-            # but best-effort no-cache exits still require history validation.
-            # Retain failed-count detection for partial reducer results as well.
+            # LightRAG 1.5.7 propagates top-level rebuild exceptions, but best-effort
+            # per-target failures and no-cache exits can still accompany success.
+            # Validate operation history before accepting retirement.
             if any(re.search(r"^Failed to\b|\bFailed:\s*\d+\s+entities\b|"
                              r"^No cached extraction results found\b", message, re.IGNORECASE)
                    for message in messages):

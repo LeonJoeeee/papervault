@@ -35,17 +35,18 @@ def search_arxiv(query: str, max_results: int = 30, *,
     Sort defaults to ``relevance``; ``submittedDate`` descending is used ONLY
     when ``sort_by_recency`` is True (threaded from ``ranking_hint=="by_recency"``).
     arXiv exposes no citation count, so it is NEVER ranked on importance.
+    ``id:`` queries pass through; other queries search all fields.
 
     Bounded retry on HTTP 429 / 5xx / connection errors with jittered backoff
     (≤3 attempts). RAISES ``BackendDegraded`` after all retries fail (a transient
-    empty/429 is NOT an authoritative 0-hit). Returns ``[]`` ONLY for an
-    empty query or a genuinely empty feed.
+    empty/429 is NOT an authoritative 0-hit). Entries missing a title or
+    publication date are skipped; no remaining entries returns ``[]``.
     """
     if not query:
         return []
 
     params = {
-        "search_query": f"all:{query}",
+        "search_query": query if query.startswith("id:") else f"all:{query}",
         "start": 0,
         "max_results": max_results,
         "sortBy": "submittedDate" if sort_by_recency else "relevance",
@@ -79,9 +80,13 @@ def search_arxiv(query: str, max_results: int = 30, *,
     papers = []
 
     for entry in root.findall("atom:entry", NS):
-        title = entry.find("atom:title", NS).text.strip().replace("\n", " ")
+        title_elem = entry.find("atom:title", NS)
+        published_elem = entry.find("atom:published", NS)
+        if title_elem is None or published_elem is None:
+            continue
+        title = title_elem.text.strip().replace("\n", " ")
         abstract = entry.find("atom:summary", NS).text.strip().replace("\n", " ")
-        published = entry.find("atom:published", NS).text
+        published = published_elem.text
         year = published[:4]
         url = entry.find("atom:id", NS).text.strip()
         arxiv_id = url.split("/abs/")[-1]

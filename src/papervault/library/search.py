@@ -23,10 +23,14 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from typing import Optional
+from weakref import WeakValueDictionary
 
 import requests
 
-from .polite_http import polite_get
+from papervault.config import polite_v2_enabled
+
+from .polite_http import get_ledger, polite_get
+from .politeness_v2 import Scope
 
 # Resolved by NAME via module globals() in the backend registry (search_<backend>),
 # so they read as "unused" to the linter — keep them imported.
@@ -298,6 +302,11 @@ CORE_MIN_INTERVAL = 6.0
 
 _LAST_CALL: dict[str, float] = {}
 _PACE_LOCK: dict[str, asyncio.Lock] = {}
+# Hold a strong local reference while using a lock. Idle locks and their loop
+# keys can then expire, including after short-lived asyncio.run() callers.
+_POLITE_FETCH_LOCKS: WeakValueDictionary[
+    tuple[asyncio.AbstractEventLoop, str], asyncio.Lock
+] = WeakValueDictionary()
 
 
 def _interval_for(backend: str) -> float:
@@ -603,7 +612,9 @@ async def _fetch_one_backend(
     ``gather`` (R3-F5).
 
     Pacing (``_pace``) runs FIRST — OUTSIDE the ``wait_for`` — so the per-backend
-    min-interval wait does NOT count against the 30s fetch timeout.
+    min-interval wait does NOT count against the 30s fetch timeout. Polite-v2
+    API backends also serialize pacing and fetching per loop/backend, waiting
+    for ledger windows before submitting to the fetch pool.
 
     Tags every surviving result with its provenance at fetch time:
       - ``_source_origin="external"`` (the §4a partition is library-positive;
@@ -649,9 +660,23 @@ async def _fetch_one_backend(
     fn_kwargs = {"max_results": max_n}
     if backend_name == "arxiv":
         fn_kwargs["sort_by_recency"] = sort_by_recency
-    await _pace(backend_name, _interval_for(backend_name))
     try:
-        raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
+        if (polite_v2_enabled()
+                and backend_name in {"arxiv", "semantic_scholar", "openalex"}
+                and getattr(backend_fn, "__module__", "").startswith("papervault.library.")):
+            key = (asyncio.get_running_loop(), backend_name)
+            lock = _POLITE_FETCH_LOCKS.get(key)
+            if lock is None:
+                lock = _POLITE_FETCH_LOCKS[key] = asyncio.Lock()
+            async with lock:
+                await _pace(backend_name, _interval_for(backend_name))
+                while (not (decision := get_ledger().gate(Scope(backend_name))).allowed
+                       and decision.reason == "window" and decision.retry_after > 0):
+                    await asyncio.sleep(decision.retry_after)
+                raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
+        else:
+            await _pace(backend_name, _interval_for(backend_name))
+            raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
         if not isinstance(raw, list) or any(not isinstance(paper, dict) for paper in raw):
             raise backend_degraded(ValueError("invalid backend results"))
         results = [_normalize_paper(p, backend_name) for p in raw]

@@ -8,6 +8,7 @@ import pytest
 @pytest.mark.parametrize("prepared", [True, False])
 async def test_cold_catalog_pool_never_bootstraps_extensions_or_runs_legacy_migrations(monkeypatch, prepared):
     from lightrag.kg import postgres_impl as backend
+    import pgvector.asyncpg as pgvector_asyncpg
     from papervault.knowledge.store.catalog_storage import acquire_catalog_client
 
     config = backend.ClientManager.get_config(vector_storage="PGVectorStorage")
@@ -56,7 +57,7 @@ async def test_cold_catalog_pool_never_bootstraps_extensions_or_runs_legacy_migr
     monkeypatch.setattr(backend.ClientManager, "get_config", lambda **kwargs: config)
     monkeypatch.setattr(backend.asyncpg, "connect", connect)
     monkeypatch.setattr(backend.asyncpg, "create_pool", create_pool)
-    monkeypatch.setattr(backend, "register_vector", register_vector)
+    monkeypatch.setattr(pgvector_asyncpg, "register_vector", register_vector)
     monkeypatch.setattr(backend.PostgreSQLDB, "check_tables", forbidden_check_tables)
 
     if not prepared:

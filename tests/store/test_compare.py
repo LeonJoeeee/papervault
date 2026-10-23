@@ -7,6 +7,8 @@ from pathlib import Path
 import subprocess
 import sys
 
+import pytest
+
 
 class Records:
     def __init__(self, *records):
@@ -110,3 +112,65 @@ def test_comparator_reports_relational_alias_drift():
     report = compare_catalog(left, right)
     assert report["different"] == 1
     assert report["differences"][0]["fields"]["alias"] == {"json": None, "postgres": "B"}
+
+
+@pytest.mark.parametrize(("identifiers", "columns"), [
+    ({"doi": " 10.1234/Retained "}, {"doi": "10.1234/retained"}),
+    ({"arxiv_id": " 2101.12345V2 "}, {"arxiv_id": "2101.12345v2"}),
+    ({"doi": " 10.1234/Retained ", "arxiv_id": " 2101.12345V2 "},
+     {"doi": "10.1234/retained", "arxiv_id": "2101.12345v2"}),
+])
+def test_export_snapshot_comparison_accepts_retained_legacy_alias_columns(tmp_path, identifiers, columns):
+    from papervault.store.adapter import LibraryAdapter
+    from papervault.store.compare import compare_catalog
+    from papervault.store.repository import Record
+
+    canonical = Record.from_payload("A", {"key": "A"})
+    alias = Record.from_payload("B", {"key": "B", **identifiers,
+        "terminal_state": {"merge": "alias", "alias_key": "A"}})
+    snapshot = tmp_path / "index.json"
+    snapshot.write_text(json.dumps({"version": 1, "papers": {"A": canonical.payload, "B": alias.payload}}))
+    report = compare_catalog(LibraryAdapter.from_snapshot(snapshot),
+                             Records(canonical, replace(alias, **columns)))
+    assert report["compared"] == 2
+    assert report["differences"] == []
+    assert report["difference_rate"] == 0
+
+
+@pytest.mark.parametrize(("drift", "expected_fields"), [
+    ("different_doi", {"doi"}), ("different_arxiv_version", {"arxiv_id"}),
+    ("unnormalized_doi", {"doi"}), ("unnormalized_arxiv", {"arxiv_id"}),
+    ("different_payload", {"doi", "arxiv_id", "payload_sha256"}),
+    ("canonical", {"doi", "arxiv_id"}),
+    ("one_canonical", {"doi", "arxiv_id", "merge"}),
+    ("left_identifier", {"doi"}), ("reverse", {"doi", "arxiv_id"}),
+    ("title", {"title"}),
+])
+def test_retained_alias_exception_does_not_hide_catalog_drift(drift, expected_fields):
+    from papervault.store.compare import record_differences
+    from papervault.store.repository import Record
+
+    left = Record.from_payload("B", {"key": "B", "doi": "10.1234/Retained",
+        "arxiv_id": "2101.12345V2", "terminal_state": {"merge": "alias", "alias_key": "A"}})
+    right = replace(left, doi="10.1234/retained", arxiv_id="2101.12345v2")
+    if drift == "different_doi":
+        right = replace(right, doi="10.1234/other")
+    elif drift == "different_arxiv_version":
+        right = replace(right, arxiv_id="2101.12345v3")
+    elif drift == "unnormalized_doi":
+        right = replace(right, doi="10.1234/Retained")
+    elif drift == "unnormalized_arxiv":
+        right = replace(right, arxiv_id="2101.12345V2")
+    elif drift == "different_payload":
+        right = replace(right, payload={**right.payload, "legacy": "changed"})
+    elif drift == "canonical":
+        left, right = replace(left, merge="canonical"), replace(right, merge="canonical")
+    elif drift == "one_canonical":
+        right = replace(right, merge="canonical")
+    elif drift == "left_identifier":
+        left = replace(left, doi="10.1234/other")
+    elif drift == "reverse":
+        left, right = right, left
+    elif drift == "title":
+        right = replace(right, title="Column drift")
+    assert set(record_differences(left, right)) == expected_fields

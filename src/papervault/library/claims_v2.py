@@ -632,6 +632,15 @@ class ClaimStore:
             check_index_readable(self.library.root)
             paper = self.library.get(key)
             claim = self.recovery_claim(key)
+            if claim is None:
+                if (paper is None or not paper.acquisition_state.quarantine
+                        or paper.acquisition_state.merge != Merge.CANONICAL
+                        or paper.acquisition_state.alias_key or paper.merge_intent is not None
+                        or expected_lease_id or drained_lease_id or not human_reason.strip()):
+                    return False
+                paper.terminal_state = replace(paper.acquisition_state, quarantine=False)
+                self.save()
+                return True
             fenced = self._release_fence(claim) if claim is not None else None
             if (paper is None or claim is None or not paper.acquisition_state.quarantine
                     or (expected_lease_id and claim.lease_id != expected_lease_id)

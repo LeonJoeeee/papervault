@@ -129,9 +129,9 @@ def guard_execution(work):
                         async with concurrency.lib_write_lock:
                             check_index_readable(library.root)
                             current = library.get(paper.key)
-                            if current is not None:
+                            if current is not None and current.merge_intent is not None:
                                 intent = current.merge_intent
-                                keys = (intent.canonical_key, intent.absorbed_key) if intent else (paper.key,)
+                                keys = (intent.canonical_key, intent.absorbed_key)
                                 for key in keys:
                                     row = library.get(key)
                                     if row is not None:

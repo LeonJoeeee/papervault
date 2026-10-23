@@ -752,6 +752,31 @@ async def test_remaining_merged_budget_can_fund_next_generation(pair):
     assert ledger.admitted(token)
 
 
+async def test_async_cancellation_without_merge_preserves_persisted_state(pair):
+    from papervault.library.merge_v2 import guard_execution
+
+    lib, left, _, ledger, _ = pair
+    before = left.model_dump(mode="json")
+    index_before = lib.index_path.read_bytes()
+    started = asyncio.Event()
+
+    @guard_execution
+    async def execute(paper, library):
+        started.set()
+        await asyncio.Event().wait()
+
+    worker = asyncio.create_task(execute(left, lib))
+    await started.wait()
+    worker.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker
+
+    assert Library(lib.root).get(left.key).model_dump(mode="json") == before
+    assert lib.index_path.read_bytes() == index_before
+    assert left.model_dump(mode="json") == before
+    assert not ledger.events()
+
+
 async def test_async_cancellation_persists_uncertain_merge_barrier(pair):
     from papervault.library.merge_v2 import guard_execution, MergeStore
     lib, left, right, ledger, now = pair
@@ -769,7 +794,10 @@ async def test_async_cancellation_persists_uncertain_merge_barrier(pair):
         await worker
     assert not await merge.drain_ready(intent)
     restarted = Library(lib.root)
-    assert restarted.get(left.key).merge_intent.status == "uncertain"
+    for paper in (left, right):
+        persisted = restarted.get(paper.key)
+        assert persisted.merge_intent.status == "uncertain"
+        assert persisted.terminal_state.quarantine is True
     assert await MergeStore(restarted, ledger=ledger, clock=lambda: now[0]).merge_records(left.key, right.key) is None
 
 

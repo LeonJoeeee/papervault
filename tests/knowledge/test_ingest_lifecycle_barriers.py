@@ -63,3 +63,46 @@ def test_legacy_clean_index_accepts_current_key_bound_scoped_override(tmp_path):
             "key": "allowed", "scope": ["acquire"], "reasons": ["off_domain"], "revision": 3}}}
     (tmp_path / "index.json").write_text(json.dumps({"version": 1, "papers": {"allowed": entry}}))
     assert set(load_vault_index(tmp_path)) == {"allowed"}
+
+
+@pytest.mark.parametrize("download_status", ["ok", "extract_failed", "metadata_only", "failed"])
+def test_materialized_legacy_terminal_remains_ingestible(tmp_path, download_status):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import derive_legacy
+
+    paper = Paper(key="legacy", download_status=download_status)
+    paper.terminal_state = derive_legacy(paper)
+    entry = paper.model_dump(mode="json")
+    (tmp_path / "index.json").write_text(json.dumps({"version": 1, "papers": {"legacy": entry}}))
+    assert set(load_vault_index(tmp_path)) == {"legacy"}
+
+
+@pytest.mark.parametrize(("retrieval", "download_status"), [
+    ("verified", ""), ("acquired", ""), ("exhausted", ""),
+    ("ineligible", "ok"), ("ineligible", "extract_failed"),
+    ("ineligible", "metadata_only"), ("ineligible", "failed"),
+])
+def test_unknown_policy_accepts_terminal_evidence(retrieval, download_status):
+    record = PaperRecord(key="legacy", download_status=download_status,
+                         terminal_state={"policy": "unknown", "retrieval": retrieval})
+    assert record.eligible
+
+
+@pytest.mark.parametrize("restriction", [
+    {"policy_reasons": ["off_domain"]}, {"required_revision": 1},
+    {"override": {"key": "legacy", "scope": ["acquire"], "revision": 1}},
+    {"quarantine": True}, {"merge": "alias", "alias_key": "canonical"},
+    {"alias_key": "canonical"},
+])
+def test_legacy_terminal_evidence_never_clears_recorded_restrictions(restriction):
+    record = PaperRecord(key="legacy", download_status="ok", terminal_state={
+        "policy": "unknown", "retrieval": "verified", **restriction})
+    assert not record.eligible
+
+
+@pytest.mark.parametrize("retrieval", ["ineligible", "eligible", "in-progress"])
+@pytest.mark.parametrize("download_status", ["", "pending"])
+def test_unknown_policy_without_terminal_evidence_remains_ineligible(retrieval, download_status):
+    record = PaperRecord(key="legacy", download_status=download_status,
+                         terminal_state={"policy": "unknown", "retrieval": retrieval})
+    assert not record.eligible

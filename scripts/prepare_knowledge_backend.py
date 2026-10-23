@@ -40,8 +40,8 @@ _KEY_CHECK = (
 
 def _pinned_tables():
     distribution = metadata.distribution("lightrag-hku")
-    if distribution.version != "1.5.4":
-        raise RuntimeError("backend preparation requires reviewed lightrag-hku==1.5.4")
+    if distribution.version != "1.5.7":
+        raise RuntimeError("backend preparation requires reviewed lightrag-hku==1.5.7")
     # Read literal schema data without importing LightRAG's dotenv/bootstrap code.
     source = distribution.locate_file("lightrag/kg/postgres_impl.py").read_text()
     tree = ast.parse(source)
@@ -86,7 +86,7 @@ def preparation_plan(*, embedding_dim, embedding_model_name=None, vector_type="v
             r"^\s*([a-zA-Z_][a-zA-Z0-9_]*)\s+(?:varchar|text|jsonb|integer|int4|bigint|timestamp|vector|halfvec)\b",
             ddl, flags=re.I | re.M)
         tables.append(table)
-    return {"dependency": "lightrag-hku==1.5.4", "embedding_dim": embedding_dim,
+    return {"dependency": "lightrag-hku==1.5.7", "embedding_dim": embedding_dim,
             "embedding_model_name": embedding_model_name, "vector_type": vector_type,
             "tables": tables, "columns": columns, "postgres": statements, "neo4j": list(_NEO4J)}
 

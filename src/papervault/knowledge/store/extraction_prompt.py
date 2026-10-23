@@ -22,7 +22,7 @@ HOW, on LightRAG 1.5.x (ported 2026-07-17; the 1.4.x mechanics are retired):
 Call ``apply_ks_extraction_prompt()`` BEFORE any ainsert (``get_graph()`` does). The strings
 must contain no literal braces other than the placeholders LightRAG .format()-substitutes.
 
-FAIL-LOUD: this anchors on 1.5.x prompt internals (pin: ``lightrag-hku>=1.5,<1.6``). If the
+FAIL-LOUD: this anchors on 1.5.x prompt internals (pin: ``lightrag-hku==1.5.7``). If the
 anchor sentence is missing, we RAISE instead of building a silently degraded graph. Same for
 ``ENTITY_EXTRACTION_USE_JSON``: JSON extraction mode reads ``entity_extraction_json_examples``,
 which we do not patch — refuse rather than run with stock examples.
@@ -46,7 +46,7 @@ KS_EXAMPLES = get_domain().extraction_examples
 _EXCLUSIONS = get_domain().extraction_exclusions
 
 # --- The one remaining monkeypatch: kill 1.5.x's `Other` escape hatch. Anchored on the
-# exact vendored sentence (prompt.py line ~62 in 1.5.4).
+# exact vendored sentence (prompt.py line ~64 in 1.5.7).
 _OTHER_CATCHALL_15 = (
     "If none of the provided entity types apply, classify it as `Other`."
 )

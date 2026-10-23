@@ -1162,7 +1162,7 @@ wheels = [
 
 [[package]]
 name = "lightrag-hku"
-version = "1.5.4"
+version = "1.5.7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1186,9 +1186,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "xlsxwriter" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/77/02/154120751550ec5ce8edb2ba6cc599c3e232dc9b9b01858fc09de2189c02/lightrag_hku-1.5.4.tar.gz", hash = "sha256:48737d21ec545e36d1d495a28b067f28f78136fe5f8b0b31d7f12632244b302c", size = 4094726, upload-time = "2026-06-24T10:25:02.446Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/cc/dd/6bba8d88a07a50a6569de6eb1fc059d57dfdaafdfe9355ea767aab007978/lightrag_hku-1.5.7.tar.gz", hash = "sha256:4d2cbb3f983b2bec209f4f154845869fc9e5800a7a2a9bb7005ba7610f4fbe0a", size = 4921093, upload-time = "2026-09-02T07:24:50.999Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/30/1c/98bafa29b030be57e96f5f0ebe21dc6908ad308abfc0b9e6efeea4952cf4/lightrag_hku-1.5.4-py3-none-any.whl", hash = "sha256:3bb28b2a763a91fb11b9ac87798140be852891edf71266cff59018d23afeea9d", size = 4216903, upload-time = "2026-06-24T10:25:00.12Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/29/44c9df718091da249c9d06967452f0f06560c58d0fdee26e57e6ac8dd25a/lightrag_hku-1.5.7-py3-none-any.whl", hash = "sha256:895b81d94ca447afc6290c0e049d339f6caed46fbf29e4324f6db987046c6fcb", size = 5039835, upload-time = "2026-09-02T07:24:48.959Z" },
 ]
 
 [[package]]
@@ -2023,7 +2023,7 @@ wheels = [
 
 [[package]]
 name = "papervault"
-version = "0.10.9"
+version = "0.10.10"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
@@ -2079,7 +2079,7 @@ requires-dist = [
     { name = "firecrawl-py", marker = "extra == 'grey'", specifier = ">=1.0" },
     { name = "flagembedding", specifier = ">=1.3" },
     { name = "httpx", specifier = ">=0.27" },
-    { name = "lightrag-hku", specifier = "==1.5.4" },
+    { name = "lightrag-hku", specifier = "==1.5.7" },
     { name = "litellm", specifier = ">=1.70" },
     { name = "mcp", specifier = ">=1.27.1,<2" },
     { name = "neo4j", specifier = ">=6.2.0" },

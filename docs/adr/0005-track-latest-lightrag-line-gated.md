@@ -31,8 +31,17 @@ new baseline supersedes it.
 
 ## Amendment — breaker deferral adapter (#148, 2026-10-07)
 
-The maintainer-approved pause adapter binds to private document-pipeline hooks in 1.5.4.
+The maintainer-approved pause adapter binds to private document-pipeline hooks, now ported
+to 1.5.7 under #313 (originally 1.5.4).
 The package requirement now pins that exact patch, matching the lockfile and runtime version
 guard; clean installs must not resolve a newer patch that the adapter has not been ported to.
 A patch upgrade must update the adapter guard and pass its queue-deferral/recovery tests as
 well as the existing port gates. The bounded minor-line policy remains the upgrade direction.
+
+The 1.5.7 patch port forwards batch ingress/owner arguments and preserves the run context
+on deferred status transitions. Catalog retirement preserves the rebuild report and unpacks
+the extraction-cache tuple. Catalog status-field updates materialize inherited rows under
+the namespace write fence, and layered reads accept the scheduler's single-status pages.
+Raw-workspace source-conflict repair is refused for catalog storage; it requires an isolated
+rebuild. The preparation schema literals remain unchanged; its reviewed dependency pin moves
+with the runtime. Historical 1.5.4 probe/recall evidence remains historical, not a 1.5.7 result.

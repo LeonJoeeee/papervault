@@ -1,4 +1,4 @@
-"""Breaker deferral at LightRAG 1.5.4's document failure boundary (#148).
+"""Breaker deferral at LightRAG 1.5.7's document failure boundary (#148).
 
 The stock pipeline consumes per-document exceptions before callers can catch them.
 This adapter preserves its workers, task cleanup and ordinary failure handling, but
@@ -20,7 +20,7 @@ from papervault.knowledge.store.build_breaker import (
 )
 
 _PAUSED = "papervault_build_paused"
-_SUPPORTED_VERSION = "1.5.4"
+_SUPPORTED_VERSION = "1.5.7"
 
 
 def is_build_paused(error: BaseException) -> bool:
@@ -43,12 +43,12 @@ class BuildAwareLightRAG(LightRAG):
                 f"found {installed}. Port the private pipeline hooks before upgrading.")
         super().__post_init__(addon_params)
 
-    async def _run_pipeline_batch(self, to_process_docs, *, pipeline_status, pipeline_status_lock):
+    async def _run_pipeline_batch(self, to_process_docs, *, pipeline_status, pipeline_status_lock, **kwargs):
         async with pipeline_status_lock:
             pipeline_status[_PAUSED] = False
         await super()._run_pipeline_batch(
             to_process_docs, pipeline_status=pipeline_status,
-            pipeline_status_lock=pipeline_status_lock)
+            pipeline_status_lock=pipeline_status_lock, **kwargs)
         if pipeline_status.get(_PAUSED):
             # All workers have wound down and every queue join completed. Stop the outer
             # pipeline from consuming request_pending and starting another batch this round.
@@ -57,7 +57,7 @@ class BuildAwareLightRAG(LightRAG):
     async def process_single_document(self, *, doc_id, status_doc, parsed_data, ctx):
         if ctx.pipeline_status.get(_PAUSED) or not get_breaker().allows():
             await self._defer_document(
-                doc_id=doc_id, status_doc=status_doc, file_path=status_doc.file_path,
+                doc_id=doc_id, status_doc=status_doc, file_path=status_doc.file_path, ctx=ctx,
                 pipeline_status=ctx.pipeline_status, pipeline_status_lock=ctx.pipeline_status_lock,
                 failed_chunks_snapshot=(status_doc.chunks_list or [], status_doc.chunks_count or 0))
             return
@@ -80,13 +80,13 @@ class BuildAwareLightRAG(LightRAG):
             doc_id=kwargs["doc_id"], status_doc=kwargs["status_doc"],
             file_path=kwargs["file_path"], pipeline_status=kwargs["pipeline_status"],
             pipeline_status_lock=kwargs["pipeline_status_lock"],
-            failed_chunks_snapshot=kwargs["failed_chunks_snapshot"])
+            failed_chunks_snapshot=kwargs["failed_chunks_snapshot"], ctx=kwargs.get("ctx"))
 
     async def _defer_document(self, *, doc_id, status_doc, file_path, pipeline_status,
-                              pipeline_status_lock, failed_chunks_snapshot):
+                              pipeline_status_lock, failed_chunks_snapshot, ctx):
         async with pipeline_status_lock:
             pipeline_status[_PAUSED] = True
         chunks, count = failed_chunks_snapshot
         await self._upsert_doc_status_transition(
-            doc_id=doc_id, status=DocStatus.PENDING, status_doc=status_doc, file_path=file_path,
+            doc_id=doc_id, status=DocStatus.PENDING, status_doc=status_doc, file_path=file_path, ctx=ctx,
             extra_fields={"error_msg": "", "chunks_list": chunks, "chunks_count": count})

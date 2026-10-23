@@ -162,7 +162,7 @@ async def test_pinned_rebuilder_hidden_failure_history_prevents_retirement_seal(
     adapter, repo, claim, finalized = await _delivery(tmp_path, delete)
     with pytest.raises(RuntimeError, match="retir|rebuild"):
         await adapter.submit(claim, "actual content", "one")
-    assert any("Failed" in message or "cannot rebuild" in message for message in observed)
+    assert any("Failed" in message or "No cached extraction results found" in message for message in observed)
     assert repo.accepted and repo.receipt is None and not repo.sealed
     assert finalized == [True]
 
@@ -199,11 +199,10 @@ async def test_clean_retirement_ignores_entity_names_and_other_workspace_failure
 async def memory_rag_for_retirement(claim, *, pause=None, kind="entity", cache_case="complete", wrap_pause=False,
                                     summary_result="summary from remaining evidence", summary_cache=None, on_summary=None):
     """Real pinned deletion/reducer over memory stores; only the LLM/backend are doubles."""
-    from functools import partial
     from lightrag import LightRAG
-    from lightrag.base import DocStatus
+    from lightrag.base import DocStatus, DocStatusStorage
     from lightrag.prompt import PROMPTS
-    from lightrag.utils import compute_mdhash_id
+    from lightrag.utils import Tokenizer, compute_mdhash_id
 
     class Store:
         def __init__(self, namespace, rows=None):
@@ -219,7 +218,20 @@ async def memory_rag_for_retirement(claim, *, pause=None, kind="entity", cache_c
             return [deepcopy(self.rows.get(key)) for key in keys]
 
         async def upsert(self, rows):
-            self.rows.update(deepcopy(rows))
+            rows = deepcopy(rows)
+            if self.namespace in {"entities_vdb", "relationships_vdb"}:
+                # Mirror PostgreSQL's vector payload projection at the backend boundary.
+                for key, row in rows.items():
+                    row.update(id=key, chunk_ids=row["source_id"].split("<SEP>"))
+                    if self.namespace == "relationships_vdb":
+                        row.update(source_id=row.pop("src_id"), target_id=row.pop("tgt_id"))
+            self.rows.update(rows)
+
+        async def get_vectors_by_ids(self, keys):
+            return {key: [1.0] for key in keys if key in self.rows}
+
+        # Use the dependency's field-update contract for the deletion recovery journal.
+        update_doc_status_fields = DocStatusStorage.update_doc_status_fields
 
         async def delete(self, keys):
             for key in keys:
@@ -276,7 +288,7 @@ async def memory_rag_for_retirement(claim, *, pause=None, kind="entity", cache_c
         async def index_done_callback(self):
             pass
 
-    class Tokenizer:
+    class ByteTokenizer:
         def encode(self, text):
             return list(text.encode())
 
@@ -295,8 +307,10 @@ async def memory_rag_for_retirement(claim, *, pause=None, kind="entity", cache_c
             raise pause
         return summary_result
 
-    rag = SimpleNamespace(workspace=claim["namespace"], chunk_entity_relation_graph=Graph(),
-                          llm_calls=calls, finalized=False)
+    # Keep the full pinned deletion/purge/flush helper chain real, with memory backends.
+    rag = object.__new__(LightRAG)
+    rag.workspace, rag.chunk_entity_relation_graph = claim["namespace"], Graph()
+    rag.llm_calls, rag.finalized = calls, False
     for role in ("full_docs", "text_chunks", "full_entities", "full_relations", "entity_chunks",
                  "relation_chunks", "llm_response_cache", "doc_status", "chunks_vdb", "entities_vdb",
                  "relationships_vdb"):
@@ -345,14 +359,12 @@ async def memory_rag_for_retirement(claim, *, pause=None, kind="entity", cache_c
         "max_source_ids_per_entity": 1 if cache_case == "limited-no-data" else 100,
         "max_source_ids_per_relation": 1 if cache_case == "limited-no-data" else 100,
         "summary_context_size": 10000, "summary_max_tokens": 10000,
-        "summary_length_recommended": 100, "force_llm_summary_on_merge": 2, "tokenizer": Tokenizer()}
+        "summary_length_recommended": 100, "force_llm_summary_on_merge": 2,
+        "tokenizer": Tokenizer(model_name="fixture", tokenizer=ByteTokenizer())}
     rag.llm_response_cache.global_config = {"enable_llm_cache": False,
         "enable_llm_cache_for_entity_extract": summary_cache is not None}
     rag._build_global_config = lambda: config
     rag._index_storages = lambda: [value for value in vars(rag).values() if isinstance(value, Store)]
-    for method in ("adelete_by_doc_id", "_insert_done", "_update_delete_retry_state"):
-        setattr(rag, method, partial(getattr(LightRAG, method), rag))
-
     async def finalize():
         rag.finalized = True
 
@@ -366,6 +378,61 @@ def retirement_repository(rag):
     repo = Repository()
     repo.get_receipt = lambda receipt_id: deepcopy(rag.retired_receipt)
     return repo
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["entity", "relationship"])
+async def test_real_retirement_rebuild_removes_only_retired_evidence(kind):
+    from papervault.knowledge.store.catalog_adapter import CatalogLightRAGAdapter
+
+    claim = {**CLAIM, "namespace": "clean_retirement_" + uuid4().hex, "retired_receipt_ids": ["retired"]}
+    rag = await memory_rag_for_retirement(claim, kind=kind)
+    await CatalogLightRAGAdapter(retirement_repository(rag))._retire(rag, claim)
+    assert await rag.doc_status.get_by_id("old-doc") is None
+    assert await rag.text_chunks.get_by_id("old:0") is None
+    graph = rag.chunk_entity_relation_graph
+    row = await graph.get_node("Shared") if kind == "entity" else await graph.get_edge("Shared", "Neighbor")
+    assert set(row["source_id"].split("<SEP>")) == {"remain:1", "remain:2"}
+    assert row["description"] == "summary from remaining evidence"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cache_shape", ["tuple", "dict"])
+async def test_retirement_cache_validation_accepts_complete_evidence_in_both_shapes(monkeypatch, cache_shape):
+    import lightrag.operate as operate
+    from papervault.knowledge.store.catalog_adapter import _RetirementRebuild
+
+    rag = await memory_rag_for_retirement({"namespace": "cache_shape_" + uuid4().hex})
+    original = operate._get_cached_extraction_results
+
+    async def cached(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        return result if cache_shape == "tuple" else result[0]
+
+    monkeypatch.setattr(operate, "_get_cached_extraction_results", cached)
+    await _RetirementRebuild._validate({"entities_to_rebuild": {"Shared": ["remain:1", "remain:2"]},
+        "relationships_to_rebuild": {}, "llm_response_cache": rag.llm_response_cache,
+        "text_chunks_storage": rag.text_chunks, "global_config": rag._build_global_config()})
+
+
+@pytest.mark.asyncio
+async def test_retirement_rebuild_preserves_original_report():
+    import lightrag.lightrag as dependency
+    from lightrag.operate import KGRebuildReport
+    from lightrag.kg.shared_storage import get_namespace_lock
+    from papervault.knowledge.store.catalog_adapter import _retirement_rebuild
+
+    rag = await memory_rag_for_retirement({"namespace": "rebuild_report_" + uuid4().hex})
+    pipeline = await _pipeline(rag.workspace)
+    with _retirement_rebuild(rag):
+        report = await dependency.rebuild_knowledge_from_chunks(
+            entities_to_rebuild={"Shared": ["remain:1", "remain:2"]}, relationships_to_rebuild={},
+            knowledge_graph_inst=rag.chunk_entity_relation_graph, entities_vdb=rag.entities_vdb,
+            relationships_vdb=rag.relationships_vdb, text_chunks_storage=rag.text_chunks,
+            llm_response_cache=rag.llm_response_cache, global_config=rag._build_global_config(),
+            pipeline_status=pipeline, pipeline_status_lock=get_namespace_lock("pipeline_status", workspace=rag.workspace))
+    assert isinstance(report, KGRebuildReport) and not report.has_warnings
+    assert (await rag.chunk_entity_relation_graph.get_node("Shared"))["description"] == "summary from remaining evidence"
 
 
 @pytest.mark.asyncio

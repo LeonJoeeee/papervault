@@ -70,7 +70,7 @@ async def test_pg_kv_retains_explicit_workspace_and_releases_original_client(mon
     released = []
 
     async def acquire(**kwargs):
-        db.vector_enabled = ClientManager.get_config(**kwargs)["enable_vector"]
+        db.vector_enabled = ClientManager.get_config(vector_storage="PGVectorStorage")["enable_vector"]
         return db
 
     async def release(client):
@@ -101,6 +101,152 @@ async def test_sealed_namespace_blocks_kv_write_before_database_io():
     gate.sealed = True
     with pytest.raises(RuntimeError, match="sealed"):
         await storage.upsert({"doc": {"content": "unsafe"}})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("read_only", [False, True])
+@pytest.mark.parametrize("method", ["update_doc_status_fields", "repair_source_conflict"])
+async def test_doc_status_mutations_respect_catalog_fences(read_only, method):
+    from papervault.knowledge.store.catalog_storage import CatalogPGDocStatusStorage, storage_binding
+
+    class DB:
+        async def query(self, *args, **kwargs):
+            pytest.fail("fenced mutation reached the database")
+
+        async def _run_with_retry(self, *args, **kwargs):
+            pytest.fail("fenced repair reached the database")
+
+    gate = Gate()
+    with storage_binding(gate, {"namespace": "pv_private"}, read_only=read_only):
+        storage = CatalogPGDocStatusStorage(namespace="doc_status", workspace="pv_private",
+                                           global_config={}, embedding_func=None)
+    storage.db = DB()
+    gate.sealed = True
+    with pytest.raises(RuntimeError, match="read.only" if read_only else "sealed"):
+        if method == "update_doc_status_fields":
+            await storage.update_doc_status_fields("doc", {"metadata": {"kg_purge": {}}})
+        else:
+            await storage.repair_source_conflict("one", primary_doc_id="doc",
+                expected_candidate_count=2, expected_candidate_fingerprint="old", dry_run=False)
+
+
+@pytest.mark.asyncio
+async def test_catalog_source_conflict_repair_requires_isolated_rebuild():
+    from papervault.knowledge.store.catalog_storage import CatalogPGDocStatusStorage, storage_binding
+
+    with storage_binding(Gate(), {"namespace": "pv_private"}):
+        storage = CatalogPGDocStatusStorage(namespace="doc_status", workspace="pv_private",
+                                           global_config={}, embedding_func=None)
+    with pytest.raises(RuntimeError, match="isolated rebuild"):
+        await storage.repair_source_conflict("one", primary_doc_id="doc",
+            expected_candidate_count=2, expected_candidate_fingerprint="old", dry_run=False)
+
+
+@pytest.mark.asyncio
+async def test_status_field_update_materializes_inherited_row_in_private_delta():
+    from copy import deepcopy
+    from datetime import datetime
+    import json
+    from papervault.knowledge.store.catalog_storage import (
+        CatalogPGDocStatusStorage, LayeredPostgresDB, storage_binding,
+    )
+
+    base = {"id": "doc", "workspace": "base", "status": "processed", "content_summary": "body",
+        "content_length": 4, "chunks_count": 1, "chunks_list": ["saved"], "file_path": "one",
+        "metadata": {"original": True}, "created_at": datetime(2026, 10, 1),
+        "updated_at": datetime(2026, 10, 1)}
+    private = {}
+
+    class DB:
+        async def query(self, sql, params=None, **kwargs):
+            assert sql.startswith("WITH _pv_visible")
+            assert params[:2] == [["base", "pv_private"], "doc"]
+            return [deepcopy(base)]
+
+        async def _run_with_retry(self, callback, **kwargs):
+            return await callback(self)
+
+        @asynccontextmanager
+        async def transaction(self):
+            yield self
+
+        async def executemany(self, sql, data):
+            assert sql.startswith("insert into LIGHTRAG_DOC_STATUS")
+            for row in data:
+                assert row[:2] == ("pv_private", "doc")
+                private.update(status=row[5], chunks_list=json.loads(row[7]), metadata=json.loads(row[9]),
+                               created_at=row[12])
+
+    gate = Gate()
+    with storage_binding(gate, {"namespace": "pv_private"}):
+        storage = CatalogPGDocStatusStorage(namespace="doc_status", workspace="pv_private",
+                                           global_config={}, embedding_func=None)
+    storage.db = LayeredPostgresDB(DB(), ["base", "pv_private"], [], "doc_status")
+    await storage.update_doc_status_fields("doc", {"metadata": {"kg_purge": {"phase": "prepared"}}})
+    assert private == {"status": "processed", "chunks_list": ["saved"],
+                       "metadata": {"kg_purge": {"phase": "prepared"}}, "created_at": datetime(2026, 10, 1)}
+    assert base["metadata"] == {"original": True} and base["chunks_list"] == ["saved"]
+    assert gate.entries > 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fields", [{"created_at": "new"}, {"unknown": "value"}])
+async def test_status_field_update_rejects_invalid_fields_before_io(fields):
+    from papervault.knowledge.store.catalog_storage import CatalogPGDocStatusStorage, storage_binding
+
+    with storage_binding(Gate(), {"namespace": "pv_private"}):
+        storage = CatalogPGDocStatusStorage(namespace="doc_status", workspace="pv_private",
+                                           global_config={}, embedding_func=None)
+    with pytest.raises(ValueError):
+        await storage.update_doc_status_fields("doc", fields)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_ok", [False, True])
+async def test_status_field_update_preserves_missing_record_contract(missing_ok):
+    from lightrag.exceptions import StorageRecordNotFoundError
+    from papervault.knowledge.store.catalog_storage import CatalogPGDocStatusStorage, storage_binding
+
+    class DB:
+        async def query(self, *args, **kwargs):
+            return None
+
+    with storage_binding(Gate(), {"namespace": "pv_private"}):
+        storage = CatalogPGDocStatusStorage(namespace="doc_status", workspace="pv_private",
+                                           global_config={}, embedding_func=None)
+    storage.db = DB()
+    if missing_ok:
+        await storage.update_doc_status_fields("missing", {"status": "pending"}, missing_ok=True)
+    else:
+        with pytest.raises(StorageRecordNotFoundError):
+            await storage.update_doc_status_fields("missing", {"status": "pending"})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("statuses", [["failed"], ["pending", "failed"]])
+async def test_layered_status_pages_accept_pinned_scheduler_queries(statuses):
+    from datetime import datetime
+    from lightrag.base import CURSOR_END, DocStatus
+    from papervault.knowledge.store.catalog_storage import (
+        CatalogPGDocStatusStorage, LayeredPostgresDB, storage_binding,
+    )
+
+    class DB:
+        async def query(self, sql, params=None, **kwargs):
+            assert sql.startswith("WITH _pv_visible")
+            assert ") SELECT " in sql
+            assert "FROM LIGHTRAG_DOC_STATUS" in sql and "FROM _pv_visible" in sql
+            assert params[0] == ["base", "pv_private"] and params[1] == 2
+            return [{"id": "doc", "status": "failed", "created_at": datetime(2026, 10, 1),
+                     "updated_at": datetime(2026, 10, 1), "file_path": "one", "metadata": {}}]
+
+    with storage_binding(Gate(), {"namespace": "pv_private"}):
+        storage = CatalogPGDocStatusStorage(namespace="doc_status", workspace="pv_private",
+                                           global_config={}, embedding_func=None)
+    storage.db = LayeredPostgresDB(DB(), ["base", "pv_private"], [], "doc_status")
+    page = await storage.get_docs_by_statuses_page([DocStatus(status) for status in statuses], limit=2, strict=True)
+    assert page.docs["doc"].status == DocStatus.FAILED
+    assert page.next_position is CURSOR_END
 
 
 def test_neo4j_constructor_does_not_inherit_environment_workspace(monkeypatch):

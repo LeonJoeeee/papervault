@@ -318,3 +318,61 @@ def test_parse_intent_splits_merged_query_fallback(terms):
         "PAMELA positron spectrum", "PAMELA positron abundance",
         "AMS-02 positron spectrum", "AMS-02 positron abundance",
     ]
+
+
+@pytest.mark.parametrize("query", [
+    "current understanding of cosmic ray transport",
+    "Current Observational Picture of solar energetic particles",
+    "current picture of magnetic reconnection",
+    "current state of heliospheric modeling",
+    "state of the art in particle acceleration",
+    "an overview of solar wind turbulence",
+    "related-work on cosmic rays",
+    "related work on heliospheric transport",
+    "an introduction to space weather",
+    "a survey of magnetic reconnection",
+    "canonical formulations and the more recent model implementations",
+    "largest historical events",
+    "FOUNDATIONAL work and latest progress",
+    "classical transport models",
+    "classic acceleration papers",
+    "seminal work on cosmic rays",
+])
+@pytest.mark.parametrize("hint", ["by_recency", "by_relevance", "by_importance"])
+def test_intent_clears_false_positive_recency_cut(query, hint):
+    class FalseRecencyLLM:
+        def call(self, messages):
+            return json.dumps({
+                "search_terms": ["cosmic ray transport"],
+                "filters": {"year_min": "2020", "year_max": None, "review_pref": "prefer"},
+                "ranking_hint": hint,
+            })
+
+    plan = parse_intent(query, FalseRecencyLLM())
+    assert plan["filters"] == {"year_min": None, "year_max": None, "review_pref": "prefer"}
+    assert plan["ranking_hint"] == ("by_relevance" if hint == "by_recency" else hint)
+
+
+@pytest.mark.parametrize("query,year_min,year_max", [
+    ("recent work on solar wind", 2020, None),
+    ("latest progress in cosmic ray transport", 2023, None),
+    ("recent overview of solar wind", 2020, None),
+    ("state of the art in 2024", 2024, None),
+    ("survey of the last five years", 2021, None),
+    ("overview of the past decade", 2016, None),
+    ("overview of the newest results", 2023, None),
+    ("current understanding this year", 2026, None),
+    ("overview of historical events between 1980 and 1990", 1980, 1990),
+    ("classical acceleration papers from 1960", 1960, 1960),
+    ("contemporary particle acceleration", 2020, None),
+])
+def test_intent_preserves_explicit_recency_and_closed_year_windows(query, year_min, year_max):
+    class DatedLLM:
+        def call(self, messages):
+            return json.dumps({"search_terms": ["solar wind"],
+                               "filters": {"year_min": year_min, "year_max": year_max},
+                               "ranking_hint": "by_recency"})
+
+    plan = parse_intent(query, DatedLLM())
+    assert plan["filters"] == {"year_min": year_min, "year_max": year_max}
+    assert plan["ranking_hint"] == "by_recency"

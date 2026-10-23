@@ -29,7 +29,7 @@ import requests
 
 from papervault.config import polite_v2_enabled
 
-from .polite_http import get_ledger, polite_get
+from .polite_http import PolitenessDenied, get_ledger, polite_get
 from .politeness_v2 import Scope
 
 # Resolved by NAME via module globals() in the backend registry (search_<backend>),
@@ -165,6 +165,8 @@ def search_openalex(query: str, *, max_results: int = 30,
     oa_headers = {"User-Agent": f"paper-pipeline (mailto:{mailto})"}
     try:
         r = polite_get(requests.get, url, params=params, timeout=30, headers=oa_headers)
+        if polite_v2_enabled() and r.status_code == 429:
+            raise backend_degraded(response=r)
         # Retry on 429 (rate limit) AND 409 (conflict/transient). RE-SEND the
         # mailto/User-Agent header on the retry (the prior single re-issue
         # dropped it, dropping OpenAlex into the slow anonymous pool).
@@ -634,7 +636,8 @@ async def _fetch_one_backend(
     lookup, the pacing wait and the thread hop — the backend is not called at
     all — while still recording the pair as DEGRADED. Otherwise the outcome
     feeds the breaker: service-scoped failures count one consecutive degrade;
-    item-scoped failures retain their observations without blaming the service.
+    item-scoped failures and local politeness denials retain their observations
+    without blaming the service.
     A completed fetch resets the counter.
     """
     started = time.monotonic()
@@ -670,9 +673,18 @@ async def _fetch_one_backend(
                 lock = _POLITE_FETCH_LOCKS[key] = asyncio.Lock()
             async with lock:
                 await _pace(backend_name, _interval_for(backend_name))
-                while (not (decision := get_ledger().gate(Scope(backend_name))).allowed
-                       and decision.reason == "window" and decision.retry_after > 0):
-                    await asyncio.sleep(decision.retry_after)
+                admission_deadline = time.monotonic() + FETCH_QUEUE_TIMEOUT_S
+                while not (decision := get_ledger().gate(Scope(backend_name))).allowed:
+                    if decision.reason == "window" and decision.retry_after > 0:
+                        await asyncio.sleep(decision.retry_after)
+                    elif decision.reason == "concurrency":
+                        if time.monotonic() >= admission_deadline:
+                            raise FetchQueueTimeout
+                        await asyncio.sleep(0.05)
+                        if time.monotonic() >= admission_deadline:
+                            raise FetchQueueTimeout
+                    else:
+                        raise PolitenessDenied(f"politeness admission denied: {decision.reason}")
                 raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
         else:
             await _pace(backend_name, _interval_for(backend_name))
@@ -681,7 +693,7 @@ async def _fetch_one_backend(
             raise backend_degraded(ValueError("invalid backend results"))
         results = [_normalize_paper(p, backend_name) for p in raw]
     except FetchQueueTimeout:
-        # Pool starvation means this source was never contacted; preserve the
+        # Admission or pool starvation means this source was never contacted; preserve the
         # historical degraded count without blaming the backend's breaker.
         logger.warning("search: backend %s skipped: no search-fetch thread free", backend_name)
         if degraded_map is not None:
@@ -695,7 +707,8 @@ async def _fetch_one_backend(
         logger.warning("search: backend %s DEGRADED: %s", backend_name, failure.code)
         if degraded_map is not None:
             degraded_map[backend_name] += 1
-        if failure.scope == "service":
+        local_denial = isinstance(error, PolitenessDenied) or isinstance(error.__cause__, PolitenessDenied)
+        if failure.scope == "service" and not local_denial:
             _breaker_record_degraded(backend_name)
         observe("degraded", error=failure)
         return []

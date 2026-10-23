@@ -343,6 +343,18 @@ class SearchPipeline:
         external_ranks = reorder_ranklists_by_rrf(external_ranks, ext_rrf, _identity_key)
         lib_key = lambda node: node["key"]
         lib_rrf = rrf_fuse(local_ranks, lib_key)
+        if (self.authority_enabled and self.authority_weight > 0
+                and plan.ranking_hint not in ("by_recency", "by_importance")):
+            top_cands = {node["key"] for rl in local_ranks for node in rl[:500]}
+            now_year = datetime.now(timezone.utc).year
+            if any(_authority_value(local_by_key[k], now_year) > 0 for k in top_cands):
+                auth_order = sorted(top_cands, key=lambda k: (
+                    -_authority_value(local_by_key[k], now_year), -lib_rrf.get(k, 0.0), k))
+                auth_rank = {k: i for i, k in enumerate(auth_order)}
+                n_lists = max(1, sum(1 for rl in local_ranks if rl))
+                for k in auth_order:
+                    lib_rrf[k] = lib_rrf.get(k, 0.0) + (
+                        3.0 * self.authority_weight * n_lists / (RRF_K + auth_rank[k]))
         local_ranks = reorder_ranklists_by_rrf(local_ranks, lib_rrf, lib_key)
         for ranklist in external_ranks:
             for node in ranklist:

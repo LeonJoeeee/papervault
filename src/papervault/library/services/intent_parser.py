@@ -223,6 +223,13 @@ Year rule (year_min / year_max emitted ONLY on an EXPLICIT recency cue):
 - NO recency/date words at all -> year_min = year_max = null. A bare topic,
   a methodology question, or "important/highly cited" WITHOUT a recency word gets
   NO year window (those map to citation_pref / ranking_hint, not a year cut).
+- Survey/overview framing such as "current understanding", "current observational
+  picture", "state of the art", "overview", or "related-work" is not a recency
+  cue: absent an explicit recency/date constraint, leave year_min = year_max = null
+  and ranking_hint = "by_relevance".
+- Requests for both foundational/canonical/historical and recent work must leave
+  year_min = year_max = null and ranking_hint = "by_relevance" so the foundational
+  work is not excluded by a recent-only window.
 Prefer generous windows over narrow ones (a narrow window can over-exclude).
 
 Output ONLY JSON:
@@ -533,6 +540,21 @@ def _parse_response(query: str, raw: str) -> SearchPlan:
     ranking_hint = parsed.get("ranking_hint", "by_relevance")
     if ranking_hint not in ("by_importance", "by_recency", "by_relevance"):
         ranking_hint = "by_relevance"
+
+    if filters.get("year_min") is not None and filters.get("year_max") is None:
+        canonical = re.search(r"\b(?:canonical|foundational|classical|classic|seminal|historical)\b", query, re.I)
+        survey = re.search(
+            r"\b(?:current\s+(?:understanding|observational\s+picture|picture|state)|"
+            r"state\s+of\s+the\s+art|related[\s-]work|overview|introduction|survey)\b", query, re.I)
+        recency = re.search(
+            r"\b(?:19|20)\d{2}\b|\b(?:recent|recently|latest|lately|newest|this\s+year|"
+            r"last\s+(?:\d+|one|two|three|five|ten|few)\s+years?|"
+            r"past\s+(?:\d+|one|two|three|five|ten|few)\s+years?|last\s+decade|past\s+decade)\b",
+            query, re.I)
+        if canonical or (survey and not recency):
+            filters["year_min"] = None
+            if ranking_hint == "by_recency":
+                ranking_hint = "by_relevance"
 
     reasoning = str(parsed.get("reasoning", ""))[:300]
 

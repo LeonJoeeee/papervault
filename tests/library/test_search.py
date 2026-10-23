@@ -1110,3 +1110,208 @@ def test_fetch_queue_timeout_env_is_parsed_defensively(monkeypatch, raw, expecte
     else:
         monkeypatch.setenv(name, raw)
     assert search._fetch_queue_timeout_from_env() == expected
+
+
+# ----------- polite-v2 denial isolation and upstream failure preservation (#308) ---
+
+
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_local_politeness_denial_does_not_feed_breaker(monkeypatch, wrapped):
+    def denied(*args, **kwargs):
+        error = polite_http.PolitenessDenied("local admission denied")
+        if wrapped:
+            from papervault.library.sources.exceptions import backend_degraded
+            raise backend_degraded(error) from error
+        raise error
+
+    monkeypatch.setattr(search, "search_semantic_scholar", denied)
+    monkeypatch.setattr(search, "_interval_for", lambda _: 0.0)
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 3)
+    search._BREAKER_FAILS["semantic_scholar"] = 2
+    degraded, observations = collections.Counter(), []
+
+    async def run():
+        with search.observe_source_gates(observations.append):
+            for i in range(4):
+                assert await search._fetch_one_backend(
+                    "solar wind", "semantic_scholar", 5, term_idx=i,
+                    degraded_map=degraded) == []
+
+    asyncio.run(run())
+    assert degraded == {"semantic_scholar": 4}
+    assert [o.status for o in observations] == ["degraded"] * 4
+    assert [o.code for o in observations] == ["transport_error"] * 4
+    assert search._BREAKER_FAILS == {"semantic_scholar": 2}
+    assert search._BREAKER_OPEN_UNTIL == {}
+
+
+@pytest.mark.parametrize("backend", ["arxiv", "semantic_scholar", "openalex"])
+@pytest.mark.parametrize("reason", ["cooldown", "disabled"])
+def test_polite_v2_terminal_gate_denial_never_submits_fetch(
+        monkeypatch, polite_search, backend, reason):
+    if reason == "cooldown":
+        polite_search.ledger.enter_cooldown(Scope(backend), "unit test")
+    else:
+        monkeypatch.setattr(search, "get_ledger", lambda: Ledger({}))
+    calls = []
+    original = search._run_fetch
+
+    async def record(*args, **kwargs):
+        calls.append(args)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(search, "_run_fetch", record)
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 1)
+    degraded, observations = collections.Counter(), []
+
+    async def run():
+        with search.observe_source_gates(observations.append):
+            return await search._fetch_one_backend(
+                "solar wind", backend, 5, term_idx=0, degraded_map=degraded)
+
+    assert asyncio.run(run()) == []
+    assert calls == []
+    assert degraded == {backend: 1}
+    assert [(o.status, o.code) for o in observations] == [("degraded", "transport_error")]
+    assert search._BREAKER_FAILS == {}
+    assert search._BREAKER_OPEN_UNTIL == {}
+
+
+@pytest.mark.parametrize("backend", ["arxiv", "semantic_scholar", "openalex"])
+def test_polite_v2_concurrency_waits_for_admission(monkeypatch, polite_search, backend):
+    scope = Scope(backend)
+    ticket = polite_search.ledger.note_sent(scope)
+    polite_search.now += 10
+    original_sleep = asyncio.sleep
+
+    async def release_after_wait(delay):
+        await original_sleep(delay)
+        polite_search.ledger.note_result(ticket, status_code=200)
+
+    monkeypatch.setattr(asyncio, "sleep", release_after_wait)
+    degraded = collections.Counter()
+    result = asyncio.run(search._fetch_one_backend(
+        "solar wind", backend, 5, term_idx=0, degraded_map=degraded))
+    assert [p["title"] for p in result] == ["solar wind"]
+    assert polite_search.sleeps == [0.05]
+    assert polite_search.denials == []
+    assert degraded == {}
+    assert search._BREAKER_OPEN_UNTIL == {}
+
+
+@pytest.mark.parametrize("backend", ["arxiv", "semantic_scholar", "openalex"])
+@pytest.mark.parametrize("late_release", [False, True])
+def test_polite_v2_concurrency_deadline_never_submits_fetch(
+        monkeypatch, polite_search, backend, late_release):
+    # Give the occupied scope no window wait after its active ticket is released.
+    ticket = polite_search.ledger.note_sent(Scope(backend))
+    polite_search.now += 10
+    monkeypatch.setattr(search, "time", SimpleNamespace(monotonic=lambda: polite_search.now))
+    monkeypatch.setattr(search, "FETCH_QUEUE_TIMEOUT_S", 0.09)
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 1)
+    original_sleep = asyncio.sleep
+    released = False
+
+    async def release_after_deadline(delay):
+        nonlocal released
+        await original_sleep(delay)
+        if late_release and len(polite_search.sleeps) == 2:
+            polite_search.ledger.note_result(ticket, status_code=200)
+            released = True
+
+    monkeypatch.setattr(asyncio, "sleep", release_after_deadline)
+    calls = []
+    original = search._run_fetch
+
+    async def record(*args, **kwargs):
+        calls.append(args)
+        return await original(*args, **kwargs)
+
+    monkeypatch.setattr(search, "_run_fetch", record)
+    degraded, observations = collections.Counter(), []
+
+    async def run():
+        with search.observe_source_gates(observations.append):
+            return await search._fetch_one_backend(
+                "solar wind", backend, 5, term_idx=0, degraded_map=degraded)
+
+    try:
+        assert asyncio.run(run()) == []
+    finally:
+        if not released:
+            polite_search.ledger.note_result(ticket, status_code=200)
+    assert calls == []
+    assert polite_search.sleeps == [0.05, 0.05]
+    assert degraded == {backend: 1}
+    assert [(o.status, o.code) for o in observations] == [("skipped", "fetch_queue_timeout")]
+    assert search._BREAKER_FAILS == {}
+    assert search._BREAKER_OPEN_UNTIL == {}
+
+
+@pytest.mark.parametrize("backend", ["arxiv", "semantic_scholar", "openalex"])
+def test_polite_v2_429_stays_rate_limited_and_cooldown_does_not_trip_breaker(
+        monkeypatch, polite_search, backend):
+    sends, sleeps = [], []
+
+    def rate_limited(url, **kwargs):
+        sends.append(url)
+        response = requests.Response()
+        response.status_code = 429
+        response.headers["Retry-After"] = "17"
+        return response
+
+    monkeypatch.setattr(requests, "get", rate_limited)
+    monkeypatch.setattr(search, "BREAKER_TRIPS", 2)
+    if backend == "openalex":
+        monkeypatch.setattr(search, "time", SimpleNamespace(
+            monotonic=time.monotonic, sleep=sleeps.append))
+    else:
+        monkeypatch.setattr(f"papervault.library.sources.{backend}.time",
+                            SimpleNamespace(sleep=sleeps.append))
+    degraded, observations = collections.Counter(), []
+
+    async def run():
+        with search.observe_source_gates(observations.append):
+            for i in range(4):
+                assert await search._fetch_one_backend(
+                    "solar wind", backend, 5, term_idx=i, degraded_map=degraded) == []
+
+    asyncio.run(run())
+    assert len(sends) == 1
+    assert sleeps == []
+    assert degraded == {backend: 4}
+    assert observations[0].code == "rate_limited"
+    assert observations[0].retry_after_s == 17.0
+    assert [o.status for o in observations] == ["degraded"] * 4
+    assert search._BREAKER_FAILS == {backend: 1}
+    assert search._BREAKER_OPEN_UNTIL == {}
+
+
+@pytest.mark.parametrize("backend", ["arxiv", "semantic_scholar"])
+@pytest.mark.parametrize("prior_failure", [False, True])
+def test_adapter_politeness_denial_stops_retries_and_preserves_prior_failure(
+        monkeypatch, backend, prior_failure):
+    import importlib
+
+    adapter = importlib.import_module(f"papervault.library.sources.{backend}")
+    attempts, sleeps = [], []
+
+    def get(*args, **kwargs):
+        attempts.append(None)
+        if prior_failure and len(attempts) == 1:
+            response = requests.Response()
+            response.status_code = 429
+            response.headers["Retry-After"] = "23"
+            return response
+        raise polite_http.PolitenessDenied("local admission denied")
+
+    monkeypatch.setattr(adapter, "polite_get", get)
+    monkeypatch.setattr(adapter, "time", SimpleNamespace(sleep=sleeps.append))
+    with pytest.raises(BackendDegraded) as caught:
+        getattr(adapter, f"search_{backend}")("solar wind")
+    assert len(attempts) == (2 if prior_failure else 1)
+    assert len(sleeps) == (1 if prior_failure else 0)
+    assert caught.value.code == ("rate_limited" if prior_failure else "transport_error")
+    assert isinstance(caught.value.__cause__, polite_http.PolitenessDenied)
+    if prior_failure:
+        assert caught.value.retry_after_s == 23.0

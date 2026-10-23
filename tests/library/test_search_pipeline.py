@@ -346,3 +346,89 @@ async def test_bibliographic_canonical_mapping_cannot_bridge_conflicting_doi(tmp
     assert "10.1234/second" in {r["doi"] for r in result["results"]}
     assert "10.1234/second" in {r["doi"] for r in seen["pool"]}
     assert lib.get("Canonical").doi == "10.1234/first"
+
+
+@pytest.fixture
+def local_authority_fusion():
+    from papervault.library.services import search_pipeline as pipeline
+
+    # More relevant papers than LIB_CAP: the landmark starts below the BM25 cut.
+    papers = [Paper(key=f"Relevant{i:03d}", title=f"Detector measurements case {i}",
+                    doi=f"10.1234/relevant{i}", year=2013)
+              for i in range(50)]
+    papers.append(Paper(key="ZLandmark", title="Detector measurements landmark study",
+                        doi="10.1234/landmark", year=1980, citation_count=50000))
+    # Nonmatching records keep the real BM25 query terms discriminative.
+    papers.extend(Paper(key=f"Other{i:03d}", title=f"Unrelated astrophysical topic {i}",
+                        doi=f"10.1234/other{i}", year=2013,
+                        citation_count=1000000 if i == 0 else 0)
+                  for i in range(150))
+    papers.append(Paper(key="OutsideYear", title="Detector measurements early",
+                        doi="10.1234/early", year=1900, citation_count=1000000))
+    searcher = pipeline.SearchPipeline(
+        library=None, registration_queue=None, llm_factory=None, parse=None,
+        retrieve=None, judge_ingest=None, judge_return=None, project=None,
+        reframe_hint=None, progress=None, authority_enabled=False, authority_weight=0.25)
+    plan = pipeline.PlannedSearch({}, ["detector measurements"], {"year_min": 1950},
+                                  15, "by_relevance")
+    retrieved = pipeline.RetrievedSearch([], papers, {})
+    return searcher, plan, retrieved
+
+
+def fuse_local(searcher, plan, retrieved):
+    return searcher.fusion(plan, retrieved, SimpleNamespace(record=lambda *args, **kwargs: None))
+
+
+def test_local_authority_prior_lifts_landmark_before_bm25_pool_cut(local_authority_fusion):
+    searcher, plan, retrieved = local_authority_fusion
+    baseline = fuse_local(searcher, plan, retrieved)
+    assert len(baseline.local) == 30
+    assert "ZLandmark" not in {p["key"] for p in baseline.local}
+    searcher.authority_enabled = True
+    fused = fuse_local(searcher, plan, retrieved)
+    keys = [p["key"] for p in fused.local]
+    assert "ZLandmark" in keys
+    assert len(keys) == 30
+    assert "OutsideYear" not in keys
+    assert not any(k.startswith("Other") for k in keys)
+    assert fused.external == baseline.external
+    assert fused.canonical_keys == baseline.canonical_keys
+
+
+@pytest.mark.parametrize("enabled,weight,hint,zero_citations", [
+    (False, 0.25, "by_relevance", False),
+    (True, 0.0, "by_relevance", False),
+    (True, 0.25, "by_recency", False),
+    (True, 0.25, "by_importance", False),
+    (True, 0.25, "by_relevance", True),
+])
+def test_local_authority_bypasses_are_byte_identical(
+        local_authority_fusion, enabled, weight, hint, zero_citations):
+    from dataclasses import asdict, replace
+
+    searcher, plan, retrieved = local_authority_fusion
+    plan = replace(plan, ranking_hint=hint)
+    if zero_citations:
+        for paper in retrieved.local:
+            paper.citation_count = 0
+    baseline = json.dumps(asdict(fuse_local(searcher, plan, retrieved)), sort_keys=True)
+    searcher.authority_enabled = enabled
+    searcher.authority_weight = weight
+    actual = json.dumps(asdict(fuse_local(searcher, plan, retrieved)), sort_keys=True)
+    assert actual == baseline
+
+
+def test_local_authority_uses_age_normalized_citations(local_authority_fusion):
+    from datetime import datetime, timezone
+
+    searcher, plan, retrieved = local_authority_fusion
+    landmark = next(p for p in retrieved.local if p.key == "ZLandmark")
+    now_year = datetime.now(timezone.utc).year
+    landmark.year, landmark.citation_count = now_year - 50, 10000
+    retrieved.local.append(Paper(
+        key="ZRecent", title="Detector measurements recent study", doi="10.1234/recent",
+        year=now_year - 1, citation_count=1000))
+    searcher.authority_enabled = True
+    keys = [p["key"] for p in fuse_local(searcher, plan, retrieved).local]
+    assert "ZRecent" in keys and "ZLandmark" in keys
+    assert keys.index("ZRecent") < keys.index("ZLandmark")

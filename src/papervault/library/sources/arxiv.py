@@ -7,7 +7,8 @@ from typing import Any
 
 import requests
 
-from ..polite_http import polite_get
+from papervault.config import polite_v2_enabled
+from ..polite_http import PolitenessDenied, polite_get
 
 from .exceptions import BackendDegraded, backend_degraded, source_errors
 from .identity import source_identity
@@ -38,7 +39,8 @@ def search_arxiv(query: str, max_results: int = 30, *,
     ``id:`` queries pass through; other queries search all fields.
 
     Bounded retry on HTTP 429 / 5xx / connection errors with jittered backoff
-    (≤3 attempts). RAISES ``BackendDegraded`` after all retries fail (a transient
+    (≤3 attempts). With polite-v2 on, a 429 returns immediately to respect the
+    ledger cooldown. RAISES ``BackendDegraded`` after all retries fail (a transient
     empty/429 is NOT an authoritative 0-hit). Entries missing a title or
     publication date are skipped; no remaining entries returns ``[]``.
     """
@@ -57,12 +59,16 @@ def search_arxiv(query: str, max_results: int = 30, *,
     for attempt in range(_MAX_RETRIES):
         try:
             resp = polite_get(requests.get, ARXIV_API_URL, params=params, timeout=30)
+        except PolitenessDenied as error:
+            raise (failure if attempt else backend_degraded(error)) from error
         except (requests.ConnectionError, requests.Timeout) as error:
             failure = backend_degraded(error)
             time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)
             continue
         if resp.status_code == 429 or resp.status_code >= 500:
             failure = backend_degraded(response=resp)
+            if polite_v2_enabled() and resp.status_code == 429:
+                raise failure
             time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)
             continue
         if not resp.ok:

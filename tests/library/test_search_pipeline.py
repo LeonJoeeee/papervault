@@ -382,13 +382,13 @@ def fuse_local(searcher, plan, retrieved):
 def test_local_authority_prior_lifts_landmark_before_bm25_pool_cut(local_authority_fusion):
     searcher, plan, retrieved = local_authority_fusion
     baseline = fuse_local(searcher, plan, retrieved)
-    assert len(baseline.local) == 30
+    assert len(baseline.local) == 45
     assert "ZLandmark" not in {p["key"] for p in baseline.local}
     searcher.authority_enabled = True
     fused = fuse_local(searcher, plan, retrieved)
     keys = [p["key"] for p in fused.local]
     assert "ZLandmark" in keys
-    assert len(keys) == 30
+    assert len(keys) == 45
     assert "OutsideYear" not in keys
     assert not any(k.startswith("Other") for k in keys)
     assert fused.external == baseline.external
@@ -432,3 +432,105 @@ def test_local_authority_uses_age_normalized_citations(local_authority_fusion):
     keys = [p["key"] for p in fuse_local(searcher, plan, retrieved).local]
     assert "ZRecent" in keys and "ZLandmark" in keys
     assert keys.index("ZRecent") < keys.index("ZLandmark")
+
+
+@pytest.mark.parametrize("n_terms", [1, 2])
+@pytest.mark.parametrize("rank,weight,selected", [(300, 0.25, True), (799, 1.0, True), (800, 1.0, False)])
+def test_local_authority_depth_and_strength(
+        local_authority_fusion, monkeypatch, n_terms, rank, weight, selected):
+    from dataclasses import replace
+    from papervault.library.services import search_pipeline as pipeline
+
+    searcher, plan, retrieved = local_authority_fusion
+    retrieved.local = [Paper(key=f"Rank{i:03d}", title=f"Detector measurements case {i}",
+                             doi=f"10.1234/rank{i}", year=2025,
+                             citation_count=10000 if i == rank else 0)
+                       for i in range(801)]
+    # Supply a controlled BM25 rank boundary; fusion, RRF and shortlisting stay real.
+    monkeypatch.setattr(pipeline, "bm25_per_term_ranklists", lambda corpus, terms: [
+        sorted(corpus, key=lambda n: n["key"]) for _ in terms])
+    plan = replace(plan, terms=[f"term{i}" for i in range(n_terms)])
+    searcher.authority_enabled, searcher.authority_weight = True, weight
+    keys = [n["key"] for n in fuse_local(searcher, plan, retrieved).local]
+    assert len(keys) == 45
+    assert (f"Rank{rank:03d}" in keys) is selected
+
+
+@pytest.fixture
+def vouched_authority_fusion(local_authority_fusion):
+    from datetime import datetime, timezone
+
+    searcher, plan, retrieved = local_authority_fusion
+    now_year = datetime.now(timezone.utc).year
+    # These records do not match BM25; their only path is the vouch supplement.
+    vouched = [Paper(key=f"Vouch{i:02d}", title=f"Independent astrophysical observation {i}",
+                     doi=f"10.1234/vouch{i}", year=now_year - 1, citation_count=i + 1)
+               for i in range(49)]
+    vouched.extend([
+        Paper(key="VouchLandmark", title="Independent canonical astrophysical study",
+              doi="10.1234/vouchlandmark", year=now_year - 1, citation_count=100),
+        Paper(key="VouchNative", title="Independent uncited astrophysical study",
+              doi="10.1234/vouchnative", year=now_year - 1),
+        Paper(key="VouchRepeated", title="Independent repeatedly observed astrophysical stub",
+              doi="10.1234/vouchrepeated", year=now_year - 1),
+        Paper(key="VouchOutsideYear", title="Independent very early astrophysical study",
+              doi="10.1234/vouchoutside", year=1900, citation_count=1000000),
+    ])
+    retrieved.local.extend(vouched)
+    retrieved.external = [dict(doi=p.doi, term_idx=0,
+                               rank=8 if p.key == "VouchLandmark" else
+                               0 if p.key in {"VouchNative", "VouchOutsideYear"} else 1000)
+                          for p in vouched]
+    retrieved.external.append(dict(doi="10.1234/vouchrepeated", term_idx=0, rank=1000))
+    return searcher, plan, retrieved
+
+
+def test_vouched_supplement_uses_authority_blended_with_external_rank(vouched_authority_fusion):
+    searcher, plan, retrieved = vouched_authority_fusion
+    baseline = fuse_local(searcher, plan, retrieved)
+    assert len(baseline.local) == 90  # 45 BM25 + 45 additional externally vouched records
+    assert [n["key"] for n in baseline.local[45:48]] == [
+        "VouchRepeated", "VouchNative", "VouchLandmark"]
+    searcher.authority_enabled = True
+    fused = fuse_local(searcher, plan, retrieved)
+    keys = [n["key"] for n in fused.local]
+    # At external rank 8, the landmark needs the specified 2*lambda blend to
+    # beat native rank 0 with authority rank 50+. A 1*lambda blend loses.
+    assert keys[45:47] == ["VouchLandmark", "VouchNative"]
+    assert len(keys) == len(set(keys)) == 90
+    assert "VouchOutsideYear" not in keys
+    assert fused.external == []
+
+
+@pytest.mark.parametrize("enabled,weight,hint", [
+    (False, 0.25, "by_relevance"), (True, 0.0, "by_relevance"),
+    (True, 0.25, "by_recency"), (True, 0.25, "by_importance"),
+])
+def test_vouched_authority_bypasses_are_byte_identical(
+        vouched_authority_fusion, enabled, weight, hint):
+    from dataclasses import asdict, replace
+
+    searcher, plan, retrieved = vouched_authority_fusion
+    plan = replace(plan, ranking_hint=hint)
+    baseline = json.dumps(asdict(fuse_local(searcher, plan, retrieved)), sort_keys=True)
+    searcher.authority_enabled, searcher.authority_weight = enabled, weight
+    actual = json.dumps(asdict(fuse_local(searcher, plan, retrieved)), sort_keys=True)
+    assert actual == baseline
+
+
+def test_vouched_authority_normalizes_age_and_venue(vouched_authority_fusion):
+    from datetime import datetime, timezone
+
+    searcher, plan, retrieved = vouched_authority_fusion
+    now_year = datetime.now(timezone.utc).year
+    records = {p.key: p for p in retrieved.local}
+    records["VouchLandmark"].year = now_year - 50
+    records["VouchLandmark"].citation_count = 1000  # 20/year
+    records["VouchNative"].citation_count = 30
+    records["VouchNative"].venue = "PRL"  # 45/year after venue weighting
+    records["VouchRepeated"].citation_count = 35  # 35/year
+    retrieved.external = [dict(doi=records[key].doi, term_idx=0, rank=0)
+                          for key in ("VouchLandmark", "VouchNative", "VouchRepeated")]
+    searcher.authority_enabled = True
+    keys = [n["key"] for n in fuse_local(searcher, plan, retrieved).local]
+    assert keys[-3:] == ["VouchNative", "VouchRepeated", "VouchLandmark"]

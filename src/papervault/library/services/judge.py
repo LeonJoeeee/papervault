@@ -189,7 +189,9 @@ For EACH candidate output, in order:
      non-paper record, and (b) which domain tier it fits.
   2. ``is_paper`` (true/false): is it a research paper / journal article / review / conference
      paper / preprint? Answer **false** for non-paper records: datasets, software, whole books,
-     errata / corrections, retractions, editorials, pure news items, conference programs.
+     errata / corrections, retractions, editorials, pure news items, conference programs,
+     conference/meeting abstracts (AGU Fall Meeting Abstracts, EGU General Assembly Abstracts,
+     COSPAR Scientific Assembly, AAS/APS Meeting Abstracts).
   3. ``tier`` (one of 1A / 1B / 1C / 2A / 2B / 2C / 3) per the rubric below. Tier 3 = off-domain.
 
 NOTE on ``is_paper``: this is a **backstop**. The caller trusts source metadata when it's present

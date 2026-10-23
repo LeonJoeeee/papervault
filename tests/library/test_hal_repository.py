@@ -234,7 +234,8 @@ def test_hal_normal_cascade_uses_identity_gate_in_memory(paper, monkeypatch, wro
     responses.get(url, body=data)
     saved, events, prompts = {}, [], []
     root = Path("/in-memory-only")
-    library = SimpleNamespace(root=root, pdf_path=lambda _: root / "paper.pdf",
+    library = SimpleNamespace(root=root, get=lambda key: paper if key == paper.key else None,
+                              pdf_path=lambda _: root / "paper.pdf",
                               has_pdf=lambda _: False, has_extract=lambda *_: False, log=events.append)
     monkeypatch.setenv("PAPERVAULT_VAULT", str(root))
     monkeypatch.setattr(download, "_atomic_save", lambda dest, data: saved.update(pdf=data))

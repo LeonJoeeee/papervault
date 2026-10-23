@@ -619,8 +619,11 @@ def download_paper(paper: Paper, library: Library, *, identity_provider=resolved
     the real PDF); ``DOWNLOAD_STATUS_FAILED`` / ``DOWNLOAD_STATUS_METADATA_ONLY``
     are the terminal misses.
 
-    Idempotent: if the file exists, returns True without re-fetching.
+    Existing files return True after the deterministic metadata exclusion check.
     """
+    from .services.registration import deterministic_garbage_reason
+    if deterministic_garbage_reason(library.get(paper.key) or paper):
+        return False
     if paper.reopen_claim is not None and (not reopen_v2_enabled() or lease_provider is valid_lease):
         if stoprules_v2_enabled():
             emit("admission-denied", reason="campaign_ownership")

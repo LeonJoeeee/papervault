@@ -39,6 +39,7 @@ dependencies = [
     # fail-loud guard; PARSING/ANALYZING doc phases handled in the scheduler. #148 pins the
     # exact patch for its private pause adapter: upgrades require the adapter tests and the
     # existing fresh port map + probe build + FAST recall gate (ADR-0005).
+    # ADR-0005 records the 1.5.7 host probe and FAST recall measurements (#313).
     "lightrag-hku==1.5.7",
     "openai>=1.50",            # raw OpenAI-compatible SDK (knowledge LLM path)
     "asyncpg>=0.29",

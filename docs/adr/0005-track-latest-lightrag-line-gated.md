@@ -45,3 +45,36 @@ the namespace write fence, and layered reads accept the scheduler's single-statu
 Raw-workspace source-conflict repair is refused for catalog storage; it requires an isolated
 rebuild. The preparation schema literals remain unchanged; its reviewed dependency pin moves
 with the runtime. Historical 1.5.4 probe/recall evidence remains historical, not a 1.5.7 result.
+
+## Verification — 1.5.7 patch port (#313, 2026-10-23)
+
+The orchestrator ran both live gates using the task lane's `lightrag-hku==1.5.7`
+environment. The [host measurement record](https://github.com/LeonJoeeee/papervault/issues/313#issuecomment-6369432590)
+contains the exact commands and artifact paths; [PR #315](https://github.com/LeonJoeeee/papervault/pull/315)
+preserves the report outputs alongside the port map and machine-checkable gates.
+
+The throwaway probe used `Bonomi2020` in workspace `l0_probe_157` (218,263 raw
+characters; 203,829 after reference stripping). It reached `processed` in 94.67 seconds:
+**22 chunks produced 579 entities and 582 relations**. Of those entities, **578/579
+(99.83%)** belong to the closed 11-type ontology; one is an `UNKNOWN` endpoint
+placeholder. There were **zero `Other` entities and zero off-ontology nodes**
+(`other_count=0`, `off_ontology={}`); the placeholder is accounted for separately.
+The host record confirms that the throwaway workspace was cleaned in both Neo4j
+and PostgreSQL after verification.
+
+The FAST comparison used `src/papervault/eval/gold_fast.jsonl` (14 questions:
+11 answerable, three traps), `variant=multiquery`, and `--no-synth`, against the
+same-corpus 1.5.4 reference:
+
+| Metric | 1.5.4 (`post144_10072338`) | 1.5.7 (`port157_1024`) | Delta |
+| --- | --- | --- | --- |
+| `gold_citation_recall` / recall@served | 0.733170 | 0.747140 | +0.013970 (+1.40 pp) |
+| `paper_recall_at_12_distinct` | 0.503153 | 0.488223 | -0.014931 (-1.49 pp) |
+
+In `--no-synth` mode, `gold_citation_recall` measures recall over distinct served
+papers using the retrieved-paper citation fallback. The recall@served gate improved;
+the orchestrator assessed the separate recall@12 movement as run-level noise.
+All 14 candidate receipts report `rerank_degraded=False`. The retained candidate
+rows are `/data/paper-vault/eval-results/port157_1024.jsonl`; offline recalculation
+from those rows and the baseline reproduces every aggregate in the host comparison
+report. These retrieval measurements do not establish synthesis quality.

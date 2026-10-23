@@ -8,6 +8,7 @@ import pytest
 
 from papervault.library import Library
 from papervault.library.mcp.server import build_server
+from papervault.library.services.registration import registration_rejection
 
 
 def candidate(**fields):
@@ -70,6 +71,78 @@ async def test_search_does_not_write_catalog_or_enqueue_downloads(tmp_path, monk
 
 def admitted(**fields):
     return candidate(_registration={"ingest_ok": True, "llm_is_paper": True, "tier": "1A"}, **fields)
+
+
+@pytest.mark.parametrize("venue", [
+    "AGU Fall Meeting Abstracts", "AGU Spring Meeting", "Meeting Abstracts",
+    "Conference Abstracts", "COSPAR Scientific Assembly", "EGU General Assembly Abstracts",
+    "AAS Meeting Abstracts", "APS Division of Plasma Physics Meeting Abstracts",
+    "APS April Meeting Abstracts", "Bulletin of the American Astronomical Society",
+    "Bulletin of the American Physical Society", "  aGu   Fall Meeting Abstracts  ",
+])
+@pytest.mark.parametrize("known", [False, True])
+def test_registration_rejects_meeting_abstract_venues(venue, known):
+    assert registration_rejection(admitted(venue=venue), known_identity=known) == "conference_abstract"
+
+
+def test_registration_still_rejects_egu_doi_without_venue():
+    assert registration_rejection(admitted(venue="", doi="10.5194/EGUSPHERE-EGU26-123")) == "conference_abstract"
+
+
+@pytest.mark.parametrize("authors", [[], None, ["anon"], [" AnOn. "], ["ANONYMOUS"], [" unknown ", "Tester, A."]])
+def test_registration_rejects_unverified_authors_only_for_new_records(authors):
+    cand = admitted(authors=authors, citation_count=1000)
+    assert registration_rejection(cand) == "unverified_low_quality"
+    assert registration_rejection(cand, known_identity=True) == ""
+
+
+@pytest.mark.parametrize("citations", [None, 0, 4, 9, "9"])
+@pytest.mark.parametrize("abstract", ["", "A substantive abstract cannot verify a low-citation stub."])
+def test_registration_rejects_identifierless_low_citation_stubs(citations, abstract):
+    assert registration_rejection(admitted(doi="", citation_count=citations, abstract=abstract)) == "unverified_low_quality"
+
+
+@pytest.mark.parametrize("fields", [
+    {"doi": "10.1234/verified", "abstract": "", "citation_count": 0},
+    {"doi": "", "arxiv_id": "2601.12345", "abstract": "", "citation_count": 0},
+    {"doi": "", "inspire_record_id": "123456", "abstract": "", "citation_count": 0},
+    {"doi": "", "citation_count": 10, "year": 1965},
+    {"doi": "", "citation_count": "10", "year": 1965},
+])
+def test_registration_admits_identified_papers_and_historical_classics(fields):
+    assert registration_rejection(admitted(**fields)) == ""
+
+
+@pytest.mark.parametrize("recid", ["not-a-recid", "0", True])
+def test_invalid_inspire_identifier_cannot_rescue_a_stub(recid):
+    assert registration_rejection(admitted(doi="", inspire_record_id=recid)) == "unverified_low_quality"
+
+
+def test_known_identity_keeps_quality_exemption_and_existing_content_floor():
+    assert registration_rejection(admitted(doi="", citation_count=0), known_identity=True) == ""
+    assert registration_rejection(admitted(doi="", abstract=""), known_identity=True) == "contentless"
+
+
+@pytest.mark.parametrize("venue", ["ICML", "NeurIPS", "ICLR", "PoS", "AIP Conference Proceedings"])
+def test_conference_papers_remain_registrable(venue):
+    assert registration_rejection(admitted(venue=venue, publication_types=["conferencepaper"])) == ""
+
+
+async def test_registration_command_enforces_quality_for_new_records(tmp_path):
+    from papervault.library.services.registration import RegistrationService
+
+    lib = Library(tmp_path)
+    queued = []
+    service = RegistrationService(lib, SimpleNamespace(add=queued.append))
+    nodes = [admitted(doi="10.1234/meeting", venue="AGU Fall Meeting Abstracts"),
+             admitted(doi="10.1234/anonymous", authors=["Anonymous"]),
+             admitted(doi="", citation_count=9), admitted(doi="10.1234/valid")]
+    outcomes = await service.register_candidates(nodes, actor="test", reason="quality-gates")
+    assert [(o["status"], o["reason"]) for o in outcomes] == [
+        ("rejected", "conference_abstract"), ("rejected", "unverified_low_quality"),
+        ("rejected", "unverified_low_quality"), ("registered", "admitted")]
+    assert lib.keys() == queued == [outcomes[3]["key"]]
+    assert Library(tmp_path).keys() == lib.keys()
 
 
 def trace_events(lib):

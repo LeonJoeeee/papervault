@@ -14,6 +14,8 @@ import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from functools import lru_cache
 from typing import Callable
 
 from papervault import config
@@ -33,8 +35,8 @@ from .registration import ServingTrace, preview_candidates, registration_rejecti
 logger = logging.getLogger(__name__)
 RETURN_THRESHOLD = 0.4
 EXT_CAP = 60
-LIB_CAP = 30
-ALSO_INCLUDE_CAP = 30
+LIB_CAP = 45
+ALSO_INCLUDE_CAP = 45
 _YEAR_NEUTRAL = 10**9
 SEARCH_AUTHORITY_PRIOR = config.search_authority_prior_enabled()
 BACKENDS = tuple(CAPS)
@@ -59,10 +61,91 @@ def _parse_authority_lambda(raw: str) -> float:
 SEARCH_AUTHORITY_LAMBDA = _parse_authority_lambda(
     os.environ.get("PAPERVAULT_SEARCH_AUTHORITY_LAMBDA", "0.25"))
 
+_SINGULAR_VENUE_WORDS = {
+    "letters", "reviews", "sciences", "proceedings", "methods", "systems", "statistics", "physics",
+}
+_VENUE_TIERS = (
+    (1.5, (
+        "10.1103/physrevlett", "10.1103/physrevx", "10.1103/revmodphys", "10.1126/science",
+        "10.1038/nature", "10.1038/s41567", "10.1038/s42254", "10.1007/s11214", "10.12942/lrsp",
+        "10.1007/s41116", "10.1073/pnas", "10.1016/j.physrep", "10.1088/0034-4885",
+        "10.1146/annurev", "10.1137/s00361445",
+    ), (
+        "prl", "prx", "rmp", "ssr", "lrsp", "pnas", "physical review letter", "physical review x",
+        "review of modern physic", "science", "science advance", "nature", "nature physic",
+        "nature review physic", "space science review", "living review in solar physic",
+        "review of geophysic", "physic report", "report on progress in physic",
+        "annual review of nuclear and particle science", "annual review of astronomy and astrophysic",
+        "annual review of fluid mechanic", "siam review",
+        "proceeding of the national academy of science",
+    )),
+    (1.2, (
+        "10.1086/", "10.3847/", "10.1029/", "10.1051/0004-6361", "10.1093/mnras",
+        "10.1103/physrevd", "10.1103/physreve", "10.1103/physrevc", "10.1088/1475-7516",
+        "10.1016/j.astropartphys", "10.1016/j.nuclphysb", "10.1016/j.nima", "10.1007/s11207",
+        "10.1016/j.pss", "10.1016/0032-0633", "10.1016/j.jcp", "10.1016/j.cma", "10.1007/s40304",
+    ), (
+        "apj", "apjl", "apjs", "jgr", "grl", "aa", "mnras", "prd", "prc", "pre", "jcap", "jcp",
+        "sisc", "cmame", "icml", "neurips", "nips", "iclr", "astrophysical journal", "astrophys j",
+        "journal of geophysical research", "geophysical research letter", "astronomy and astrophysic",
+        "astron astrophys", "monthly notice of the royal astronomical society", "mon not roy astron soc",
+        "physical review d", "phys rev d", "physical review c", "physical review e",
+        "journal of cosmology and astroparticle physic", "astroparticle physic", "nuclear physic b",
+        "nuclear instrument and method in physic research", "solar physic", "planetary and space science",
+        "journal of computational physic", "siam journal on scientific computing",
+        "computer method in applied mechanic and engineering", "international conference on machine learning",
+        "neural information processing system", "advance in neural information processing system",
+        "international conference on learning representation", "communication in mathematic and statistic",
+    )),
+)
+_LOW_TIER_VENUE = re.compile(
+    r"agu fall meeting|agu spring meeting|meeting abstract|conference abstract|"
+    r"cospar scientific assembly|egu general assembly|aas meeting|aps division of plasma|"
+    r"bulletin of the american astronomical society|bulletin of the american physical society|"
+    r"^pos$|proceeding of science|international cosmic ray conference|aip conf proc|"
+    r"aip conference proceeding|hal ccsd|^ccsd$")
+
+
+@lru_cache(maxsize=2048)
+def _venue_name_multiplier(venue: str) -> float | None:
+    words = re.sub(r"[^a-z0-9\s]", "", venue.lower()).split()
+    stem = " ".join(word[:-1] if word in _SINGULAR_VENUE_WORDS else word for word in words)
+    if not stem:
+        return None
+    if _LOW_TIER_VENUE.search(stem):
+        return 0.5
+    # Match exact names across both tiers before fuzzy matching: Physical Review
+    # C/D/E must not inherit the S tier from their similarity to Physical Review X.
+    for multiplier, _, names in _VENUE_TIERS:
+        if stem in names:
+            return multiplier
+    ratio, multiplier = max(
+        (SequenceMatcher(None, stem, name).ratio(), multiplier)
+        for multiplier, _, names in _VENUE_TIERS for name in names)
+    return multiplier if ratio >= 0.88 else None
+
+
+def _venue_tier_multiplier(cand: dict) -> float:
+    """Classify venue authority; identifiers rescue unknown/abbreviated venues."""
+    doi, venue = (cand.get("doi") or "").strip().lower(), cand.get("venue") or ""
+    venue_multiplier = _venue_name_multiplier(venue)
+    if doi.startswith("10.5194/egusphere-egu") or venue_multiplier == 0.5:
+        return 0.5
+    # A broad publisher DOI (e.g. 10.1029/) must not demote an explicitly
+    # recognized S-tier journal such as Reviews of Geophysics.
+    for multiplier, prefixes, _ in _VENUE_TIERS:
+        if doi.startswith(prefixes) or venue_multiplier == multiplier:
+            return multiplier
+    if (venue.strip() and not (doi or cand.get("arxiv_id") or cand.get("inspire_record_id"))
+            and (cand.get("citation_count") or 0) < 5):
+        return 0.5
+    return 1.0
+
 
 def _authority_value(cand: dict, now_year: int) -> float:
     cites, year = cand.get("citation_count") or 0, cand.get("year")
-    return cites / max(1, now_year - year) if isinstance(year, int) and year > 0 else float(cites)
+    rate = cites / max(1, now_year - year) if isinstance(year, int) and year > 0 else float(cites)
+    return rate * _venue_tier_multiplier(cand)
 
 
 def _authority_reorder(scored, *, now_year=None, enabled=None, lam=None, k=60):
@@ -343,10 +426,11 @@ class SearchPipeline:
         external_ranks = reorder_ranklists_by_rrf(external_ranks, ext_rrf, _identity_key)
         lib_key = lambda node: node["key"]
         lib_rrf = rrf_fuse(local_ranks, lib_key)
-        if (self.authority_enabled and self.authority_weight > 0
-                and plan.ranking_hint not in ("by_recency", "by_importance")):
-            top_cands = {node["key"] for rl in local_ranks for node in rl[:500]}
-            now_year = datetime.now(timezone.utc).year
+        authority_active = (self.authority_enabled and self.authority_weight > 0
+                            and plan.ranking_hint not in ("by_recency", "by_importance"))
+        now_year = datetime.now(timezone.utc).year
+        if authority_active:
+            top_cands = {node["key"] for rl in local_ranks for node in rl[:800]}
             if any(_authority_value(local_by_key[k], now_year) > 0 for k in top_cands):
                 auth_order = sorted(top_cands, key=lambda k: (
                     -_authority_value(local_by_key[k], now_year), -lib_rrf.get(k, 0.0), k))
@@ -354,7 +438,7 @@ class SearchPipeline:
                 n_lists = max(1, sum(1 for rl in local_ranks if rl))
                 for k in auth_order:
                     lib_rrf[k] = lib_rrf.get(k, 0.0) + (
-                        3.0 * self.authority_weight * n_lists / (RRF_K + auth_rank[k]))
+                        4.0 * self.authority_weight * n_lists / (RRF_K + auth_rank[k]))
         local_ranks = reorder_ranklists_by_rrf(local_ranks, lib_rrf, lib_key)
         for ranklist in external_ranks:
             for node in ranklist:
@@ -363,10 +447,20 @@ class SearchPipeline:
         local = round_robin(local_ranks, LIB_CAP, lib_key)
         selected = {n["key"] for n in local}
         vouched = [n for n in local_by_key.values() if n.get("folded_vouch")]
-        also_include = sorted(
-            (n for n in vouched if n["key"] not in selected and plan.year_eligible(n)),
-            key=lambda n: (-n["folded_vouch"], -n["external_rrf_score"],
-                           -(n.get("citation_count") or 0), -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
+        also_include = [n for n in vouched if n["key"] not in selected and plan.year_eligible(n)]
+        if authority_active:
+            v_auth_order = sorted(also_include, key=lambda n: (
+                -_authority_value(n, now_year), -n["external_rrf_score"],
+                -n["folded_vouch"], -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
+            v_auth_rank = {n["key"]: i for i, n in enumerate(v_auth_order)}
+            also_include.sort(key=lambda n: (
+                -(n["external_rrf_score"] + 2.0 * self.authority_weight / (RRF_K + v_auth_rank[n["key"]])),
+                -n["folded_vouch"], -_authority_value(n, now_year),
+                -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
+        else:
+            also_include.sort(key=lambda n: (
+                -n["folded_vouch"], -n["external_rrf_score"], -(n.get("citation_count") or 0),
+                -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
         local.extend(also_include[:ALSO_INCLUDE_CAP])
         selected = {n["key"] for n in local}
         ext_selected = {_identity_key(n) for n in external}

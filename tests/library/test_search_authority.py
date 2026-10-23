@@ -8,6 +8,8 @@ injected knobs (env-independent) so the age-normalization math is deterministic.
 
 from __future__ import annotations
 
+import pytest
+
 from papervault.library.mcp.server import (
     SEARCH_AUTHORITY_PRIOR,
     SEARCH_AUTHORITY_LAMBDA,
@@ -166,3 +168,126 @@ def test_lambda_zero_is_identity():
     scored = [(0.9, x_top_worst), (0.8, y_rank2_best), (0.7, f2), (0.6, f1)]
     out = _authority_reorder(scored, enabled=True, now_year=2026, lam=0.0)
     assert [c["key"] for _s, c in out] == [c["key"] for _s, c in scored]
+
+
+@pytest.mark.parametrize("venue", [
+    "PRL", "PRX", "RMP", "SSR", "LRSP", "PNAS", "Physical Review Letters",
+    "Physical Review X", "Reviews of Modern Physics", "Science", "Science Advances",
+    "Nature", "Nature Physics", "Nature Reviews Physics", "Space Science Reviews",
+    "Living Reviews in Solar Physics", "Reviews of Geophysics", "Physics Reports",
+    "Reports on Progress in Physics", "Annual Review of Nuclear and Particle Science",
+    "Annual Review of Astronomy and Astrophysics", "Annual Review of Fluid Mechanics",
+    "SIAM Review", "Proceedings of the National Academy of Sciences",
+    "  PHYSICAL   REVIEW, LETTERS. ", "Space Science Reviws",
+])
+def test_flagship_venue_authority(venue):
+    from papervault.library.services.search_pipeline import _venue_tier_multiplier
+
+    cand = dict(venue=venue, year=2016, citation_count=40)
+    assert _venue_tier_multiplier(cand) == 1.5
+    assert _authority_value(cand, 2026) == 6.0
+
+
+@pytest.mark.parametrize("venue", [
+    "ApJ", "ApJL", "ApJS", "JGR", "GRL", "A&A", "AA", "MNRAS", "PRD", "PRC", "PRE",
+    "JCAP", "JCP", "SISC", "CMAME", "ICML", "NeurIPS", "NIPS", "ICLR",
+    "Astrophysical Journal", "Astrophys. J.", "Journal of Geophysical Research",
+    "Geophysical Research Letters", "Astronomy and Astrophysics", "Astron. Astrophys.",
+    "Monthly Notices of the Royal Astronomical Society", "Mon. Not. Roy. Astron. Soc.",
+    "Physical Review D", "Phys. Rev. D", "Physical Review C", "Physical Review E",
+    "Journal of Cosmology and Astroparticle Physics", "Astroparticle Physics",
+    "Nuclear Physics B", "Nuclear Instruments and Methods in Physics Research",
+    "Solar Physics", "Planetary and Space Science", "Journal of Computational Physics",
+    "SIAM Journal on Scientific Computing", "Computer Methods in Applied Mechanics and Engineering",
+    "International Conference on Machine Learning", "Neural Information Processing Systems",
+    "Advances in Neural Information Processing Systems",
+    "International Conference on Learning Representations",
+    "Communications in Mathematics and Statistics", "Physical Reviw D",
+])
+def test_core_domain_venue_authority(venue):
+    from papervault.library.services.search_pipeline import _venue_tier_multiplier
+
+    cand = dict(venue=venue, year=2016, citation_count=40)
+    assert _venue_tier_multiplier(cand) == 1.2
+    assert _authority_value(cand, 2026) == 4.8
+
+
+@pytest.mark.parametrize("prefix", [
+    "10.1103/physrevlett", "10.1103/physrevx", "10.1103/revmodphys", "10.1126/science",
+    "10.1038/nature", "10.1038/s41567", "10.1038/s42254", "10.1007/s11214", "10.12942/lrsp",
+    "10.1007/s41116", "10.1073/pnas", "10.1016/j.physrep", "10.1088/0034-4885",
+    "10.1146/annurev", "10.1137/s00361445",
+])
+@pytest.mark.parametrize("venue", ["", "Phys. Rev. Lett.", "Unrecognized journal typo"])
+def test_flagship_doi_fallback(prefix, venue):
+    from papervault.library.services.search_pipeline import _venue_tier_multiplier
+
+    assert _venue_tier_multiplier(dict(doi=prefix.upper() + ".123", venue=venue)) == 1.5
+
+
+@pytest.mark.parametrize("prefix", [
+    "10.1086/", "10.3847/", "10.1029/", "10.1051/0004-6361", "10.1093/mnras",
+    "10.1103/physrevd", "10.1103/physreve", "10.1103/physrevc", "10.1088/1475-7516",
+    "10.1016/j.astropartphys", "10.1016/j.nuclphysb", "10.1016/j.nima", "10.1007/s11207",
+    "10.1016/j.pss", "10.1016/0032-0633", "10.1016/j.jcp", "10.1016/j.cma", "10.1007/s40304",
+])
+@pytest.mark.parametrize("venue", ["", "Astrophys. J.", "Unrecognized journal typo"])
+def test_core_domain_doi_fallback(prefix, venue):
+    from papervault.library.services.search_pipeline import _venue_tier_multiplier
+
+    assert _venue_tier_multiplier(dict(doi=prefix.upper() + "123", venue=venue)) == 1.2
+
+
+@pytest.mark.parametrize("venue", [
+    "AGU Fall Meeting Abstracts", "AGU Spring Meeting", "Meeting Abstracts",
+    "Conference Abstracts", "COSPAR Scientific Assembly", "EGU General Assembly",
+    "AAS Meeting", "APS Division of Plasma Physics",
+    "Bulletin of the American Astronomical Society", "Bulletin of the American Physical Society",
+    "PoS", "Proceedings of Science", "International Cosmic Ray Conference",
+    "AIP Conf. Proc.", "AIP Conference Proceedings", "HAL CCSD", "CCSD",
+])
+def test_abstract_and_short_proceedings_authority(venue):
+    from papervault.library.services.search_pipeline import _venue_tier_multiplier
+
+    cand = dict(venue=venue, doi="10.1234/abstract", year=2016, citation_count=40)
+    assert _venue_tier_multiplier(cand) == 0.5
+    assert _authority_value(cand, 2026) == 2.0
+
+
+@pytest.mark.parametrize("cand,multiplier", [
+    ({}, 1.0), ({"venue": "", "doi": ""}, 1.0),
+    ({"venue": "arXiv", "arxiv_id": "2601.12345"}, 1.0),
+    ({"arxiv_id": "2601.12345"}, 1.0),
+    ({"venue": "Other Journal", "doi": "10.1234/paper"}, 1.0),
+    ({"venue": "Other Journal", "arxiv_id": "2601.12345"}, 1.0),
+    ({"venue": "Other Journal", "inspire_record_id": "123"}, 1.0),
+    ({"venue": "Other Journal", "citation_count": 5}, 1.0),
+    ({"venue": "Other Journal", "citation_count": 4}, 0.5),
+    ({"venue": "Other Journal", "citation_count": None}, 0.5),
+    ({"venue": "ApJ"}, 1.2), ({"venue": "PRL"}, 1.5),
+    ({"doi": "10.5194/EGUSPHERE-EGU26-123"}, 0.5),
+    ({"venue": "EGU General Assembly", "arxiv_id": "2601.12345"}, 0.5),
+])
+def test_tier_defaults_and_identifier_exemptions(cand, multiplier):
+    from papervault.library.services.search_pipeline import _venue_tier_multiplier
+
+    assert _venue_tier_multiplier(cand) == multiplier
+
+
+@pytest.mark.parametrize("year", [None, 0, "2016", 2026, 2027])
+def test_venue_multiplier_preserves_missing_or_future_year_fallback(year):
+    assert _authority_value(dict(venue="PRL", citation_count=40, year=year), 2026) == 60.0
+
+
+@pytest.mark.parametrize("venue,doi,multiplier", [
+    ("Reviews of Geophysics", "10.1029/RG020i002p00335", 1.5),
+    ("Physical Review D", "10.1103/PhysRevLett.116.241105", 1.5),
+    ("EGU General Assembly", "10.1126/science.123", 0.5),
+    ("Nature", "10.5194/egusphere-egu26-123", 0.5),
+])
+def test_overlapping_venue_and_doi_tiers(venue, doi, multiplier):
+    from papervault.library.services.search_pipeline import _venue_tier_multiplier
+
+    cand = dict(venue=venue, doi=doi, citation_count=40, year=2016)
+    assert _venue_tier_multiplier(cand) == multiplier
+    assert _authority_value(cand, 2026) == 4 * multiplier

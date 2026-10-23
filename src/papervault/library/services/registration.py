@@ -53,6 +53,10 @@ _NON_PAPER_TYPES = {
     "supplementary-material",
 }
 _IDENTIFIERS = {"doi", "arxiv_id", "paper_id", "inspire_record_id"}
+_CONFERENCE_ABSTRACT_VENUE = re.compile(
+    r"agu fall meeting|agu spring meeting|meeting abstract|conference abstract|"
+    r"cospar scientific assembly|egu general assembly|aas meeting|aps .* meeting abstract|"
+    r"bulletin of the american astronomical society|bulletin of the american physical society")
 
 
 def metadata_is_paper(publication_types) -> bool | None:
@@ -70,14 +74,21 @@ def registration_rejection(candidate: dict, *, known_identity: bool = False) -> 
     if not judgment.get("ingest_ok") or judgment.get("tier") not in INGEST_TIERS:
         return "domain_unjudged_or_rejected"
     doi = (candidate.get("doi") or "").lower()
-    if doi.startswith("10.5194/egusphere-egu") and doi[21:22].isdigit():
+    venue = " ".join((candidate.get("venue") or "").lower().split())
+    if ((doi.startswith("10.5194/egusphere-egu") and doi[21:22].isdigit())
+            or _CONFERENCE_ABSTRACT_VENUE.search(venue)):
         return "conference_abstract"
     meta = metadata_is_paper(candidate.get("publication_types"))
     if not (meta if meta is not None else judgment.get("llm_is_paper")):
         return "non_paper"
-    if not (candidate.get("doi") or candidate.get("arxiv_id")
-            or retained_inspire_fields(candidate)["inspire_record_id"]
-            or (candidate.get("abstract") or "").strip()):
+    identified = (candidate.get("doi") or candidate.get("arxiv_id")
+                  or retained_inspire_fields(candidate)["inspire_record_id"])
+    if not known_identity:
+        authors = candidate.get("authors") or []
+        if (not authors or authors[0].strip().lower() in {"anon", "anon.", "anonymous", "unknown"}
+                or (not identified and int(candidate.get("citation_count") or 0) < 10)):
+            return "unverified_low_quality"
+    if not (identified or (candidate.get("abstract") or "").strip()):
         return "contentless"
     if known_identity:
         return ""  # legacy quality validation applies only to a newly allocated record

@@ -1223,7 +1223,7 @@ async def test_search_ingest_does_not_overwrite_audit_set_tier(
 
 
 @pytest.mark.asyncio
-async def test_search_ingest_plugs_reject_egu_abstract_and_contentless_stub(
+async def test_search_ingest_quality_gates_reject_abstracts_and_unverified_stubs(
         server, populated_lib, monkeypatch):
     """Junk-ingress PLUGs (2026-06-03): an EGU conference abstract (egusphere-egu DOI)
     and a content-less ghost stub (no doi/arxiv/abstract) are NOT ingested EVEN WHEN
@@ -1239,11 +1239,16 @@ async def test_search_ingest_plugs_reject_egu_abstract_and_contentless_stub(
             "abstract": "A real physics-informed inversion of a transport coefficient.",
             "doi": "10.1/realpaper", "arxiv_id": "", "citation_count": 5,
             "publication_types": ["JournalArticle"]}
+    meeting = dict(real, title="AGU meeting on PINN inversion", venue="AGU Fall Meeting Abstracts",
+                   doi="10.1234/meeting")
+    anonymous = dict(real, title="Anonymous PINN inversion record", authors=["Anonymous"],
+                     doi="10.1234/anonymous")
+    stub = dict(real, title="Unverified PINN inversion record", doi="", citation_count=9)
 
     async def fake_external(terms, *, year_min=None, year_max=None, ranking_hint="by_relevance"):
-        return [_tag(egu, 0, 0), _tag(ghost, 0, 1), _tag(real, 0, 2)], {}
+        return [_tag(cand, 0, i) for i, cand in enumerate([egu, ghost, meeting, anonymous, stub, real])], {}
 
-    async def fake_ingest(cands, *, llm=None):  # gate WOULD pass all 3 — only the plugs stop egu/ghost
+    async def fake_ingest(cands, *, llm=None):  # the LLM would admit every candidate
         return {i: {"reason": "", "tier": "1A", "ingest_ok": True, "llm_is_paper": True}
                 for i in range(len(cands))}, 0
 
@@ -1262,6 +1267,9 @@ async def test_search_ingest_plugs_reject_egu_abstract_and_contentless_stub(
     assert any("Real PINN inversion" in t for t in titles)   # PLUG-clear → ingested
     assert not any("EGU abstract" in t for t in titles)      # PLUG A (egusphere-egu DOI) → rejected
     assert not any("Ghost stub" in t for t in titles)        # PLUG B (no doi/arxiv/abstract) → rejected
+    for rejected in (meeting, anonymous, stub):
+        assert rejected["title"] not in titles
+        assert rejected["title"] not in {r["title"] for r in out["results"]}
 
 
 @pytest.mark.asyncio

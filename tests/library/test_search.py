@@ -10,12 +10,18 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import json
 import logging
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
+import requests
 import responses
 
-from papervault.library import search
+from papervault.library import polite_http, search
+from papervault.library.politeness_v2 import AdmissionDenied, Ledger, Scope
 from papervault.library.sources.exceptions import BackendDegraded
 
 
@@ -365,6 +371,172 @@ def test_search_external_async_records_backend_degraded(monkeypatch):
     assert degraded.get("semantic_scholar") == 2
     assert degraded.get("core") == 2
     assert degraded.get("arxiv", 0) == 0    # genuine empty is NOT a degrade
+
+
+# ----------- polite-v2 fan-out pacing (#306) --------------------------------
+
+
+@pytest.fixture
+def polite_search(monkeypatch, fetch_pool):
+    """Real adapters and configured accounting, with controlled HTTP and time."""
+    fetch_pool(8)
+    monkeypatch.setenv("PAPERVAULT_POLITE_V2", "1")
+    monkeypatch.setenv("PAPERVAULT_POLITE_ENVELOPES", json.dumps({
+        "openalex": {"analogue": "arxiv", "initial": [[1, 6]],
+                     "hard_cap": [[1, 3]], "authorization": "unit test"},
+    }))
+    clock = SimpleNamespace(now=100.0, sleeps=[], denials=[], delay=0.01, sleep_delay=0.0,
+                            sleep_fraction=1.0, blocked=None,
+                            started=threading.Event(), release=threading.Event(),
+                            other_finished=threading.Event())
+    monkeypatch.setattr(polite_http, "_ledger", None)
+    monkeypatch.setattr(polite_http, "_configuration", None)
+    monkeypatch.setattr(polite_http, "_unavailable", set())
+    monkeypatch.setattr(polite_http, "Ledger",
+                        lambda policies: Ledger(policies, clock=lambda: clock.now))
+    clock.ledger = polite_http.get_ledger()
+    note_sent = clock.ledger.note_sent
+
+    def record_send(scope):
+        try:
+            return note_sent(scope)
+        except AdmissionDenied as error:
+            clock.denials.append(error.decision.reason)
+            raise
+
+    monkeypatch.setattr(clock.ledger, "note_sent", record_send)
+    # Isolate ledger windows from legacy arXiv/CORE pacing.
+    monkeypatch.setattr(search, "_interval_for", lambda backend: 0.0)
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay):
+        clock.sleeps.append(delay)
+        clock.now += delay * clock.sleep_fraction
+        clock.sleep_fraction = 1.0
+        await real_sleep(clock.sleep_delay)
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    # A broken fan-out must fail promptly rather than spend seconds on retries.
+    for module in ("arxiv", "semantic_scholar"):
+        monkeypatch.setattr(f"papervault.library.sources.{module}.time",
+                            SimpleNamespace(sleep=lambda _: None))
+
+    def transport(url, *, params, **kwargs):
+        response = requests.Response()
+        response.status_code = 200
+        if "export.arxiv.org" in url:
+            backend, query = "arxiv", params["search_query"].removeprefix("all:")
+            body = ('<feed xmlns="http://www.w3.org/2005/Atom"><entry>'
+                    f'<id>http://arxiv.org/abs/1710.09668</id><title>{query}</title>'
+                    '<summary>Test</summary><published>2017-10-26T00:00:00Z</published>'
+                    '</entry></feed>')
+        elif "api.semanticscholar.org" in url:
+            backend, query = "semantic_scholar", params["query"]
+            body = json.dumps({"data": [{"title": query, "year": 2017}]})
+        else:
+            assert url == "https://api.openalex.org/works"
+            backend, query = "openalex", params["search"]
+            body = json.dumps({"results": [{"title": query, "publication_year": 2017}]})
+        if backend == clock.blocked:
+            clock.started.set()
+            assert clock.release.wait(5)
+        time.sleep(clock.delay)  # Hold the real in-flight ledger ticket.
+        if backend == "openalex" and query == "b":
+            clock.other_finished.set()
+        response._content = body.encode()
+        return response
+
+    monkeypatch.setattr(requests, "get", transport)
+    return clock
+
+
+@pytest.mark.parametrize("backend,interval", [
+    ("arxiv", 3.0), ("semantic_scholar", 2.0), ("openalex", 6.0),
+])
+def test_polite_v2_fanout_serializes_across_searches_and_event_loops(
+        monkeypatch, polite_search, backend, interval):
+    monkeypatch.setattr(search, "CAPS", {backend: 5})
+    observations = []
+
+    async def run():
+        with search.observe_source_gates(observations.append):
+            return await asyncio.gather(search.search_external_async(["a", "b"]),
+                                        search.search_external_async(["c", "d"]))
+
+    for _ in range(2):
+        for (papers, degraded), titles in zip(asyncio.run(run()), (["a", "b"], ["c", "d"])):
+            assert [p["title"] for p in papers] == titles
+            assert [p["term_idx"] for p in papers] == [0, 1]
+            assert not degraded
+        assert not search._BREAKER_OPEN_UNTIL
+    assert polite_search.sleeps == [interval] * 7
+    assert polite_search.denials == []
+    snapshot = polite_search.ledger.snapshot(Scope(backend))
+    assert (snapshot.sent, snapshot.in_flight, snapshot.positive_completions) == (8, 0, 8)
+    assert [o.status for o in observations] == ["success"] * 8
+
+
+def test_polite_v2_rechecks_window_after_early_wakeup(monkeypatch, polite_search):
+    monkeypatch.setattr(search, "CAPS", {"semantic_scholar": 5})
+    polite_search.sleep_fraction = 0.5
+    papers, degraded = asyncio.run(search.search_external_async(["a", "b"]))
+    assert [p["title"] for p in papers] == ["a", "b"]
+    assert not degraded
+    assert polite_search.sleeps == [2.0, 1.0]
+    assert polite_search.denials == []
+
+
+def test_polite_v2_lock_and_window_waits_do_not_use_fetch_timeout(polite_search):
+    polite_search.sleep_delay = 0.25  # Each window wait exceeds the fetch timeout.
+
+    async def run():
+        return await asyncio.gather(*(
+            search._fetch_one_backend(term, "semantic_scholar", 5, term_idx=i, timeout=0.2)
+            for i, term in enumerate(["a", "b", "c", "d"])
+        ))
+
+    assert [batch[0]["title"] for batch in asyncio.run(run())] == ["a", "b", "c", "d"]
+    assert polite_search.sleeps == [2.0] * 3
+    assert polite_search.denials == []
+    assert not search._BREAKER_OPEN_UNTIL
+
+
+def test_polite_v2_backends_progress_independently(monkeypatch, polite_search):
+    monkeypatch.setattr(search, "CAPS", {"arxiv": 5, "openalex": 5})
+    polite_search.blocked = "arxiv"
+
+    async def run():
+        task = asyncio.create_task(search.search_external_async(["a", "b"]))
+        try:
+            assert await asyncio.to_thread(polite_search.started.wait, 5)
+            assert await asyncio.to_thread(polite_search.other_finished.wait, 5)
+        finally:
+            polite_search.release.set()
+            papers, degraded = await task
+        assert len(papers) == 4
+        assert not degraded
+
+    asyncio.run(run())
+    assert polite_search.denials == []
+
+
+@pytest.mark.parametrize("backend", ["arxiv", "semantic_scholar", "openalex"])
+@pytest.mark.parametrize("flag,stub", [("0", False), ("1", True)])
+def test_polite_v2_adds_no_wait_for_flag_off_or_injected_backends(
+        monkeypatch, polite_search, backend, flag, stub):
+    monkeypatch.setenv("PAPERVAULT_POLITE_V2", flag)
+    monkeypatch.setattr(search, "CAPS", {backend: 5})
+    if stub:
+        monkeypatch.setattr(search, f"search_{backend}", lambda q, **kw: [_paper(q)])
+
+    def forbidden(*args):
+        pytest.fail("legacy/test backend consulted the politeness ledger")
+
+    monkeypatch.setattr(polite_search.ledger, "gate", forbidden)
+    papers, degraded = asyncio.run(search.search_external_async(["a", "b"]))
+    assert [p["title"] for p in papers] == ["a", "b"]
+    assert not degraded
+    assert polite_search.sleeps == []
 
 
 # ----------- per-backend circuit breaker (#115) ------------------------------

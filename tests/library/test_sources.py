@@ -54,6 +54,43 @@ def test_search_arxiv_parses_atom_feed():
     assert p["arxiv_id"] == "2401.0001v1"
 
 
+@pytest.mark.parametrize("query,expected", [
+    ("id:1710.09668", "id:1710.09668"), ("test query", "all:test query"),
+])
+@responses.activate
+def test_search_arxiv_preserves_id_queries(query, expected):
+    from urllib.parse import parse_qs, urlparse
+
+    responses.get("http://export.arxiv.org/api/query",
+                  body='<feed xmlns="http://www.w3.org/2005/Atom"/>')
+    assert search_arxiv(query, max_results=1) == []
+    sent = parse_qs(urlparse(responses.calls[0].request.url).query)
+    assert sent["search_query"] == [expected]
+    assert sent["max_results"] == ["1"]
+
+
+@pytest.mark.parametrize("entry", [
+    "<entry><title>Error</title></entry>",
+    "<entry><published>2024-01-15T00:00:00Z</published></entry>",
+])
+@responses.activate
+def test_search_arxiv_skips_entries_missing_required_elements(entry):
+    responses.get("http://export.arxiv.org/api/query",
+                  body=_ATOM_RESPONSE.replace("<entry>", entry + "<entry>", 1))
+    papers = search_arxiv("test query")
+    assert [p["title"] for p in papers] == ["A Test Paper Title", "Second Paper"]
+    assert [p["arxiv_id"] for p in papers] == ["2401.0001v1", "2401.0002v1"]
+
+
+@responses.activate
+def test_search_arxiv_error_only_feed_returns_empty():
+    responses.get("http://export.arxiv.org/api/query", body=(
+        '<feed xmlns="http://www.w3.org/2005/Atom">'
+        '<entry><title>Error</title><id>http://arxiv.org/api/errors</id></entry></feed>'
+    ))
+    assert search_arxiv("id:1710.09668", max_results=1) == []
+
+
 def test_search_arxiv_empty_query_returns_empty():
     assert search_arxiv("") == []
 

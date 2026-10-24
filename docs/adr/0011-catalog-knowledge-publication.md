@@ -1,6 +1,6 @@
-# Catalog-owned knowledge publication and coverage
+# 0011 — Catalog-owned knowledge publication and coverage
 
-Status: implementation of the accepted [P4 design, issue #278](https://github.com/LeonJoeeee/papervault/issues/278), [P5a extraction registration, issue #282](https://github.com/LeonJoeeee/papervault/issues/282), and [P5c maintenance, issue #284](https://github.com/LeonJoeeee/papervault/issues/284); activation requires the evidence and writer handoff below.
+Status: Accepted (2026-10-22); implementation of the accepted [P4 design, issue #278](https://github.com/LeonJoeeee/papervault/issues/278), [P5a extraction registration, issue #282](https://github.com/LeonJoeeee/papervault/issues/282), and [P5c maintenance, issue #284](https://github.com/LeonJoeeee/papervault/issues/284); activation requires the evidence and writer handoff below.
 
 ## Context
 

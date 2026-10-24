@@ -5,7 +5,7 @@ Live authority flip: **EXECUTED**, with owner approval, by the orchestrator on
 [live cutover decision and execution record](https://github.com/LeonJoeeee/papervault/issues/268#issuecomment-6257668738)
 supersedes the preparation-only status. PostgreSQL database `papervault_catalog` is now
 the authoritative catalog; `/data/paper-vault/index.json` is its canonical export.
-[The persistence/cutover ADR](../adr/DRAFT-catalog-persistence-cutover.md) defines the
+[The persistence/cutover ADR](../adr/0010-catalog-persistence-cutover.md) defines the
 mechanics accepted on [#268](https://github.com/LeonJoeeee/papervault/issues/268).
 
 ## Executed sequence

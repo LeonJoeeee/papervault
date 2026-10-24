@@ -1,6 +1,6 @@
-# Independent MinerU service ownership
+# 0009 — Independent MinerU service ownership
 
-Status: Implements the owner rulings in [issue #235](https://github.com/LeonJoeeee/papervault/issues/235) and [issue #237](https://github.com/LeonJoeeee/papervault/issues/237) (2026-10-16), with the HTTP task client update accepted in [issue #288](https://github.com/LeonJoeeee/papervault/issues/288) (2026-10-22); number assigned at merge.
+Status: Accepted (2026-10-22); implements the owner rulings in [issue #235](https://github.com/LeonJoeeee/papervault/issues/235) and [issue #237](https://github.com/LeonJoeeee/papervault/issues/237) (2026-10-16), with the HTTP task client update accepted in [issue #288](https://github.com/LeonJoeeee/papervault/issues/288) (2026-10-22).
 
 ## Context
 

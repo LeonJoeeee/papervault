@@ -865,7 +865,7 @@ def test_default_max_tokens_is_131000_when_env_unset(tmp_path):
 
 
 @pytest.mark.parametrize("gateway", [False, True])
-@pytest.mark.parametrize("level", ["flash", "standard", "pro"])
+@pytest.mark.parametrize("level", ["flash", "standard", "pro", "max", "ultra"])
 async def test_request_preserves_level_without_caller_effort(tmp_path, monkeypatch, gateway, level):
     monkeypatch.setattr(config, "USE_GATEWAY", gateway)
     monkeypatch.setattr(config, "GATEWAY_URL", "http://gw.example/v1")

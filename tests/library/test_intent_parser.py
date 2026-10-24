@@ -378,7 +378,7 @@ def test_intent_preserves_explicit_recency_and_closed_year_windows(query, year_m
     assert plan["ranking_hint"] == "by_recency"
 
 
-@pytest.mark.parametrize("level", [None, "flash", "standard", "pro"])
+@pytest.mark.parametrize("level", [None, "flash", "standard", "pro", "max", "ultra"])
 def test_intent_default_client_uses_its_dedicated_route(monkeypatch, level):
     from papervault.library import llm
 

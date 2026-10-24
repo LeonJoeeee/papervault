@@ -7,9 +7,9 @@ from papervault import config
 from papervault.llm_routing import route
 
 ROLE_LEVELS = [
-    ("build", "standard"), ("keyword", "flash"), ("synth", "pro"),
+    ("build", "standard"), ("keyword", "flash"), ("synth", "max"),
     ("gate", "flash"), ("verify", "flash"), ("judge", "standard"),
-    ("decompose", "standard"), ("eval_judge", "standard"), ("intent", "pro"),
+    ("decompose", "pro"), ("eval_judge", "standard"), ("intent", "pro"),
 ]
 
 
@@ -27,7 +27,7 @@ def test_agreed_role_level(role, want):
 
 
 @pytest.mark.parametrize("role,_", ROLE_LEVELS)
-@pytest.mark.parametrize("level", ["flash", "standard", "pro"])
+@pytest.mark.parametrize("level", ["flash", "standard", "pro", "max", "ultra"])
 def test_each_role_can_be_overridden(monkeypatch, role, _, level):
     monkeypatch.setenv(f"PAPERVAULT_LLM_{role.upper()}", level)
     assert route(role) == level
@@ -41,14 +41,14 @@ def test_blank_override_uses_role_default(monkeypatch, role, want, blank):
 
 
 def test_whitespace_is_normalized(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", " pro ")
-    assert route(" SYNTH ") == "pro"
+    monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", " max ")
+    assert route(" SYNTH ") == "max"
 
 
 @pytest.mark.parametrize("bad", ["cheap", "openai/pro", "provider-model", "pro:suffix", "PRO"])
 def test_invalid_override_names_the_variable(monkeypatch, bad):
     monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", bad)
-    with pytest.raises(ValueError, match="PAPERVAULT_LLM_SYNTH.*flash.*standard.*pro"):
+    with pytest.raises(ValueError, match="PAPERVAULT_LLM_SYNTH.*flash.*standard.*pro.*max.*ultra"):
         route("synth")
 
 
@@ -68,7 +68,7 @@ def test_retired_model_overrides_cannot_replace_levels(monkeypatch):
 
 
 @pytest.mark.parametrize("gateway", [False, True])
-@pytest.mark.parametrize("level", ["flash", "standard", "pro"])
+@pytest.mark.parametrize("level", ["flash", "standard", "pro", "max", "ultra"])
 def test_library_request_preserves_each_level(tmp_path, monkeypatch, gateway, level):
     from papervault.library import llm
 
@@ -105,7 +105,9 @@ def test_doctor_accepts_level_defaults_without_model_slots(tmp_path, monkeypatch
     report = cli._Report()
     cli._check_config(report)
     assert report.failures == 0
-    assert "synth=pro" in capsys.readouterr().out
+    output = capsys.readouterr().out
+    assert "synth=max" in output
+    assert "decompose=pro" in output
 
 
 def test_doctor_reports_invalid_role_override(tmp_path, monkeypatch, capsys):

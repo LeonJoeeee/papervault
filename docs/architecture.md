@@ -121,8 +121,8 @@ retrieved-paper citation fallback, not a synthesis-quality measurement.
 ### LLM stage routing
 
 All text LLM stages use these nine roles. `PAPERVAULT_LLM_<ROLE>` overrides the
-default level with `flash`, `standard` or `pro`. Search intent selects its own
-handle; the ingest and return gates share the judge handle.
+default level with `flash`, `standard`, `pro`, `max` or `ultra`. Search intent selects
+its own handle; the ingest and return gates share the judge handle.
 
 | Plane / LLM stage | Role | Default |
 | --- | --- | --- |
@@ -132,8 +132,8 @@ handle; the ingest and return gates share the judge handle.
 | S1 extracted-chunk clarity review and whole-document completeness | `gate` | `flash` |
 | S2 build entity/relation extraction and merge summaries | `build` | `standard` |
 | S2 query high/low-level keyword extraction when needed | `keyword` | `flash` |
-| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `standard` |
-| S2 evidence-grounded synthesis (production/eval) | `synth` | `pro` |
+| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `pro` |
+| S2 evidence-grounded synthesis (production/eval) | `synth` | `max` |
 | Evaluation answer/refusal scoring | `eval_judge` | `standard` |
 
 Planner, gate, verification and decomposition prompts include concrete calibration

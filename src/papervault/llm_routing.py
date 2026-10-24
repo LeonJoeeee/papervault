@@ -1,6 +1,6 @@
 """Role → gateway level routing for every PaperVault text LLM call.
 
-Operators override a role with PAPERVAULT_LLM_<ROLE>=flash|standard|pro.
+Operators override a role with PAPERVAULT_LLM_<ROLE>=flash|standard|pro|max|ultra.
 The endpoint owns each level's model and effort. Direct endpoints must also
 serve these level aliases; caller-side provider models are no longer selected.
 """
@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 
-LEVELS = ("flash", "standard", "pro")
+LEVELS = ("flash", "standard", "pro", "max", "ultra")
 _GATEWAY_PREFIX = "papervault-"
 
 
@@ -20,11 +20,11 @@ _DEFAULT_LEVELS = {
     "intent": "pro",
     "build": "standard",
     "keyword": "flash",
-    "synth": "pro",
+    "synth": "max",
     "gate": "flash",
     "verify": "flash",
     "judge": "standard",
-    "decompose": "standard",
+    "decompose": "pro",
     "eval_judge": "standard",
 }
 ROLES = tuple(_DEFAULT_LEVELS)

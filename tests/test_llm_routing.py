@@ -9,7 +9,7 @@ from papervault.llm_routing import route
 ROLE_LEVELS = [
     ("build", "standard"), ("keyword", "flash"), ("synth", "pro"),
     ("gate", "flash"), ("verify", "flash"), ("judge", "standard"),
-    ("decompose", "standard"), ("eval_judge", "standard"),
+    ("decompose", "standard"), ("eval_judge", "standard"), ("intent", "pro"),
 ]
 
 

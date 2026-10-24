@@ -205,6 +205,19 @@ title / venue / abstract, independent of any metadata.
 Output ONLY one JSON object:
 {{"items": [{{"i": <int>, "reason": "<str>", "is_paper": <bool>, "tier": "<1A|1B|1C|2A|2B|2C|3>"}}, ...]}}
 The ``i`` must match the candidate's ``i``.
+
+==== Worked examples (apply the configured rubric above) ====
+Core space-physics research: retain as tier 1A.
+Input: {{"candidates": [{{"i": 0, "title": "Solar modulation of galactic cosmic-ray protons", "venue": "Journal of Geophysical Research: Space Physics", "abstract": "We infer heliospheric diffusion and drift coefficients from proton spectra over a solar cycle."}}]}}
+Output: {{"items": [{{"i": 0, "reason": "Research article on heliospheric cosmic-ray transport, a core space-physics mechanism.", "is_paper": true, "tier": "1A"}}]}}
+
+Transferable AI4Science method: retain as tier 2B despite the fluid application.
+Input: {{"candidates": [{{"i": 0, "title": "Physics-informed neural networks for forward and inverse nonlinear PDEs", "venue": "Journal of Computational Physics", "abstract": "A differentiable PDE-residual loss learns solutions and unknown transport coefficients from sparse fluid observations."}}]}}
+Output: {{"items": [{{"i": 0, "reason": "Research article; PDE-residual inverse method transfers to plasma transport and scientific parameter inference.", "is_paper": true, "tier": "2B"}}]}}
+
+Reject off-domain research and meeting abstracts for their respective reasons.
+Input: {{"candidates": [{{"i": 0, "title": "Consumer brand loyalty in supermarket surveys", "venue": "Journal of Retailing", "abstract": "We analyze household purchasing preferences."}}, {{"i": 1, "title": "A preliminary solar energetic particle event catalog", "venue": "AGU Fall Meeting Abstracts", "abstract": "Meeting presentation abstract summarizing planned event measurements."}}]}}
+Output: {{"items": [{{"i": 0, "reason": "Genuine retail research, outside space physics and transferable AI4Science.", "is_paper": true, "tier": "3"}}, {{"i": 1, "reason": "Core space-physics topic, but a meeting abstract rather than a research paper.", "is_paper": false, "tier": "1A"}}]}}
 """
 _INGEST_SYSTEM = _INGEST_SYSTEM.replace("__DOMAIN_LABEL__", get_domain().label)
 
@@ -304,6 +317,23 @@ answers + what it gives the intent, or "no sub-part: same field only") then scor
   0.0-0.2 : off-topic
 Output ONLY: {"items":[{"i":<int>,"reason":"<str>","score":<float>}, ...]}
 The "i" MUST be the candidate's provided "i" (do NOT renumber).
+
+==== Absolute-score calibration examples ====
+Direct hit: the paper answers the complete requested mechanism.
+Input: {"intent": "How do gradient and curvature drifts cause charge-sign-dependent cosmic-ray solar modulation?", "candidate": {"i": 0, "title": "Charge-sign-dependent modulation by gradient and curvature drifts", "abstract": "We derive drift transport and compare opposite-charge spectra across magnetic-polarity cycles."}}
+Output: {"items": [{"i": 0, "reason": "Directly explains charge-sign-dependent drift modulation and tests its polarity-cycle predictions.", "score": 0.95}]}
+
+Focused sub-aspect / method transfer: strong utility without covering all sub-topics.
+Input: {"intent": "PINN methods for solar energetic particle transport, including coefficient inversion and uncertainty", "candidate": {"i": 0, "title": "Physics-informed inversion of advection-diffusion coefficients", "abstract": "Sparse tracer observations constrain unknown diffusion coefficients through a PDE-residual neural loss; uncertainty is not studied."}}
+Output: {"items": [{"i": 0, "reason": "Provides a borrowable coefficient-inversion method for the transport sub-aspect; lacks SEP validation and uncertainty.", "score": 0.76}]}
+
+Tangential background: limited payload may support also_include; not a direct answer.
+Input: {"intent": "Infer SEP pitch-angle diffusion with PINNs", "candidate": {"i": 0, "title": "A primer on heliospheric particle scattering", "abstract": "Defines pitch-angle diffusion and its observational context, without inference algorithms or neural methods."}}
+Output: {"items": [{"i": 0, "reason": "Defines the requested diffusion coefficient as background, but gives no inversion method; possible also_include.", "score": 0.45}]}
+
+Keyword-only collision: shared words carry no utility for this intent.
+Input: {"intent": "Cosmic-ray diffusion in heliospheric magnetic turbulence", "candidate": {"i": 0, "title": "Diffusion models for cosmic-themed image generation", "abstract": "A text-to-image model generates artistic star fields, without charged-particle transport or plasma physics."}}
+Output: {"items": [{"i": 0, "reason": "No intended sub-part: diffusion means image generation, not cosmic-ray transport.", "score": 0.10}]}
 """
 _RETURN_SYSTEM = _RETURN_SYSTEM.replace("__DOMAIN_LABEL__", get_domain().label)
 

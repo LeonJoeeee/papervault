@@ -17,7 +17,7 @@ def test_intent_observation_marks_undisclosed_serving_metadata_unknown():
     with observe_intent(observations.append):
         plan = parse_intent("Find cosmic ray transport", client)
 
-    assert set(plan) == {"search_terms", "filters", "limit_suggested", "ranking_hint", "reasoning"}
+    assert set(plan) == {"search_terms", "kg_concepts", "filters", "limit_suggested", "ranking_hint", "reasoning"}
     assert len(observations) == 1
     receipt = observations[0]
     assert receipt.model == receipt.provider == "unknown"
@@ -376,3 +376,67 @@ def test_intent_preserves_explicit_recency_and_closed_year_windows(query, year_m
     plan = parse_intent(query, DatedLLM())
     assert plan["filters"] == {"year_min": year_min, "year_max": year_max}
     assert plan["ranking_hint"] == "by_recency"
+
+
+@pytest.mark.parametrize("level", [None, "flash", "standard", "pro"])
+def test_intent_default_client_uses_its_dedicated_route(monkeypatch, level):
+    from papervault.library import llm
+
+    monkeypatch.delenv("PAPERVAULT_LLM_INTENT", raising=False)
+    if level:
+        monkeypatch.setenv("PAPERVAULT_LLM_INTENT", level)
+    requested = []
+
+    def get_client(*, model=None):
+        requested.append(model)
+        return FakeLLM(["solar modulation"])
+
+    monkeypatch.setattr(llm, "get_llm", get_client)
+    assert parse_intent("solar modulation")["search_terms"] == ["solar modulation"]
+    assert requested == [level or "pro"]
+
+
+def test_injected_intent_client_bypasses_route_resolution(monkeypatch):
+    monkeypatch.setenv("PAPERVAULT_LLM_INTENT", "invalid")
+    assert parse_intent("solar modulation", FakeLLM(["solar modulation"]))["search_terms"] == ["solar modulation"]
+
+
+def test_kg_concepts_are_independent_normalized_canonical_terms():
+    class ConceptLLM:
+        def call(self, messages):
+            return json.dumps({
+                "search_terms": ["PINN SEP", "PAMELA positron spectrum"],
+                "kg_concepts": ["  Parker transport equation  ", "", None, 3,
+                                "physics-informed neural networks", "Parker transport equation"],
+            })
+
+    plan = parse_intent("Find transport methods", ConceptLLM())
+    assert plan["kg_concepts"] == ["Parker transport equation", "physics-informed neural networks"]
+    assert plan["search_terms"] == ["PINN SEP", "PAMELA positron spectrum", "PAMELA positron abundance"]
+
+
+@pytest.mark.parametrize("concepts", [None, "solar modulation", {}, [], [None, 3, " "]])
+def test_invalid_or_empty_kg_concepts_fall_back_to_final_search_terms(concepts):
+    class ConceptLLM:
+        def call(self, messages):
+            return json.dumps({"search_terms": ["PAMELA AMS-02 positron spectrum"],
+                               "kg_concepts": concepts})
+
+    plan = parse_intent("positron measurements", ConceptLLM())
+    assert plan["kg_concepts"] == ["PAMELA positron spectrum", "PAMELA positron abundance",
+                                   "AMS-02 positron spectrum", "AMS-02 positron abundance"]
+
+
+def test_missing_kg_concepts_fall_back_to_query_when_terms_are_missing():
+    assert parse_intent("  solar modulation  ", FakeLLM([]))["kg_concepts"] == ["solar modulation"]
+
+
+def test_kg_concepts_are_bounded_after_deduplication():
+    class ConceptLLM:
+        def call(self, messages):
+            return json.dumps({"search_terms": ["solar modulation"],
+                               "kg_concepts": ["concept 0"] * 8 + [f"concept {i}" for i in range(1, 10)]})
+
+    assert parse_intent("solar modulation", ConceptLLM())["kg_concepts"] == [
+        "concept 0", "concept 1", "concept 2", "concept 3", "concept 4", "concept 5", "concept 6", "concept 7",
+    ]

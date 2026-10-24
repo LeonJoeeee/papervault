@@ -17,6 +17,7 @@ def gateway_model(level: str) -> str:
     project so the gateway never needs ambiguous global aliases (standard/pro)."""
     return f"{_GATEWAY_PREFIX}{level}"
 _DEFAULT_LEVELS = {
+    "intent": "pro",
     "build": "standard",
     "keyword": "flash",
     "synth": "pro",

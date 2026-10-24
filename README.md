@@ -9,7 +9,7 @@ server. Claude Code, Codex CLI, Antigravity CLI/IDE and other MCP clients share 
 | `get_paper` | Resolve a citation key, DOI, arXiv ID or fuzzy title and return metadata plus a serve-safe full-text path when available. |
 | `query` | Retrieve evidence from the knowledge graph and synthesize an answer with verified paper citations. |
 
-Version **0.10.12** documents the post-refactor search, catalog and knowledge contracts.
+Version **0.10.13** adds dual-track local retrieval and calibrated LLM planning and gates.
 The product is pre-release (closed beta). Read the [PRD](docs/PRD.md) for scope,
 [architecture](docs/architecture.md) for boundaries, [installation guide](docs/INSTALL.md)
 for deployment, and [baselines](docs/baselines.md#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
@@ -73,6 +73,29 @@ agy mcp add papervault http://127.0.0.1:8080/mcp
 Start a new Antigravity session after installing. Agent shells contain no retrieval
 or lifecycle logic.
 
+### LLM stages and routing
+
+Every text LLM call selects one of nine roles. Set `PAPERVAULT_LLM_<ROLE>` to
+`flash`, `standard` or `pro`; unset or blank uses the defaults below. Both direct
+endpoints and the optional gateway must serve these level aliases. A supplied
+test/client handle bypasses role selection for that call.
+
+| Plane and stage | Role | Default |
+| --- | --- | --- |
+| S1 search intent: API terms and local KG concepts in one call | `intent` | `pro` |
+| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `standard` |
+| S1 downloaded PDF identity verification | `verify` | `flash` |
+| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `flash` |
+| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `standard` |
+| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `flash` |
+| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `standard` |
+| S2 evidence-grounded answer synthesis, including eval | `synth` | `pro` |
+| Evaluation answer and refusal judgments | `eval_judge` | `standard` |
+
+Embedding (BGE-M3), reranking and OCR use their existing local/service paths and
+do not select text LLM roles. The prompt examples calibrate the planner, both
+search judges, PDF identity, clarity/completeness, decomposition and fan-out.
+
 ## Search and catalog quality
 
 `search_papers` combines arXiv, ADS, Semantic Scholar, OpenAlex, INSPIRE and CORE
@@ -82,13 +105,17 @@ method boundaries: **intent → plan → retrieval → fusion → return gate �
 The operational stages below include the gates and independently admitted command
 path within those boundaries; they are not six separate services.
 
-1. **Stage 1 — intent and plan.** Parse search terms, result count, year bounds and
-   ranking hints. The post-parse `year_min` guard protects canon: for a lower-bound-only
+1. **Stage 1 — intent and plan.** The `intent` role parses API/BM25 `search_terms`
+   (short phrases), independent canonical scientific `kg_concepts`, result count,
+   year bounds and ranking hints in one call. Missing/empty concepts default to
+   the normalized terms; the API terms keep their existing expansion rules.
+   The post-parse `year_min` guard protects canon: for a lower-bound-only
    plan, canonical/foundational/classical/seminal/historical wording clears the lower
    bound, and survey/overview/current-understanding wording clears it when no explicit
    recency cue exists. A cleared bound also resets `by_recency` to `by_relevance`.
    Bounded date intervals remain intact; unknown years survive year filtering.
-2. **Stage 2 — retrieval.** Fetch external terms alongside a local-library snapshot.
+2. **Stage 2 — retrieval.** Snapshot the local library, then fetch external terms
+   alongside optional KG/vector candidates off the event loop.
    Under polite v2, arXiv, Semantic Scholar and OpenAlex serialize admission/fetch
    through a per-`(event_loop, backend)` lock. Backend pacing and fetch-thread queue
    waits precede timed execution. `PolitenessDenied`, including wrapped denials, and
@@ -101,11 +128,33 @@ path within those boundaries; they are not six separate services.
 
    **Stage 2.5 — fusion.** `SearchPipeline.fusion` resolves aliases and compatible
    bibliographic duplicates, retaining external rank evidence on local records.
-   Term-wise BM25/RRF pooling admits up to `LIB_CAP=45` local candidates plus
+   Dual-track local retrieval combines **BM25 + PGVector chunks/entities/relations
+   + Neo4j cross-facet topology + authority**. BGE-M3 embeds the full user query
+   and canonical concepts; chunk vectors use the full query, while entity and
+   relation vectors also use concepts. RRF merges their paper ranks. Edges between
+   different concept facets and high-weight hub edges add topology evidence.
+   `file_path` values split on `<SEP>` resolve to retained canonical paper keys;
+   serving exclusions and year bounds still apply. KG candidates can reach the
+   local pool without a BM25 keyword match. KG ranks contribute to fusion beside
+   per-term local ranks; external ranks retain their existing evidence and pool.
+   Term-wise BM25/KG/RRF pooling admits up to `LIB_CAP=45` local candidates plus
    `ALSO_INCLUDE_CAP=45` additional externally vouched local records; the external
    pool cap is 60. The local `authority_weight` prior enters RRF **before the pool
    cut**, helping landmark papers reach judgment. It also weights the vouched
    supplement. Explicit recency/importance ordering bypasses this prior.
+
+   `PAPERVAULT_SEARCH_KG=0` disables this optional arm. If unset, it is enabled
+   only when `PAPERVAULT_STORAGE_BACKEND=postgres`; `PAPERVAULT_SEARCH_KG=1`
+   explicitly enables it. Configure the knowledge database with `POSTGRES_*`
+   (not the catalog DSN), `POSTGRES_WORKSPACE` and `NEO4J_*`; any explicit Neo4j
+   workspace must match. Queries use PostgreSQL read-only transactions with
+   `hnsw.ef_search=120` and Neo4j read sessions, without schema initialization.
+   When `NEO4J_DATABASE` is unset, the reader tries LightRAG's
+   `chunk-entity-relation` database and falls back to the home database only if
+   the preferred database does not exist. Encoding shares S2's GPU admission
+   semaphore; database reads do not hold its permit.
+   Missing configuration, embedding/backend failures or unavailable stores yield
+   no KG candidates and leave the BM25/external search available.
 3. **Stage 3 — domain/ingest gate (the “flash gate”).** Judge external candidates
    against the domain-pack tiers and paper classification. Source publication types
    take precedence when conclusive; an LLM paper/non-paper judgment fills missing
@@ -642,7 +691,8 @@ stated in its description. The declared fields move together: `pyproject.toml`
 `[project].version`, the `papervault` entry in `uv.lock` (refresh with `uv lock`),
 `plugin/.claude-plugin/plugin.json`, `plugin/plugin.json`, and the `papervault`
 entry in `.claude-plugin/marketplace.json`. `tests/test_plugin_version_sync.py`
-fails when they drift. This documentation-only change is a patch bump to **0.10.12**.
+fails when they drift. This retrieval/routing/prompt change uses the issue-requested
+patch version **0.10.13**.
 
 A release is a tag naming the version already on `main` (`vX.Y.Z`, optionally
 `-stage`); the release commit changes no version field. CI builds wheel/sdist on

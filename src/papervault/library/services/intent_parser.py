@@ -2,6 +2,7 @@
 
 Translates a natural-language research intent into a structured search plan:
   - search_terms: list of keyword phrases to feed to backend search APIs
+  - kg_concepts: canonical concepts for local knowledge graph/vector retrieval
   - filters: year_min / year_max (the only REAL filters, emitted only on an
     explicit recency cue) + citation_pref / review_pref (SOFT ranking hints)
   - limit_suggested: count hint from intent (e.g. "5 papers" -> 5; None otherwise)
@@ -25,6 +26,7 @@ from dataclasses import dataclass
 from typing import NotRequired, Optional, TypedDict
 
 from papervault.domain import get_domain
+from papervault.llm_routing import route
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +72,7 @@ _EXPERIMENT_ALIASES = {
 
 class SearchPlan(TypedDict):
     search_terms: list[str]
+    kg_concepts: list[str]
     filters: dict
     limit_suggested: Optional[int]
     ranking_hint: str
@@ -193,6 +196,13 @@ The downstream pipeline takes:
 
   Each term should be 2-6 words, except when retaining a full instrument name
   requires more. Don't include single common words.
+- kg_concepts: canonical scientific concepts, physical mechanisms, entities, and
+  methods for local knowledge graph and vector retrieval. These are independent
+  of the short API search_terms: expand scientific acronyms and name meaningful
+  concepts such as "Parker transport equation", "pitch-angle scattering", or
+  "physics-informed neural networks". Do not pad with API variants, review/recency
+  words, or invented topics. Emit up to 8 distinct concepts; preserve the intent's
+  scientific scope. If absent or empty, the server uses the final search_terms.
 - named_entities: experiment/instrument/mission names explicitly written in the
   user's intent, copied using the user's spelling. Include held-out instruments
   such as Voyager 1 or ACE when named. Do not include methods or phenomena such
@@ -235,6 +245,7 @@ Prefer generous windows over narrow ones (a narrow window can over-exclude).
 Output ONLY JSON:
 {
   "search_terms": ["...", "...", ...],
+  "kg_concepts": ["<canonical scientific concept or mechanism>", ...],
   "named_entities": ["<explicit experiment or instrument name>", ...],
   "filters": {
     "year_min": <int|null>,
@@ -255,6 +266,7 @@ RULE exception. The reasoning names the facets.)
 Intent: "a review of PINN"
 Output: {
   "search_terms": ["physics-informed neural network", "PINN survey review"],
+  "kg_concepts": ["physics-informed neural networks"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": "prefer"},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
@@ -264,6 +276,7 @@ Output: {
 Intent: "recent PINN work on SEP transport"
 Output: {
   "search_terms": ["solar energetic particle transport", "physics-informed neural network", "Parker transport equation", "SEP propagation inversion"],
+  "kg_concepts": ["solar energetic particle transport", "physics-informed neural networks", "Parker transport equation", "particle propagation inverse problem"],
   "filters": {"year_min": 2023, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_recency",
@@ -273,6 +286,7 @@ Output: {
 Intent: "Voyager cosmic ray measurements in the outer heliosphere"
 Output: {
   "search_terms": ["Voyager heliospheric cosmic ray flux", "cosmic ray modulation", "termination shock heliopause", "anomalous cosmic ray interstellar"],
+  "kg_concepts": ["Voyager", "galactic cosmic rays", "heliospheric modulation", "termination shock", "heliopause", "anomalous cosmic rays"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
@@ -282,6 +296,7 @@ Output: {
 Intent: "latest progress on UHECR"
 Output: {
   "search_terms": ["ultra-high-energy cosmic ray", "Pierre Auger cosmic ray spectrum", "Telescope Array cosmic ray spectrum", "UHECR composition spectrum", "extragalactic UHECR origin"],
+  "kg_concepts": ["ultra-high-energy cosmic rays", "Pierre Auger Observatory", "Telescope Array", "cosmic ray composition", "extragalactic particle acceleration"],
   "filters": {"year_min": 2023, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_recency",
@@ -291,6 +306,7 @@ Output: {
 Intent: "Find original papers on cosmic ray positron measurements from PAMELA and AMS-02, covering positron abundance and energy spectra."
 Output: {
   "search_terms": ["cosmic ray positron measurements", "PAMELA positron abundance", "AMS-02 positron fraction", "Payload for Antimatter Matter Exploration and Light-nuclei Astrophysics positron abundance", "Alpha Magnetic Spectrometer positron fraction", "PAMELA positron energy spectrum", "AMS-02 positron energy spectrum", "Alpha Magnetic Spectrometer positron energy spectrum"],
+  "kg_concepts": ["cosmic ray positrons", "PAMELA", "Alpha Magnetic Spectrometer", "positron fraction", "positron energy spectrum"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": "off"},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
@@ -300,6 +316,7 @@ Output: {
 Intent: "AI applied to MHD simulation"
 Output: {
   "search_terms": ["machine learning magnetohydrodynamics simulation", "neural network surrogate model", "operator learning PDE", "solar wind plasma simulation"],
+  "kg_concepts": ["magnetohydrodynamics", "machine learning surrogate models", "neural operators", "solar wind plasma"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
@@ -309,6 +326,7 @@ Output: {
 Intent: "Bayesian inversion inverse-problem methodology"
 Output: {
   "search_terms": ["Bayesian inversion inverse problem", "uncertainty quantification posterior", "Gaussian process regression", "variational inference"],
+  "kg_concepts": ["Bayesian inverse problems", "posterior uncertainty quantification", "Gaussian processes", "variational inference"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
@@ -318,6 +336,7 @@ Output: {
 Intent: "highly cited GCR review from 2024"
 Output: {
   "search_terms": ["galactic cosmic ray review", "GCR solar modulation", "cosmic ray transport heliosphere"],
+  "kg_concepts": ["galactic cosmic rays", "solar modulation", "heliospheric cosmic ray transport"],
   "filters": {"year_min": 2024, "year_max": 2024, "citation_pref": 5, "review_pref": "prefer"},
   "limit_suggested": null,
   "ranking_hint": "by_importance",
@@ -327,6 +346,7 @@ Output: {
 Intent: "I want 5 of the most important papers in the PINN field, from the last 3 years"
 Output: {
   "search_terms": ["physics-informed neural network", "PINN training optimization", "PINN benchmark applications"],
+  "kg_concepts": ["physics-informed neural networks", "neural network training optimization", "scientific machine learning benchmarks"],
   "filters": {"year_min": 2023, "year_max": null, "citation_pref": 20, "review_pref": null},
   "limit_suggested": 5,
   "ranking_hint": "by_importance",
@@ -336,6 +356,7 @@ Output: {
 Intent: "latest progress on PINN applied to fluid dynamics"
 Output: {
   "search_terms": ["physics-informed neural network fluid dynamics", "Navier-Stokes neural solver", "turbulence modeling deep learning", "PINN CFD application"],
+  "kg_concepts": ["physics-informed neural networks", "Navier-Stokes equations", "turbulence modeling", "computational fluid dynamics"],
   "filters": {"year_min": 2024, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_recency",
@@ -345,6 +366,7 @@ Output: {
 Intent: "classic foundational work in the PINN field"
 Output: {
   "search_terms": ["physics-informed neural network", "PINN original formulation", "deep learning differential equations"],
+  "kg_concepts": ["physics-informed neural networks", "neural differential equation solvers"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": 50, "review_pref": "off"},
   "limit_suggested": null,
   "ranking_hint": "by_importance",
@@ -354,6 +376,7 @@ Output: {
 Intent: "machine learning"
 Output: {
   "search_terms": ["machine learning"],
+  "kg_concepts": ["machine learning"],
   "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": null},
   "limit_suggested": null,
   "ranking_hint": "by_relevance",
@@ -422,7 +445,7 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
         query: Natural language intent. May be Chinese or English. Can be
             terse ("PINN review") or expressive (full paragraph).
         llm: Optional pre-built LLM instance (for testing). Defaults to
-            ``get_llm()``.
+            ``get_llm(model=route("intent"))``.
 
     Returns:
         SearchPlan dict with normalized fields.
@@ -438,7 +461,7 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
     try:
         with observe_llm_calls(calls.append):
             if llm is None:
-                llm = get_llm()
+                llm = get_llm(model=route("intent"))
             raw = llm.call([
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": f"Intent: {query}\nOutput:"},
@@ -503,6 +526,17 @@ def _parse_response(query: str, raw: str) -> SearchPlan:
     _distinct = [t for t in _expanded if not (t in _seen or _seen.add(t))]  # order-preserving dedup
     search_terms = _distinct[:MAX_SEARCH_TERMS]  # cap LAST — up to 8 DISTINCT terms
 
+    # Concepts remain independent of API term splitting and measurement siblings.
+    # Bound embedding fanout after normalization; older planner replies fall back
+    # to the final normalized terms rather than the raw, possibly malformed list.
+    concepts = parsed.get("kg_concepts")
+    kg_concepts = list(dict.fromkeys(
+        concept.strip() for concept in concepts
+        if isinstance(concept, str) and concept.strip()
+    ))[:MAX_SEARCH_TERMS] if isinstance(concepts, list) else []
+    if not kg_concepts:
+        kg_concepts = list(search_terms)
+
     filters = parsed.get("filters") or {}
     if not isinstance(filters, dict):
         filters = {}
@@ -565,6 +599,7 @@ def _parse_response(query: str, raw: str) -> SearchPlan:
 
     plan: SearchPlan = {
         "search_terms": search_terms,
+        "kg_concepts": kg_concepts,
         "filters": filters,
         "limit_suggested": limit_suggested,
         "ranking_hint": ranking_hint,

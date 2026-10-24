@@ -185,7 +185,28 @@ EACH object output:
   "ll":    2-6 LOW-LEVEL / specific keywords (named entities, instruments, quantities, models)
 
 Return ONLY the JSON array. These keywords are used DIRECTLY for graph retrieval (no further
-extraction), so make them precise and discriminating."""
+extraction), so make them precise and discriminating.
+
+==== Worked examples ====
+Information need: PINN training optimization
+Only two real angles: the method anchor and its training issue. Do not add
+"physics-informed deep learning" as a third synonym of the anchor.
+Output: [
+  {{"query": "physics-informed neural network", "hl": ["physics-informed learning", "differential equation solving"], "ll": ["PINN", "PDE residual loss"]}},
+  {{"query": "PINN training optimization", "hl": ["optimization dynamics", "loss balancing"], "ll": ["gradient imbalance", "adaptive loss weights", "spectral bias"]}}
+]
+
+Information need: Compare cosmic-ray modulation by diffusion and drift over the solar cycle using observations and transport models
+The anchor preserves the requested mechanism; the remaining angles separate
+physics, mathematical model, observational system, and polarity regime.
+Output: [
+  {{"query": "cosmic ray solar modulation", "hl": ["heliospheric modulation", "cosmic ray transport"], "ll": ["galactic cosmic rays", "proton spectrum"]}},
+  {{"query": "cosmic ray diffusion and drift mechanisms", "hl": ["particle diffusion", "charge-sign drift"], "ll": ["diffusion tensor", "gradient drift", "curvature drift"]}},
+  {{"query": "Parker transport equation models", "hl": ["transport modeling", "adiabatic cooling"], "ll": ["Parker transport equation", "solar wind convection"]}},
+  {{"query": "AMS-02 cosmic ray solar cycle observations", "hl": ["spectral measurements", "time-dependent modulation"], "ll": ["AMS-02", "proton flux", "positron fraction"]}},
+  {{"query": "solar magnetic polarity cycle modulation", "hl": ["magnetic polarity reversal", "solar cycle variability"], "ll": ["A-positive polarity", "A-negative polarity", "heliospheric current sheet"]}}
+]
+"""
 
 
 def _parse_facets(raw: str, cap: int) -> list[dict]:
@@ -252,6 +273,9 @@ How many distinct library papers would a thorough answer need to cite? Standard:
 
 Examples:
   "What single parameter does the force-field approximation use?"  -> 3
+  "How do gradient and curvature drifts produce charge-sign-dependent cosmic-ray modulation?"  -> 5
+  "How can a PINN infer the diffusion coefficient in the Parker equation from sparse spectra,
+   and what checks diagnose a reliable inversion?"  -> 6
   "Synthesize how solar modulation, drift, and diffusion jointly shape the GCR proton spectrum over a
    solar cycle, across competing model families."  -> 12
   "Explain the light-emission mechanism of single-bubble sonoluminescence."  -> 1

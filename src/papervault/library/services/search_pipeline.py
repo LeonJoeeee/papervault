@@ -12,7 +12,7 @@ import copy
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from functools import lru_cache
@@ -30,6 +30,7 @@ from .bm25_search import (
     reorder_ranklists_by_rrf, round_robin, rrf_fuse,
 )
 from .intent_parser import named_entity_groups, observe_intent
+from .kg_search import kg_local_search
 from .registration import (
     ServingTrace, _find, _view, preview_candidates, registration_rejection, serving_excluded,
 )
@@ -193,6 +194,11 @@ class PlannedSearch:
     filters: dict
     limit: int
     ranking_hint: str
+    query: str = ""
+
+    @property
+    def kg_concepts(self) -> list[str]:
+        return self.intent.get("kg_concepts") or self.terms
 
     def year_eligible(self, node):
         return not YEAR_DROP(node, self.filters.get("year_min"), self.filters.get("year_max"))
@@ -203,6 +209,7 @@ class RetrievedSearch:
     external: list[dict]
     local: list
     degraded: dict
+    kg_ranks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -341,26 +348,29 @@ class SearchPipeline:
             async with concurrency.llm_sem:
                 return await asyncio.to_thread(self.parse, query, llm)
 
-    def plan(self, intent, trace):
+    def plan(self, intent, trace, *, query=""):
         plan = PlannedSearch(intent, intent["search_terms"], intent.get("filters") or {},
                              intent.get("limit_suggested") or int(os.environ.get("PAPER_SEARCH_DEFAULT_LIMIT", "15")),
-                             intent.get("ranking_hint", "by_relevance"))
-        trace.record("plan", terms=len(plan.terms), limit=plan.limit,
+                             intent.get("ranking_hint", "by_relevance"), query=query)
+        trace.record("plan", terms=len(plan.terms), kg_concepts=len(plan.kg_concepts), limit=plan.limit,
                      year_min=plan.filters.get("year_min"), year_max=plan.filters.get("year_max"),
                      ranking_hint=plan.ranking_hint)
         return plan
 
     async def retrieval(self, plan, trace):
         await self.progress(2, "searching external sources")
+        local = await asyncio.to_thread(self.library.all_papers, include_quarantined=True)
+        local = [p.model_copy(deep=True) for p in local]
+        view = _view(self.library, {p.key: p for p in local})
         with observe_source_gates(trace.record_backend):
             async with network_slot(concurrency.network_sem, self.library, actor="search"):
-                (external, degraded), local = await asyncio.gather(
+                (external, degraded), kg_ranks = await asyncio.gather(
                     self.retrieve(plan.terms, year_min=plan.filters.get("year_min"),
                                   year_max=plan.filters.get("year_max"), ranking_hint=plan.ranking_hint),
-                    asyncio.to_thread(self.library.all_papers, include_quarantined=True))
-        # Snapshot Paper objects as well as external dicts before later async gates.
-        result = RetrievedSearch(copy.deepcopy(external), [p.model_copy(deep=True) for p in local], degraded)
-        trace.record("retrieval", external=len(external), local=len(local))
+                    asyncio.to_thread(kg_local_search, plan.query, plan, view,
+                                      embedding_loop=asyncio.get_running_loop()))
+        result = RetrievedSearch(copy.deepcopy(external), local, degraded, kg_ranks)
+        trace.record("retrieval", external=len(external), local=len(local), kg=len(kg_ranks))
         return result
 
     def fusion(self, plan, retrieved, trace):
@@ -408,6 +418,11 @@ class SearchPipeline:
                 bibliography[bib_key].append(node)
         corpus = [node for node in local_by_key.values() if plan.year_eligible(node)]
         local_ranks = bm25_per_term_ranklists(corpus, plan.terms)
+        # Resolve KG evidence against this same canonical, year-eligible snapshot.
+        # An alias or several matching chunks can grant only one vote per track.
+        eligible_keys = {node["key"] for node in corpus}
+        kg_keys = dict.fromkeys(canonical_keys.get(key, key) for key in retrieved.kg_ranks)
+        kg_ranks = [local_by_key[key] for key in kg_keys if key in eligible_keys]
         buckets = collections.defaultdict(list)
         # Secondary identifiers/title and explicit aliases use preview's
         # version-compatible lookup, bound to this request's catalog snapshot.
@@ -445,26 +460,28 @@ class SearchPipeline:
         ext_rrf = rrf_fuse(external_ranks, _identity_key)
         external_ranks = reorder_ranklists_by_rrf(external_ranks, ext_rrf, _identity_key)
         lib_key = lambda node: node["key"]
-        lib_rrf = rrf_fuse(local_ranks, lib_key)
+        ranked_lists = [("local", ranks) for ranks in local_ranks] + [("kg", kg_ranks)]
+        pool_ranks = [ranks for _, ranks in ranked_lists]
+        lib_rrf = rrf_fuse(pool_ranks, lib_key)
         authority_active = (self.authority_enabled and self.authority_weight > 0
                             and plan.ranking_hint not in ("by_recency", "by_importance"))
         now_year = datetime.now(timezone.utc).year
         if authority_active:
-            top_cands = {node["key"] for rl in local_ranks for node in rl[:800]}
+            top_cands = {node["key"] for rl in pool_ranks for node in rl[:800]}
             if any(_authority_value(local_by_key[k], now_year) > 0 for k in top_cands):
                 auth_order = sorted(top_cands, key=lambda k: (
                     -_authority_value(local_by_key[k], now_year), -lib_rrf.get(k, 0.0), k))
                 auth_rank = {k: i for i, k in enumerate(auth_order)}
-                n_lists = max(1, sum(1 for rl in local_ranks if rl))
+                n_lists = max(1, sum(1 for rl in pool_ranks if rl))
                 for k in auth_order:
                     lib_rrf[k] = lib_rrf.get(k, 0.0) + (
                         4.0 * self.authority_weight * n_lists / (RRF_K + auth_rank[k]))
-        local_ranks = reorder_ranklists_by_rrf(local_ranks, lib_rrf, lib_key)
+        pool_ranks = reorder_ranklists_by_rrf(pool_ranks, lib_rrf, lib_key)
         for ranklist in external_ranks:
             for node in ranklist:
                 node["_rrf"] = ext_rrf.get(_identity_key(node), 0)
         external = round_robin(external_ranks, EXT_CAP, _identity_key)
-        local = round_robin(local_ranks, LIB_CAP, lib_key)
+        local = round_robin(pool_ranks, LIB_CAP, lib_key)
         selected = {n["key"] for n in local}
         vouched = [n for n in local_by_key.values() if n.get("folded_vouch")]
         also_include = [n for n in vouched if n["key"] not in selected and plan.year_eligible(n)]
@@ -580,11 +597,11 @@ class SearchPipeline:
             return {"status": "error", "results": [], "message": "empty query — pass a natural-language description of what you're working on and what literature you want to find"}
         trace, llm = ServingTrace(self.library), self.llm_factory()
         try:
-            intent = await self.intent(query, llm, trace)
+            intent = await self.intent(query, None, trace)
         except ValueError:
             return {"status": "error", "results": [], "message": "could not parse the query into a search plan — try a clearer natural-language description of what you want to find",
                     "reframe_hint": self.reframe_hint()}
-        plan = self.plan(intent, trace)
+        plan = self.plan(intent, trace, query=query)
         retrieved = await self.retrieval(plan, trace)
         fused = self.fusion(plan, retrieved, trace)
         selection = await self.return_gate(query, plan, fused, llm, trace)
@@ -592,6 +609,7 @@ class SearchPipeline:
         unconfigured, degraded = _derive_source_health(retrieved.degraded, len(plan.terms))
         response = {"status": "ok", "results": results, **(service_fields or {}), "intent_parsed": {
             "search_terms": plan.terms,
+            "kg_concepts": plan.kg_concepts,
             "filters_applied": {name: plan.filters.get(name) for name in ("year_min", "year_max", "citation_pref", "review_pref")},
             "limit_resolved": plan.limit, "sources_degraded": degraded, "sources_unconfigured": unconfigured,
             "judge_batches_dropped": {"ingest": selection.ingest_dropped, "return": selection.return_dropped},

@@ -813,9 +813,12 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
           ✗ "machine learning solar"
 
         Pipeline (3-LLM, 2026-05-31):
-          1. LLM1 parses your intent → search terms + filters + result count
+          1. LLM1 (intent role, default pro) parses your intent → search terms
+             + canonical KG concepts + filters + result count in one call
           2. Multi-source external search (arxiv + ads + S2 + openalex
-             + inspire + core, in parallel) merged with the in-library snapshot
+             + inspire + core, in parallel) merged with the in-library snapshot.
+             Optional read-only PGVector/Neo4j retrieval adds local KG candidates
+             to BM25 and authority fusion before the local pool cut.
           3. LLM2 judges NEW external candidates for domain + paper-ness.
              Off-domain/non-paper records are dropped; eligible candidates
              remain external until an independent registration command commits.
@@ -846,6 +849,8 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
             if off) and to catch silent recall loss. Fields:
               - ``search_terms`` / ``filters_applied`` (year_min, year_max,
                 citation_pref, review_pref) / ``limit_resolved``: the parsed plan.
+              - ``kg_concepts``: canonical scientific concepts for optional local
+                graph/vector retrieval, defaulting to normalized search terms.
               - ``reasoning``: the parser's one-line read of your intent.
               - ``sources_degraded``: backends that were configured but failed
                 or were skipped on every term this run — fewer sources searched, so

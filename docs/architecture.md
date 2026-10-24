@@ -46,8 +46,33 @@ uses per-`(event_loop, backend)` locks for migrated arXiv/Semantic Scholar/OpenA
 calls; politeness denials and executor queue waits do not spend backend-breaker
 failures. Cancellation cannot establish that a synchronous executor has drained.
 
+The `intent` LLM role emits short API/BM25 `search_terms` and separate canonical
+scientific `kg_concepts` in one call; missing concepts default to normalized terms.
+Dual-track local retrieval combines **BM25 + PGVector chunks/entities/relations +
+Neo4j cross-facet topology + authority**. The full query and concepts are encoded
+with the existing BGE-M3 singleton off the event loop. Chunks use the full query;
+entities and relations use query plus concept vectors. Per-track paper ranks fuse
+with RRF, augmented by cross-facet edges between concept entity sets and
+`log(1 + weight)` hub evidence. Split `<SEP>` paths resolve to canonical library
+keys within the request snapshot. Exclusions, alias safety and year bounds apply
+before the 45-candidate local pool cut; externally vouched supplementation remains
+separate. KG ranks participate alongside local ranks in fusion without changing
+external API terms or their rank evidence.
+
+This optional S1 reader opens its own bounded read-only PostgreSQL transaction
+(`default_transaction_read_only=on`, `SET LOCAL hnsw.ef_search=120`) and Neo4j read
+session over the configured knowledge workspace; it does not initialize LightRAG
+stores or mutate derived data. Neo4j follows LightRAG's `chunk-entity-relation`
+database default and read-only home-database fallback on `DatabaseNotFound`.
+Encoding shares S2's serving-loop GPU semaphore and retains its permit until the
+synchronous worker finishes even after caller cancellation; DB reads hold no GPU
+permit. `PAPERVAULT_SEARCH_KG` defaults on only with
+`PAPERVAULT_STORAGE_BACKEND=postgres`; explicit `0` disables and `1` enables.
+Missing configuration or PG/Neo4j/BGE failure returns an empty KG list, preserving
+BM25/external serving. This is candidate discovery, not S2 evidence publication.
+
 Fusion resolves aliases and compatible bibliographic duplicates while retaining
-external rank evidence. Local BM25/RRF selection and final `by_relevance` ordering
+external rank evidence. Local BM25/KG/RRF selection and final `by_relevance` ordering
 both receive the configured authority prior: citation velocity multiplied by a
 domain-aware venue classifier combining venue names, DOI prefixes and fallback
 evidence (1.5x / 1.2x / 1.0x / 0.5x). Explicit recency/importance bypasses it.
@@ -92,6 +117,28 @@ annotations. Production and eval share synthesis and the pure response builder.
 `[paper_key]` citations, with operator documents separate. Empty coverage skips
 synthesis; abstract-only evidence is capped at `"weak"`. FAST `--no-synth` uses the
 retrieved-paper citation fallback, not a synthesis-quality measurement.
+
+### LLM stage routing
+
+All text LLM stages use these nine roles. `PAPERVAULT_LLM_<ROLE>` overrides the
+default level with `flash`, `standard` or `pro`. Search intent selects its own
+handle; the ingest and return gates share the judge handle.
+
+| Plane / LLM stage | Role | Default |
+| --- | --- | --- |
+| S1 intent parsing (API terms, local KG concepts, filters and ranking hints) | `intent` | `pro` |
+| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `standard` |
+| S1 downloaded PDF identity verification | `verify` | `flash` |
+| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `flash` |
+| S2 build entity/relation extraction and merge summaries | `build` | `standard` |
+| S2 query high/low-level keyword extraction when needed | `keyword` | `flash` |
+| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `standard` |
+| S2 evidence-grounded synthesis (production/eval) | `synth` | `pro` |
+| Evaluation answer/refusal scoring | `eval_judge` | `standard` |
+
+Planner, gate, verification and decomposition prompts include concrete calibration
+examples. Local embedding/reranking and the MinerU OCR service remain outside text
+LLM routing.
 
 ### Authority, publication and derivatives
 

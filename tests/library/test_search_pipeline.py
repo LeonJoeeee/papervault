@@ -70,6 +70,85 @@ def fuse_library(lib, external):
     return searcher.fusion(plan, retrieved, ServingTrace(lib))
 
 
+def test_planned_search_preserves_query_and_independent_kg_concepts():
+    from papervault.library.services.search_pipeline import PlannedSearch
+
+    intent = {"kg_concepts": ["diffusive shock acceleration", "Parker transport equation"]}
+    plan = PlannedSearch(intent, ["SEP transport"], {}, 10, "by_relevance",
+                         query="How are energetic particles accelerated?")
+    assert plan.query == "How are energetic particles accelerated?"
+    assert plan.kg_concepts == ["diffusive shock acceleration", "Parker transport equation"]
+    legacy = PlannedSearch({}, ["SEP transport"], {}, 10, "by_relevance")
+    assert legacy.kg_concepts == ["SEP transport"]
+
+
+@pytest.mark.asyncio
+async def test_retrieval_runs_kg_off_loop_against_the_local_snapshot(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    from papervault.library.services import search_pipeline as pipeline
+    from papervault.library.services.registration import ServingTrace
+
+    lib = Library(tmp_path)
+    paper = add_record(lib, **node("Local", "Original detector measurements"))
+    event_thread = threading.get_ident()
+    event_loop = asyncio.get_running_loop()
+    kg_observations = []
+
+    def kg_search(query, plan, view, *, embedding_loop):
+        assert embedding_loop is event_loop
+        kg_observations.append((query, plan.kg_concepts, view.get("Local").title,
+                                threading.get_ident() != event_thread))
+        return ["Local"]
+
+    async def external(*args, **kwargs):
+        paper.title = "Changed while external fetch runs"
+        return [], {}
+
+    async def progress(*args):
+        pass
+
+    monkeypatch.setattr(pipeline, "kg_local_search", kg_search, raising=False)
+    searcher = pipeline.SearchPipeline(lib, None, None, None, external, None, None,
+                                       None, None, progress)
+    plan = SimpleNamespace(terms=["detector measurements"], filters={}, ranking_hint="by_relevance",
+                           query="Find detector measurements", kg_concepts=["particle detector"])
+    result = await searcher.retrieval(plan, ServingTrace(lib))
+    assert result.kg_ranks == ["Local"]
+    assert kg_observations == [("Find detector measurements", ["particle detector"],
+                                "Original detector measurements", True)]
+    assert result.local[0].title == "Original detector measurements"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_lets_intent_parser_select_its_own_role(tmp_path):
+    from papervault.library.services.search_pipeline import SearchPipeline
+
+    judge_handle = object()
+    lib = Library(tmp_path)
+
+    def parse(query, llm):
+        assert llm is None, "A shared judge handle bypasses the dedicated intent route"
+        return {"search_terms": ["detector measurements"], "kg_concepts": ["particle detector"]}
+
+    async def retrieve(*args, **kwargs):
+        return [], {}
+
+    async def judge(*args, llm, **kwargs):
+        assert llm is judge_handle
+        return {}, 0
+
+    async def progress(*args):
+        pass
+
+    queue = SimpleNamespace(submit=lambda *args, **kwargs: None)
+    searcher = SearchPipeline(lib, queue, lambda: judge_handle, parse, retrieve, judge, judge,
+                              None, lambda: "reframe", progress)
+    result = await searcher.run("detector measurements")
+    assert result["status"] == "ok"
+    assert result["intent_parsed"]["kg_concepts"] == ["particle detector"]
+
+
 @pytest.mark.parametrize("fields", [
     {"venue": "AGU Fall Meeting Abstracts"}, {"venue": "EGU General Assembly Abstracts"},
     {"venue": "AAS Meeting Abstracts"}, {"venue": "APS April Meeting Abstracts"},
@@ -508,6 +587,58 @@ def test_local_authority_prior_lifts_landmark_before_bm25_pool_cut(local_authori
     assert not any(k.startswith("Other") for k in keys)
     assert fused.external == baseline.external
     assert fused.canonical_keys == baseline.canonical_keys
+
+
+def test_kg_only_paper_reaches_local_pool_with_alias_year_and_policy_fences(local_authority_fusion):
+    from papervault.library.services.search_pipeline import RetrievedSearch
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    searcher, plan, retrieved = local_authority_fusion
+    semantic = Paper(key="Semantic", title="Suprathermal populations at interplanetary discontinuities",
+                     doi="10.1234/semantic", year=2020)
+    alias = Paper(key="OldAlias", title="Old source title", doi="10.1234/alias")
+    alias.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key="Semantic", quarantine=True)
+    excluded = Paper(key="Excluded", title="Unrelated paper", doi="10.1234/excluded", year=2020)
+    excluded.domain_status = "off_domain"
+    retrieved.local.extend([semantic, alias, excluded])
+    retrieved = RetrievedSearch([], retrieved.local, {},
+                                kg_ranks=["Excluded", "OutsideYear", "Missing", "OldAlias", "Semantic"])
+    fused = fuse_local(searcher, plan, retrieved)
+    keys = [p["key"] for p in fused.local]
+    assert "Semantic" in keys
+    assert len(keys) == len(set(keys)) == 45
+    assert not {"Excluded", "OutsideYear", "Missing", "OldAlias"} & set(keys)
+
+
+def test_kg_rrf_consensus_lifts_deep_bm25_hit_before_pool_cut(local_authority_fusion, monkeypatch):
+    from papervault.library.services import search_pipeline as pipeline
+
+    searcher, plan, retrieved = local_authority_fusion
+    retrieved.local = [Paper(key=f"Rank{i:03d}", title=f"Detector measurements {i}",
+                             doi=f"10.1234/rank{i}", year=2020) for i in range(100)]
+    monkeypatch.setattr(pipeline, "bm25_per_term_ranklists", lambda corpus, terms: [
+        sorted(corpus, key=lambda n: n["key"])])
+    retrieved = pipeline.RetrievedSearch([], retrieved.local, {}, kg_ranks=["Rank090"])
+    keys = [p["key"] for p in fuse_local(searcher, plan, retrieved).local]
+    assert keys[0] == "Rank090"
+    assert len(keys) == 45
+
+
+def test_authority_prior_applies_to_kg_only_candidates(local_authority_fusion):
+    from papervault.library.services.search_pipeline import RetrievedSearch
+
+    searcher, plan, retrieved = local_authority_fusion
+    retrieved.local = [Paper(key=f"Semantic{i:03d}", title=f"Suprathermal populations {i}",
+                             doi=f"10.1234/semantic{i}", year=2020,
+                             citation_count=10000 if i == 70 else 0) for i in range(100)]
+    retrieved = RetrievedSearch([], retrieved.local, {},
+                                kg_ranks=[f"Semantic{i:03d}" for i in range(100)])
+    baseline = fuse_local(searcher, plan, retrieved)
+    assert "Semantic070" not in {p["key"] for p in baseline.local}
+    searcher.authority_enabled = True
+    keys = [p["key"] for p in fuse_local(searcher, plan, retrieved).local]
+    assert "Semantic070" in keys
+    assert len(keys) == 45
 
 
 @pytest.mark.parametrize("enabled,weight,hint,zero_citations", [

@@ -179,6 +179,19 @@ _VERIFY_PROMPT = (
     "a different work), a publisher landing / search / recommendation page, a "
     "paywall stub, or a different paper that merely CITES the requested one.\n"
     'Reply with ONLY a JSON object: {"match": true|false, "reason": "<short>"}'
+    "\n\nWorked examples:\n"
+    "Requested: Solar modulation of galactic cosmic rays; Elena Rossi, Wei Zhang.\n"
+    "PDF first page: Modulation of Galactic Cosmic Rays in the Heliosphere; "
+    "W. Zhang and E. Rossi; journal version of the same preprint, with the same abstract and results.\n"
+    'Output: {"match": true, "reason": "Same work; journal title variation and reordered abbreviated author names."}\n\n'
+    "Requested: Physics-informed transport inversion; Ana Silva, Bo Chen.\n"
+    "PDF first page: Neural image denoising; C. Patel, D. Kim. Its introduction cites "
+    "Silva and Chen, Physics-informed transport inversion, as related work.\n"
+    'Output: {"match": false, "reason": "Different title and authors; the requested paper appears only as a citation on page 1."}\n\n'
+    "Requested: Solar modulation of galactic cosmic rays; Elena Rossi, Wei Zhang.\n"
+    "PDF text: Publisher article page. Solar modulation of galactic cosmic rays. "
+    "Rossi, Zhang. Abstract. Subscribe or purchase PDF to access the full article.\n"
+    'Output: {"match": false, "reason": "Publisher paywall landing stub, without the requested article body."}\n'
 )
 
 

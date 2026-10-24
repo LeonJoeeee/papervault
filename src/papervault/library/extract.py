@@ -257,6 +257,16 @@ _REVIEW_PROMPT = (
     "long names\n\n"
     "Issues list must be concrete (quote the specific garbled chars or "
     "phrases). Empty if ok."
+    "\n\nWorked examples:\n"
+    "Chunk: The inferred diffusion coefficient decreases with increasing magnetic "
+    "turbulence, and the measured particle flux therefore\n"
+    'Output: {"ok": true, "issues": [], "confidence": 0.98}\n'
+    "This is clean prose ending mid-sentence at a normal chunk boundary.\n\n"
+    "Chunk: Hull Hull Hulf Hull Hulf TO GUO GUILLOS a n d t h a t Hull Hulf Hull\n"
+    'Output: {"ok": false, "issues": ["Looping Hull Hulf and corrupt TO GUO GUILLOS; per-character spacing a n d t h a t"], "confidence": 0.99}\n\n'
+    "Chunk: The fit gives $D = D_0 E^\\alpha$. <span>Density</span> is "
+    "$n=3$ cm<sup>-3</sup>.<br><table><tr><td>Energy</td><td>1 GeV</td></tr></table>\n"
+    'Output: {"ok": true, "issues": [], "confidence": 0.97}\n'
 )
 
 
@@ -409,6 +419,18 @@ _GATE_PROMPT = (
     "'short but whole letter'. When complete=false, ``reason`` must name which "
     "of the three conditions and quote the evidence (e.g. 'truncated: ends "
     "\\'we therefore conclu\\'' or 'paywall: \\'Sign in to access\\'')."
+    "\n\nWorked examples:\n"
+    "Entire text: A two-page research letter. Abstract: We report a new solar-wind "
+    "measurement. Results: The measured drift is 4 km/s. Conclusions: The observation "
+    "supports the predicted drift. References: Rossi (2024), Space Physics, 12, 34.\n"
+    'Output: {"complete": true, "reason": "Short but whole two-page letter, ending at a complete reference entry."}\n\n'
+    "Entire text: Solar-wind drift measurements. Rossi et al. Abstract. Sign in "
+    "to access this article. Subscribe or purchase PDF.\n"
+    'Output: {"complete": false, "reason": "Login/paywall stub: Sign in to access; no article body."}\n\n'
+    "Entire text: Abstract: We solve the transport equation. Methods: We use "
+    "a conservative flux. Results: The final coefficient is $D=\\frac{a}{\n"
+    'Output: {"complete": false, "reason": "Truncated: final equation ends at an unclosed denominator after frac{a}{."}\n'
+    "Likewise a body ending 'we therefore conclu' with nothing after is a mid-word cut.\n"
 )
 
 

@@ -5,7 +5,11 @@ floor", "published budget"). Every number here is a real measurement with a date
 conditions — never an aspiration. Organized by the caller-facing businesses; component
 instruments and arbitration rules at the end.
 
-> Result tags cited below (e.g. `frozen154_*`, `srb_v1_*`, `mfr_v2_*`) name LOCAL,
+> The [2026-10-24 post-v0.10.10 baseline](#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
+> records retrieval, landmark coverage, catalog hygiene and the LightRAG 1.5.7 gates
+> carried into v0.10.11. The July/F0 and October recovery/maintenance sections remain
+> historical measurements under their original conditions; they are not remeasurements
+> of the new stack. Result tags cited below (e.g. `frozen154_*`, `srb_v1_*`, `mfr_v2_*`) name LOCAL,
 > untracked evidence files (they embed verbatim paper text — see the Evidence convention
 > in `docs/eval.md`). They are provenance labels, not repo paths.
 
@@ -393,6 +397,54 @@ cover the retained evidence; the first rehearsal's measurements remain unchanged
 This synthetic metadata rehearsal does not qualify full-text/graph/vector rebuild
 cost, production downtime, full-system RTO or host-failure recovery. Defaults remain
 legacy.
+
+## Post-v0.10.10 retrieval, coverage, hygiene, and LightRAG 1.5.7 baseline — 2026-10-24
+
+These are the verified post-refactor measurements supplied in
+[issue #316](https://github.com/LeonJoeeee/papervault/issues/316), recorded for the
+v0.10.11 documentation release. They use deployment #1's PostgreSQL-authoritative
+catalog and the 12 frozen landmark pools (111 pool entries). The LightRAG patch
+port gates have their own [host measurement record](https://github.com/LeonJoeeee/papervault/issues/313#issuecomment-6369432590)
+and [ADR-0005 verification](adr/0005-track-latest-lightrag-line-gated.md#verification--157-patch-port-313-2026-10-23).
+This section supersedes neither the frozen F0 artifact nor the dated July and
+P5b/P5c measurements. The documentation change performs no new live evaluation.
+
+| Ruler / measurement | Verified result | Meaning |
+| --- | --- | --- |
+| R2 landmark metadata | **111/111 (100.0%)** | Every frozen pool entry matches catalog metadata. |
+| R2 landmark readable | **110/111 (99.1%)** | A retained Markdown/text extract exists for 110 pool entries. |
+| R2 landmark indexed | **111/111 (100.0%)** | Every pool entry has a processed document-status match in LightRAG workspace `l0`. |
+| R1 `mustfind_recall` | **0.4060 mean / 0.1000 min; 45/111 hits** | Served-list recall over the frozen pools, using the retained must-find instrument. |
+| Catalog hygiene | **26,860 canonical rows: 25,213 eligible; 1,647 fenced** | Eligible means not excluded by `serving_excluded`; it does not grant acquisition permission. |
+
+R2 follows the legacy metadata/file-existence/processed-path ruler described in F0,
+counting pool entries rather than deduplicated works. Indexed coverage is independent
+of readable coverage: a processed backend row is not proof of a currently readable,
+revision-compatible P4 publication. No 100% P4 conforming-coverage claim follows.
+
+R1 progressed **0.2067 → 0.3303 → 0.4060** across the recorded retrieval iterations.
+The mean is the macro-average across intents; 45/111 is the total pool-entry hit
+count, not that macro-average. Full corpus coverage and served recall measure
+different things: a stored landmark can still miss an intent's served window.
+These observations do not establish a new noise floor, paired arbitration result,
+precision score or latency measurement.
+
+The hygiene census excludes aliases from its denominator. The fence retains the
+1,647 canonical identity rows and their artifacts; it does not delete them.
+New-record `registration_rejection` and retained-record `serving_excluded` /
+`deterministic_garbage_reason` prevent new pollution and rediscovery of excluded
+identities. Missing legacy metadata alone is not deterministic garbage evidence.
+
+| LightRAG 1.5.7 ADR-0005 gate | Verified result | Conditions |
+| --- | --- | --- |
+| `l0_probe_157`, `Bonomi2020` | **578/579 entities in the closed ontology; 0 `"Other"`; 0 off-ontology nodes** | One `UNKNOWN` relation-endpoint placeholder is counted separately. The throwaway workspace was cleaned after verification. |
+| `gold_fast.jsonl` FAST recall@served | **0.7471 vs 0.7332; +1.40 pp** | 1.5.7 vs same-corpus 1.5.4 reference, `variant=multiquery`, `--no-synth`, 14 questions (11 answerable, three traps). |
+
+The probe produced 22 chunks, 579 entities and 582 relations. FAST uses the explicit
+retrieved-paper citation fallback; it does not measure synthesis quality. All 14
+candidate receipts reported `rerank_degraded=False`. ADR-0005 retains the exact
+aggregates, separate recall@12 movement, result tags and artifact provenance; its
+historical 1.5.4 measurements remain historical.
 
 ## Arbitration rules (how these numbers may change)
 

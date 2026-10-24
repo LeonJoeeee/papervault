@@ -1,550 +1,468 @@
 # papervault
 
-A self-hosted **literature + knowledge layer for coding agents**, delivered as one MCP
-server. Point any MCP-capable agent (Claude Code, Codex CLI, Antigravity CLI/IDE, and others) at it and the agent gains
-three tools:
+A self-hosted literature and knowledge layer for coding agents, delivered as one MCP
+server. Claude Code, Codex CLI, Antigravity CLI/IDE and other MCP clients share three tools:
 
-- **`search_papers`** — discover literature by describing your research intent in prose;
-  relevant finds are auto-ingested (downloaded, OCR'd, full text on disk).
-- **`get_paper`** — look up papers by citation key / DOI / arXiv id / fuzzy title; read
-  verbatim full text from a returned path.
-- **`query`** — ask the knowledge base a question, get a cited prose answer synthesized
-  from a knowledge graph distilled from everything the library has ingested.
+| Tool | Purpose |
+| --- | --- |
+| `search_papers` | Discover papers from a natural-language research intent; submit independently admitted registration and background acquisition. |
+| `get_paper` | Resolve a citation key, DOI, arXiv ID or fuzzy title and return metadata plus a serve-safe full-text path when available. |
+| `query` | Retrieve evidence from the knowledge graph and synthesize an answer with verified paper citations. |
 
-The corpus compounds without babysitting: search → queryable knowledge in tens of minutes,
-self-healing ingest queues, cited answers grounded in real sources.
-
-Search serving runs through the six-stage `library/services/search_pipeline.py`
-(intent → plan → retrieval → fusion → return gate → serving), with registration
-admitted separately from the served list. Canonical deduplication and named-entity
-slot reservation preserve relevant evidence; the default `by_relevance` ordering
-uses `PAPERVAULT_SEARCH_AUTHORITY_PRIOR=1` and a gentle `0.25` RRF authority blend
-(`PAPERVAULT_SEARCH_AUTHORITY_LAMBDA`; set the prior to `0` to disable).
-Official ADS `ADS_SCAN` PDFs can proceed to OCR with deferred identity verification;
-`extract.py` requires a positive post-OCR identity check before publishing their text.
-
-On the catalog query path, one single-generation `serving_manifest` stays pinned
-through retrieval and synthesis. Responses distinguish evidence candidates in
-`retrieved_papers` from verified inline `[paper_key]` citations in `cited_papers`.
-Empty coverage skips synthesis, and evidence drawn only from abstracts is capped
-at `"weak"` coverage. See [architecture](docs/architecture.md#search-query-and-lifecycle-contracts)
-for the delivered search, query and lifecycle contracts.
-
-> **Status:** pre-release (closed beta). See `docs/PRD.md` for scope and `docs/architecture.md`
-> for structure. This is industrial-grade infrastructure, not a toy — read the hardware floor
-> before installing.
+Version **0.10.11** documents the post-refactor search, catalog and knowledge contracts.
+The product is pre-release (closed beta). Read the [PRD](docs/PRD.md) for scope,
+[architecture](docs/architecture.md) for boundaries, [installation guide](docs/INSTALL.md)
+for deployment, and [baselines](docs/baselines.md#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
+for dated measurements. The [constitution and refactor plan](docs/adr/0007-papervault-constitution.md)
+govern collection integrity and useful retrieval together.
 
 ## Hardware floor (not optional)
 
-papervault runs its own embedding, reranking, and OCR models locally. There is **no GPU-less
-or degraded mode** — below the floor, this product is not for you.
-
-- **1× NVIDIA GPU, 24 GB** (RTX 3090 / 4090 class). A single card runs the full stack
-  (embed + rerank + OCR co-tenant) inside a measured VRAM budget; a second GPU is comfort,
-  never a requirement.
-- **Linux + CUDA.**
-- **An OpenAI-compatible LLM endpoint + key**, supplied by you (graph build, search
-  triage, and answer synthesis all route to it). papervault bundles no keys.
-- **Docker** (for the Neo4j + Postgres backing stores).
+The supported deployment uses Linux and CUDA, one **24 GB-class NVIDIA GPU** (RTX
+3090/4090 class), Docker for Neo4j and PostgreSQL, and an operator-supplied
+OpenAI-compatible LLM endpoint and key. Embedding and reranking run locally; the
+independent MinerU OCR service shares the GPU. The hardware floor is part of the
+product contract. The factory domain pack is **space physics and AI4Science**;
+its search rubric, ontology, examples and instructions live in
+[`src/papervault/domain/`](src/papervault/domain/). Other domains need their own
+configuration and evaluation gold sets.
 
 ## Quick start
 
-See [`docs/INSTALL.md`](docs/INSTALL.md) for the full walkthrough. In brief:
+Follow [INSTALL.md](docs/INSTALL.md) for the complete setup:
 
 ```bash
-cp .env.example .env          # then fill in your LLM endpoint + key + data dir
-docker volume create ks-pgdata      # external volumes hold the production data (create once)
+cp .env.example .env          # fill in the LLM endpoint, key and data roots
+# External Docker volumes hold the backing stores; create once.
+docker volume create ks-pgdata
 docker volume create ks-neo4jdata
-docker compose --env-file .env -f deploy/docker-compose.yml up -d   # Neo4j + Postgres
-uv venv && uv pip install -e ".[grey]"              # core HTTP OCR client + grey download tiers
-.venv/bin/papervault doctor   # verify GPU, databases, LLM config
-.venv/bin/papervault serve    # start the MCP server
+docker compose --env-file .env -f deploy/docker-compose.yml up -d
+uv venv && uv pip install -e ".[grey]"
+.venv/bin/papervault doctor
+.venv/bin/papervault serve
 ```
 
-Provision the standalone `mineru-service` separately at `http://127.0.0.1:30000`
-(override with `MINERU_URL`). papervault submits PDFs to its official `mineru-api`
-task API over HTTP, waits in the shared FIFO queue, and reads the completed markdown.
-The service owns model preload and GPU unloading after 20 idle minutes. papervault's
-`mineru` extra is retained as an empty compatibility extra: `uv sync --extra mineru`
-remains valid without installing `mineru` or `torchvision` in the caller's environment.
-`papervault doctor` checks the configured endpoint's `/health`.
-
-Then register the server with your agent. Claude Code and Antigravity (`agy`) can install
-the bundled `plugin/` shell; Codex CLI and other clients connect directly to the MCP
-endpoint — see [Connecting an agent](docs/INSTALL.md#connecting-an-agent).
+Provision `mineru-service` separately at `http://127.0.0.1:30000` (override with
+`MINERU_URL`). papervault uses the official `mineru-api` HTTP task API through core
+`httpx`: submit, poll, then read completed markdown. MinerU owns FIFO processing,
+model preload, recovery and GPU unloading after 20 idle minutes. The `mineru` extra
+is empty for compatibility; `uv sync --extra mineru` installs no OCR runtime in the
+caller. `papervault doctor` checks `/health`.
 
 Knowledge auto-ingest is opt-in: `.env.example` sets `KS_AUTO_INGEST_ENABLED=false`.
-Set it to `true` after configuring and populating the vault to enable the background
-search-to-queryable loop; installing and serving alone does not start distillation.
-Sci-Hub and the other grey download tiers remain off until explicitly enabled.
+Enable it after configuring and populating the vault. With ingestion enabled,
+search → acquisition → extraction → distillation compounds the corpus in the
+background; returning a search hit does not promise completed acquisition.
+Grey download tiers also require explicit opt-in; see [ADR-0004](docs/adr/0004-grey-download-tiers-flag-gated.md).
 
-For Antigravity CLI/IDE, validate and install the native plugin from the repo root:
+### Connect an agent
+
+The bundled `plugin/` is a thin MCP registration shell for Claude Code and
+Antigravity. Codex CLI and other clients connect directly to
+`http://127.0.0.1:8080/mcp` by default. See
+[Connecting an agent](docs/INSTALL.md#connecting-an-agent) for client configuration,
+custom endpoints and remote tailnet access.
 
 ```bash
 agy plugin validate ./plugin --json
 agy plugin install ./plugin
+# Alternative: direct MCP registration
+agy mcp add papervault http://127.0.0.1:8080/mcp
 ```
 
-Start a new Antigravity session to load the tools from `http://127.0.0.1:8080/mcp`.
-For direct MCP registration instead of the plugin, use
-`agy mcp add papervault http://127.0.0.1:8080/mcp`; replace the URL for a custom endpoint.
-The install guide also covers IDE MCP configuration and remote tailnet connections.
+Start a new Antigravity session after installing. Agent shells contain no retrieval
+or lifecycle logic.
 
-## Domain
+## Search and catalog quality
 
-papervault ships tuned for **space physics + AI4Science** as the factory default and worked
-sample. The domain layer — search-gate rubric, entity ontology, extraction few-shots,
-instruction text — lives in editable config files (`src/papervault/domain/`). Adapting to
-another field means editing those files; quality outside the shipped domain is the adapting
-operator's responsibility.
+`search_papers` combines arXiv, ADS, Semantic Scholar, OpenAlex, INSPIRE and CORE
+with the local library. The coordinator in
+[`SearchPipeline`](src/papervault/library/services/search_pipeline.py) has six
+method boundaries: **intent → plan → retrieval → fusion → return gate → serving**.
+The operational stages below include the gates and independently admitted command
+path within those boundaries; they are not six separate services.
 
-## Acquisition state v2
+1. **Stage 1 — intent and plan.** Parse search terms, result count, year bounds and
+   ranking hints. The post-parse `year_min` guard protects canon: for a lower-bound-only
+   plan, canonical/foundational/classical/seminal/historical wording clears the lower
+   bound, and survey/overview/current-understanding wording clears it when no explicit
+   recency cue exists. A cleared bound also resets `by_recency` to `by_relevance`.
+   Bounded date intervals remain intact; unknown years survive year filtering.
+2. **Stage 2 — retrieval.** Fetch external terms alongside a local-library snapshot.
+   Under polite v2, arXiv, Semantic Scholar and OpenAlex serialize admission/fetch
+   through a per-`(event_loop, backend)` lock. Backend pacing and fetch-thread queue
+   waits precede timed execution. `PolitenessDenied`, including wrapped denials, and
+   queue starvation remain observable but do not trip the circuit breaker. Service
+   failures do: the defaults are three consecutive failures and a **3,600-second**
+   cooldown; successful zero-hit fetches reset the breaker too. Configure
+   `PAPERVAULT_SEARCH_BREAKER_TRIPS` / `PAPERVAULT_SEARCH_BREAKER_COOLDOWN_S` and
+   `PAPERVAULT_SEARCH_FETCH_WORKERS` / `PAPERVAULT_SEARCH_FETCH_QUEUE_TIMEOUT_S`.
+   Unconfigured, degraded and genuine zero-hit sources remain distinguishable.
 
-`PAPERVAULT_TERMINAL_V2=1` opts into the first acquisition-pipeline v2 slice
-(default off). Acquisition checks retrieval eligibility, canonical identity,
-policy permission, and the independent quarantine marker immediately before
-download dispatch. Ordinary downloads keep their in-memory coordination;
-campaign re-opens use the durable lease and budget providers described below.
+   **Stage 2.5 — fusion.** `SearchPipeline.fusion` resolves aliases and compatible
+   bibliographic duplicates, retaining external rank evidence on local records.
+   Term-wise BM25/RRF pooling admits up to `LIB_CAP=45` local candidates plus
+   `ALSO_INCLUDE_CAP=45` additional externally vouched local records; the external
+   pool cap is 60. The local `authority_weight` prior enters RRF **before the pool
+   cut**, helping landmark papers reach judgment. It also weights the vouched
+   supplement. Explicit recency/importance ordering bypasses this prior.
+3. **Stage 3 — domain/ingest gate (the “flash gate”).** Judge external candidates
+   against the domain-pack tiers and paper classification. Source publication types
+   take precedence when conclusive; an LLM paper/non-paper judgment fills missing
+   metadata. Production search passes a shared judge handle to its gates, defaulting
+   to `PAPERVAULT_LLM_JUDGE=standard`; the separate extraction `gate` role defaults
+   to `flash`. The stage name does not select a model.
+4. **Stage 4 — relevance and quality gates.** `registration_rejection` screens the
+   external pool for conference/meeting abstracts, non-papers, contentless stubs and
+   invalid new-record metadata before preview. Newly allocated records need named
+   authors and either a DOI/arXiv/INSPIRE identity or sufficient citation evidence;
+   an identifierless record also needs an abstract. Known identities have narrower
+   legacy-quality exceptions. `judge_return` then scores local and eligible external
+   candidates against the actual research need; only scores **≥0.4** survive.
+   Failed/unjudged batches are dropped and counted, never accepted by default.
+5. **Stage 5 — decoupled registration and acquisition.** The command set is selected
+   independently of the served result cap. After constructing the response, search
+   submits bounded registration requests without awaiting admission, catalog writes
+   or acquisition. The command rechecks `registration_rejection`, current identity,
+   policy and catalog revisions, then commits admitted metadata and pending work.
+   Background queues acquire and extract accepted papers. Queue refusal, shutdown
+   or command failure is traced and does not change the search response.
+6. **Stage 6 — final ordering and serving.** Within the return gate, default
+   `by_relevance` ordering blends dense relevance rank with authority rank using RRF
+   (`k=60`); it can cross relevance-score bands but cannot resurrect a rejected paper.
+   Named-entity slot reservation retains accepted witnesses within the result cap.
+   Serving rechecks current exclusions and years before returning. This ordering
+   precedes the asynchronous Stage 5 command execution; the stage numbers describe
+   responsibilities, not a registration-before-return dependency.
 
-Legacy dimensions are derived without rewriting the index: `metadata_only` and
-`failed` map to exhausted retrieval, while `ok` and `extract_failed` map to
-acquired retrieval (`ok` becomes verified only with a recorded, labelled extract).
-All cause-unrecorded terminals retain unknown policy and cannot acquire again
-until a separate policy ruling. A status reset or identity backfill alone cannot
-clear that policy. New status writes record dimensions and cause; legacy dimensions
-are persisted only when their record is next changed. Existing artifacts remain
-available through the ordinary serving path.
+### Authority at both ranking boundaries
 
-`PAPERVAULT_IDENTITY_V2=1` opts into slice 2 (default off). Its pure identity
-ladder selects DOI, then a namespaced source ID, then a URL; CORE work and output
-IDs stay distinct. The ladder selects a canonical identity without merging
-records or changing download order. URL recovery checks correspondence again
-before adopting a DOI: unresolved evidence stays retryable, and a contradiction
-records a rejection of that route while retaining the paper and other routes.
-Redirects retain the final evidence-bearing URL; supplied landing/source
-bibliography participates in the decision, and raw evidence types survive adoption.
-Existing identity records remain readable; optional evidence is omitted when absent.
+`PAPERVAULT_SEARCH_AUTHORITY_PRIOR=1` enables both the local fusion prior and final
+relevance blend; set it to `0` to disable. `PAPERVAULT_SEARCH_AUTHORITY_LAMBDA=0.25`
+is passed as `authority_weight` to fusion and as λ to final ordering. The final
+score is `1/(60 + relevance_rank) + λ/(60 + authority_rank)`.
+Disabling the prior or setting λ to zero removes the added RRF terms. The base
+relevance ordering still uses authority to break ties after score and external
+rank evidence.
 
-Correspondence uses a minimum normalized title length of 25, title sequence
-similarity ≥0.92 (≥0.97 without a reference year), title token Jaccard ≥0.90,
-author surname Jaccard ≥0.50 plus reference first-surname agreement, and a year
-difference ≤1. Missing or malformed required evidence stays unresolved. DOI
-resolver forms and supported publisher DOI paths are compared canonically;
-supplied contradictory bibliography rejects the route even when DOI forms agree.
+Authority combines **citation velocity** and a **three-layer, domain-aware venue/DOI
+classifier**. Citation velocity is `citation_count / max(1, current_year - year)`;
+missing/invalid years use raw citation counts. Classification combines normalized
+exact/fuzzy venue names, recognized DOI prefixes, and fallback identifier/citation
+evidence. Its multipliers are:
 
-With the identity flag on, `domain_status` markers `off_domain`, `non_paper`,
-and `bad_extract` project to excluded policy with the same reason; unknown markers
-project to unknown policy. Retrieval state and existing artifacts are retained.
-Existing scoped policy overrides are retained and must cover the domain reason.
-This applies to legacy and stored dimensions at read time. Enable terminal-v2
-to enforce this projection at ordinary download dispatch. Re-open v2 independently
-enforces acquisition admission and domain restrictions for campaigns.
+| Multiplier | Evidence |
+| --- | --- |
+| **1.5x** | Recognized leading/review venues, such as PRL, Nature, Space Science Reviews or Reviews of Geophysics, including known DOI routes. |
+| **1.2x** | Recognized domain and methods venues, such as ApJ, JGR, A&A, MNRAS, JCP and major ML conferences. |
+| **1.0x** | Neutral fallback for other identified or unclassified papers. |
+| **0.5x** | Explicit low-tier/conference-abstract evidence, or a venue-only record with no DOI/arXiv/INSPIRE identity and fewer than five citations. |
 
-`PAPERVAULT_REOPEN_V2=1` opts into slice 3 (default off). In a maintenance window
-with `papervault.service` stopped, run an explicit bounded campaign:
+Exact names across tiers precede fuzzy matching (threshold 0.88); low-tier evidence
+wins before positive tiers, while a broad publisher DOI does not demote a recognized
+1.5x venue. This is a ranking signal, not a claim that citation counts establish
+canon or permission to bypass quality gates. Explicit `by_recency` / `by_importance`
+hints bypass both authority blends and retain relevance-score-first ordering.
+See [ADR-0008](docs/adr/0008-search-authority-venue-and-garbage-fencing.md) and
+[evaluation knobs](docs/eval.md#retrieval-tuning-knobs-benchmark-arbitrated).
+
+### Two-way quality fence
+
+`registration_rejection` prevents new catalog pollution; `serving_excluded` protects
+reads and acquisition from positively identified bad legacy rows. The latter checks
+domain status, acquisition quarantine, explicitly excluded policy, and
+`deterministic_garbage_reason`: conference abstracts, positively classified non-papers
+or anonymous first authors. Missing legacy metadata alone is insufficient to exclude.
+Aliases and identity rows remain durable, preventing rediscovery from allocating the
+same junk again. Routine `JANITOR_PURGE` / `Library.purge()` deletion is retired.
+
+Serving eligibility and acquisition eligibility are separate. For a `Paper`, eligible
+retrieval alone does not authorize download: `state_v2.admission` also requires a
+canonical nonalias identity, resolved correspondence, applicable policy, no quarantine,
+and valid lease/budget evidence. `Paper` has no `eligible` property. A terminal
+acquisition status alone does not hide valid existing evidence from serving.
+
+Official ADS `ADS_SCAN` PDFs may defer identity verification to OCR, bound to the
+inspected PDF hash. Publishing their text requires a positive post-OCR title/author
+identity verdict; mismatch or unavailable verification retains evidence without
+publishing it. Cancelling a fetch can withdraw queued executor work but cannot prove
+a running synchronous thread has stopped. Registration shields and drains its writer
+before propagating cancellation; campaign cancellation retains its permit until
+executor drain and quarantines uncertain work.
+
+## Knowledge engine and query evidence
+
+The framework spine is **`lightrag-hku==1.5.7`**, with Neo4j graph storage and
+PostgreSQL KV, vector and document-status stores. BGE-M3 embedding and the BGE
+reranker run in process on the GPU. A domain pack supplies a closed entity ontology,
+extraction guidance and examples. The exact patch pin and fail-loud private-hook
+adapter guards follow [ADR-0005](docs/adr/0005-track-latest-lightrag-line-gated.md):
+an upgrade needs a fresh port map, prompt gates, pause/deferral and recovery tests,
+a throwaway ontology probe and a FAST recall comparison.
+
+Adapters preserve LightRAG's extraction, merge, deletion and query reducers. The
+1.5.7 port forwards batch ingress/owner arguments and deferred run context, handles
+retirement rebuild reports and extraction-cache tuples, and materializes inherited
+status updates under the namespace write fence. Raw-workspace conflict repair is
+refused for catalog storage; it requires an isolated rebuild.
+
+The query plane (S2) pins one catalog `serving_manifest` for the whole request:
+anchor and facet retrieval, traversal, caches, aggregation and synthesis share one
+generation. Reader pins protect dependencies; policy, input compatibility and fresh
+evidence are rechecked against that same view before returning. Promotion cannot
+switch an in-flight query to another generation. Multiquery overlaps decomposition
+with anchor retrieval, drains cancelled decomposition and gates fan-out on coverage.
+Evidence prioritizes `canon`, then `fulltext`, then `abstract_only`; textbooks and
+explicit canon annotations establish canon status.
+
+Production and eval share synthesis and the pure `build_outfeed` response builder.
+`retrieved_papers` lists evidence candidates; `cited_papers` contains only exact
+inline `[paper_key]` citations verified against that pool. Operator documents are
+reported separately. Empty coverage skips synthesis; exclusively abstract evidence
+can reach at most `"weak"` coverage. `query_receipt` exposes generation, variant,
+coverage, retrieved/cited counts, reranker degradation and synthesis observations.
+FAST `--no-synth` eval explicitly uses retrieved papers as its citation fallback.
+
+## Catalog authority (P2)
+
+`PAPERVAULT_CATALOG_AUTHORITY` selects `json` (the unset default) or `postgres`.
+PostgreSQL requires an explicit `PAPERVAULT_CATALOG_DSN` and migrated schema
+(`PAPERVAULT_CATALOG_SCHEMA=catalog` by default); it never falls back to JSON.
+Library commits revision-guarded record deltas, audit and pending work atomically.
+Stale conflicts surface as `catalog_conflict`; catalog deletion is refused.
+Artifact bytes become durable before their catalog references.
+
+Deployment #1 uses **`papervault_catalog`** with `PAPERVAULT_CATALOG_AUTHORITY=postgres`,
+following the [authorized 2026-10-19 cutover](https://github.com/LeonJoeeee/papervault/issues/268#issuecomment-6257668738).
+Ordinary PG saves do not rewrite `index.json`. The verified canonical JSON export
+is a projection, generated by `papervault-export.timer` hourly at **:17** (host CST,
+`OnCalendar=*:17`), or explicitly:
+
+```bash
+.venv/bin/python scripts/export_catalog.py --output <path> --verify
+```
+
+The [persistence decision](docs/adr/DRAFT-catalog-persistence-cutover.md) and
+[cutover record](docs/specs/2026-10-18-p2-readiness.md) define writer fencing and
+rehearsal. After authoritative writes resume, recovery is forward-only; restoring an
+old JSON export cannot roll back accepted catalog mutations. Deployment #1 retains
+external Docker volumes `ks-pgdata` / `ks-neo4jdata` and container names `ks-postgres`
+/ `ks-neo4j`; changing them requires a separately authorized migration that preserves
+and verifies the original data.
+
+## Acquisition v2
+
+The six flags below default **off** and accept `1`, `true` or `yes`. Their contracts
+are recorded in [ADR-0006](docs/adr/0006-acquisition-pipeline-v2-contracts.md) and the
+[acquisition design](docs/specs/2026-10-12-acquisition-pipeline-v2.md).
+
+| Flag | Contract |
+| --- | --- |
+| `PAPERVAULT_TERMINAL_V2` | Enforce retrieval/policy/merge/identity/quarantine admission immediately before ordinary dispatch. Legacy dimensions are projected on read and persisted on a state write; a status reset alone grants no policy permission. |
+| `PAPERVAULT_IDENTITY_V2` | DOI → namespaced source ID → URL identity ladder, preserving CORE work/output namespaces. Correspondence may accept, abstain or reject one route; identity selection alone neither merges nor reorders download tiers. Domain markers project into policy; terminal v2 enforces this at ordinary dispatch. |
+| `PAPERVAULT_REOPEN_V2` | Explicit bounded campaigns with durable pre-dispatch reservations, generation/lease claims, isolated staging and guarded publication. Campaign admission independently enforces identity, policy and quarantine. |
+| `PAPERVAULT_POLITE_V2` | Process-shared API request windows, concurrency and cooldowns at the migrated request boundaries; every configured window must admit a send. |
+| `PAPERVAULT_MERGE_V2` | Paired durable merge intent, stopped admission and verified executor/claim drain before canonical/alias consolidation; conservative restrictions and budgets survive the merge. |
+| `PAPERVAULT_STOPRULES_V2` | Detect duplicate in-flight identity, exceeded quota windows and identity-mismatched publication; halt campaigns/cool scopes/quarantine as applicable. Admission refusals and rejected PDF tiers are not violations. |
+
+Unknown policy denies new acquisition without an applicable scoped ruling. Existing
+artifacts remain retained. Disabling a flag does not erase persisted claims, quarantine,
+merge intents, budget consumption or campaign halts. Stop rules do not enforce the
+unmeasured significant-regression term (`SIGNIFICANT_REGRESSION_FRACTION=0.20`).
+
+### Campaigns, policy and recovery
+
+Use a maintenance window with `papervault.service` stopped for write operations.
+Standalone campaigns and rulings share an exclusive writer lock and refuse a running
+service, unavailable service probe or incompatible active work. The orchestrator
+owns live application. `reopen-campaign` requires `--dry-run` for a read-only
+preview; `policy-ruling` previews by default and writes only with `--apply`:
 
 ```bash
 python -m papervault.library.cli reopen-campaign --cap 20 --dry-run --json
+# Apply the bounded campaign in the stopped-service window.
 python -m papervault.library.cli reopen-campaign --cap 20 --json
 python -m papervault.library.cli reopen-campaign --keys approved.keys --cap 50 --dry-run --json
-```
-
-The selector takes exhausted retrieval (or an explicitly ruled eligible terminal)
-with allowed policy, canonical resolved
-identity and no quarantine. It changes only retrieval eligibility; unknown or
-excluded policy needs a separate ruling. Dry-run reads the current catalog authority and validates
-authorization without creating files or sending requests. Apply claims and
-enqueues the selected cohort through the existing download queue, waits for its
-results, and refuses a live service, unavailable service probe, or active campaign.
-An exclusive `.reopen-campaign.lock` prevents concurrent standalone writers.
-It does not recover unrelated pending work. There are no automatic campaigns.
-Optional `--keys FILE` restricts selection to citation keys in file order (one
-per line, with `#` comments and duplicates ignored). Every listed key is checked,
-including those after the cap: missing keys, records refused by `reopenable()`,
-exhausted budgets, and eligible keys deferred by the cap appear in the accounting.
-An empty key file selects nothing.
-
-Scoped policy rulings apply to explicit citation keys across all source cohorts:
-
-```bash
 python -m papervault.library.cli policy-ruling --keys approved.keys --action acquire --reason 'Owner approved recovery' --actor owner
-# In a maintenance window with papervault.service stopped:
+# Apply the previewed ruling in the stopped-service window.
 python -m papervault.library.cli policy-ruling --keys approved.keys --action acquire --reason 'Owner approved recovery' --actor owner --apply
 ```
 
-The default is a read-only report of matched keys and current policies. Missing
-keys, quarantine, aliases, merge intents and unsettled claims refuse the whole
-request. `acquire` (`override`) creates a key-bound acquisition grant covering
-current policy reasons and makes failed/metadata-only/pending retrieval eligible.
-`exclude` (`restrict`) sets excluded policy and metadata-only status; `clear`
-clears the stored ruling. Separate domain exclusions still apply. These acts
-preserve artifacts and never release quarantine. UNKNOWN continues to deny
-acquisition without an applicable ruling.
+Key files contain one citation key per line, with comments/duplicates ignored; an
+empty file selects nothing. Accounting includes refused and cap-deferred keys.
+Rulings are key-bound, revisioned and append-only. `acquire` (`override`) grants
+permission for covered policy reasons; `exclude` (`restrict`) denies acquisition;
+`clear` clears the ruling. None releases quarantine. PG commits record, ruling,
+audit and pending work together; JSON-mode crash-intent replay requires the latest
+key-bound revision, original record snapshot and matching covered reasons. Spent or
+superseded grants cannot reopen work. `audit` download retries and `add --force-refresh`
+record `operator_reopen` without granting policy permission; extraction retries retain
+their attempt/defer reset behavior through named operator services.
+`audit --retry-low-quality` and `audit --retry-extract-keys` use those extraction
+services; download audit retries accept `--reason` and `--actor`.
 
-Rulings carry UTC time, action, scope, reason, actor, keys and revision. Repeating
-the same ruling reuses its evidence; a different action or reason advances the
-revision. Grants apply only to acquisition on their original key and remain until
-superseded by a later ruling/revision. Under PostgreSQL, record changes, ruling,
-audit and pending work commit atomically; stale decisions refuse. The JSON
-correction ledger is a compatibility copy after commit. In JSON mode intent is
-saved before state with an explicit record snapshot. Only the latest intent for
-each key can recover an interrupted index save, and only while that snapshot and
-its covered policy reasons still match. Legacy rows without recovery metadata
-are completed history. Replaying a spent or superseded grant never reopens it;
-reconsideration requires a new ruling reason. Merges retain the revision barrier
-of every dropped grant.
+Standing limits are **200 reservations per campaign** and **three starts per rolling
+seven UTC days**, including interrupted starts. The fsynced append-only
+`reopen-budget.jsonl` remains authoritative for consumption across restart/index
+rollback. Reservation precedes dispatch; uncertainty never refunds or resends.
+Results publish from `.reopen-staging/<lease-id>/` only under the exact generation,
+lease, identity, policy, budget and changed-artifact guards. Expiry does not prove
+termination: uncertain/dispatched restart work stays quarantined and charged.
+Retain staging until drain/fencing is established.
 
-Download audit retries and `add --force-refresh` record an `operator_reopen` act
-and set retrieval eligible without granting policy permission. Audit accepts
-`--reason` and `--actor` (default reason names the retry action). Extraction
-retries retain the existing status/attempt/defer reset contract. The legacy
-background janitor no longer purges terminal records.
+The lifecycle CLI exposes:
 
-Recovery commands require an explicit reason and actor, and refuse a running
-service. `claim-recover KEY [--lease-id ID]` refunds only proven-unsent work;
-dispatched attempts require `--executor-proof`. `release-quarantine KEY
-[--lease-id ID]` records a human disposition and fences the old generation without
-refunding it. `campaign-halt ID` stops new dispatch; `--drained` additionally
-finishes only after outstanding reservations and record claims settle.
-`merge-consolidate CANONICAL ABSORBED` and `merge-restart CANONICAL` retain alias
-records and artifacts, respect drain barriers, and require merge V2. All five
-commands accept `--reason REASON --actor ACTOR`.
+| Command | Guarded operation |
+| --- | --- |
+| `claim-recover KEY [--lease-id ID]` | Refund only proven-unsent work; dispatched attempts need `--executor-proof`. |
+| `release-quarantine KEY [--lease-id ID]` | Record explicit human disposition and fence the old generation without refund. |
+| `campaign-halt ID [--drained]` | Stop new dispatch; finish only after outstanding reservations and claims settle. |
+| `merge-consolidate CANONICAL ABSORBED` | Require merge v2, quiesce/drain both records, retain alias and artifacts. |
+| `merge-restart CANONICAL` | Restart an expired paired wait under the existing fences; uncertain commits need separate recovery. |
 
-Rulings and standalone campaigns share the writer lock and refuse a running
-service or unavailable service probe. The orchestrator owns live application.
+All five require `--reason REASON --actor ACTOR` and a stopped service. Merge budgets
+sum spent consumption, take the minimum applicable ceiling and advance generations;
+a ledger/catalog disagreement fails closed. Ordinary retries never release expired
+or uncertain merge fences.
 
-Standing authorization permits at most 200 reservations per campaign and three
-campaign starts in any rolling seven days (UTC wall clock), including interrupted
-starts. Larger campaigns require the owner and are refused by this CLI. The
-append-only `reopen-budget.jsonl`, beside `index.json`, records version-1 JSON
-events for authorization, reservation, dispatch, completion, proven-not-sent
-refunds and fencing. Appends and claim index saves require successful `fsync`;
-unreadable accounting refuses acquisition. A reservation precedes dispatch and
-survives process restart and index rollback. A restored record missing its claim
-cannot acquire through the ordinary path when the ledger records its generation.
-Refunds are compensating events,
-never removal of consumption; uncertainty never refunds or resends.
+### API politeness and envelopes
 
-The optional worker-owned `reopen_claim` record stores generation, lease ID,
-expiry, campaign, scope and phase. Every result uses that exact capability;
-state and PDF/text publication are fenced together under the library write-lock.
-Attempts download into `.reopen-staging/<lease-id>/` inside the vault, with copied
-assets and a detached record. Successful publication checks current policy,
-identity and changed-artifact baselines; it preserves concurrent metadata and
-applies artifact deletions as well as writes. Completed generations apply once.
-Normal legacy records keep their serialization when the flag is off. A publication
-fence failure halts further campaign dispatch; queued attempts refund only when
-the runner proves they were never sent.
-
-Expiry or uncertain execution sets the independent quarantine marker; expiry
-never proves thread termination. Dispatched attempts are quarantined on restart,
-and their resources remain charged. Cancellation quarantines promptly and retains
-the download permit until the executor actually drains. Turning the flag off stops
-new campaigns and does not turn persisted claims into ordinary downloads. Uncertain staging must be
-retained until recovery establishes drain/fencing. The maintenance API
-`ClaimStore.release_quarantine(key, drained_lease_id=...)` requires evidence that
-the exact executor drained, or an explicit `human_reason=...`; it advances the
-durable generation and records the evidence without refunding. After every
-campaign executor is drained/fenced, `BudgetLedger.finish_campaign(...,
-drained=True)` records closure. These are single-writer operations, matching the
-existing process model in `services/concurrency.py`; they are not scheduler tasks.
-
-`PAPERVAULT_MERGE_V2=1` opts into slice 5 (default off). Duplicate identity
-consolidation and preprint/journal promotion persist a paired merge intent,
-refuse new claims on both keys, and wait for queued work, live executors and
-durable campaign claims to drain. Each checkpoint uses the existing library
-write lock; it releases the lock between checkpoints so executors can finish.
-The merge intent projects quarantine for new admission without marking existing
-execution as uncertain. Dispatched campaign results still pass the normal
-generation, lease, policy, identity and budget publication checks and settle their
-claims. Lease-expiry or execution-uncertainty quarantine continues to drop results.
-The default wait is 60 seconds (`MergeStore.quiesce(..., wait_seconds=...)`).
-An expired or uncertain wait stays quarantined and blocked after restart;
-expiry never permits a merge or refunds uncertain consumption. The operator
-or orchestrator can explicitly call `await MergeStore.restart(expired_intent,
-wait_seconds=60)` to persist a fresh paired wait without releasing either fence.
-The returned intent must still pass the normal drain checks before `merge_records`;
-ordinary retries do not restart expired waits. Uncertain execution/commit intents
-remain blocked and require separate operator recovery.
-
-The canonical record retains the union of restrictions, intersection of grants,
-and source observations. The absorbed record remains an alias; `resolve_alias`
-returns its canonical record. Existing artifacts remain in this vault and are
-read through retained paths. `reopen-budget.jsonl` receives an explicit `merge`
-event with both keys, generations before/after and drain evidence, before the
-index is saved. Spent budgets sum, ceilings take the minimum of the affected
-keys' campaign caps (the standing 200-paper cap for keys with no history), and
-generations re-sequence to their sum plus one. A ledger/index disagreement fails
-closed and requires operator repair; an uncertain commit is never replayed.
-Disabling the flag retains fences on persisted intents and merged records.
-Plain metadata fills use their existing path; untouched legacy rows gain no
-merge fields. Standalone synchronous consolidations use the same write lock;
-runtime callers must own it on the server's event loop.
-
-`PAPERVAULT_POLITE_V2=1` opts into slice 4 (default off). API sends for Wiley,
-Crossref, Unpaywall, Semantic Scholar, OpenAlex and arXiv share one process ledger
-per service, combining credentials, IPs and endpoints conservatively. Every
-configured sliding window must admit the send, with concurrency accounted
-separately. A full window, occupied permit, cooldown or unavailable accounting
-refuses the send; the wrapper does not add retries or waits. With the flag off,
-the original transport receives the same arguments and returns the same response.
-
-Wiley starts at 1 request/second **and** 30/600 seconds, below the issue's
-documented 3/second and 60/600 seconds. Semantic Scholar starts at 1/2 seconds
-(the batch module documents 1/second); arXiv's API retains 1/3 seconds. Each
-service has concurrency 1. Crossref, Unpaywall and OpenAlex have no numeric
-provider limit documented in the current code and remain **disabled** until an
-explicit envelope is configured and authorized. Retry delays, sweep caps and
-the existing network semaphore are not provider windows.
-
-`PAPERVAULT_POLITE_ENVELOPES` accepts a JSON object keyed by `crossref`,
-`unpaywall` or `openalex`. Each entry needs `analogue` (`wiley`,
-`semantic_scholar` or `arxiv`), `initial` and `hard_cap` arrays of
-`[requests, seconds]`, and a nonempty `authorization` reference. An initial
-window must correspond to each analogue window, in increasing duration order;
-its duration may grow, its burst cannot exceed the analogue, and its rate must
-be at most half the analogue. Caps specify maximum counts and minimum durations
-for those corresponding windows. Missing
-fields disable that scope; malformed or changed live configuration fails closed.
-For example, the shape for a separately authorized envelope based on Wiley is:
+Built-in limits are Wiley **1/second and 30/600 seconds**, Semantic Scholar
+**1/2 seconds**, arXiv API **1/3 seconds**, each with concurrency **1**. Crossref,
+Unpaywall and OpenAlex are disabled under polite v2 until an explicitly authorized
+`PAPERVAULT_POLITE_ENVELOPES` entry exists. This JSON accepts those three scopes only:
 
 ```json
 {"crossref":{"analogue":"wiley","initial":[[1,1],[30,600]],"hard_cap":[[1,1],[60,600]],"authorization":"owner approval reference"}}
 ```
 
-This example records an assumption, not a claim about Crossref's permission.
-The pure `Ledger.increase(scope, windows)` API takes explicitly chosen values:
-at most +25% in rate per window after 24 hours and fresh, completed 2xx evidence.
-Counts may increase or durations shorten, within the configured caps. There
-is no automatic ramp. Configurations, increases, cap freezes, cooldowns and
-resumes are inspectable through `Ledger.snapshot()`. A 429, or three timeouts
-in a rolling 60 seconds, starts a 60-second scope cooldown and stops further
-speed-up. A late timeout extends the quiet window. After it expires, requests
-resume at the same limits. Unread/partially closed streams and unproven raw
-streams without a content length earn no ramp evidence. The ledger is in memory
-under the existing single-process model; envelope state and request windows do
-not survive a restart, so restart is not a supported way to clear a live quota
-or cooldown. Browser/stealth, publisher content, redirects and arXiv page/PDF
-paths remain for later slices; existing semaphore and cascade behavior is retained.
+Each initial window corresponds to the chosen `wiley`, `semantic_scholar` or `arxiv`
+analogue, with no larger burst, no shorter duration and at most half its rate. Caps
+bound counts and durations. The example is an operator assumption requiring separate
+authorization, not a statement of provider permission. Missing fields disable a
+scope; malformed or changed live configuration fails closed.
 
-`PAPERVAULT_STOPRULES_V2=1` opts into slice 6 (default off). Reconcile evaluates
-the rules before routing; download queue rounds and campaign settlement also
-evaluate them. The detectors consume durable outstanding claims and merge
-redirects, actual scope send timestamps, and explicit publication evidence.
-They never interpret an admission refusal or a rejected PDF tier as a violation.
-Named thresholds in `library/stop_rules.py` are zero: duplicate in-flight
-identity halts the campaign; an exceeded quota window cools the scope and halts
-active campaigns; identity-mismatched publication halts its campaign (or active
-campaigns for unclaimed work) and quarantines the current record.
-Publication comparison uses the adopted DOI-first canonical identity and resolves
-merge aliases. Clearing or repairing a secondary identifier or route leaves a
-matching canonical identity intact and does not trigger a stop.
-Verified blank identifier fills keep their existing promotion behavior; the
-comparison advances only for fills acknowledged by the existing writers.
-`SIGNIFICANT_REGRESSION_FRACTION=0.20` defines
-the measurement term; it does not enforce a fourth rule without measurements.
+The wrapper refuses a full window, occupied permit or cooldown without adding
+waits/retries. Explicit `Ledger.increase` is bounded to +25% rate after 24 hours
+and fresh completed 2xx evidence; there is no automatic ramp. A 429 or three timeouts
+in 60 seconds starts a 60-second cooldown. Restart is not a supported quota reset.
+Browser/content/redirect and arXiv page/PDF paths are outside this API migration.
 
-Campaign halt is an idempotent append-only ledger event, distinct from verified
-finish/drain. Replay denies new reservations and dispatches, while existing
-dispatched work keeps its completion and accounting semantics. Uncertain work
-stays charged; proven-unsent queued work can settle normally. Scope cooldown
-uses the same lock and configured quiet window as 429/timeout cooldown; repeated
-rounds do not extend an active cooldown, and resume never increases the limits.
-Disabling the flag stops evaluation and new measurement fields; persisted
-campaign halts continue to fence admission.
+## Identity correction and acquisition observability
 
-Enabled manifest events add `identity_version` (v2 identity definition),
-`attempt_generation`, `lease_id` and an opaque `request_scope_id`, preserving
-existing fields. Unknown correlation values are null; request scope is distinct
-from the campaign's logical scope. Wait, executor/request service, and actual
-executor drain have separate duration fields. Incomplete attempts are recorded
-as censored, with null unobserved durations, and never back-filled with an
-estimated latency or outcome. `admission-denied` records refused sends;
-`verified-success` requires positive identity verification and live publication,
-so verification fail-open and temporary campaign stages do not count as success.
-
-## URL identity backfill
-
-For records with a URL but no DOI or arXiv ID, inspect a bounded sample without
-writing to the vault:
+Inspect URL-only records without modifying the vault:
 
 ```bash
 python -m papervault.library.cli identity-backfill --cap 20 --json
 ```
 
-Recovery checks DOI/publisher and arXiv URL patterns, then one citation-metadata
-landing fetch (including its redirect target), then exact ADS, CORE, OpenAlex or
-INSPIRE metadata. DOI registry metadata or the current arXiv page must pass the
-existing title/author consistency screen before an identifier is filled. Missing,
-blocked, ambiguous or conflicting evidence causes abstention. Existing identifiers
-and collisions are left intact; successful fills retain route, URL, verified title
-and UTC observation time in `identity_recovery`.
+Backfill checks URL patterns, a citation-metadata landing fetch (including redirects),
+then exact source metadata. DOI registry/arXiv evidence must pass title/author
+correspondence before adoption. Missing, blocked or contradictory evidence causes
+abstention; existing identifiers/collisions are retained. In an authorized stopped-service
+window, `--apply --acquire` persists verified identities and runs the ordinary cascade
+only for newly recovered rows without assets. `--keys FILE` restricts selection;
+required `--cap` is 1–50 and bounds inspection/acquisition.
 
-In an authorized maintenance window after deployment, add `--apply --acquire` to
-persist identities and immediately run the ordinary current-only cascade on only
-the newly recovered rows without existing assets. `--keys FILE` restricts selection
-to listed citation keys (one per line). `--cap` is required, accepts 1–50, and bounds
-both inspected and acquired records; unrelated terminal sets are never reset.
-Writes refuse while `papervault.service` is running. The JSON result and library
-manifest record recovery counts by route, acquisition outcomes, and successful
-sources (including the winning member of aggregator groups). Report that post-deploy
-pass's numbers on [issue #197](https://github.com/LeonJoeeee/papervault/issues/197).
-
-The standing correction pipeline uses that same verification/application path with
-acquisition disabled. Notify it explicitly after a credential becomes available or
-an affected source is repaired/deployed, in an authorized maintenance window:
+The standing correction pipeline uses the same verification path with acquisition
+**disabled**. Notify it after credentials or source evidence arrive:
 
 ```bash
 python -m papervault.library.cli correction-event credential_arrived --source ads --cap 20 --apply
 python -m papervault.library.cli correction-event source_repaired --source core --cap 10 --apply
 python -m papervault.library.cli correction-event identifiers_arrived --source ads --keys affected.keys --cap 10 --apply
+python -m papervault.library.cli correction-sweep --apply
+python -m papervault.library.cli correction-report --kind conflicts
+python -m papervault.library.cli correction-report --kind manifests --manifest ID
+python -m papervault.library.cli correction-adjudicate results.json --apply
+python -m papervault.library.cli correction-report --month YYYY-MM
+python -m papervault.library.cli correction-report --kind routes
 ```
 
-These commands are the operator notification points; they do not watch credentials
-or poll source health. Source adapters can use the same async `run_event` interface
-with the running library. `identifiers_arrived` requires explicit stored citation
-keys whose source identifiers or locator URLs gained evidence. Each event intersects
-keys with its source cohort, then caps selection at the required `--cap` (1–50).
-Without keys, only identifierless rows and unrecorded verified routes consume the cap.
-Known identifiers remain intact. The standing pipeline applies DOI recoveries;
-non-DOI claims are recorded as deferred because #198's lower identity ladder is TBD.
-Requests are serial, with at least one second between inspected records and sweep
-cohorts; the reviewed source helpers retain their timeouts, limits and cooldowns.
+Events intersect explicit keys with the source cohort; `identifiers_arrived` requires
+keys. Each pass requires a 1–50 cap. The monthly task has a durable 30-day floor,
+rotating key/cohort cursors, default 20 per cohort (maximum 50), and a total maximum
+of 100; `--per-cohort-cap` / `--total-cap` may lower these values. The pipeline
+records DOI recoveries and defers lower-ladder claims; it neither downloads assets
+nor resets terminal states. DOI collisions wait for V2 alias consolidation.
 
-Library background boot owns a monthly correction task. Its durable due time has
-a 30-day floor, survives restart, and starts 30 days after first activation. An
-operator may run the first sweep earlier with `correction-sweep --apply`; subsequent
-sweeps respect that floor. Each cohort defaults to 20 selected papers (hard maximum
-50); the whole sweep defaults to and cannot exceed 100. Both citation-key and cohort
-cursors rotate so capped misses and later cohorts progress. CORE starts last per
-its measured ceiling. Override the defaults downward with `--per-cohort-cap` and
-`--total-cap`. The constants and validation live in `services/correction_pipeline.py`;
-the reviewed backfill's record ceiling remains in `services/identity_backfill.py`.
+`correction-ledger.json` retains conflicts, route evidence, scheduling, investigations
+and monthly reports. At ten pending subject papers it creates a manifest for an
+orchestrator-dispatched Codex `gpt-6-luna` / `max` investigation; the library launches
+no agent. Adjudication imports `manifest_id` and `results` entries (`conflict_id`,
+`status: resolved|needs_human`, `decision`, `evidence`). Resolved entries need evidence;
+replay is idempotent. Decisions do not authorize field changes. Reports are read-only;
+maintenance writes refuse a running service.
 
-`correction-ledger.json`, beside the vault's `index.json`, keeps conflicts, immutable
-batch manifests, adjudications, route findings, scheduling and monthly aggregates.
-The library manifest records every pass and monthly report. Merge/enrichment and
-verified-identity claim hooks stage conflicting fields with both original sides and
-provenance; they retain existing fill-blanks behavior. The backfill still never
-merges or purges a collision. The title-based DOI resolver uses non-destructive
-V2 alias consolidation; with merge V2 disabled it leaves the collision waiting.
+Key-scoped ADS events may import `--routes FILE`: at most three `{key, url,
+source_identifier, provenance}` routes per paper, bound to the stored bibcode with
+timezone-aware `checked_at`, `verification: "remote_pdf"` and survey evidence.
+Route reports supply scoped reopening evidence.
 
-At ten distinct pending subject papers, one atomic ledger write emits and assigns
-a manifest for an **orchestrator-dispatched Codex CLI `gpt-6-luna` / `max`** agent.
-Each manifest contains ten papers and at most fifty conflicts. No agent is launched
-by the library. Export its actual evidence with `correction-report --kind manifests
---manifest ID`. Import an investigation using `correction-adjudicate results.json
---apply`, where JSON contains `manifest_id` and `results` entries with `conflict_id`,
-`status` (`resolved` or `needs_human`), `decision`, and `evidence`. Resolved answers
-require evidence; omitted/unadjudicable answers become retained `needs_human`.
-Identical replay is idempotent; foreign/duplicate answers fail atomically. Adjudication
-records a decision and does not apply field changes. Those require separate scoped
-authorization. `correction-report --month YYYY-MM` reports aggregate counts and current
-unresolved dispositions; `--kind conflicts` exports the retained evidence. All report
-exports are read-only; maintenance writes refuse while the service is running.
+The manifest also retains download outcomes and scalar `download_telemetry` spans:
+queue wait, network admission, executor/cascade, tier/group/member, verification,
+publication and actual drain. Correlate `run_id`, key, UTC times and span IDs;
+partial attempts remain censored. `status=ok` means control flow returned, not that
+acquisition succeeded. Whole-cascade permits can contain multiple member requests;
+browser-call spans do not measure process memory. Validate provider limits with
+request counts/status/rate headers and matching host measurements, not semaphore
+counts alone. Stop-rule correlation fields preserve unknown values as null.
 
-Verified stored ADS full-text observations are copied into the route ledger. A #205
-survey packet may also be supplied to a key-scoped ADS event using `--routes FILE`:
-a JSON list of `{key, url, source_identifier, provenance}` objects, with the exact
-stored ADS bibcode and provenance containing timezone-aware `checked_at`,
-`verification: "remote_pdf"`, and the survey's evidence (for example `issue: 205` and
-`status_code: 200`). Imports require selected keys and at most three routes per paper.
-`correction-report --kind routes` is the #174 scoped re-open's selection interface.
-The correction pipeline downloads no assets and changes no terminal states.
+## Catalog knowledge publication (P4)
 
-Download telemetry is appended to the same manifest by ordinary acquisitions. Existing
-outcomes retain their fields and gain `timing`: a 32-character `run_id`, UTC `at`,
-and, inside a tier slot, `slot_id`, `slot_started_at`, `slot_ended_at`, and monotonic
-`slot_duration_s`. These slot endpoints describe elapsed time **at outcome emission**;
-use the corresponding completed `tier` span for the full slot including final bookkeeping.
+`PAPERVAULT_KNOWLEDGE_JOBS=legacy` is the default. Selecting `postgres` requires
+PostgreSQL library authority plus a **rehearsed, committed authority handoff**;
+a configuration edit cannot transfer ownership. Follow the
+[publication decision](docs/adr/DRAFT-catalog-knowledge-publication.md) and
+[P4 procedure](docs/specs/2026-10-20-p4-knowledge-handoff.md). This documentation
+records implementation contracts, not a live P4 activation.
 
-Additional `download_telemetry` records share `run_id`, paper `key`, `actor`
-(`download` or competing `search`), UTC `at`, process/thread IDs, and `phase`/`mark`.
-Spans have `start` and `end` marks with `span_id`, `parent_span_id`, `started_at`,
-`ended_at`, monotonic `duration_s`, and control-flow `status` (`ok`, `error`,
-`cancelled`). Status `ok` means the operation returned; tier success remains the
-existing outcome event. Phases cover `queue_worker`, `network_wait`, `network_hold`,
-actual `executor` work, `cascade`, arXiv `preflight`, `tier`, `strategy`,
-`verification`, `pdf_save`, `firecrawl`, parallel `group`/`member`, and `browser_call`.
-`enqueue`/`dequeue` points pair by queue sequence and run ID; dequeue includes
-`enqueued_at`, `queue_wait_s`, worker ID and priority. `queue_drop` points close
-stale priority-promoted tuples with their sequence and dequeue time. Cascade end carries
-`paper_status`, `outcome_source` and `pdf_returned`; group `winner` points precede
-executor drain. Mirror members use indices, never target URLs. Telemetry stores
-scalar fields only, bounds labels to 64 characters and keys to 128, and retains
-only one admission stamp per queued tuple. New-record failures emit a warning and
-do not change acquisition results. Manifest writes serialize complete JSONL records.
+Catalog intake captures exact immutable input bytes, metadata and versioned recipes.
+Jobs, attempts, submissions, expected inventories, sealed receipts and generation
+manifests have separate identities. Private LightRAG deltas overlay one pinned
+aggregate; adapters resolve latest replacement rows and tombstones before retrieval
+or traversal. Unpublished outputs cannot alter the serving view. Publication
+atomically checks current inputs, eligibility, aggregate base and output evidence
+before recording lineage, selections, audit and downstream work. Candidate publication
+does not promote production. Unknown outcomes retain charges and recovery pins.
 
-The semaphore spans describe **whole cascade/search admission**, including browser,
-verification and executor drain; member fan-out can issue multiple requests per
-permit. Browser-call spans observe the exposed fetch API, not process creation/exit,
-PSS/RSS or isolated remote latency. Cancellation can release a permit before the
-executor thread ends; measure both timelines. Partial spans at capture boundaries
-must be censored. Request counts/status/rate headers and same-window host process
-memory measurements remain necessary to validate upstream limits and resource costs.
-This instrumentation changes neither the four workers nor the four semaphore permits.
+P5a extends this boundary to extraction: `extracts/inputs/<sha256>` and
+`extracts/versions/<completion_id>/{output.md,completion.json}` retain consumed bytes
+and immutable receipts. Conventional markdown paths are compatibility projections.
+Legacy/JSON extraction may retain a durable pending bundle without catalog coverage;
+committed catalog extraction uses `publish_derivation` to register receipt,
+derivation, audit and distillation outbox together. Recovery delivers the original
+evidence without re-extracting or inventing historical recipes. Staged reopening
+still needs its guarded claim/writeback transaction.
 
-## Catalog persistence
-
-Deployment #1 has used PostgreSQL database **`papervault_catalog` as the live catalog
-authority** since the [owner-approved cutover on 2026-10-19](https://github.com/LeonJoeeee/papervault/issues/268#issuecomment-6257668738),
-with `PAPERVAULT_CATALOG_AUTHORITY=postgres`, an explicit `PAPERVAULT_CATALOG_DSN`
-and a migrated catalog. Library saves commit revision-guarded delta batches with
-audit and pending work; stale conflicts surface as `catalog_conflict`.
-PG saves leave JSON untouched. The user unit `papervault-export.timer` generates
-the verified canonical `index.json` export hourly at **:17** (host CST,
-`OnCalendar=*:17`); JSON is a projection rather than a second authority.
-`scripts/export_catalog.py --output <path> --verify` is the explicit export command.
-Configuration still defaults to JSON when the authority setting is unset;
-PostgreSQL record purge/deletion remains refused.
-
-The [execution record and historical rehearsal runbook](docs/specs/2026-10-18-p2-readiness.md)
-record the live cutover and the closed frozen-snapshot rollback boundary: after
-authoritative writes resumed, recovery is forward-only. Knowledge publication is a
-separate handoff: `PAPERVAULT_KNOWLEDGE_JOBS` still defaults to `legacy`, and switching
-it to `postgres` requires its own rehearsed and committed authority transition.
+Coverage requires selected compatible publications and fresh positive verification
+of every required output (default observation age **300 seconds**). Backend
+`processed` status alone is insufficient. The read-only
+`scripts/coverage_report.py` separates this P4 ruler from legacy coverage. Physical
+retirement verifies document discovery/contribution indexes, reducer rebuilds and
+graph/vector consistency before sealing; missing historical evidence needs an
+isolated rebuild. Corpus-scale layered-query latency and cumulative manifest
+metadata growth remain activation qualification concerns.
 
 ## Coordinated recovery
 
-P5b provides `scripts/snapshot_derivatives.py` and `scripts/rebuild_derivatives.py`.
-Both require explicit roots and connection identities and default to dry-run. They
-disable dotenv discovery. `PAPERVAULT_KNOWLEDGE_JOBS=legacy` remains the default;
-these tools do not activate catalog scheduling, change the serving generation,
-promote a rebuild, or delete research assets.
+P5b uses `scripts/snapshot_derivatives.py` and `scripts/rebuild_derivatives.py` with
+explicit roots/connection identities, dotenv discovery disabled and dry-run defaults.
+Operational roots are `/data/p5b-recovery` and `/data/p5b-drills/<drill-id>` on the
+owner's RAID. The orchestrator owns weekly scheduling and production drills in the
+monthly reboot window (at most two hours); [staging evidence](docs/baselines.md)
+does not establish live scheduling or full-system recovery qualification.
 
-The operational roots approved in [#283](https://github.com/LeonJoeeee/papervault/issues/283)
-are `/data/p5b-recovery` and `/data/p5b-drills/<drill-id>` on the owner's RAID.
-The worker's staging runs use explicit isolated `/tmp` roots, recorded in
-[the baseline evidence](docs/baselines.md). The orchestrator owns deployment,
-weekly operational snapshots and production drills in the monthly reboot window
-(at most two hours). No timer or live backup configuration is activated by this PR.
+Drain library, graph and administrative backend writers before capture. Exclusive
+vault/knowledge leases, catalog/backend writer barriers and PostgreSQL table locks
+bind one checkpoint. A complete set contains the catalog schema/index inventory,
+rows/sequences/epoch/audit boundary, entire vault and operational ledgers, immutable
+extraction/knowledge inputs, recipes/receipts, PostgreSQL KV/cache/status/vector
+materializations, and Neo4j graph/schema. Hashes, lengths and dependency closure are
+verified before registration. Independently timed dumps, the nightly catalog-only
+dump and hourly JSON export do not constitute this set.
 
-A complete set contains the catalog schema, installed index definitions (including
-importer-installed DOI/arXiv uniqueness), exact row encodings, sequence state,
-checkpoint/epoch/audit boundary; the entire vault including source bytes, extraction
-inputs/versions and operational ledgers; knowledge inputs/local state; recipes and
-receipts; all PostgreSQL KV/cache/doc-status/vector tables including retained extra
-tables and indexes; and Neo4j nodes, relationships, properties, indexes and
-constraints. Every component binds the same checkpoint and has file lengths and
-SHA-256 hashes. Verification also checks sealed receipt ancestry and recomputes
-the hashes of retained PostgreSQL/graph materializations; empty tables cannot stand
-in for missing outputs. Pending extraction completions must retain their source,
-input, recipe and artifact dependency closure even before catalog registration.
-Catalog registration happens after the exported checkpoint and
-cannot appear in its own dump. The existing nightly catalog-only dump and hourly
-JSON export remain separate operations; neither alone covers these dependencies.
-
-Drain all library and graph clients before capture. The coordinator holds exclusive
-vault/knowledge-root leases, catalog writer/backend-access advisory locks, and
-PostgreSQL table locks through export, verification and registration. Graph clients
-hold their root lease through successful storage finalization; failed flushes fail
-closed. Neo4j's transaction relies on this drained application boundary, so direct
-administrative/backend writers must also be stopped by the operator. A busy barrier
-refuses capture. An independently timed collection of database dumps is not accepted
-as a coordinated set.
-
-The source JSON configuration has this shape (credentials are named environment
-variables, never values in a committed configuration):
+Use an explicit source JSON configuration; credentials name environment variables:
 
 ```json
 {
@@ -567,11 +485,9 @@ variables, never values in a committed configuration):
 }
 ```
 
-Use the actual installed table names, including any embedding-model suffixes. A
-missing role or incompatible schema refuses capture. The source catalog must have
-the explicit knowledge-schema migration (version 7 with P5c); capture does not migrate
-the source. Run the preview first; the
-orchestrator can schedule the applied `--due` command weekly after arranging drain:
+Supply actual installed table names, including embedding-model suffixes. Missing
+roles or incompatible schema refuse capture; source migration is explicit (knowledge
+schema version 7 for P5c).
 
 ```bash
 .venv/bin/python scripts/snapshot_derivatives.py --config source.json --root /data/p5b-recovery
@@ -579,35 +495,19 @@ orchestrator can schedule the applied `--due` command weekly after arranging dra
 .venv/bin/python scripts/snapshot_derivatives.py --verify /data/p5b-recovery/<snapshot-id>
 ```
 
-`--due` requires a new complete set when the newest verified retained set is at
-least seven days old. UTC microseconds plus a UUID distinguish same-day snapshots.
-Four verified complete sets roll; failed and sample exports cannot replace them.
-Older packages remain protected if they still hold the only retained copy of
-research/input bytes, so an unresolved protection can temporarily exceed four.
-Mutable projections and ledgers are included in every set without pinning each
-historical revision indefinitely. Removal is limited to verified owned recovery
-package copies; no source tree or live backend is pruned.
+`--due` requires a new complete set after seven days. Retain four verified complete
+sets; failed/sample exports cannot displace them, and only-copy protections may
+retain more. Pruning is limited to verified owned package copies. Plans include
+retained sets, staging and reservations; insufficient physical headroom refuses
+capture. The **2 TB** derivative soft cap / **80%** threshold produces alert evidence
+for snapshots, never emergency source deletion. Capture/restore has a two-hour
+deadline; export memory cost and full-corpus timings require separate qualification.
 
-The operational derivative soft cap is **2 TB (2,000,000,000,000 bytes)**, with an
-**80% alert (1.6 TB)**. Plans account for derivatives, retained sets, a staged export
-and a held capacity reservation. Insufficient filesystem headroom refuses the run;
-crossing the soft cap emits alert evidence and never triggers asset deletion.
-Blocking snapshot/restore work has a two-hour deadline. Logical exports use memory
-proportional to the exported database data; full-corpus resource qualification is
-still required before operational scheduling.
-
-Restore and replay use separate target configurations. Catalog targets must be
-absent `catalog_recovery_*` schemas in an explicitly named `test`/`rehearsal`
-database; PostgreSQL derivative targets use absent `recovery_backend_*` schemas
-with matching extensions. Neo4j requires a distinct empty endpoint/database and
-`"disposable": true`; source aliases and populated unowned targets are rejected.
-Reruns resume only a target bound to the same operation and package. The packaged
-DDL is trusted operator material, not an import format for untrusted third parties.
-Catalog export format 2 binds the full installed index inventory to the checkpoint.
-Restore recreates additional indexes and compares every definition with the source,
-including on resume; invalid/unready indexes and older packages without index state
-are refused. An index definition incompatible with the bundled table constraints
-rolls back the empty catalog target rather than silently weakening its integrity.
+Restore/replay use distinct isolated targets. Catalog schemas must be absent
+`catalog_recovery_*` in an explicitly named test/rehearsal database; derivative
+schemas must be absent `recovery_backend_*` with matching extensions. Neo4j must be
+an empty distinct endpoint/database marked `"disposable": true`. Resume requires the
+same operation/package binding and verifies completed materializations and indexes.
 
 ```bash
 .venv/bin/python scripts/rebuild_derivatives.py --mode restore --package <set> --root <empty-target> --generation restored
@@ -615,185 +515,139 @@ rolls back the empty catalog target rather than silently weakening its integrity
 .venv/bin/python scripts/rebuild_derivatives.py --mode replay --package <set> --root <other-empty-target> --generation replayed --source-generation <source-generation> --config replay-target.json --apply
 ```
 
-Restore preserves historical content recipes/receipts, installs a new durable writer
-fence and epoch, and records a separate materialization receipt. Copied dispatch
-remains disabled; that receipt cannot supply fresh live acceptance. Replay imports
-only selected original inputs/recipes into a fresh candidate catalog and runs the
-normal admission, execution, readback, sealing and publication path, producing new
-attempts and receipts. Isolated replay explicitly resets unit-level execution
-quarantine on fresh units; its plan and receipt record each affected unit's original
-revision and reason under `unit_quarantine_disposition`. Record-level policy and
-quarantine remain enforced, and the source is unchanged. This reset is scoped to
-non-promotable sample execution, not a live quarantine release. It never imports
-historical runnable jobs. Physical replay
-requires `"physical_replay": true`, explicit isolated PostgreSQL/Neo4j targets, the
-exact supported recipe, and its installed models/providers. It does not substitute
-a different transform when the original recipe is unavailable. Metadata replay
-needs no graph/model calls. Physical replay's PostgreSQL DSN must name one IP
-address (with the same `hostaddr`, if present); DNS, multi-host and alternate
-address routing are rejected. Runtime tables must resolve to the owned target
-schema, including on resume, before any backend write.
+Restore preserves original content recipes/receipts while installing a new epoch
+and writer fence; copied dispatch remains disabled. Replay executes selected original
+inputs/recipes through new attempts and receipts without importing runnable history.
+Its unit-level execution-quarantine reset is recorded and limited to isolated samples;
+record policy/quarantine still applies. Physical replay needs `"physical_replay": true`,
+exact recipes/providers/models and explicit isolated backends. Its PG DSN names one
+IP (matching `hostaddr` if present), with runtime tables verified in the owned schema.
+Metadata replay needs no graph/model calls. P5b replay generations are permanently
+sample/non-promotable. These tools neither change live authority nor select serving.
 
-Both paths recheck completed materializations on resume. Restore verifies its added
-candidate/catalog rows against an atomically recorded digest and rejects extra
-Neo4j indexes or constraints. Replay preserves completed
-admissions, stops on errors or deadline, and may resume in a later permitted monthly
-window; it cannot extend a consumed window in the same month. All drill/replay
-candidate generations created by the P5b replay tool are permanently marked sample
-and cannot promote. P5c's separate candidate fork/promotion path is described below.
-
-Weekly cadence is a scheduling policy, not a committed RPO; acceptable loss and
-full-system recovery time remain unqualified. Sample elapsed time is not full RTO,
-especially where source strata or rebuild work were unavailable. RAID and these
-local copies share the host failure domain. Off-host replication and host-loss/
-disaster recovery remain outside P5b and are not satisfied by this evidence.
+Weekly cadence is not a measured RPO; sample timings are not full RTO. Same-host
+RAID copies share the host failure domain and do not provide off-host disaster recovery.
 
 ## Disposable extracts and isolated maintenance
 
-P5c adds `scripts/maintain_derivatives.py` for catalog inspection, explicit extract
-disposition, monthly windows, resumable GC, candidate forks and promotion. It disables
-dotenv discovery, requires an explicit DSN environment name, schema and vault, and
-defaults to a read-only plan. Catalog scheduling remains opt-in; the default is
-`PAPERVAULT_KNOWLEDGE_JOBS=legacy`. The orchestrator owns production activation and
-the monthly reboot drill. Worker rehearsals use disposable stores and `/tmp` roots.
+P5c's `scripts/maintain_derivatives.py` handles retention, bounded GC and isolated
+candidate rebuild/promotion. It requires explicit DSN/schema/vault identities,
+disables dotenv discovery and defaults to a read-only plan.
 
-Every registered extract starts **protected**. An operator may mark only its
-immutable markdown output disposable using a reason, nonce and exact retention
-revision. Eligibility begins **90 days after accepted supersession**, regardless of
-file age: the clock starts when the last extraction head or record selection ceases.
-Reselecting an older output cancels that clock; removing its last selection starts
-a new ninety-day interval. Record selections include physical path aliases.
-Pre-P5c receipts start protected. Their migration timestamp is provisional: first
-verified vault binding establishes a conservative clock from current selections,
-since earlier absolute-path and alias selections cannot be reconstructed without
-that root. An unselected historical output waits ninety days from that binding.
-Source inputs, receipts, current heads, selected records, live generations, queued
-jobs, reader pins and unresolved recovery/job pins remain protected. Reader pins
-expire within two hours; job/recovery pins require an explicit reviewed disposition.
+Every extract starts **protected**. Only an explicitly disposable immutable
+`output.md` may be collected, **90 days after losing its last accepted head/record
+selection**. Reselection cancels the clock; file age is irrelevant. Pre-P5c rows
+start protected and acquire a conservative clock on verified vault binding. Source
+inputs, receipts, current selections, live generations, jobs and reader/recovery pins
+remain protected. Reader pins expire within two hours; job/recovery pins need a
+reviewed disposition.
 
-GC commits a permanent deletion intent before filesystem IO and checks reference
-admission under the same catalog writer lock. A tombstoned identity cannot acquire
-new references. It verifies the exact path, hash, size and single-link regular file
-through directory descriptors, rejects symlinks, and unlinks only that `output.md`.
-A failed unlink or lost catalog response retains its intent; retry resumes the same
-deletion under a fresh valid lease. Filesystem/catalog writers must use the normal
-fences; administrative writers must be drained during maintenance. Recovery sets
-accept valid disposal evidence while still verifying every source and receipt.
-Pre-GC snapshots conservatively keep their existing protected-byte retention; GC
-does not change snapshot cadence or automatically prune those older packages.
-
-Use `inspect` to obtain the current authority, window, retention revisions and
-eligibility reasons. Supply a JSON payload for every other action:
+GC commits a permanent deletion intent under the same writer lock as reference
+admission before filesystem IO. It verifies exact path/hash/size and a regular,
+single-link file through directory descriptors, rejects symlinks and unlinks only
+the named output. Interrupted deletion resumes the same intent under a fresh lease.
+Sources/receipts and pre-GC snapshot protections remain intact.
 
 ```bash
 .venv/bin/python scripts/maintain_derivatives.py inspect --dsn-env MAINTENANCE_CATALOG_DSN --catalog-schema <schema> --vault <vault> --operation-id inspect
 .venv/bin/python scripts/maintain_derivatives.py gc --dsn-env MAINTENANCE_CATALOG_DSN --catalog-schema <schema> --vault <vault> --payload gc.json --operation-id gc-batch
-# Apply only in the explicitly recorded window; one batch names at most 100 completions.
 .venv/bin/python scripts/maintain_derivatives.py gc --dsn-env MAINTENANCE_CATALOG_DSN --catalog-schema <schema> --vault <vault> --payload gc.json --operation-id gc-batch --owner <operator> --window-id <window> --apply
 ```
 
-The module CLI also exposes `extract-retention`, `extract-pin`,
-`release-extract-pin` and `extract-gc`, with the same explicit `--dsn-env`,
-`--catalog-schema`, `--vault`, `--operation-id` and optional `--apply` boundary.
-Use each command's `--help` for exact revision, nonce, owner and disposition
-arguments. `extract-gc --completion-id ID` accepts repeated explicit identities;
-apply requires the recorded window and lease owner. These commands reuse the
-same reducers, protections and bounded maintenance coordinator as the script.
+`inspect` exposes authority, retention revisions and eligibility. Other actions
+consume explicit JSON payloads:
 
-| Action | Required JSON payload |
+| Action | Required payload |
 | --- | --- |
-| `window` | `window_id`, `kind: "monthly_reboot"`, timezone-qualified `starts_at`/`ends_at` (at most 7,200 seconds), `operator_nonce`, `expected_revision` from authority's `maintenance_revision` |
-| `disposition` | `completion_id`, boolean `disposable`, `reason`, `operator_nonce`, `expected_revision` from `retention_revision` |
-| `gc` | `completion_ids`: 1–100 distinct explicit completion IDs |
-| `fork` | new `generation_id`, active `source_generation_id`, `expected_manifest_revision`, `expected_requirements_revision` |
-| `promote` | candidate `generation_id`, `expected_manifest_revision`, `expected_requirements_revision`, `expected_serving_revision` |
+| `window` | `window_id`, `kind: "monthly_reboot"`, timezone-qualified `starts_at`/`ends_at` (≤7,200 seconds), `operator_nonce`, authority `expected_revision` |
+| `disposition` | `completion_id`, boolean `disposable`, `reason`, `operator_nonce`, retention `expected_revision` |
+| `gc` | `completion_ids`: 1–100 distinct explicit IDs |
+| `fork` | New `generation_id`, active `source_generation_id`, `expected_manifest_revision`, `expected_requirements_revision` |
+| `promote` | Candidate `generation_id`, `expected_manifest_revision`, `expected_requirements_revision`, `expected_serving_revision` |
 
-For `inspect`, an optional payload containing `generation_id` includes that generation's
-revision. Fork and promotion require `--owner`/`--window-id` on apply, just as GC does.
-The tool holds a fenced maintenance lease and rechecks it before committing. Fork
-queues work in a fresh candidate with no selected output. The ordinary scheduler
-builds it only inside the monthly window with funded capacity. Candidate publication
-never changes production selection. Both scheduler awaits and guarded backend
-operations cancel at the window deadline. Already-sent remote operations can have
-unknown outcomes; their private versions and capacity remain protected until verified.
-Promotion requires a complete compatible
-manifest, fresh output observations and exact current revisions; a sample generation
-cannot promote. Preserve the operation ID and payload when retrying a lost response.
+`inspect` may take `generation_id`. GC/fork/promote apply needs `--owner` and
+`--window-id`; a fenced lease and exact revisions are rechecked before commit.
+The module CLI also exposes `extract-retention`, `extract-pin`, `release-extract-pin`
+and `extract-gc` with the same explicit target/operation/apply boundary; use `--help`
+for revision, nonce and disposition arguments. `extract-gc --completion-id ID` may
+repeat explicit identities. Preserve operation IDs/payloads across lost responses.
 
-Catalog intake and new execution reserve physical space under a shared
-`<knowledge_root>/maintenance/capacity` root. The **2 TB** cap and **80%** alert include
-filesystem derivatives, outstanding reservations and the external usage census.
-Insufficient capacity blocks new work and preserves current/protected bytes; there
-is no emergency deletion. `PAPERVAULT_CATALOG_EXECUTION_BYTES` is a positive per-job
-estimate (default 1 GiB), including scratch and output, not a hard quota. Admission
-requires headroom for outstanding jobs' output plus twice the new estimate for
-its reservation and output.
-Unknown execution outcomes keep their reservation across restart until verified
-receipt recovery; unknown files are never automatically cleared. Completed external
-growth remains charged until a qualified census started after settlement covers it.
-Admission samples the census and counts reservations inside the same serialization
-boundary used by settlement. A controlled build pause settles the exact deferred
-attempt, including after restart, while keeping its partial output charged until
-a later census covers it. Recovery pins and uncertain cost records remain intact.
-Receipt recovery
-and publication of already sealed work remain available when new admission stops.
+Fork queues a fresh unselected candidate. Execution is funded and bounded to the
+recorded monthly reboot window; deadline cancellation retains uncertain remote
+outputs and charges. Promotion separately requires a complete compatible manifest,
+fresh evidence and exact current revisions. Sample generations cannot promote.
 
-`PAPERVAULT_DERIVATIVE_USAGE_FILE` must point to an operator-owned mode-0600 JSON
-census refreshed within 300 seconds, with `scope: {vault_root, knowledge_root}`,
-timezone-qualified `measured_at`, and nonnegative `backend_bytes`. Include external
-PostgreSQL/Neo4j derivatives and retained sets outside the two filesystem roots;
-the runtime also measures catalog relation bytes. Missing, stale or mismatched
-measurements block new work, including metadata intake. An explicitly measured
-zero is valid for a metadata-only fixture. This is conservative admission
-accounting; per-job estimates and Neo4j size estimates do not establish an exact
-disk quota or corpus-scale capacity qualification. The 80% threshold logs a capacity
-alert. A census marked `metadata_sample: true` cannot fund physical execution.
+### Capacity accounting and usage census
 
-Generate the census with `scripts/measure_derivative_usage.py`. Reuse the explicit
-snapshot source configuration above and add `extra_derivative_roots`, listing retained
-recovery sets and every other derivative filesystem root outside `vault/extracts`
-and `knowledge_root` (an explicit empty list affirms none). The output's parent must
-already exist. Both PostgreSQL and Neo4j adapters are required unless
-`metadata_sample: true` proves that the catalog has only metadata dependencies.
-The preview only prints measurements; `--apply` atomically publishes the protected
-census. Refresh it at least every 300 seconds while new work is being admitted.
+New catalog intake/execution reserves physical capacity under
+`<knowledge_root>/maintenance/capacity`. The **2,000,000,000,000-byte (2 TB)** cap and
+**80% (1.6 TB)** alert include filesystem derivatives, reservations and external
+backend/retained-set usage. Unfunded work stops without deleting protected assets;
+sealed-receipt recovery/publication remains available. The default estimate is
+`PAPERVAULT_CATALOG_EXECUTION_BYTES=1073741824` (1 GiB per job), including scratch
+and output. Headroom covers outstanding output plus twice the new estimate.
+Unknown outcomes remain charged across restart until verified settlement; completed
+external growth stays charged until a census begun after settlement covers it.
+
+`PAPERVAULT_DERIVATIVE_USAGE_FILE` names operator-owned mode-0600 JSON refreshed
+within **300 seconds**: `scope: {vault_root, knowledge_root}`, timezone-qualified
+`measured_at` and nonnegative `backend_bytes`. Include external PG/Neo4j and retained
+sets outside those roots; runtime adds catalog relation sizes. Missing, stale or
+mismatched evidence blocks even metadata intake. A `metadata_sample: true` census
+cannot fund physical execution. Estimates do not establish an exact disk quota or
+corpus-scale performance qualification.
+
+Reuse the snapshot configuration with `extra_derivative_roots` listing every
+external derivative/recovery root (an explicit empty list affirms none). Both PG
+and Neo4j measurement adapters are required unless a metadata-only fixture is
+proved. The output parent must exist; preview prints measurements, apply atomically
+publishes the protected census:
 
 ```bash
 .venv/bin/python scripts/measure_derivative_usage.py --config source-with-capacity-roots.json --output <usage.json>
 .venv/bin/python scripts/measure_derivative_usage.py --config source-with-capacity-roots.json --output <usage.json> --apply
 ```
 
-`scripts/drill_derivative_maintenance.py` exercises the protocol in a new disposable
-PostgreSQL fixture and small isolated filesystem roots. The recorded P5c rehearsal
-in [baseline evidence](docs/baselines.md) covers deletion retries, preserved source
-hashes, capacity refusal, isolated candidate publication and guarded promotion.
-Its metadata-only timings do not qualify full-text rebuilds or production RTO.
-Isolated recovery replay uses the same capacity gate for input import, backend
-preparation and claim-bound execution/reconciliation. It measures the target files
-and catalog relation sizes, keeping reservation state under
-`<target>/knowledge/maintenance/capacity`. Physical replay additionally requires a
-fresh protected `PAPERVAULT_DERIVATIVE_USAGE_FILE` census scoped to
-`vault_root=<target>/vault` and `knowledge_root=<target>/knowledge`; a metadata-only
-sample cannot fund it. Metadata-only replay measures its local files and catalog
-synchronously without an external census. `PAPERVAULT_CATALOG_EXECUTION_BYTES`
-sets the positive per-job estimate (default 1 GiB).
+Isolated physical replay uses the same capacity gate with a census scoped to
+`<target>/vault` and `<target>/knowledge`; metadata replay measures its local files
+and catalog synchronously. `scripts/drill_derivative_maintenance.py` exercises the
+protocol in disposable stores. The [P5c baseline](docs/baselines.md#p5c-isolated-maintenance-rehearsal--2026-10-21)
+records synthetic metadata timings, not production full-text rebuild cost or RTO.
+
+## Development and evaluation
+
+Use a worktree-local environment; the primary checkout's editable install tests
+the primary tree. Repository records are English. Install and run the required checks:
+
+```bash
+UV_CACHE_DIR=/tmp/uv-cache uv sync --extra dev
+.venv/bin/pytest -m 'not integration' -q
+.venv/bin/ruff check src tests
+```
+
+[Evaluation](docs/eval.md) explains gold sets, reference-machine runs and benchmark
+arbitration. Raw eval outputs contain paper text and stay local/untracked under
+`PAPERVAULT_EVAL_DIR`; publish summary evidence on the issue or PR. CI tests scoring
+logic without GPU/DB/network and does not replace reference-hardware retrieval gates.
+[Baselines](docs/baselines.md) separates dated legacy rulers, post-refactor measurements
+and isolated recovery/maintenance rehearsals.
 
 ## Releases
 
-papervault is consumed **by pin** (ADR-0001): deployments track an annotated git tag
-(`vX.Y.Z[-stage]`), never `main`.
+papervault is consumed **by pin** ([ADR-0001](docs/adr/0001-public-repo-is-upstream.md)):
+deployments track an annotated git tag (`vX.Y.Z[-stage]`), never `main`.
 
-The repo carries **one version**, and every change PR bumps it per the semver call stated in
-its description. The declared version fields move together in that PR: `pyproject.toml`
-`[project].version` plus the `papervault` entry in `uv.lock` (refresh with `uv lock`),
-`plugin/.claude-plugin/plugin.json` and `plugin/plugin.json` `version`, and the `papervault` entry's `version` in
-`.claude-plugin/marketplace.json`; `tests/test_plugin_version_sync.py` fails when they drift.
+The repo carries **one version**, and every change PR bumps it per the semver call
+stated in its description. The declared fields move together: `pyproject.toml`
+`[project].version`, the `papervault` entry in `uv.lock` (refresh with `uv lock`),
+`plugin/.claude-plugin/plugin.json`, `plugin/plugin.json`, and the `papervault`
+entry in `.claude-plugin/marketplace.json`. `tests/test_plugin_version_sync.py`
+fails when they drift. This documentation-only change is a patch bump to **0.10.11**.
 
-A release IS a tag — CI's build job produces the wheel/sdist for every commit, so tagging is
-the whole ceremony: the tag names the version already on `main` (`vX.Y.Z`, plus an optional
-`-stage` suffix), and a release commit changes no version field. Latest tag: `v0.1.6-beta`
-(closed beta), cut before the one-version rule, so its number predates the package version.
+A release is a tag naming the version already on `main` (`vX.Y.Z`, optionally
+`-stage`); the release commit changes no version field. CI builds wheel/sdist on
+every commit. The historical `v0.1.6-beta` tag predates the one-version rule.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT — see [LICENSE](LICENSE).

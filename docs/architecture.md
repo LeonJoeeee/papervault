@@ -1,115 +1,143 @@
 # papervault — Architecture
 
 > Shared baseline for all parallel work. Read before any task.
-> Changing anything here = public merge + human approval + an ADR.
-
-The owner-ratified [papervault constitution v2.1-rc2](specs/2026-10-18-papervault-constitution.md) and [refactor plan v0.3](specs/2026-10-18-papervault-refactor-plan.md) (2026-10-18) govern the redesign, with the constitution taking precedence. [ADR-0007](adr/0007-papervault-constitution.md) records their rationale, independent review trail, owner clarifications, authorization boundary, and deferred mechanisms. This overview describes the existing implementation; future changes and implementation slices must conform to the governing documents.
+> Changing anything here = touching the core: public merge + human approval + an ADR.
 
 ## Context
-papervault is a self-hosted literature + knowledge layer for coding agents. It runs as ONE MCP server process exposing three tools — `search_papers` (discover + auto-ingest literature), `get_paper` (metadata + full-text lookup), `query` (cited synthesis from a knowledge graph) — with an independently managed MinerU OCR service plus Neo4j and Postgres. Agents connect over MCP (Claude Code and Antigravity CLI/IDE via the bundled plugin; Codex CLI and any MCP client via documented config). All LLM calls route to one operator-supplied OpenAI-compatible endpoint. Hardware floor: one 24 GB-class NVIDIA GPU on Linux (PRD constraints).
+
+papervault is a self-hosted literature and knowledge layer exposing one MCP endpoint
+with `search_papers`, `get_paper` and `query`. It connects coding agents to scholarly
+sources, a retained paper vault and a cited graph-RAG knowledge base. One Python
+server uses an operator-supplied OpenAI-compatible LLM endpoint, local GPU embedding
+and reranking, an independently managed MinerU HTTP OCR service, PostgreSQL and
+Neo4j. Linux/CUDA and one 24 GB-class NVIDIA GPU define the hardware floor. The
+[ratified constitution and refactor plan](adr/0007-papervault-constitution.md) govern
+collection integrity and useful retrieval as joint primary contracts.
 
 ## Structure
-One Python package (`papervault`), one server process, subsystems as modules:
 
-- **library/** — search serving and literature acquisition. `library/mcp/server.py` delegates to the six-stage `services/search_pipeline.py`; `services/registration.py` separately admits registration and acquisition work. Source adapters cover arXiv, ADS, Semantic Scholar, OpenAlex, INSPIRE and CORE. The LLM ingest gate (domain-pack rubric), tiered download cascade (shadow-library and anti-bot tiers flag-gated, default off — ADR-0004), extract queue driving the OCR server, catalog persistence (Postgres authority + canonical `index.json` export) and per-paper extracts remain here. Policy, recovery and extraction maintenance use named operator services. Library owns all writes to the vault.
-- **knowledge/** — knowledge distillation + serving. `ingest/` captures and distills evidence, `scheduler/` admits work, `store/` owns backend adapters and catalog serving, and `query/` retrieves and synthesizes. Legacy rounds read the vault and reconcile the ingest ledger; the P4 catalog implementation instead captures immutable inputs, admits catalog jobs and publishes verified isolated LightRAG outputs. LightRAG uses Neo4j graph and Postgres KV/vector/doc-status stores; in-process GPU embed + rerank (BGE-M3, bge-reranker). `query/aquery.py` pins catalog serving across a whole query and shares response assembly with eval.
-- **mcp/** — the single endpoint, three tools, progress heartbeat (long queries survive client idle timeouts).
-- **domain pack** (config, not code) — search-gate rubric, entity ontology, extraction few-shots, instruction fragments. Space physics is the factory default and worked sample (ADR-0003).
-- **eval/** — the bundled harness (recall@served, hallucination rate, trap gates) + method notes. Retrieval/pipeline quality changes are benchmark-arbitrated.
-- **plugin shell** — the minimal installable `plugin/` subdir: Claude Code uses `plugin/.claude-plugin/plugin.json` + `plugin/.mcp.json`, routed to by the repo-root `.claude-plugin/marketplace.json`; Antigravity (`agy`) CLI/IDE uses native `plugin/plugin.json` + `plugin/mcp_config.json`. Both register the same HTTP MCP endpoint (`http://127.0.0.1:8080/mcp` by default); only `plugin/` ships on install. [Agent setup](INSTALL.md#connecting-an-agent) covers native AGY installation (`agy plugin install ./plugin`) and direct MCP configuration, also used by Codex CLI. No skills shipped in v1. Thin by rule; per-agent adapters never hold logic.
+One package, one server process, with these ownership boundaries:
 
-Boundaries: library owns vault artifacts and registration. The legacy library→knowledge handoff reads `index.json` and paper artifacts. P4 reads catalog records and captures exact immutable artifact/metadata revisions before execution; the hourly JSON remains a projection. Reader and writer are versioned together inside the package. External processes: shared MinerU OCR service (official `mineru-api` task HTTP API via core `httpx`; service-owned FIFO queue, model preload, 20-minute idle GPU unload and recovery; no library pre-flight, with submit/poll/result requests determining reachability), Neo4j + Postgres (docker-compose), the operator LLM endpoint (OpenAI-compatible).
+| Component | Responsibility and boundary |
+| --- | --- |
+| `mcp/` | The three-tool public interface, progress heartbeats and request admission. Agent plugins register the endpoint and contain no business logic. |
+| `library/` | Search coordination, bibliographic identity, registration, acquisition and extraction. Library owns vault writes; registration is a separately admitted command. |
+| `store/` | Transactional catalog authority, revisions, audit/outbox, publication lineage, recovery and derivative lifecycle/capacity. JSON exports are projections under PostgreSQL authority. |
+| `knowledge/` | Immutable knowledge intake, distillation scheduling, LightRAG backend adapters, evidence retrieval and synthesis. Catalog commands accept verified outputs; backend computation alone grants no publication authority. |
+| `domain/` | Configured search rubric, entity ontology, extraction examples and instructions; space physics/AI4Science is the factory domain. |
+| `eval/` | Gold workloads, scoring and shared response assembly; reference-machine retrieval evidence complements CI's deterministic scoring tests. |
 
-## Search, query and lifecycle contracts
+Persistence has three logical roles: **Source** retains research/input bytes;
+**Catalog** owns identity, policy, registration and processing/publication facts;
+**Derived** holds extracts, vectors, graph data and indexes bound to exact inputs
+and recipes. These are authority roles, not three required database engines.
+Library and knowledge ship together; their internal interfaces are versioned as
+one package. The MCP contract is the compatibility surface.
 
-**S1 search plane (#251).** `library/services/search_pipeline.py` separates intent,
-plan, retrieval, fusion, return gate and serving into six stages with request-local
-snapshots and stage traces. Serving submits independently selected registration
-requests without waiting for admission, execution or acquisition success. Fusion
-and `preview_candidates` share canonical serving deduplication, fold aliases and
-bibliographic duplicates, and retain external rank evidence on local records.
-Named-entity slot reservation preserves accepted witnesses within the result cap.
-In `by_relevance` ordering, `PAPERVAULT_SEARCH_AUTHORITY_PRIOR=1` is the default:
-a pool-only, age-normalized citation-authority RRF blend with
-`PAPERVAULT_SEARCH_AUTHORITY_LAMBDA=0.25`. Set the prior to `0` to disable it;
-explicit recency/importance hints bypass the blend, and it never admits a gate reject.
+### Search, query and lifecycle contracts
 
-All six search sources use structured `BackendDegraded` failures under constitution
-Art. 6.4: `code`, `scope` (`item` or `service`), `retryability` (`permanent`,
-`transient_with_delay`, `transient_no_delay`) and `retry_after_s`. Missing or invalid
-delays default to five seconds only for delayed transient failures; the other classes
-carry no delay. Genuine zero-hit responses remain distinct from unavailable,
-unconfigured or malformed sources, and receipts omit provider bodies and error text.
-Official ADS `ADS_SCAN` (and validated official scanned-PDF routes) may pass through
-download with identity verification deferred to OCR, bound to the inspected PDF hash.
-`library/extract.py` requires a positive post-OCR title/author identity verdict before
-publishing the completion; mismatch or unavailable/malformed verification retains the
-rejected evidence and withholds publication.
+**S1 — search and acquisition.** `SearchPipeline` separates intent, plan, retrieval,
+fusion, return gate and serving using request-local snapshots and bounded traces.
+The post-parse guard clears a lone `year_min` for canonical wording, or survey wording
+without explicit recency, preserving foundational candidates. External adapters
+(arXiv, ADS, Semantic Scholar, OpenAlex, INSPIRE and CORE) distinguish genuine zero
+hits from structured `BackendDegraded` outcomes. Polite-v2 search admission/fetch
+uses per-`(event_loop, backend)` locks for migrated arXiv/Semantic Scholar/OpenAlex
+calls; politeness denials and executor queue waits do not spend backend-breaker
+failures. Cancellation cannot establish that a synchronous executor has drained.
 
-**S2 query plane (#252).** Catalog serving pins one single-generation
-`serving_manifest` for the full `query()` execution: anchor and facet retrieval,
-graph traversal, caches, aggregation and synthesis all share that view. Reader pins
-protect its dependencies; eligibility, compatible inputs and fresh evidence are
-revalidated against that exact manifest before returning, without switching to a
-newly promoted generation. `query/multiquery.py` overlaps `_decompose()` with anchor
-retrieval, cancels and drains decomposition if the anchor rejects fusion, and admits
-fan-out estimation only after the coverage gate. Fused evidence prioritizes
-`canon`, then `fulltext`, then `abstract_only` before the served-window cut; textbooks
-and explicit canon annotations establish canon status, never citation counts alone.
+Fusion resolves aliases and compatible bibliographic duplicates while retaining
+external rank evidence. Local BM25/RRF selection and final `by_relevance` ordering
+both receive the configured authority prior: citation velocity multiplied by a
+domain-aware venue classifier combining venue names, DOI prefixes and fallback
+evidence (1.5x / 1.2x / 1.0x / 0.5x). Explicit recency/importance bypasses it.
+Authority cannot admit a gate reject; accepted named-entity witnesses receive
+reserved result slots. Registration candidates are selected independently of the
+served cap, and serving never waits for their command admission or acquisition.
+The [operator reference](../README.md#search-and-catalog-quality) describes the
+operational stages, pool limits, gates and knobs; [ADR-0008](adr/0008-search-authority-venue-and-garbage-fencing.md)
+records the decision.
 
-Production and `eval/run_eval.py` share `query/aquery.py`'s synthesis and pure
-`build_outfeed` response builder. `retrieved_papers` records the evidence candidates;
-`cited_papers` contains only exact inline `[paper_key]` citations verified against
-that pool, with operator documents reported separately. FAST eval with `--no-synth`
-uses retrieved candidates as its explicit citation fallback. Empty coverage skips
-synthesis; exclusively `abstract_only` evidence can reach at most `"weak"`, even with
-a rich graph signal. `query_receipt` reports generation, variant, coverage, retrieved
-and cited counts, reranker degradation and synthesis observations.
+The two-way quality fence rejects new garbage through `registration_rejection`
+and excludes bad retained rows through `serving_excluded` / positive
+`deterministic_garbage_reason` evidence. Domain exclusions, policy and quarantine
+also fence serving; missing legacy metadata alone does not. Identity/alias rows
+and research assets remain retained. A `Paper`'s acquisition eligibility is enforced
+by `state_v2.admission`: eligible retrieval, canonical resolved identity, applicable
+policy, no quarantine and valid lease/budget evidence. Scoped policy rulings cannot
+silently release quarantine. Campaign claims reserve durable budgets before dispatch;
+generation/lease fences guard staged publication. Expiry and cancellation never
+prove executor termination or refund uncertain work. Merge intents stop admission
+and require drain before canonical/alias consolidation. Persisted fences survive
+flag changes. Routine purge is refused. Official ADS scans defer identity checking
+to a hash-bound post-OCR verdict before extraction publication.
 
-**S3 lifecycle completion (#253).** Scoped policy rulings commit record changes,
-append-only ruling history, audit and pending work in one PostgreSQL transaction;
-the JSON correction ledger is a compatibility projection. JSON-mode crash-intent
-replay checks the latest key-bound revision, original record snapshot and covered
-policy reasons, so spent or superseded grants cannot reopen acquisition. Library CLI
-operators `claim-recover`, `release-quarantine`, `campaign-halt`, `merge-consolidate`
-and `merge-restart` preserve lease, budget, policy and drain fences and require actor
-and reason in a stopped-service maintenance window. Extraction maintenance
-(`audit --retry-low-quality`, `audit --retry-extract-keys`) routes through named
-operator services and retains immutable extraction evidence. The routine
-`JANITOR_PURGE`/`purge()` route is retired: reconciliation does not delete research
-assets; `Library.purge()` refuses destructive record/artifact deletion in both
-PostgreSQL and standalone JSON modes.
+**S2 — knowledge and query.** The framework spine is exactly
+`lightrag-hku==1.5.7`, with Neo4j graph and PostgreSQL KV/vector/doc-status stores.
+BGE-M3 embedding and BGE reranking run in process. [ADR-0005](adr/0005-track-latest-lightrag-line-gated.md)
+requires exact-patch adapter guards, a port map, prompt-content gates, queue-deferral/
+recovery tests, ontology probe and FAST recall evidence for upgrades. Adapters
+preserve LightRAG reducers, ingress/owner arguments, deferred context, retirement
+reports and extraction-cache contracts. Catalog status updates obey namespace
+fences; raw-workspace repair is refused in favor of isolated rebuilds.
 
-## Catalog, publication and maintenance
+A catalog query pins one single-generation `serving_manifest` across retrieval,
+traversal, caches, aggregation and synthesis. Reader pins protect that view; policy,
+compatible inputs and fresh evidence are revalidated against it before return,
+without switching to a newly promoted generation. Multiquery overlaps decomposition
+with anchor retrieval, drains cancellation and gates fan-out on coverage. Evidence
+prioritizes canon, full text, then abstracts; canon comes from textbooks or explicit
+annotations. Production and eval share synthesis and the pure response builder.
+`retrieved_papers` identifies candidates; `cited_papers` contains only verified inline
+`[paper_key]` citations, with operator documents separate. Empty coverage skips
+synthesis; abstract-only evidence is capped at `"weak"`. FAST `--no-synth` uses the
+retrieved-paper citation fallback, not a synthesis-quality measurement.
 
-Since the [owner-approved live cutover on 2026-10-19](https://github.com/LeonJoeeee/papervault/issues/268#issuecomment-6257668738),
-deployment #1 uses PostgreSQL database **`papervault_catalog` as catalog authority**
-with `PAPERVAULT_CATALOG_AUTHORITY=postgres`. Library's existing working set reads
-catalog records and commits revision-guarded delta batches with audit/pending work.
-`index.json` is the **canonical export**, generated separately with verification by
-the user unit `papervault-export.timer` **hourly at :17** (`OnCalendar=*:17`, host CST).
-It is not a second authority and is not rewritten by ordinary PG saves. Configuration
-still defaults to JSON when the authority setting is unset; the live deployment
-explicitly selects Postgres. PG deletion is refused in P2. The
-[catalog persistence ADR](adr/DRAFT-catalog-persistence-cutover.md) records commit
-semantics, completion guards and rehearsal fencing; the
-[execution record and historical rehearsal runbook](specs/2026-10-18-p2-readiness.md)
-record the live sequence, operational timers and closed rollback boundary: recovery
-after the writes-resumed marker is forward-only.
+### Authority, publication and derivatives
 
-The [P4 knowledge publication decision](adr/DRAFT-catalog-knowledge-publication.md) adds catalog-owned jobs, attempts, receipts, expected inventories, generation manifests, selections and nonauthoritative observations. `PAPERVAULT_KNOWLEDGE_JOBS` defaults to `legacy`; selecting `postgres` requires a separately rehearsed and committed authority handoff, not just configuration. Isolated attempt deltas preserve LightRAG's existing reducers while serving pins a catalog-selected logical aggregate before retrieval and traversal. The [P4 procedure](specs/2026-10-20-p4-knowledge-handoff.md) defines the capture, writer fences, dedicated database/backend checks and forward-only rollback. This code change does not record a live activation.
+**P2 — catalog authority.** PostgreSQL library saves commit revision-guarded record
+deltas, audit and pending work atomically, with durable bytes before references.
+Conflicts fail explicitly; record deletion is refused. Configuration defaults to
+JSON, while deployment #1 explicitly selects `papervault_catalog` as authority.
+Its hourly verified `index.json` export is a projection. PostgreSQL failures never
+fall back to JSON. Authority handoff fences writers; recovery after writes resume
+preserves accepted mutations and proceeds forward. See the
+[persistence decision](adr/DRAFT-catalog-persistence-cutover.md).
 
-P5a adds extraction evidence to that publication boundary. MinerU and Firecrawl completions retain exact consumed inputs under `extracts/inputs/` and immutable output/receipt bundles under `extracts/versions/<completion_id>/`. The library's conventional markdown file is a compatibility projection. In legacy or standalone JSON mode, the bundle is durable pending registration and grants no catalog coverage. Under committed catalog authority, `publish_derivation` atomically registers the extraction receipt, derivation, audit and distillation outbox before success. Recovery delivers the original evidence without another transformation or execution attempt. Reopen staging retains refused outputs and requires its existing guarded writeback before selection; merge adoption retains the original extraction lineage.
+**P4/P5a — verified publication.** Knowledge implementation selection defaults to
+`legacy`; `postgres` requires its own rehearsed, committed authority handoff, not
+just a flag. Catalog intake captures immutable inputs and recipes; jobs, attempts,
+submissions, inventories, receipts and selections have separate identities. Attempts
+write private LightRAG deltas over one pinned aggregate, using latest-row replacement
+and tombstones. Verified sealed receipts precede atomic lineage/publication/audit/
+outbox acceptance. Candidates do not move production selection. Immutable extraction
+input/output/receipt bundles precede registration; legacy pending bundles grant no
+catalog coverage. Recovery delivers original evidence without re-execution or
+fabricated provenance. Complete coverage requires compatible selected publications
+and fresh positive output observations, not backend `processed` alone. See the
+[publication decision](adr/DRAFT-catalog-knowledge-publication.md).
 
-P5b coordinates verified recovery sets without changing live authority. P5c adds explicitly disposable extract retention and isolated maintenance. Supersession starts a ninety-day clock; default protection, current selections and reader/job/recovery references prevent deletion. A catalog writer lock serializes new references with permanent deletion tombstones, and fenced monthly leases bound resumable filesystem deletion. Source inputs and receipts remain immutable. Rebuilds fork into unselected candidates; complete compatible manifests and exact revision checks gate promotion. Shared physical reservations and fresh external usage accounting block unfunded intake/execution at the 2 TB derivative soft cap, with an 80% alert and no emergency asset deletion. These tools do not activate catalog scheduling or claim recovery from host loss. The [operator workflow](../README.md#disposable-extracts-and-isolated-maintenance) specifies the explicit targets and retained evidence.
-
-Deployment #1 retains the legacy container names `ks-postgres` and `ks-neo4j`; production data lives in the existing Docker volumes `ks-pgdata` and `ks-neo4jdata`, declared external in `deploy/docker-compose.yml`. A future move off these names requires a maintenance window: stop PaperVault and both stores, copy each volume to its new name, update Compose, bring the stores up, and verify data and connectivity before resuming PaperVault. Preserve the original volumes for rollback: stop the replacement stores, restore the original Compose names and volumes, and bring the original stores up before resuming PaperVault.
+**P5b/P5c — recovery and derivative lifecycle.** Coordinated sets bind catalog,
+retained sources, inputs, receipts and physical PostgreSQL/Neo4j outputs to one
+verified checkpoint under drained writer barriers. Isolated restore/replay creates
+new fences; sample generations cannot promote. Retention protects source bytes,
+receipts, selections and reader/job/recovery dependencies. Only explicitly disposable
+extract outputs superseded for ninety days can enter fenced, resumable GC; permanent
+deletion intents serialize with new references. Rebuilds fork unselected candidates
+and promote only complete compatible freshly verified manifests with exact revisions.
+Shared reservations and fresh external usage accounting stop unfunded new intake/
+execution at the 2 TB derivative cap, with an 80% alert and no emergency asset
+purge. Sealed-receipt recovery remains available. Applied maintenance uses bounded
+monthly windows. Same-host recovery sets do not establish host-loss recovery or
+full-system RPO/RTO. [Operator procedures](../README.md#coordinated-recovery) and
+[dated baselines](baselines.md) carry commands, qualification limits and measurements.
 
 ## Key quality goals
-1. **Measured, not claimed** — the eval harness is a product component; risky quality changes merge only with benchmark arbitration.
-2. **Single-GPU budget** — resident models + OCR co-tenant fit a published 24 GB VRAM envelope under full co-load, zero OOM.
-3. **Zero-babysit ingestion** — queues and scheduler rounds are self-healing; the corpus compounds unattended (search → queryable in ~tens of minutes).
-4. **One way to run** — a single profile; no fallbacks or degraded modes; failures are explicit and diagnosable.
-5. **MCP is the only compatibility surface** — everything of value lives at or below the tool contract; agent-specific shells stay thin.
 
-Decisions and their reasons: `docs/adr/`, including [independent MinerU ownership](adr/DRAFT-independent-mineru-service.md).
+1. **Collection integrity and useful retrieval** — preserve durable identity/evidence while measuring recall, precision and availability with separate rulers.
+2. **One authority per fact** — atomic catalog mutations and verified publication prevent exports or derived computation from becoming competing authorities.
+3. **Fail-closed, recoverable execution** — explicit degradation, durable fences and retained uncertainty prevent silent acceptance, duplicate dispatch and destructive repair.
+4. **Single-GPU operation** — bounded admission, concurrency and capacity preserve the published hardware envelope.
+5. **Stable agent interface** — one MCP surface and thin client shells keep behavior inside the shared package.
+
+Decisions and their reasons: `docs/adr/`.

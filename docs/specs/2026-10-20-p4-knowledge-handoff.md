@@ -1,6 +1,6 @@
 # P4 knowledge authority rehearsal
 
-This procedure implements [issue #278](https://github.com/LeonJoeeee/papervault/issues/278) and [the publication decision](../adr/DRAFT-catalog-knowledge-publication.md). It is an operator procedure, not a record of a completed cutover. The feature defaults to legacy; installation, a restart and a flag change do not fence a writer. Heavy rebuilds and drills belong in the owner's monthly server-reboot window, at most two hours.
+This procedure implements [issue #278](https://github.com/LeonJoeeee/papervault/issues/278) and [the publication decision](../adr/0011-catalog-knowledge-publication.md). It is an operator procedure, not a record of a completed cutover. The feature defaults to legacy; installation, a restart and a flag change do not fence a writer. Heavy rebuilds and drills belong in the owner's monthly server-reboot window, at most two hours.
 
 ## Connections and evidence
 

@@ -102,7 +102,7 @@ JSON, while deployment #1 explicitly selects `papervault_catalog` as authority.
 Its hourly verified `index.json` export is a projection. PostgreSQL failures never
 fall back to JSON. Authority handoff fences writers; recovery after writes resume
 preserves accepted mutations and proceeds forward. See the
-[persistence decision](adr/DRAFT-catalog-persistence-cutover.md).
+[persistence decision](adr/0010-catalog-persistence-cutover.md).
 
 **P4/P5a — verified publication.** Knowledge implementation selection defaults to
 `legacy`; `postgres` requires its own rehearsed, committed authority handoff, not
@@ -115,7 +115,7 @@ input/output/receipt bundles precede registration; legacy pending bundles grant 
 catalog coverage. Recovery delivers original evidence without re-execution or
 fabricated provenance. Complete coverage requires compatible selected publications
 and fresh positive output observations, not backend `processed` alone. See the
-[publication decision](adr/DRAFT-catalog-knowledge-publication.md).
+[publication decision](adr/0011-catalog-knowledge-publication.md).
 
 **P5b/P5c — recovery and derivative lifecycle.** Coordinated sets bind catalog,
 retained sources, inputs, receipts and physical PostgreSQL/Neo4j outputs to one

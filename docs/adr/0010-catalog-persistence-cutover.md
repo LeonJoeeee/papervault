@@ -1,8 +1,6 @@
-# Catalog persistence and fenced cutover
+# 0010 — Catalog persistence and fenced cutover
 
-Status: design accepted on [#268](https://github.com/LeonJoeeee/papervault/issues/268),
-including its guarded-completion amendment of 2026-10-18. Number assigned at integration.
-This implements P2 preparation; live activation requires separate owner authorization.
+Status: Accepted (2026-10-22); design accepted on [#268](https://github.com/LeonJoeeee/papervault/issues/268), including its guarded-completion amendment of 2026-10-18; live on deployment #1.
 
 ## Context
 
@@ -52,7 +50,7 @@ failed/unknown publication commit for forward recovery. Artifact bytes precede t
 catalog references; a failed catalog commit may leave unpublished bytes and must not
 be treated as successful publication. P5a now adds immutable extraction bundles and
 atomic derivation/receipt/outbox registration to this guarded completion transaction;
-see [knowledge publication](DRAFT-catalog-knowledge-publication.md#extraction-registration-p5a).
+see [knowledge publication](0011-catalog-knowledge-publication.md#extraction-registration-p5a).
 
 In PG mode, purge and missing keys in a save refuse before record deletion or
 artifact unlink. Lifecycle completion (#253) routes DOI collisions through the

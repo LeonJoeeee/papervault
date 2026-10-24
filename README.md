@@ -9,7 +9,7 @@ server. Claude Code, Codex CLI, Antigravity CLI/IDE and other MCP clients share 
 | `get_paper` | Resolve a citation key, DOI, arXiv ID or fuzzy title and return metadata plus a serve-safe full-text path when available. |
 | `query` | Retrieve evidence from the knowledge graph and synthesize an answer with verified paper citations. |
 
-Version **0.10.13** adds dual-track local retrieval and calibrated LLM planning and gates.
+Version **0.10.14** adopts a five-level LLM gateway ladder with `decompose=pro` and `synth=max`.
 The product is pre-release (closed beta). Read the [PRD](docs/PRD.md) for scope,
 [architecture](docs/architecture.md) for boundaries, [installation guide](docs/INSTALL.md)
 for deployment, and [baselines](docs/baselines.md#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
@@ -76,9 +76,9 @@ or lifecycle logic.
 ### LLM stages and routing
 
 Every text LLM call selects one of nine roles. Set `PAPERVAULT_LLM_<ROLE>` to
-`flash`, `standard` or `pro`; unset or blank uses the defaults below. Both direct
-endpoints and the optional gateway must serve these level aliases. A supplied
-test/client handle bypasses role selection for that call.
+`flash`, `standard`, `pro`, `max` or `ultra`; unset or blank uses the defaults below.
+Both direct endpoints and the optional gateway must serve these level aliases.
+A supplied test/client handle bypasses role selection for that call.
 
 | Plane and stage | Role | Default |
 | --- | --- | --- |
@@ -88,8 +88,8 @@ test/client handle bypasses role selection for that call.
 | S1 extracted-text chunk clarity review and document completeness gate | `gate` | `flash` |
 | S2 knowledge build: entity/relation extraction and merge summaries | `build` | `standard` |
 | S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `flash` |
-| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `standard` |
-| S2 evidence-grounded answer synthesis, including eval | `synth` | `pro` |
+| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `pro` |
+| S2 evidence-grounded answer synthesis, including eval | `synth` | `max` |
 | Evaluation answer and refusal judgments | `eval_judge` | `standard` |
 
 Embedding (BGE-M3), reranking and OCR use their existing local/service paths and
@@ -691,8 +691,8 @@ stated in its description. The declared fields move together: `pyproject.toml`
 `[project].version`, the `papervault` entry in `uv.lock` (refresh with `uv lock`),
 `plugin/.claude-plugin/plugin.json`, `plugin/plugin.json`, and the `papervault`
 entry in `.claude-plugin/marketplace.json`. `tests/test_plugin_version_sync.py`
-fails when they drift. This retrieval/routing/prompt change uses the issue-requested
-patch version **0.10.13**.
+fails when they drift. This gateway ladder/defaults change uses the issue-requested
+patch version **0.10.14**.
 
 A release is a tag naming the version already on `main` (`vX.Y.Z`, optionally
 `-stage`); the release commit changes no version field. CI builds wheel/sdist on

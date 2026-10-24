@@ -494,7 +494,7 @@ def get_llm(*, max_tokens: int | None = None, model: str | None = None):
 
     ``model`` is the requested level. LiteLLM's openai/ prefix is transport syntax;
     both the gateway and direct endpoint receive the bare level unchanged. Direct
-    endpoints must serve flash/standard/pro aliases and own their model and effort.
+    endpoints must serve flash/standard/pro/max/ultra aliases and own their model and effort.
     The key pool retains its hot reload, failover and credential-disable behavior.
     """
     mt = max_tokens or _DEFAULT_MAX_TOKENS

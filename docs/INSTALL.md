@@ -96,18 +96,19 @@ includes commented examples. Changes affecting retrieval quality require arbitra
 
 ## LLM routing and migration
 
-Every text LLM request sends a gateway level: `flash`, `standard`, or `pro`.
+Every text LLM request sends a gateway level: `flash`, `standard`, `pro`, `max`, or `ultra`.
 The endpoint resolves its model and effort per key. Defaults are:
 
 | Role | Level | Override |
 | --- | --- | --- |
 | Graph extraction/merge | standard | `PAPERVAULT_LLM_BUILD` |
 | Query keyword extraction | flash | `PAPERVAULT_LLM_KEYWORD` |
-| Answer synthesis | pro | `PAPERVAULT_LLM_SYNTH` |
+| Answer synthesis | max | `PAPERVAULT_LLM_SYNTH` |
 | Extract clarity/completeness gates | flash | `PAPERVAULT_LLM_GATE` |
 | PDF metadata verification | flash | `PAPERVAULT_LLM_VERIFY` |
-| Library intent/judges/resolver/re-rank | standard | `PAPERVAULT_LLM_JUDGE` |
-| Decomposition (production multiquery and eval) | standard | `PAPERVAULT_LLM_DECOMPOSE` |
+| Library search intent | pro | `PAPERVAULT_LLM_INTENT` |
+| Library judges/resolver/re-rank | standard | `PAPERVAULT_LLM_JUDGE` |
+| Decomposition (production multiquery and eval) | pro | `PAPERVAULT_LLM_DECOMPOSE` |
 | Eval judges | standard | `PAPERVAULT_LLM_EVAL_JUDGE` |
 
 For example, `PAPERVAULT_LLM_SYNTH=standard` overrides synthesis. Values must be

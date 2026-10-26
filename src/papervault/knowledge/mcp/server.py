@@ -317,8 +317,9 @@ async def _lifespan(_app: "FastMCP") -> AsyncIterator[None]:
 
 mcp = FastMCP("knowledge-system", lifespan=_lifespan, instructions="""
 knowledge-system (KS) is your bolt-on expert knowledge base. It has ingested everything
-the lab has read — papers, space-physics textbooks, satellite + onboard-instrument
-references, and distilled insights — and digested it so you can just ask.
+the lab has read in space physics, space computing, and AI4Science — papers,
+textbooks, satellite + onboard-instrument references, spaceborne hardware/networking
+studies, and distilled insights — and digested it so you can just ask.
 
 - What it's for: accurate, reliable, in-depth answers about what the field already knows,
   grounded in real sources (every answer carries [paper_key] cites) — not guesses.
@@ -387,8 +388,9 @@ async def _progress_heartbeat(ctx: Context, stop: asyncio.Event) -> None:
 async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     """Ask the lab's bolt-on expert knowledge base a question, in plain language.
 
-    KS has ingested everything the lab has read — papers, space-physics textbooks,
-    satellite + onboard-instrument references, and distilled insights — and digested it
+    KS covers space physics, space computing, and AI4Science. It has ingested what
+    the lab has read — papers, textbooks, satellite + onboard-instrument references,
+    spaceborne hardware/networking studies, and distilled insights — and digested it
     into something you can just ask. It gives you an accurate, sourced answer about what
     the field already knows, instead of you guessing.
 
@@ -401,6 +403,9 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     or deciding whom to cite.
 
     Good examples (rich intent — match these):
+      ✓ "Compare radiation-tolerant on-board AI hardware and inter-satellite task
+         offloading for a LEO computing constellation. What power, latency, and
+         thermal limits do the sources establish, and which faults can TMR mask?"
       ✓ "我做 Voyager 外日球层 XPINN 反演 cycle 3, 想看 PINN stiff PDE 训练稳定性
          最近进展, 尤其 adaptive sampling 那条线, 看能不能借鉴到 Parker transport"
       ✓ "What's the cross-paper consensus on whether AD-only PINN under-constrains

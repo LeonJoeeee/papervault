@@ -163,12 +163,16 @@ Decompose the need into ONE ANCHOR + its DISTINCT FACETS. TWO HARD RULES govern 
   outvote the user's actual intent. Get the anchor right first; everything else expands around it.
 
   RULE 2 — FACETS COVER DISTINCT ANGLES, NOT REWORDINGS. Each remaining facet must cover a DIFFERENT
-  angle of the intent, not a near-duplicate rewording of the same idea. The facets of a space-physics
-  + AI4Science intent are usually some of:
-    * phenomenon — what is being studied (e.g. cosmic ray transport, SEP events)
-    * method — how (e.g. physics-informed neural network, Bayesian inversion)
-    * system — which mission / instrument / object / dataset (e.g. Voyager, Parker Solar Probe)
-    * regime — which range / condition / horizon (e.g. outer heliosphere, solar maximum)
+  angle of the intent, not a near-duplicate rewording of the same idea. The facets of a space
+  physics, space computing, and AI4Science intent are usually some of:
+    * phenomenon — what is being studied or computed (e.g. cosmic ray transport, SEP events,
+      on-board AI workloads, remote-sensing payload processing)
+    * method — how (e.g. physics-informed neural network, Bayesian inversion, quantized neural
+      inference, fault mitigation, inter-satellite task offloading)
+    * system — which mission / instrument / object / dataset / hardware / constellation
+      (e.g. Voyager, Parker Solar Probe, radiation-tolerant FPGA, satellite computing constellation)
+    * regime — which range / condition / horizon (e.g. outer heliosphere, solar maximum,
+      LEO/MEO/GEO orbit, power/latency budget, radiation exposure)
   Aim for ONE facet per real angle present in the intent. Vary terminology ACROSS facets, but the
   variation must change the ANGLE, not just reword the same angle.
 
@@ -257,7 +261,7 @@ _DECOMPOSE_TIMEOUT_S = float(os.getenv("KS_DECOMPOSE_TIMEOUT_S", "300"))
 # floor budget -> no trap leak. KS_MQ_FANOUT default "1" (PROMOTED ON 2026-06-18, +0.0324 validated;
 # set =0 for the byte-identical 60/5 baseline) — see the line-349 block, the authoritative default.
 _FANOUT_SYSTEM = (
-    "You size the retrieval budget for a literature query over a space-physics + AI4Science paper "
+    f"You size the retrieval budget for a literature query over a {get_domain().label} paper "
     "library. Estimate how many DISTINCT library papers a THOROUGH, COMPLETE answer would need to "
     "draw on. Output ONLY a single integer, nothing else."
 )
@@ -268,8 +272,11 @@ How many distinct library papers would a thorough answer need to cite? Standard:
 - a mechanism spanning a few works        -> 4-7
 - broad synthesis / multi-way comparison / "review the field" / several competing hypotheses,
   particle species, or parameter regimes  -> 8-15
-- a question this library almost certainly CANNOT answer (off-domain: condensed-matter, chemistry,
-  pure math — outside cosmic-ray / heliophysics / solar / space-weather + AI4Science) -> 1
+- space-computing questions (orbital edge computing, on-board AI, radiation-tolerant hardware,
+  satellite computing constellations, orbital compute power/thermal systems) are IN-DOMAIN:
+  use the same 2-15 budgets above according to breadth
+- a question this library almost certainly CANNOT answer (outside space physics, space computing,
+  and AI4Science, with no transferable scientific ML or constrained-compute methodology) -> 1
 
 Examples:
   "What single parameter does the force-field approximation use?"  -> 3
@@ -278,6 +285,10 @@ Examples:
    and what checks diagnose a reliable inversion?"  -> 6
   "Synthesize how solar modulation, drift, and diffusion jointly shape the GCR proton spectrum over a
    solar cycle, across competing model families."  -> 12
+  "Compare orbital edge computing architectures and inter-satellite task offloading methods."  -> 8
+  "How does on-board AI process satellite remote-sensing payloads under power constraints?"  -> 5
+  "Compare radiation-tolerant FPGA neural inference and single-event-upset mitigation methods."  -> 6
+  "Review satellite computing constellations across orbital regimes, scheduling, energy and thermal control."  -> 12
   "Explain the light-emission mechanism of single-bubble sonoluminescence."  -> 1
 
 Output ONLY the integer."""

@@ -150,14 +150,18 @@ The downstream pipeline takes:
 
   RULE 2 — TERMS COVER DISTINCT FACETS, NOT REWORDINGS. Each remaining term must
   cover a DIFFERENT facet of the intent — a different ANGLE — not a near-duplicate
-  rewording of the same idea. The facets of a space-physics + AI4Science intent
-  are usually some of:
-    * phenomenon — what is being studied (e.g. cosmic ray transport, SEP events)
-    * method — how (e.g. physics-informed neural network, Bayesian inversion)
-    * system — which mission / instrument / object / dataset (e.g. Voyager,
-      Parker Solar Probe, neutron monitor)
+  rewording of the same idea. The facets of a space physics, space computing,
+  and AI4Science intent are usually some of:
+    * phenomenon — what is being studied or computed (e.g. cosmic ray transport,
+      SEP events, on-board AI workloads, remote-sensing payload processing)
+    * method — how (e.g. physics-informed neural network, Bayesian inversion,
+      quantized neural inference, fault mitigation, task offloading)
+    * system — which mission / instrument / object / dataset / hardware /
+      constellation (e.g. Voyager, Parker Solar Probe, neutron monitor,
+      radiation-tolerant FPGA, satellite computing constellation)
     * regime — which range / condition / horizon (e.g. outer heliosphere,
-      solar maximum, multi-year forecast)
+      solar maximum, multi-year forecast, LEO/MEO/GEO orbit, power/latency
+      budget, radiation exposure)
   Aim for ONE term per real facet present in the intent. Vary terminology ACROSS
   facets (expand acronyms, mix domain phrasing) — but the variation should change
   the FACET, not just reword the same facet. Instrument acronym/full-name pairs
@@ -383,11 +387,21 @@ Output: {
   "reasoning": "Core=machine learning (anchor, verbatim). VERY broad and facet-less: no phenomenon/method/system/regime is named, so there is NOTHING orthogonal to split. Keep terms FEW — do NOT pad term 0 or invent synonym shards (deep learning / neural network are the SAME broad concept, not distinct facets). One honest anchor term; caller should narrow. No recency/review/impact cue -> all filters null."
 }
 
+Intent: "Find methods for on-board AI inference on radiation-tolerant FPGAs in satellite computing constellations under power and radiation constraints."
+Output: {
+  "search_terms": ["on-board AI inference", "radiation-tolerant FPGA", "satellite computing constellations", "quantized neural inference", "orbital compute power radiation constraints"],
+  "kg_concepts": ["on-board artificial intelligence", "radiation-tolerant FPGA", "satellite computing constellations", "quantized neural inference", "single-event upset", "payload power consumption"],
+  "filters": {"year_min": null, "year_max": null, "citation_pref": null, "review_pref": null},
+  "limit_suggested": null,
+  "ranking_hint": "by_relevance",
+  "reasoning": "Core=on-board AI inference (verbatim workload anchor). Facets: hardware (radiation-tolerant FPGA), system (satellite computing constellations), method (quantization), regime (power/radiation constraints). No recency cue -> no year window."
+}
+
 ==== End few-shots ====
 """
 # Domain label from the active domain pack (ADR-0003, papervault.domain), substituted at
-# import (loader-cached). The facet-taxonomy examples below the label stay space-physics-
-# specific (no domain-pack field covers them).
+# import (loader-cached). Facet-taxonomy examples cover the factory domain
+# (no domain-pack field covers them).
 _SYSTEM_PROMPT = _SYSTEM_PROMPT.replace("__DOMAIN_LABEL__", get_domain().label)
 
 

@@ -8,4 +8,11 @@
 
 11. **Capture the scientific substance in the description:** Each entity_description must preserve the *specific* content the text states about the entity, not a generic gloss. When the text gives them, include: quantitative facts (values, ranges, units, scaling, e.g. 'increases with radial distance'), the conditions or regime in which it holds, the mechanism, and the DIRECTION of any effect (increases/decreases, correlated/anti-correlated, governs/constrains). Prefer 'A transport parameter governing parallel diffusion; observed to increase with radial distance and consistent with quasi-linear theory' over 'A parameter related to particle transport.' Likewise, each relationship_description must state HOW the entities are related (the mechanism or quantitative dependence), not merely that they are related.
 
+12. **Space-computing mapping onto the CLOSED 11-type ontology:** Never introduce new types such as Hardware, Satellite, Architecture, or Metric. Use the existing types according to what the text describes:
+    *   `Instrument`: spaceborne processors, chips, FPGAs, accelerators, and terminals; name the concrete device when supplied.
+    *   `Mission`: satellites, computing constellations, and orbital data center missions or deployed platforms.
+    *   `Method` or `Model`: algorithms, schedulers, and architectures; use Method for a procedure or design technique, Model for a mathematical or computational representation. A concrete hardware device remains Instrument.
+    *   `Phenomenon`: radiation effects and fault modes, including single-event effects (SEE), single-event upset (SEU), single-event latchup (SEL), and total-ionizing-dose-induced degradation (TID effects).
+    *   `Quantity`: compute throughput (TOPS), energy efficiency (TOPS/W), power, latency, and radiation metrics such as total ionizing dose (TID). Distinguish the dose metric from the resulting radiation-induced Phenomenon; do not duplicate an acronym and its canonical name.
+
 ---Examples---

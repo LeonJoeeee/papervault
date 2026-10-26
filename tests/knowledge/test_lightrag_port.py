@@ -40,6 +40,19 @@ def test_guidance_carries_full_closed_ontology_and_exclusions():
     assert d.extraction_exclusions.strip() in g
 
 
+@pytest.mark.parametrize("entity_type, terms", [
+    ("Instrument", ("processors", "chips", "FPGAs", "accelerators", "terminals")),
+    ("Mission", ("satellites", "computing constellations", "orbital data center")),
+    ("Method", ("algorithms", "schedulers", "architectures", "Model")),
+    ("Phenomenon", ("SEU", "SEL", "TID")),
+    ("Quantity", ("TOPS", "TOPS/W", "latency", "power", "TID")),
+])
+def test_guidance_delivers_space_computing_type_mappings(entity_type, terms):
+    guidance = get_domain().entity_types_guidance
+    rules = [line for line in guidance.splitlines() if f"`{entity_type}`" in line]
+    assert any(all(term in rule for term in terms) for rule in rules)
+
+
 def test_apply_patch_kills_other_and_installs_examples(prompts_snapshot):
     ep.apply_ks_extraction_prompt(examples=True, exclusions=True)
     sysp = lr_prompt.PROMPTS["entity_extraction_system_prompt"]
@@ -70,3 +83,33 @@ def test_new_doc_phases_exist_and_are_midtransit():
     # The enum members the scheduler now treats as mid-transit must exist on the pinned line.
     assert DocStatus.PARSING == "parsing"
     assert DocStatus.ANALYZING == "analyzing"
+
+
+def test_space_computing_extraction_example_uses_closed_ontology_and_valid_records():
+    pack = get_domain()
+    assert pack.entity_types == [
+        "Concept", "Method", "Phenomenon", "Dataset", "Instrument", "Mission",
+        "Quantity", "Material", "Model", "Finding", "Application",
+    ]
+    assert len(pack.extraction_examples) == 4
+    rendered = pack.extraction_examples[-1].format(
+        tuple_delimiter="<|#|>", completion_delimiter="<|COMPLETE|>")
+    assert "{" not in rendered and "}" not in rendered
+    output = rendered.split("<Output>", 1)[1].strip().splitlines()
+    assert output[-1] == "<|COMPLETE|>"
+    entities, relations = {}, []
+    for line in output[:-1]:
+        fields = line.split("<|#|>")
+        if fields[0] == "entity":
+            assert len(fields) == 4
+            assert fields[2] in {t.lower() for t in pack.entity_types}
+            entities[fields[1]] = fields[2]
+        else:
+            assert fields[0] == "relation" and len(fields) == 5
+            relations.append(fields[1:3])
+    assert entities["Orbital Edge Computing Constellation"] == "mission"
+    assert entities["Radiation-Tolerant FPGA"] == "instrument"
+    assert entities["Quantized Neural Inference"] == "method"
+    assert entities["Single-Event Upset"] == "phenomenon"
+    assert entities["Total Ionizing Dose"] == "quantity"
+    assert relations and all(source in entities and target in entities for source, target in relations)

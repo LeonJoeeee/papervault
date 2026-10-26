@@ -9,7 +9,8 @@ server. Claude Code, Codex CLI, Antigravity CLI/IDE and other MCP clients share 
 | `get_paper` | Resolve a citation key, DOI, arXiv ID or fuzzy title and return metadata plus a serve-safe full-text path when available. |
 | `query` | Retrieve evidence from the knowledge graph and synthesize an answer with verified paper citations. |
 
-Version **0.10.14** adopts a five-level LLM gateway ladder with `decompose=pro` and `synth=max`.
+Version **0.10.15** expands the default research domain and venue authority to include
+space computing alongside space physics and AI4Science.
 The product is pre-release (closed beta). Read the [PRD](docs/PRD.md) for scope,
 [architecture](docs/architecture.md) for boundaries, [installation guide](docs/INSTALL.md)
 for deployment, and [baselines](docs/baselines.md#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
@@ -22,10 +23,16 @@ The supported deployment uses Linux and CUDA, one **24 GB-class NVIDIA GPU** (RT
 3090/4090 class), Docker for Neo4j and PostgreSQL, and an operator-supplied
 OpenAI-compatible LLM endpoint and key. Embedding and reranking run locally; the
 independent MinerU OCR service shares the GPU. The hardware floor is part of the
-product contract. The factory domain pack is **space physics and AI4Science**;
+product contract. The factory domain pack is **space physics, space computing, and AI4Science**;
 its search rubric, ontology, examples and instructions live in
 [`src/papervault/domain/`](src/papervault/domain/). Other domains need their own
 configuration and evaluation gold sets.
+
+Space computing covers orbital/satellite edge computing and computing constellations;
+on-board AI and payload processing; spaceborne accelerators and radiation/fault tolerance;
+space-air-ground computing and inter-satellite offloading/routing/scheduling; and orbital
+data centers with compute energy management and thermal control. These additions use the
+existing 11 entity types; the bundled pack remains named `space_physics`.
 
 ## Quick start
 
@@ -691,8 +698,8 @@ stated in its description. The declared fields move together: `pyproject.toml`
 `[project].version`, the `papervault` entry in `uv.lock` (refresh with `uv lock`),
 `plugin/.claude-plugin/plugin.json`, `plugin/plugin.json`, and the `papervault`
 entry in `.claude-plugin/marketplace.json`. `tests/test_plugin_version_sync.py`
-fails when they drift. This gateway ladder/defaults change uses the issue-requested
-patch version **0.10.14**.
+fails when they drift. This compatible factory-domain/venue expansion uses the issue-requested
+patch version **0.10.15**.
 
 A release is a tag naming the version already on `main` (`vX.Y.Z`, optionally
 `-stage`); the release commit changes no version field. CI builds wheel/sdist on

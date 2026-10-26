@@ -211,13 +211,17 @@ Core space-physics research: retain as tier 1A.
 Input: {{"candidates": [{{"i": 0, "title": "Solar modulation of galactic cosmic-ray protons", "venue": "Journal of Geophysical Research: Space Physics", "abstract": "We infer heliospheric diffusion and drift coefficients from proton spectra over a solar cycle."}}]}}
 Output: {{"items": [{{"i": 0, "reason": "Research article on heliospheric cosmic-ray transport, a core space-physics mechanism.", "is_paper": true, "tier": "1A"}}]}}
 
-Transferable AI4Science method: retain as tier 2B despite the fluid application.
+Transferable AI4Science method: retain as tier 1B despite the fluid application.
 Input: {{"candidates": [{{"i": 0, "title": "Physics-informed neural networks for forward and inverse nonlinear PDEs", "venue": "Journal of Computational Physics", "abstract": "A differentiable PDE-residual loss learns solutions and unknown transport coefficients from sparse fluid observations."}}]}}
-Output: {{"items": [{{"i": 0, "reason": "Research article; PDE-residual inverse method transfers to plasma transport and scientific parameter inference.", "is_paper": true, "tier": "2B"}}]}}
+Output: {{"items": [{{"i": 0, "reason": "Research article; PDE-residual inverse method transfers to plasma transport and scientific parameter inference.", "is_paper": true, "tier": "1B"}}]}}
+
+Space computing: retain orbital systems and on-board AI hardware as tier 1C.
+Input: {{"candidates": [{{"i": 0, "title": "Task offloading in orbital edge computing constellations", "venue": "IEEE Transactions on Mobile Computing", "abstract": "A scheduler coordinates satellite compute and inter-satellite links under orbital contact and power constraints."}}, {{"i": 1, "title": "Radiation-tolerant FPGA acceleration for on-board remote-sensing inference", "venue": "IEEE Transactions on Aerospace and Electronic Systems", "abstract": "Quantized neural inference and triple modular redundancy mitigate single-event upsets within satellite payload power and latency budgets."}}]}}
+Output: {{"items": [{{"i": 0, "reason": "Research article on orbital task offloading and satellite computing constellations, a core space-computing system.", "is_paper": true, "tier": "1C"}}, {{"i": 1, "reason": "Research article on radiation-tolerant on-board AI hardware; spaceborne vision processing is core space computing.", "is_paper": true, "tier": "1C"}}]}}
 
 Reject off-domain research and meeting abstracts for their respective reasons.
 Input: {{"candidates": [{{"i": 0, "title": "Consumer brand loyalty in supermarket surveys", "venue": "Journal of Retailing", "abstract": "We analyze household purchasing preferences."}}, {{"i": 1, "title": "A preliminary solar energetic particle event catalog", "venue": "AGU Fall Meeting Abstracts", "abstract": "Meeting presentation abstract summarizing planned event measurements."}}]}}
-Output: {{"items": [{{"i": 0, "reason": "Genuine retail research, outside space physics and transferable AI4Science.", "is_paper": true, "tier": "3"}}, {{"i": 1, "reason": "Core space-physics topic, but a meeting abstract rather than a research paper.", "is_paper": false, "tier": "1A"}}]}}
+Output: {{"items": [{{"i": 0, "reason": "Genuine retail research, outside space physics, space computing, and transferable AI4Science.", "is_paper": true, "tier": "3"}}, {{"i": 1, "reason": "Core space-physics topic, but a meeting abstract rather than a research paper.", "is_paper": false, "tier": "1A"}}]}}
 """
 _INGEST_SYSTEM = _INGEST_SYSTEM.replace("__DOMAIN_LABEL__", get_domain().label)
 
@@ -297,8 +301,10 @@ for being focused. Only a paper answering the WHOLE intent reaches 0.9+. But do 
 reward mere field membership: same broad area, no sub-part answered → 0.2-0.4.
 
 CROSS-DOMAIN METHOD TRANSFER is real utility: a paper from ANOTHER field whose
-method/technique the researcher can lift into this intent (a PINN / operator / inverse
-trick from fluids, imaging, etc. for a physics-ML intent) scores on its transferability
+method/technique the researcher can lift into a space physics, space computing, or
+AI4Science intent (a PINN / operator / inverse trick from fluids or imaging; quantization,
+fault tolerance, or scheduling from constrained edge systems for on-board AI or orbital
+computing) scores on its transferability
 (0.7-0.9), NOT cut for the wrong field. But "also ML / also a PDE / shared vocabulary"
 with no actually-borrowable mechanism is NOT transfer → 0.2-0.4.
 

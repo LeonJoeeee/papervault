@@ -73,6 +73,8 @@ _VENUE_TIERS = (
         "10.1038/nature", "10.1038/s41567", "10.1038/s42254", "10.1007/s11214", "10.12942/lrsp",
         "10.1007/s41116", "10.1073/pnas", "10.1016/j.physrep", "10.1088/0034-4885",
         "10.1146/annurev", "10.1137/s00361445",
+        "10.1038/s41928", "10.1038/s42256", "10.1109/jproc", "10.1109/comst",
+        "10.1016/j.paerosci",
     ), (
         "prl", "prx", "rmp", "ssr", "lrsp", "pnas", "physical review letter", "physical review x",
         "review of modern physic", "science", "science advance", "nature", "nature physic",
@@ -81,12 +83,18 @@ _VENUE_TIERS = (
         "annual review of nuclear and particle science", "annual review of astronomy and astrophysic",
         "annual review of fluid mechanic", "siam review",
         "proceeding of the national academy of science",
+        "nature electronics", "nature machine intelligence", "proceeding of the ieee",
+        "ieee communications surveys tutorials", "progress in aerospace science",
     )),
     (1.2, (
         "10.1086/", "10.3847/", "10.1029/", "10.1051/0004-6361", "10.1093/mnras",
         "10.1103/physrevd", "10.1103/physreve", "10.1103/physrevc", "10.1088/1475-7516",
         "10.1016/j.astropartphys", "10.1016/j.nuclphysb", "10.1016/j.nima", "10.1007/s11207",
         "10.1016/j.pss", "10.1016/0032-0633", "10.1016/j.jcp", "10.1016/j.cma", "10.1007/s40304",
+        "10.1109/taes", "10.1109/tns", "10.1016/j.actaastro", "10.2514/1.a", "10.2514/1.j",
+        "10.1016/j.ast", "10.1016/j.cja", "10.1109/tgrs", "10.1109/jsac", "10.1109/twc",
+        "10.1109/tmc", "10.1109/jiot", "10.1109/mnet", "10.1109/tc.", "10.1109/tcad",
+        "10.1109/tpds",
     ), (
         "apj", "apjl", "apjs", "jgr", "grl", "aa", "mnras", "prd", "prc", "pre", "jcap", "jcp",
         "sisc", "cmame", "icml", "neurips", "nips", "iclr", "astrophysical journal", "astrophys j",
@@ -99,6 +107,19 @@ _VENUE_TIERS = (
         "computer method in applied mechanic and engineering", "international conference on machine learning",
         "neural information processing system", "advance in neural information processing system",
         "international conference on learning representation", "communication in mathematic and statistic",
+        # Names use _venue_name_multiplier's punctuation removal and singularization.
+        "ieee transactions on aerospace and electronic system", "taes",
+        "ieee transactions on nuclear science", "tns", "acta astronautica",
+        "journal of spacecraft and rockets", "aiaa journal", "aerospace science and technology",
+        "chinese journal of aeronautics", "ieee transactions on geoscience and remote sensing", "tgrs",
+        "ieee journal on selected areas in communications", "jsac",
+        "ieee transactions on wireless communications", "twc",
+        "ieee transactions on mobile computing", "tmc", "ieee internet of things journal",
+        "ieee network", "asplos", "isca", "micro", "hpca", "osdi", "sosp", "nsdi", "eurosys",
+        "mobicom", "sensys", "dac", "fpga", "cvpr", "iccv", "eccv", "sc",
+        "ieee transactions on computers",
+        "ieee transactions on computeraided design of integrated circuits and system", "tcad",
+        "ieee transactions on parallel and distributed system", "tpds",
     )),
 )
 _LOW_TIER_VENUE = re.compile(

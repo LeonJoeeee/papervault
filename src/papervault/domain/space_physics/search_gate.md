@@ -1,18 +1,20 @@
-# Research Domain — Space Physics + AI4Science
+# Research Domain — Space Physics, Space Computing, and AI4Science
 
 ## Core criterion
 
-For each candidate paper, decide: does the paper's **method OR physics**
-have reusable value for a researcher working on **space physics +
-AI4Science**?
+For each candidate paper, decide: does the paper's **method, physics, OR
+space-computing system/hardware/networking contribution** have reusable value
+for a researcher working on **space physics, space computing, and AI4Science**?
 
-- If the paper is in our physics domain → keep
-- If the paper's method can be reused on our physics problems → keep
+- If the paper is in our space-physics or space-computing domain → keep
+- If the paper's method can be reused on our physics or space-computing problems → keep
 - If the paper is a methodological advance (no specific application) → keep
-- If the paper applies methods to a non-physics domain (medical,
-  finance, NLP, vision, etc.) — REJECT, unless the methodological
-  contribution is the main point (rare; applications usually are not
-  method-novel)
+- If the paper applies existing methods to an unrelated domain (medical,
+  finance, generic NLP/vision, terrestrial commercial cloud/web/mobile, etc.)
+  with no reusable scientific or constrained-compute contribution → reject.
+  A transferable methodological contribution that is the main point can qualify
+  under Tier 1B or Tier 2. Spaceborne remote-sensing/vision on-board processing
+  and orbital networking/computing are core Tier 1C contributions.
 
 ## Tiers
 
@@ -22,33 +24,57 @@ AI4Science**?
   heliospheric physics, magnetospheric physics, ionosphere, solar wind,
   solar physics, space weather, plasma in space context, particle
   acceleration in space.
-- **1B — AI4Science methods**: PINN/XPINN/PINO, neural operators
-  (FNO/DeepONet/etc.), Bayesian inversion, Gaussian process, Neural
-  Process, symbolic regression, equation discovery, surrogate models,
-  scientific ML, physics-informed methods, inverse problem ML.
-- **1C — Cross (space physics × AI)** — HIGHEST PRIORITY: PINN for
-  solar/SEP/GCR, ML for cosmic ray forecasting, neural inversion of
-  space-plasma observations, GNN-PINN for multi-spacecraft etc.
+- **1B — AI4Science & scientific/efficient ML methods**: PINN/XPINN/PINO,
+  neural operators (FNO/DeepONet/etc.), Bayesian inversion, Gaussian process,
+  Neural Process, symbolic regression, equation discovery, surrogate models,
+  scientific ML, physics-informed methods, inverse problem ML; model
+  compression, quantization, pruning, and acceleration methods transferable
+  to resource-constrained scientific or orbital inference.
+- **1C — Cross & Space Computing (space physics × AI, OR orbital/spaceborne
+  computing)** — HIGHEST PRIORITY: PINN for solar/SEP/GCR, ML for cosmic ray
+  forecasting, neural inversion of space-plasma observations, GNN-PINN for
+  multi-spacecraft, plus all five space-computing sub-directions:
+  1. Orbital/satellite edge computing and spaceborne computing constellations:
+     LEO/MEO/GEO computing constellations and in-orbit cloud/edge computing.
+  2. On-board AI inference/training and real-time satellite payload,
+     remote-sensing, or space-weather data processing.
+  3. Space computing hardware architectures, FPGA/SoC/ASIC/NPU acceleration,
+     and radiation-tolerant / fault-tolerant computing: SEE/SEU/SEL/TID
+     mitigation, triple modular redundancy (TMR), radiation-hardened processors.
+  4. Space-air-ground integrated computing (SAGIN) and inter-satellite link
+     (ISL) task offloading, routing, and collaborative scheduling.
+  5. Space data centers, orbital compute energy management, and thermal
+     control systems for spaceborne compute.
 
 ### Tier 2 — Adjacent (usually keep)
 
-- **2A — Adjacent physics × AI**: lab plasma + ML, geophysics + ML,
-  climate/ocean + ML, fluid dynamics + ML, astrophysics + ML, particle
-  physics + ML. Methods transfer to our physics.
-- **2B — General AI methodology**: new neural architectures, optimizers,
-  training techniques, no specific physics application (still useful as
-  method input).
-- **2C — Adjacent physics (no AI)**: only when methods or physics
-  directly transferable to space physics (e.g., shock acceleration in
-  lab plasma).
+- **2A — Adjacent physics or constrained edge/fault-tolerant systems × AI**:
+  lab plasma + ML, geophysics + ML, climate/ocean + ML, fluid dynamics + ML,
+  astrophysics + ML, particle physics + ML; embedded/edge AI, fault-tolerant
+  distributed computing, and low-power hardware acceleration whose methods
+  directly transfer to spaceborne resource/radiation constraints or our physics.
+- **2B — General AI & systems methodology**: new neural architectures,
+  optimizers, training techniques, and general efficient inference/systems
+  methodology, with no specific physics application required.
+- **2C — Adjacent physics or aerospace/radiation engineering (no AI)**:
+  methods or physics directly transferable to space physics (e.g., shock
+  acceleration in lab plasma); spacecraft electronics, semiconductor radiation
+  effects, satellite communications, and spacecraft thermal/power engineering
+  transferable to space computing.
 
 ### Tier 3 — Off-domain (reject)
 
-- AI applied to medical / biology / agriculture / finance / business /
-  education / NLP / vision / social science / theology / law — REJECT
-  even if the method is novel (the application is the focus, not the
-  method).
-- Non-physics without AI4Science methodological angle.
+- Application-focused medical / biology / agriculture / finance / business /
+  education / generic NLP / generic vision / social science / theology / law
+  papers without a transferable constrained-compute/AI4Science methodological
+  contribution. Applying an existing PINN or neural architecture alone is not
+  method novelty.
+- Purely terrestrial commercial cloud/web/mobile applications with no
+  orbital/spaceborne context or transferable constrained-compute/AI4Science
+  methodology; other non-physics work without such a contribution.
+- Spaceborne remote-sensing/vision on-board processing and orbital
+  networking/computing are **Tier 1C**, NOT rejected as generic vision, NLP,
+  or business applications.
 
 ## Decision flow
 
@@ -156,3 +182,30 @@ Abstract: We use a Bayesian NN to model GCR modulation by solar activity...
 → `{"keep": true, "score": 0.4, "tier": "1C", "rank_reason": "AI for CR but Bayesian (not PINN) and GCR (not SEP); tangential"}`
 
 (Note: keep because it's Tier 1C, but score reflects partial query match.)
+
+### Example 11 — Tier 1C orbital edge computing (accept)
+
+```
+Title: "Collaborative task offloading in LEO satellite edge computing constellations"
+Abstract: We schedule on-board compute and inter-satellite link routing in a
+space-air-ground integrated network under orbital contact and power constraints...
+```
+→ `{"keep": true, "score": 0.9, "tier": "1C", "rank_reason": "Orbital edge computing with ISL offloading and collaborative scheduling"}`
+
+### Example 12 — Tier 1C radiation-tolerant on-board AI (accept)
+
+```
+Title: "Radiation-tolerant FPGA acceleration for on-board remote-sensing neural inference"
+Abstract: Quantized inference and triple modular redundancy mitigate single-event
+upsets while processing satellite imagery within payload power and latency budgets...
+```
+→ `{"keep": true, "score": 0.95, "tier": "1C", "rank_reason": "Spaceborne FPGA neural inference and SEU mitigation; core computing, not generic vision"}`
+
+### Example 13 — Tier 1C orbital data center engineering (accept)
+
+```
+Title: "Joint energy management and thermal control for orbital data centers"
+Abstract: We coordinate compute loads, solar power, and radiator capacity across
+orbital eclipse cycles to maintain safe processor temperatures...
+```
+→ `{"keep": true, "score": 0.9, "tier": "1C", "rank_reason": "Power and thermal systems directly support spaceborne compute"}`

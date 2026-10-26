@@ -66,3 +66,28 @@ relation{tuple_delimiter}AMS-02{tuple_delimiter}Galactic Cosmic Rays{tuple_delim
 relation{tuple_delimiter}Force-Field Approximation{tuple_delimiter}Solar Modulation{tuple_delimiter}modeling, single-parameter{tuple_delimiter}The force-field approximation describes solar modulation with a single parameter.
 relation{tuple_delimiter}Local Interstellar Spectrum{tuple_delimiter}Solar Modulation{tuple_delimiter}input, modeling constraint{tuple_delimiter}The local interstellar spectrum constrains solar modulation models.
 {completion_delimiter}
+===EXAMPLE===
+<Entity_types>
+["concept","method","phenomenon","dataset","instrument","mission","quantity","material","model","finding","application"]
+
+<Input Text>
+```
+An orbital edge computing constellation processes satellite remote-sensing images on board instead of downlinking every raw frame. Each satellite uses a radiation-tolerant FPGA for quantized neural inference, reducing payload power consumption by 40% relative to full-precision inference at the same image rate. Triple modular redundancy (TMR) masks a single-event upset (SEU) in one replicated compute path. The FPGA is qualified to a total ionizing dose (TID) of 30 krad(Si). An inter-satellite task offloading scheduler routes overflow workloads over inter-satellite links when a satellite reaches its power limit.
+```
+
+<Output>
+entity{tuple_delimiter}Orbital Edge Computing Constellation{tuple_delimiter}mission{tuple_delimiter}A satellite constellation that processes remote-sensing images on board rather than downlinking every raw frame.
+entity{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}instrument{tuple_delimiter}A spaceborne FPGA used for quantized neural inference and qualified to a total ionizing dose of 30 krad(Si).
+entity{tuple_delimiter}Quantized Neural Inference{tuple_delimiter}method{tuple_delimiter}A reduced-precision inference method that lowers payload power consumption by 40% relative to full-precision inference at the same image rate.
+entity{tuple_delimiter}Payload Power Consumption{tuple_delimiter}quantity{tuple_delimiter}Electrical power consumed by on-board processing; reduced by 40% with quantized inference at the same image rate.
+entity{tuple_delimiter}Triple Modular Redundancy{tuple_delimiter}method{tuple_delimiter}A fault-mitigation technique (TMR) that masks an upset in one replicated compute path.
+entity{tuple_delimiter}Single-Event Upset{tuple_delimiter}phenomenon{tuple_delimiter}A radiation-induced fault (SEU) in a compute path that triple modular redundancy can mask.
+entity{tuple_delimiter}Total Ionizing Dose{tuple_delimiter}quantity{tuple_delimiter}The accumulated radiation dose (TID) used to qualify the FPGA, with a stated qualification level of 30 krad(Si).
+entity{tuple_delimiter}Inter-Satellite Task Offloading Scheduler{tuple_delimiter}method{tuple_delimiter}An algorithm that routes overflow workloads over inter-satellite links when a satellite reaches its power limit.
+relation{tuple_delimiter}Orbital Edge Computing Constellation{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}on-board computing, hardware{tuple_delimiter}Each satellite in the constellation uses a radiation-tolerant FPGA to process remote-sensing images on board.
+relation{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}Quantized Neural Inference{tuple_delimiter}acceleration, inference{tuple_delimiter}The FPGA executes quantized neural inference for on-board image processing.
+relation{tuple_delimiter}Quantized Neural Inference{tuple_delimiter}Payload Power Consumption{tuple_delimiter}power reduction, efficiency{tuple_delimiter}Quantized inference reduces payload power consumption by 40% at the same image rate relative to full-precision inference.
+relation{tuple_delimiter}Triple Modular Redundancy{tuple_delimiter}Single-Event Upset{tuple_delimiter}fault mitigation, redundancy{tuple_delimiter}Triple modular redundancy masks a single-event upset in one replicated compute path.
+relation{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}Total Ionizing Dose{tuple_delimiter}qualification, radiation tolerance{tuple_delimiter}The FPGA is qualified to a total ionizing dose of 30 krad(Si).
+relation{tuple_delimiter}Inter-Satellite Task Offloading Scheduler{tuple_delimiter}Orbital Edge Computing Constellation{tuple_delimiter}task offloading, power constraint{tuple_delimiter}The scheduler routes overflow workloads between satellites when a constellation member reaches its power limit.
+{completion_delimiter}

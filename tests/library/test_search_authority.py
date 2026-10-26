@@ -179,6 +179,8 @@ def test_lambda_zero_is_identity():
     "Annual Review of Astronomy and Astrophysics", "Annual Review of Fluid Mechanics",
     "SIAM Review", "Proceedings of the National Academy of Sciences",
     "  PHYSICAL   REVIEW, LETTERS. ", "Space Science Reviws",
+    "Nature Electronics", "Nature Machine Intelligence", "Proceedings of the IEEE",
+    "IEEE Communications Surveys & Tutorials", "Progress in Aerospace Sciences",
 ])
 def test_flagship_venue_authority(venue):
     from papervault.library.services.search_pipeline import _venue_tier_multiplier
@@ -203,6 +205,18 @@ def test_flagship_venue_authority(venue):
     "Advances in Neural Information Processing Systems",
     "International Conference on Learning Representations",
     "Communications in Mathematics and Statistics", "Physical Reviw D",
+    "IEEE Transactions on Aerospace and Electronic Systems", "TAES",
+    "IEEE Transactions on Nuclear Science", "TNS", "Acta Astronautica",
+    "Journal of Spacecraft and Rockets", "AIAA Journal", "Aerospace Science and Technology",
+    "Chinese Journal of Aeronautics", "IEEE Transactions on Geoscience and Remote Sensing", "TGRS",
+    "IEEE Journal on Selected Areas in Communications", "JSAC",
+    "IEEE Transactions on Wireless Communications", "TWC",
+    "IEEE Transactions on Mobile Computing", "TMC", "IEEE Internet of Things Journal",
+    "IEEE Network", "ASPLOS", "ISCA", "MICRO", "HPCA", "OSDI", "SOSP", "NSDI", "EuroSys",
+    "MobiCom", "SenSys", "DAC", "FPGA", "CVPR", "ICCV", "ECCV", "SC",
+    "IEEE Transactions on Computers",
+    "IEEE Transactions on Computer-Aided Design of Integrated Circuits and Systems", "TCAD",
+    "IEEE Transactions on Parallel and Distributed Systems", "TPDS",
 ])
 def test_core_domain_venue_authority(venue):
     from papervault.library.services.search_pipeline import _venue_tier_multiplier
@@ -217,6 +231,8 @@ def test_core_domain_venue_authority(venue):
     "10.1038/nature", "10.1038/s41567", "10.1038/s42254", "10.1007/s11214", "10.12942/lrsp",
     "10.1007/s41116", "10.1073/pnas", "10.1016/j.physrep", "10.1088/0034-4885",
     "10.1146/annurev", "10.1137/s00361445",
+    "10.1038/s41928", "10.1038/s42256", "10.1109/jproc", "10.1109/comst",
+    "10.1016/j.paerosci",
 ])
 @pytest.mark.parametrize("venue", ["", "Phys. Rev. Lett.", "Unrecognized journal typo"])
 def test_flagship_doi_fallback(prefix, venue):
@@ -230,6 +246,10 @@ def test_flagship_doi_fallback(prefix, venue):
     "10.1103/physrevd", "10.1103/physreve", "10.1103/physrevc", "10.1088/1475-7516",
     "10.1016/j.astropartphys", "10.1016/j.nuclphysb", "10.1016/j.nima", "10.1007/s11207",
     "10.1016/j.pss", "10.1016/0032-0633", "10.1016/j.jcp", "10.1016/j.cma", "10.1007/s40304",
+    "10.1109/taes", "10.1109/tns", "10.1016/j.actaastro", "10.2514/1.a", "10.2514/1.j",
+    "10.1016/j.ast", "10.1016/j.cja", "10.1109/tgrs", "10.1109/jsac", "10.1109/twc",
+    "10.1109/tmc", "10.1109/jiot", "10.1109/mnet", "10.1109/tc.", "10.1109/tcad",
+    "10.1109/tpds",
 ])
 @pytest.mark.parametrize("venue", ["", "Astrophys. J.", "Unrecognized journal typo"])
 def test_core_domain_doi_fallback(prefix, venue):

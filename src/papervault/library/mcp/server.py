@@ -625,6 +625,8 @@ def build_server(library_path: Optional[str] = None,
     if mcp is None:
         mcp = FastMCP("paper-library", instructions="""
 This is the literature-library plane of papervault — the raw papers themselves.
+Its research scope is space physics, space computing, and AI4Science, including
+orbital edge computing, on-board AI, and spaceborne hardware/networking systems.
 Find papers and read their full text. Adding papers to the library happens for you
 (search ingests what it discovers) — not something you call. get_paper is read-only:
 a named paper not already in the library returns not_found (it is NOT fetched on lookup).
@@ -776,7 +778,7 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         """Find research papers matching a natural-language research intent.
 
         Use this when you need to discover or look up literature in
-        **space physics + AI4Science**. **Do NOT pass keywords** — pass a
+        **space physics, space computing, and AI4Science**. **Do NOT pass keywords** — pass a
         full description of what you're doing and what you want to find.
         The backend parses your intent with an LLM, so being expressive
         helps; being terse hurts.
@@ -789,6 +791,11 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
           - Any constraints (year, importance, specific venues, etc.)
 
         Good examples (rich intents):
+          ✓ "I'm designing on-board AI for a LEO computing constellation.
+             Find quantized inference on radiation-tolerant FPGAs and
+             inter-satellite task offloading methods under power and
+             latency constraints, including orbital energy/thermal control."
+
           ✓ "I'm doing XPINN inversion of the Voyager 1/2 outer
              heliosphere; I want recent advances in PINN training
              stability for stiff PDEs — especially the adaptive-sampling

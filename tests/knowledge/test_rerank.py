@@ -297,7 +297,7 @@ def test_extraction_prompt_idempotent():
         sysp = lr_prompt.PROMPTS["entity_extraction_system_prompt"]
         assert sysp.count("Exclusions (do NOT extract") == 1
         assert sysp.count("Acronym canonicalization") == 1
-        assert len(lr_prompt.PROMPTS["entity_extraction_examples"]) == 3
+        assert len(lr_prompt.PROMPTS["entity_extraction_examples"]) == 4
     finally:
         lr_prompt.PROMPTS["entity_extraction_examples"] = saved_examples
         lr_prompt.PROMPTS["entity_extraction_system_prompt"] = saved_sysp

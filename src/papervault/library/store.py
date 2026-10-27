@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import re
+import stat
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -296,6 +297,7 @@ class Library:
         self.md_dir = self.root / "extracts" / "md"
         self.txt_dir = self.root / "extracts" / "txt"
         self.manifest_path = self.root / "manifest.log"
+        self._md_source_cache: dict[str, tuple[int, int, Optional[str]]] = {}
 
         if not read_only:
             for d in (self.topics_dir, self.pdfs_dir, self.md_dir, self.txt_dir):
@@ -1334,21 +1336,32 @@ class Library:
         """Return the YAML frontmatter ``source:`` value of {key}.md, or
         None if the file is missing or has no frontmatter. Used to detect
         firecrawl-sourced (text-only) extracts so the marker upgrade path
-        and idempotent re-entry work correctly."""
+        and idempotent re-entry work correctly. Cache unchanged file headers
+        by path, modification time and size."""
         p = self.md_path(key)
-        if not p.is_file():
-            return None
+        cache_key = str(p)
         try:
-            head = p.read_text(encoding="utf-8", errors="replace")[:500]
+            st = p.stat()
+            if not stat.S_ISREG(st.st_mode):
+                self._md_source_cache.pop(cache_key, None)
+                return None
+            stamp = (st.st_mtime_ns, st.st_size)
+            cached = self._md_source_cache.get(cache_key)
+            if cached is not None and cached[:2] == stamp:
+                return cached[2]
+            with p.open("r", encoding="utf-8", errors="replace") as f:
+                head = f.read(500)
         except Exception:
+            self._md_source_cache.pop(cache_key, None)
             return None
-        if not head.startswith("---\n"):
-            return None
-        end = head.find("\n---\n", 4)
-        if end < 0:
-            return None
-        for line in head[4:end].splitlines():
-            s = line.strip()
-            if s.startswith("source:"):
-                return s.split(":", 1)[1].strip()
-        return None
+        source = None
+        if head.startswith("---\n"):
+            end = head.find("\n---\n", 4)
+            if end >= 0:
+                for line in head[4:end].splitlines():
+                    s = line.strip()
+                    if s.startswith("source:"):
+                        source = s.split(":", 1)[1].strip()
+                        break
+        self._md_source_cache[cache_key] = (*stamp, source)
+        return source

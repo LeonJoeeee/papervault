@@ -164,7 +164,10 @@ class DownloadQueue:
                 if paper.reopen_claim is not None and (
                     paper.reopen_claim.phase in {"dispatched", "released"}
                     or paper.acquisition_state.quarantine))
-        for paper in self.library.all_papers(include_quarantined=reopen_v2_enabled()) if recover else []:
+        papers = self.library.all_papers(include_quarantined=reopen_v2_enabled()) if recover else []
+        for i, paper in enumerate(papers, 1):
+            if i % 250 == 0:
+                await asyncio.sleep(0)
             if paper.reopen_claim is not None:
                 if reopen_v2_enabled() and paper.reopen_claim.phase in {"queued", "dispatched"}:
                     from ..claims_v2 import ClaimStore

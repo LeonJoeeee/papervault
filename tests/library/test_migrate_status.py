@@ -12,8 +12,12 @@ migration NEVER runs against the live vault — every fixture is a tmp dir.
 from __future__ import annotations
 
 import json
+import os
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
+import pytest
 
 from papervault.library.models import DownloadStatus
 from papervault.library.services.migrate_status import migrate_status
@@ -56,6 +60,103 @@ def _rec(key: str, status: str, **kw) -> dict:
     }
     base.update(kw)
     return base
+
+
+@pytest.mark.parametrize(("header", "expected"), [
+    ("---\nsource: firecrawl\n---\n", "firecrawl"),
+    ("# No frontmatter\n", None),
+    ("---\ntitle: No source\n---\n", None),
+    ("---\nsource: firecrawl\n", None),
+    ("---\n" + " " * 500 + "source: firecrawl\n---\n", None),
+])
+def test_md_source_bounds_reads_and_caches_optional_result(tmp_path, monkeypatch, header, expected):
+    lib = Library(tmp_path)
+    path = lib.md_path("Test")
+    path.write_text(header + "Long scientific text. " * 10000, encoding="utf-8")
+    original_open = Path.open
+    reads = []
+
+    @contextmanager
+    def observe_open(p, *args, **kwargs):
+        with original_open(p, *args, **kwargs) as stream:
+            if p != path:
+                yield stream
+                return
+
+            def read(size=-1):
+                reads.append(size)
+                return stream.read(size)
+
+            yield SimpleNamespace(read=read)
+
+    monkeypatch.setattr(Path, "open", observe_open)
+    try:
+        assert lib.md_source("Test") == expected
+        assert lib.md_source("Test") == expected
+        assert reads == [500]
+    finally:
+        lib.close()
+
+
+def test_md_source_invalidates_on_mtime_size_removal_and_path_change(tmp_path, monkeypatch):
+    lib = Library(tmp_path)
+    path = lib.md_path("Test")
+    original = "---\nsource: firecrawl\n---\n"
+    replacement = "---\nsource: mineruocr\n---\n"
+    path.write_text(original)
+    try:
+        assert lib.md_source("Test") == "firecrawl"
+        before = path.stat()
+        # Same size, different content and mtime.
+        path.write_text(replacement)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+        assert path.stat().st_size == before.st_size
+        assert lib.md_source("Test") == "mineruocr"
+        # Same mtime, different size/content.
+        before = path.stat()
+        path.write_text("# No frontmatter\n")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert lib.md_source("Test") is None
+        # Removing a file must evict even a cached None result.
+        before = path.stat()
+        path.unlink()
+        assert lib.md_source("Test") is None
+        path.write_text("---\nsource:x\n---\n")
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        assert path.stat().st_size == before.st_size
+        assert lib.md_source("Test") == "x"
+        # Cache identity follows the resolved artifact path, not the paper key.
+        other = path.with_name("Other.md")
+        other.write_text("---\nsource:y\n---\n")
+        os.utime(other, ns=(before.st_atime_ns, before.st_mtime_ns))
+        monkeypatch.setattr(lib, "md_path", lambda key: other)
+        assert lib.md_source("Test") == "y"
+    finally:
+        lib.close()
+
+
+@pytest.mark.parametrize("has_pdf", [False, True])
+def test_exhausted_firecrawl_skips_source_read(tmp_path, monkeypatch, has_pdf):
+    from papervault.library.services.classify import TERMINAL, classify
+
+    root = _shaped_index(tmp_path, {
+        "Test": _rec("Test", "ok", firecrawl_pdf_hunt_exhausted=True),
+    })
+    lib = Library(root)
+    _write_md(lib, "Test")
+    if has_pdf:
+        _write_pdf(lib, "Test")
+
+    def unexpected_read(key):
+        pytest.fail("an exhausted PDF hunt must short-circuit Markdown provenance reads")
+
+    monkeypatch.setattr(lib, "md_source", unexpected_read)
+    try:
+        assert migrate_status(lib)["migrated"] == 0
+        assert classify(lib.get("Test"), lib) == TERMINAL
+        assert lib.has_extract("Test", "md")
+    finally:
+        lib.close()
 
 
 def test_round_trip_over_preshaped_index(tmp_path):

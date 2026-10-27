@@ -100,6 +100,56 @@ def test_start_recovery_enqueues_only_eligible(lib_four_papers, monkeypatch):
     assert n == 1
 
 
+@pytest.mark.parametrize("pending_identity", [False, True])
+async def test_start_recovers_once_and_scans_off_loop(lib_four_papers, monkeypatch, pending_identity):
+    import threading
+    from papervault.library import extract
+    from papervault.library.services import extraction_registration as registration
+
+    lib, key_a, key_b, *_ = lib_four_papers
+    lib.get(key_b).verification_deferred_to_ocr = pending_identity
+    loop_thread = threading.get_ident()
+    calls, scan_threads, identity_threads, classify_threads = [], [], [], []
+    recover = registration.recover_completions
+    all_papers = lib.all_papers
+    identity = eq_mod.pending_ocr_identity
+    classify = eq_mod.classify
+
+    def observe_recovery(library, **kwargs):
+        calls.append(kwargs)
+        assert threading.get_ident() != loop_thread
+        return recover(library, **kwargs)
+
+    def observe_scan(*args, **kwargs):
+        scan_threads.append(threading.get_ident())
+        return all_papers(*args, **kwargs)
+
+    def observe_identity(*args):
+        identity_threads.append(threading.get_ident())
+        return identity(*args)
+
+    def observe_classify(*args):
+        classify_threads.append(threading.get_ident())
+        return classify(*args)
+
+    monkeypatch.setattr(registration, "recover_completions", observe_recovery)
+    monkeypatch.setattr(lib, "all_papers", observe_scan)
+    monkeypatch.setattr(eq_mod, "pending_ocr_identity", observe_identity)
+    monkeypatch.setattr(eq_mod, "classify", observe_classify)
+    monkeypatch.setattr(extract, "pdf_probe", lambda *_: extract.PDFProbe(False, 2))
+    queue = ExtractQueue(lib)
+    monkeypatch.setattr(queue, "_target_worker_count", lambda: 0)
+    try:
+        await queue.start()
+        await queue.start()  # Startup remains idempotent.
+        assert calls == [{"exclude_keys": {key_b} if pending_identity else None}]
+        for observed in (scan_threads, identity_threads, classify_threads):
+            assert observed and loop_thread not in observed
+        assert set(queue._pending) == ({key_a, key_b} if pending_identity else {key_a})
+    finally:
+        await queue.stop()
+
+
 def test_add_processes_one_then_chains_insight(lib_four_papers, monkeypatch):
     """A successful extract should call on_success (insight chain)."""
     lib, key_a, *_ = lib_four_papers

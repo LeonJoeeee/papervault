@@ -518,7 +518,10 @@ def test_extract_returns_newly_recovered_version(extraction, monkeypatch):
     assert library.manifest_path.read_text() == before
 
 
-@pytest.mark.parametrize("malformed", [b'{"record_key":', b'\xff', b'null', b'[]', b'{}'])
+@pytest.mark.parametrize("malformed", [
+    b'{"record_key":', b'\xff', b'null', b'[]', b'{}',
+    b'{"record_key": ""}', b'{"record_key": null}', b'{"record_key": 42}',
+])
 @pytest.mark.parametrize("per_key", [False, True])
 def test_malformed_completion_does_not_block_healthy_recovery(extraction, caplog, malformed, per_key):
     from papervault.library.services.extraction_registration import begin_extraction, recover_completions
@@ -542,3 +545,76 @@ def test_malformed_completion_does_not_block_healthy_recovery(extraction, caplog
     assert str(bad_path) in caplog.text
     assert paper.extract_attempts == 0
     assert not library.manifest_path.exists()
+
+
+def test_completion_key_filter_precedes_evidence_validation(extraction, monkeypatch):
+    from papervault.library.services.extraction_registration import begin_extraction
+    from papervault.store.extraction import ExtractionStore
+
+    library, paper = extraction
+    other, _ = library.upsert({"title": "Unrelated solar plasma observations",
+                               "authors": ["B. Author"], "year": 2025})
+    store = ExtractionStore(library.root)
+    for row in (paper, other):
+        request = begin_extraction(row, library, b"# Input", engine="firecrawl",
+                                   source_role="provider_markdown")
+        store.finalize(request, b"# Retained output")
+    validate = store._validate_evidence
+    validated = []
+
+    def observe(completion):
+        validated.append(completion["record_key"])
+        return validate(completion)
+
+    monkeypatch.setattr(store, "_validate_evidence", observe)
+    assert [c["record_key"] for c in store.completions(key=paper.key)] == [paper.key]
+    assert validated == [paper.key]
+    validated.clear()
+    assert list(store.completions(key="Absent")) == []
+    assert validated == []
+
+
+@pytest.mark.parametrize("damage", ["corrupt", "missing"])
+def test_recovery_excludes_keys_in_one_pass_and_isolates_invalid_evidence(
+        extraction, monkeypatch, damage):
+    from papervault.library.services.extraction_registration import begin_extraction, recover_completions
+    from papervault.store.extraction import ExtractionStore
+
+    library, healthy = extraction
+    excluded, _ = library.upsert({"title": "Scan awaiting post OCR identity verification",
+                                  "authors": ["Scan"], "year": 2024})
+    broken, _ = library.upsert({"title": "Coronal magnetic fields and reconnection",
+                                "authors": ["Broken"], "year": 2023})
+    store = ExtractionStore(library.root)
+    retained = {}
+    for paper in (healthy, excluded, broken):
+        request = begin_extraction(paper, library, b"# Input", engine="firecrawl",
+                                   source_role="provider_markdown")
+        completion = store.finalize(request, b"# Retained output")
+        retained[paper.key] = completion
+        if paper is not healthy:
+            output = store.path(completion["output_inventory"][0]["path"])
+            if damage == "corrupt":
+                output.write_bytes(b"Corrupt")
+            else:
+                output.unlink()
+    scans = []
+    completions = ExtractionStore.completions
+
+    def observe_scan(self, *, key=None):
+        scans.append(key)
+        yield from completions(self, key=key)
+
+    monkeypatch.setattr(ExtractionStore, "completions", observe_scan)
+    report = recover_completions(library, exclude_keys={excluded.key})
+
+    assert scans == [None]
+    assert report == {"recovered": 1, "blocked": [{
+        "completion_id": retained[broken.key]["completion_id"],
+        "reason": "invalid retained evidence",
+    }]}
+    assert healthy.extraction_completion_id == retained[healthy.key]["completion_id"]
+    assert library.md_path(healthy.key).read_bytes() == b"# Retained output"
+    assert excluded.extraction_completion_id is None
+    assert broken.extraction_completion_id is None
+    assert not library.md_path(excluded.key).exists()

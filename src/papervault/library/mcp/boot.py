@@ -93,6 +93,7 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
     async def _deferred_boot() -> None:
         """The potentially-long library warm-up — runs AFTER the port binds."""
         nonlocal reconcile_task, correction_task
+        await asyncio.sleep(0)
         try:
             # One-time download_status migration — normalize every legacy status to
             # the clean routing enum BEFORE the queues' recovery scans read a
@@ -100,7 +101,7 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
             from ..services.migrate_status import (
                 STUB_DELETION_RULE, migrate_status, should_persist)
 
-            report = migrate_status(library)
+            report = await asyncio.to_thread(migrate_status, library)
             if should_persist(report):
                 async with concurrency.lib_write_lock:
                     library.save()

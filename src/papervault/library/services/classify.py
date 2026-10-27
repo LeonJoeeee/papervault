@@ -163,8 +163,8 @@ def _classify_legacy(paper: Paper, library) -> Action:
         # gone) OR an EXHAUSTED firecrawl-md instead RESTS (rule-5 TERMINAL,
         # served via text_path) — never a permanent re-download hot-loop.
         if (
-            library.md_source(key) == "firecrawl"
-            and not paper.firecrawl_pdf_hunt_exhausted
+            not paper.firecrawl_pdf_hunt_exhausted
+            and library.md_source(key) == "firecrawl"
         ):
             return DOWNLOAD
         return TERMINAL

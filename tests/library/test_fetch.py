@@ -65,6 +65,68 @@ def test_normalize_arxiv_strips_version(raw, expected):
     assert fetch.normalize_arxiv(raw) == expected
 
 
+@pytest.mark.parametrize("raw,expected", [
+    (" DOI: 10.1000/xyz ", "10.1000/xyz"),
+    ("doi: https://dx.doi.org/10.1000/xyz", "10.1000/xyz"),
+    ("10.1051/0004-6361/202450705 10.1051/0004-6361/202450705 10.1051/0004-636",
+     "10.1051/0004-6361/202450705"),
+    ("HTTPS://DOI.ORG/10.1000/xyz, 10.1000/xyz", "10.1000/xyz"),
+    ("doi:10.1000/xyz;\n10.1000/xyz", "10.1000/xyz"),
+    ("not a doi", "not a doi"),
+    ("not 10.1000/xyz", "not 10.1000/xyz"),
+])
+def test_normalize_doi_metadata_tokens(raw, expected):
+    assert fetch.normalize_doi(raw) == expected
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("arXiv:math.GT/0309136v2", "math.GT/0309136"),
+    ("oai:arxiv.org:hep-th/9901001v3", "hep-th/9901001"),
+    ("https://arxiv.org/abs/2401.12345v2", "2401.12345"),
+    ("http://www.arxiv.org/pdf/astro-ph/0009009v1.pdf", "astro-ph/0009009"),
+    ("https://export.arxiv.org/pdf/math.GT/0309136.pdf", "math.GT/0309136"),
+])
+def test_arxiv_wrappers_and_subject_classes(raw, expected):
+    assert fetch.looks_like_arxiv(raw)
+    assert fetch.normalize_arxiv(raw) == expected
+
+
+@pytest.mark.parametrize("raw,valid", [
+    ("0704.0001", True), ("0703.0001", False), ("0604.0001", False),
+    ("2401.12345v2", True), ("2412.12345", True),
+    ("2400.12345", False), ("2413.12345", False), ("1234.5678", False),
+    ("2020.0001", False), ("2401.123456", False), ("2401.12345junk", False),
+    ("astro-ph/0009009", True), ("math.GT/0309136", True),
+    ("hep-th/9101001", True), ("hep-th/9012001", False),
+    ("hep-th/0712001", True), ("hep-th/0801001", False),
+    ("hep-th/9900001", False), ("hep-th/9913001", False),
+    ("oai:arxiv.org:hep-th/9901001v2", True),
+    ("https://arxiv.org/pdf/math.GT/0309136v2.pdf", True),
+    ("10.1109/RADECS.2011.61314xx", False), ("", False),
+])
+def test_external_arxiv_calendar_validation(raw, valid):
+    assert fetch.is_valid_arxiv_id(raw) is valid
+
+
+@pytest.mark.parametrize("doi,url,expected", [
+    ("10.48550/arXiv.2401.12345v2", "", "2401.12345"),
+    ("DOI: 10.48550/ARXIV.astro-ph/0009009", "", "astro-ph/0009009"),
+    ("https://dx.doi.org/10.48550/arXiv.math.GT/0309136", "", "math.GT/0309136"),
+    ("", "https://arxiv.org/abs/2401.12345v2", "2401.12345"),
+    ("", "http://export.arxiv.org/pdf/math.GT/0309136v1.pdf", "math.GT/0309136"),
+    ("10.48550/arXiv.2413.12345", "", ""),
+    ("10.48550/arXiv.arXiv:2401.12345", "", ""),
+    ("10.1000/2401.12345", "", ""),
+    ("", "https://example.org/abs/2401.12345", ""),
+    ("", "https://arxiv.org.evil.test/abs/2401.12345", ""),
+    ("", "https://arxiv.org/abs/2401.12345junk", ""),
+    ("", "2401.12345", ""),
+    ("10.48550/arXiv.2413.12345", "https://arxiv.org/abs/0704.0001", "0704.0001"),
+])
+def test_extract_arxiv_id_from_doi_or_url(doi, url, expected):
+    assert fetch.extract_arxiv_id_from_doi_or_url(doi, url) == expected
+
+
 # ----------- fetch_by_doi ---------------------------------------------------
 
 

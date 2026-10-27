@@ -20,6 +20,7 @@ from typing import Any
 
 import requests
 
+from .. import fetch
 from .exceptions import BackendDegraded, backend_degraded, source_errors, source_results
 from .identity import identity_values, source_identity
 
@@ -87,8 +88,9 @@ def search_core(query: str, max_results: int = 30) -> list[dict[str, Any]]:
             year = None
 
         # Identifiers: doi top-level; arxivId top-level (rarely set)
-        doi = (work.get("doi") or "").strip()
-        arxiv_id = (work.get("arxivId") or "").strip()
+        doi = fetch.normalize_doi(work.get("doi") or "")
+        arxiv_id = fetch.extract_valid_arxiv_id(work.get("arxivId") or "")
+        arxivs = [work["arxivId"]] if arxiv_id else []
 
         # Venue: CORE uses "publisher" (publisher house) but the journal
         # name lives under "journals[0].title" when available
@@ -106,6 +108,10 @@ def search_core(query: str, max_results: int = 30) -> list[dict[str, Any]]:
             sf = work.get("sourceFulltextUrls") or []
             if isinstance(sf, list) and sf:
                 url = sf[0] if isinstance(sf[0], str) else ""
+        if not arxiv_id:
+            arxiv_id = fetch.extract_arxiv_id_from_doi_or_url(doi, url)
+            if arxiv_id:
+                arxivs.append(arxiv_id)
 
         outputs = identity_values(work.get("outputs"))
         # Work responses also carry output API URLs. Label the numeric output
@@ -116,7 +122,7 @@ def search_core(query: str, max_results: int = 30) -> list[dict[str, Any]]:
         for field, namespace in (("magId", "core:mag"), ("pubmedId", "core:pubmed")):
             if field in work:
                 ids[namespace] = work[field]
-        dois, arxivs = [doi], [arxiv_id]
+        dois = [doi]
         identifiers = work.get("identifiers") or []
         if isinstance(identifiers, dict):
             identifiers = [{"type": kind, "identifier": value}

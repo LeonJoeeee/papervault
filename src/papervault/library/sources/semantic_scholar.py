@@ -7,6 +7,7 @@ from typing import Any
 import requests
 
 from papervault.config import polite_v2_enabled
+from ..fetch import normalize_doi
 from ..polite_http import PolitenessDenied, polite_get
 
 from .exceptions import BackendDegraded, backend_degraded, source_errors, source_results
@@ -67,7 +68,7 @@ def search_semantic_scholar(query: str, max_results: int = 30) -> list[dict[str,
     for paper in records:
         authors = [a.get("name", "") for a in paper.get("authors", [])]
         ext_ids = paper.get("externalIds") or {}
-        doi = ext_ids.get("DOI", "")
+        doi = normalize_doi(ext_ids.get("DOI") or "")
         arxiv_id = ext_ids.get("ArXiv", "")
         venue = paper.get("venue") or (paper.get("publicationVenue") or {}).get("name", "")
 

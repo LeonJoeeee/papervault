@@ -18,6 +18,7 @@ from typing import Any
 
 import requests
 
+from .. import fetch
 from .exceptions import BackendDegraded, backend_degraded, source_errors, source_results
 from .identity import source_identity
 
@@ -28,7 +29,7 @@ MAX_RETRIES = 5
 RETRY_DELAY = 5.0
 MAX_AUTHORS = 30
 
-_ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})")
+_ARXIV_TOKEN_RE = re.compile(r"(?:(?:arxiv:|oai:arxiv\.org:)\s*)?([^\s:]+)", re.I)
 _AUTH_WARNED = False
 
 
@@ -42,26 +43,16 @@ def _warn_auth_once(detail: str) -> None:
 
 
 def _extract_arxiv_id(identifiers: list[str]) -> str:
-    """Pull a bare arxiv id (e.g. '2401.0001') from an ADS identifier list."""
+    """Extract a valid, version-stripped ID from explicit or standalone tokens."""
     for ident in identifiers or []:
         if not isinstance(ident, str):
             continue
-        # Direct prefix forms: "arXiv:2401.0001" or just "2401.0001"
-        if ident.lower().startswith("arxiv:"):
-            tail = ident.split(":", 1)[1].strip()
-            m = _ARXIV_ID_RE.search(tail)
-            if m:
-                return m.group(1)
-        m = _ARXIV_ID_RE.match(ident.strip())
-        if m:
-            return m.group(1)
-    # Fallback: any string that contains a NEW-style arxiv id
-    for ident in identifiers or []:
-        if not isinstance(ident, str):
-            continue
-        m = _ARXIV_ID_RE.search(ident)
-        if m:
-            return m.group(1)
+        if identifier := fetch.extract_arxiv_id_from_doi_or_url(doi=ident):
+            return identifier
+        token = _ARXIV_TOKEN_RE.fullmatch(ident.strip())
+        if token and not token.group(1).endswith(".pdf"):
+            if identifier := fetch.extract_valid_arxiv_id(token.group(1)):
+                return identifier
     return ""
 
 
@@ -138,11 +129,13 @@ def search_ads(query: str, max_results: int = 30) -> list[dict[str, Any]]:
 
         abstract = (doc.get("abstract") or "") or ""
 
-        doi_list = doc.get("doi") or []
+        doi_list = [fetch.normalize_doi(value) for value in doc.get("doi") or []]
         doi = (doi_list[0] if doi_list else "") or ""
 
         identifiers = doc.get("identifier") or []
-        arxiv_id = _extract_arxiv_id(identifiers)
+        arxiv_ids = [identifier for ident in identifiers
+                     if (identifier := _extract_arxiv_id([ident]))]
+        arxiv_id = arxiv_ids[0] if arxiv_ids else ""
 
         bibcode = doc.get("bibcode") or ""
         venue = (doc.get("pub") or "") or ""
@@ -153,12 +146,14 @@ def search_ads(query: str, max_results: int = 30) -> list[dict[str, Any]]:
             url = f"https://ui.adsabs.harvard.edu/abs/{bibcode}/abstract"
         elif doi:
             url = f"https://doi.org/{doi}"
+        if not arxiv_id:
+            arxiv_id = fetch.extract_arxiv_id_from_doi_or_url(doi, url)
+            if arxiv_id:
+                arxiv_ids.append(arxiv_id)
         identity = source_identity(
             "ads", source_ids={"ads:bibcode": bibcode, "ads:identifier": identifiers},
             dois=doi_list,
-            arxiv_ids=[ident.split(":", 1)[1] for ident in identifiers
-                       if isinstance(ident, str) and ident.lower().startswith("arxiv:")]
-                      or [arxiv_id],
+            arxiv_ids=arxiv_ids,
             urls=url,
         )
 

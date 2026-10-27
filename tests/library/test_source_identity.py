@@ -26,7 +26,7 @@ CASES = [
      [f"https://arxiv.org/abs/{ARXIV}", f"https://arxiv.org/pdf/{ARXIV}"]),
     ("ads", {"ads:bibcode": ["2024ApJ...123..456A"],
              "ads:identifier": [f"arXiv:{ARXIV}", "oai:ads:record"]},
-     [DOI, "10.1234/second"], [ARXIV],
+     [DOI, "10.1234/second"], ["2401.00001"],  # ADS canonical IDs; raw version above.
      ["https://ui.adsabs.harvard.edu/abs/2024ApJ...123..456A/abstract"]),
     ("semantic_scholar", {"semantic_scholar:paper": ["ss-paper"],
                           "semantic_scholar:external:CorpusId": ["123"],

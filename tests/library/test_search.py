@@ -521,13 +521,17 @@ def test_polite_v2_backends_progress_independently(monkeypatch, polite_search):
 
 
 @pytest.mark.parametrize("backend", ["arxiv", "semantic_scholar", "openalex"])
-@pytest.mark.parametrize("flag,stub", [("0", False), ("1", True)])
+@pytest.mark.parametrize("flag,stub", [("0", False), ("1", True), ("1", "same_module")])
 def test_polite_v2_adds_no_wait_for_flag_off_or_injected_backends(
         monkeypatch, polite_search, backend, flag, stub):
     monkeypatch.setenv("PAPERVAULT_POLITE_V2", flag)
     monkeypatch.setattr(search, "CAPS", {backend: 5})
     if stub:
-        monkeypatch.setattr(search, f"search_{backend}", lambda q, **kw: [_paper(q)])
+        def injected(q, **kw):
+            return [_paper(q)]
+        if stub == "same_module":
+            injected.__module__ = getattr(search, f"search_{backend}").__module__
+        monkeypatch.setattr(search, f"search_{backend}", injected)
 
     def forbidden(*args):
         pytest.fail("legacy/test backend consulted the politeness ledger")
@@ -1315,3 +1319,107 @@ def test_adapter_politeness_denial_stops_retries_and_preserves_prior_failure(
     assert isinstance(caught.value.__cause__, polite_http.PolitenessDenied)
     if prior_failure:
         assert caught.value.retry_after_s == 23.0
+
+
+@pytest.mark.parametrize("raw,doi,arxiv", [
+    ({"doi": "DOI: 10.48550/arXiv.2401.12345v2"}, "10.48550/arXiv.2401.12345v2", "2401.12345"),
+    ({"url": "https://arxiv.org/abs/math.GT/0309136v2"}, "", "math.GT/0309136"),
+    ({"doi": "https://doi.org/10.1000/xyz 10.1000/xyz"}, "10.1000/xyz", ""),
+    ({"arxiv_id": "arXiv:2401.12345v2"}, "", "2401.12345"),
+    ({"arxiv_id": "2025.35287", "doi": "10.1109/TNS.2025.3528764"},
+     "10.1109/TNS.2025.3528764", ""),
+    ({"arxiv_id": "2012.05554", "doi": "10.1111/j.1365-246X.2012.05554.x"},
+     "10.1111/j.1365-246X.2012.05554.x", "2012.05554"),
+    ({"arxiv_id": "1234.5678v2", "doi": "10.1000/unrelated"}, "10.1000/unrelated", "1234.5678"),
+    ({"arxiv_id": "2020.0001"}, "", "2020.0001"),
+    ({"doi": "10.48550/arXiv.2413.12345"}, "10.48550/arXiv.2413.12345", ""),
+    ({"url": "https://example.org/abs/2401.12345"}, "", ""),
+])
+def test_normalize_paper_identifier_boundaries(raw, doi, arxiv):
+    paper = search._normalize_paper({"title": "Identifier boundary", **raw}, "ads")
+    assert paper["doi"] == doi
+    assert paper["arxiv_id"] == arxiv
+    assert paper["source_identities"][0]["arxiv_ids"] == ([arxiv] if arxiv else [])
+
+
+@pytest.mark.parametrize("fields,doi,arxiv", [
+    ({"doi": "DOI: 10.48550/arXiv.2401.12345v2"}, "10.48550/arXiv.2401.12345v2", "2401.12345"),
+    ({"doi": "https://doi.org/10.1000/xyz 10.1000/xyz"}, "10.1000/xyz", ""),
+    ({"primary_location": {"landing_page_url": "https://arxiv.org/abs/math.GT/0309136"}},
+     "", "math.GT/0309136"),
+    ({"primary_location": {"pdf_url": "https://arxiv.org/pdf/astro-ph/0009009v1.pdf"}},
+     "", "astro-ph/0009009"),
+    ({"doi": "10.1000/published", "open_access": {"oa_url": "https://arxiv.org/abs/2401.12345"}},
+     "10.1000/published", "2401.12345"),
+    ({"doi": "10.48550/arXiv.2413.12345"}, "10.48550/arXiv.2413.12345", ""),
+])
+@responses.activate
+def test_openalex_derives_arxiv_identity_from_metadata(fields, doi, arxiv):
+    responses.get("https://api.openalex.org/works", json={"results": [{
+        "id": "https://openalex.org/W123", "title": "Preprint metadata", **fields,
+    }]})
+    paper = search.search_openalex("test")[0]
+    assert paper["doi"] == doi
+    assert paper["arxiv_id"] == arxiv
+    assert paper["source_identities"][0]["arxiv_ids"] == ([arxiv] if arxiv else [])
+
+
+@pytest.mark.parametrize("reason", ["cooldown", "disabled"])
+def test_polite_v2_denied_arxiv_fanout_skips_pacing(monkeypatch, polite_search, reason):
+    monkeypatch.setattr(search, "_interval_for", lambda backend: 3.0)
+    monkeypatch.setattr(search, "time", SimpleNamespace(monotonic=lambda: polite_search.now))
+    monkeypatch.setattr(search, "_LAST_CALL", {"arxiv": polite_search.now})
+    monkeypatch.setattr(search, "_PACE_LOCK", {})
+    if reason == "cooldown":
+        polite_search.ledger.enter_cooldown(Scope("arxiv"), "test")
+    else:
+        monkeypatch.setattr(search, "get_ledger", lambda: Ledger({}))
+    paced = []
+    original = search._pace
+
+    async def pace(*args):
+        paced.append(args)
+        await original(*args)
+
+    monkeypatch.setattr(search, "_pace", pace)
+    degraded, observations = collections.Counter(), []
+
+    async def run():
+        with search.observe_source_gates(observations.append):
+            return await asyncio.gather(*[
+                search._fetch_one_backend(term, "arxiv", 5, term_idx=i, degraded_map=degraded)
+                for i, term in enumerate(["solar", "wind", "plasma"])
+            ])
+
+    assert asyncio.run(run()) == [[], [], []]
+    assert paced == []
+    assert polite_search.sleeps == []
+    assert search._LAST_CALL == {"arxiv": 100.0}
+    assert degraded == {"arxiv": 3}
+    assert [o.latency_ms for o in observations] == [0.0, 0.0, 0.0]
+    assert search._BREAKER_FAILS == {}
+
+
+@pytest.mark.parametrize("reason", ["cooldown", "disabled"])
+def test_polite_v2_rechecks_gate_after_arxiv_pacing(monkeypatch, polite_search, reason):
+    monkeypatch.setattr(search, "_interval_for", lambda backend: 3.0)
+    monkeypatch.setattr(search, "time", SimpleNamespace(monotonic=lambda: polite_search.now))
+    monkeypatch.setattr(search, "_LAST_CALL", {"arxiv": polite_search.now})
+    monkeypatch.setattr(search, "_PACE_LOCK", {})
+    original_sleep = asyncio.sleep
+
+    async def sleep(delay):
+        await original_sleep(delay)
+        if reason == "cooldown":
+            polite_search.ledger.enter_cooldown(Scope("arxiv"), "during pacing")
+        else:
+            monkeypatch.setattr(search, "get_ledger", lambda: Ledger({}))
+
+    async def forbidden(*args):
+        pytest.fail("gate changed during pacing but search still submitted a fetch")
+
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+    monkeypatch.setattr(search, "_run_fetch", forbidden)
+    assert asyncio.run(search._fetch_one_backend("solar", "arxiv", 5, term_idx=0)) == []
+    assert polite_search.sleeps == [3.0]
+    assert search._BREAKER_FAILS == {}

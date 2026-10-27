@@ -29,6 +29,7 @@ import requests
 
 from papervault.config import polite_v2_enabled
 
+from . import fetch
 from .polite_http import PolitenessDenied, get_ledger, polite_get
 from .politeness_v2 import Scope
 
@@ -95,6 +96,7 @@ CAPS = {
     "inspire":          15,
     "core":             15,
 }
+_POLITE_V2_SEARCH_SCOPES = {"arxiv", "semantic_scholar", "openalex"}
 
 
 def _normalize_ss_paper(paper: dict, source: str) -> dict:
@@ -205,12 +207,17 @@ def search_openalex(query: str, *, max_results: int = 30,
                  .get("display_name") or "").strip()
         if not venue:
             venue = ((w.get("host_venue") or {}).get("display_name") or "").strip()
-        doi = (w.get("doi") or "").replace("https://doi.org/", "").strip()
+        doi = fetch.normalize_doi(w.get("doi") or "")
         location = w.get("primary_location") or {}
+        urls = [w.get("doi"), w.get("id"), location.get("landing_page_url"),
+                location.get("pdf_url"), (w.get("open_access") or {}).get("oa_url")]
+        arxiv_id = fetch.extract_arxiv_id_from_doi_or_url(doi)
+        if not arxiv_id:
+            arxiv_id = next((identifier for url in urls
+                             if (identifier := fetch.extract_arxiv_id_from_doi_or_url(url=url))), "")
         identity = source_identity(
             "openalex", source_ids={"openalex:work": (w.get("id") or "").rsplit("/", 1)[-1]},
-            dois=doi, urls=[w.get("doi"), w.get("id"), location.get("landing_page_url"),
-                            location.get("pdf_url"), (w.get("open_access") or {}).get("oa_url")],
+            dois=doi, arxiv_ids=[arxiv_id] if arxiv_id else [], urls=urls,
         )
         out.append({
             "title": title,
@@ -218,7 +225,7 @@ def search_openalex(query: str, *, max_results: int = 30,
             "abstract": abstract,
             "year": w.get("publication_year"),
             "doi": doi,
-            "arxiv_id": "",
+            "arxiv_id": arxiv_id,
             "paper_id": (w.get("id") or "").rsplit("/", 1)[-1],
             "venue": venue,
             "publication_types": [w.get("type") or ""],
@@ -262,14 +269,25 @@ _REVIEW_KEYWORDS = ("review", "survey", "overview", "perspective", "annual")
 
 def _normalize_paper(p: dict, source: str) -> dict:
     """Normalize a search result into the Paper dict shape (sans key)."""
+    doi = fetch.normalize_doi(p.get("doi") or "")
+    arxiv_id = fetch.normalize_arxiv(p.get("arxiv_id") or "")
+    # Preserve synthetic IDs used by callers; reject the invalid numeric DOI
+    # fragments fabricated by older external adapters when there is evidence.
+    if (arxiv_id and arxiv_id[0].isdigit() and arxiv_id in doi
+            and not doi.lower().startswith("10.48550/")
+            and not fetch.is_valid_arxiv_id(arxiv_id)):
+        arxiv_id = ""
+    if not arxiv_id:
+        arxiv_id = fetch.extract_arxiv_id_from_doi_or_url(doi, p.get("url") or "")
+    p = {**p, "doi": doi, "arxiv_id": arxiv_id}
     return {
         "title": (p.get("title") or "").strip(),
         "authors": p.get("authors") or [],
         "year": int(p.get("year")) if p.get("year") and str(p.get("year")).isdigit() else None,
         "venue": p.get("venue") or "",
         "abstract": (p.get("abstract") or "").strip(),
-        "doi": (p.get("doi") or "").strip(),
-        "arxiv_id": (p.get("arxiv_id") or "").strip(),
+        "doi": doi,
+        "arxiv_id": arxiv_id,
         "paper_id": (p.get("paper_id") or "").strip(),
         **retained_inspire_fields(p),
         "url": (p.get("url") or "").strip(),
@@ -580,6 +598,22 @@ def _year_drop(paper: dict, year_min, year_max) -> bool:
     return (year_min is not None and y < year_min) or (year_max is not None and y > year_max)
 
 
+async def _wait_for_search_admission(backend_name: str) -> None:
+    """Wait for local capacity, but fail immediately on terminal ledger denials."""
+    admission_deadline = time.monotonic() + FETCH_QUEUE_TIMEOUT_S
+    while not (decision := get_ledger().gate(Scope(backend_name))).allowed:
+        if decision.reason == "window" and decision.retry_after > 0:
+            await asyncio.sleep(decision.retry_after)
+        elif decision.reason == "concurrency":
+            if time.monotonic() >= admission_deadline:
+                raise FetchQueueTimeout
+            await asyncio.sleep(0.05)
+            if time.monotonic() >= admission_deadline:
+                raise FetchQueueTimeout
+        else:
+            raise PolitenessDenied(f"politeness admission denied: {decision.reason}")
+
+
 async def _fetch_one_backend(
     query: str,
     backend_name: str,
@@ -613,7 +647,7 @@ async def _fetch_one_backend(
     NOT inside the threaded ``backend_fn`` — race-safe under the concurrent
     ``gather`` (R3-F5).
 
-    Pacing (``_pace``) runs FIRST — OUTSIDE the ``wait_for`` — so the per-backend
+    Pacing (``_pace``) runs after polite-v2 admission and OUTSIDE ``wait_for``, so the per-backend
     min-interval wait does NOT count against the 30s fetch timeout. Polite-v2
     API backends also serialize pacing and fetching per loop/backend, waiting
     for ledger windows before submitting to the fetch pool.
@@ -665,26 +699,18 @@ async def _fetch_one_backend(
         fn_kwargs["sort_by_recency"] = sort_by_recency
     try:
         if (polite_v2_enabled()
-                and backend_name in {"arxiv", "semantic_scholar", "openalex"}
-                and getattr(backend_fn, "__module__", "").startswith("papervault.library.")):
+                and backend_name in _POLITE_V2_SEARCH_SCOPES
+                and backend_fn is _DEFAULT_BACKEND_FNS.get(backend_name)):
             key = (asyncio.get_running_loop(), backend_name)
             lock = _POLITE_FETCH_LOCKS.get(key)
             if lock is None:
                 lock = _POLITE_FETCH_LOCKS[key] = asyncio.Lock()
             async with lock:
-                await _pace(backend_name, _interval_for(backend_name))
-                admission_deadline = time.monotonic() + FETCH_QUEUE_TIMEOUT_S
-                while not (decision := get_ledger().gate(Scope(backend_name))).allowed:
-                    if decision.reason == "window" and decision.retry_after > 0:
-                        await asyncio.sleep(decision.retry_after)
-                    elif decision.reason == "concurrency":
-                        if time.monotonic() >= admission_deadline:
-                            raise FetchQueueTimeout
-                        await asyncio.sleep(0.05)
-                        if time.monotonic() >= admission_deadline:
-                            raise FetchQueueTimeout
-                    else:
-                        raise PolitenessDenied(f"politeness admission denied: {decision.reason}")
+                await _wait_for_search_admission(backend_name)
+                interval = _interval_for(backend_name)
+                await _pace(backend_name, interval)
+                if interval > 0:
+                    await _wait_for_search_admission(backend_name)
                 raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
         else:
             await _pace(backend_name, _interval_for(backend_name))
@@ -833,3 +859,5 @@ def search_all(*args, **kwargs):
 # ``search_semantic_scholar``; a stray ``s2`` key would fire this RuntimeError.
 if not all(f"search_{_n}" in globals() for _n in CAPS):   # noqa: E305
     raise RuntimeError("search.py: a backend in CAPS has no search_* function")
+
+_DEFAULT_BACKEND_FNS = {name: globals()[f"search_{name}"] for name in CAPS}

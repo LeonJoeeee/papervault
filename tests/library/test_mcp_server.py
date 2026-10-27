@@ -98,6 +98,44 @@ def server(populated_lib, monkeypatch):
 
 # ---------------- async helpers ---------------------------------------------
 
+
+async def test_deferred_boot_yields_before_threaded_migration(server, monkeypatch):
+    import logging
+    import threading
+    from unittest.mock import AsyncMock
+    from papervault.library.mcp.boot import start_background
+    from papervault.library.services import migrate_status
+
+    entered, release = threading.Event(), threading.Event()
+    migration_threads = []
+    loop_thread = threading.get_ident()
+
+    def slow_migration(library):
+        migration_threads.append(threading.get_ident())
+        entered.set()
+        release.wait(timeout=2)
+        return {"total": 0, "migrated": 0, "by_rule": {}}
+
+    monkeypatch.setattr(migrate_status, "migrate_status", slow_migration)
+    monkeypatch.setattr(server._paper_extract_queue, "start", AsyncMock())
+    monkeypatch.setattr(server._paper_download_queue, "start", AsyncMock())
+    shutdown = await start_background(server, logging.getLogger(__name__))
+    try:
+        # Model the first yield in knowledge startup before the lifespan yields.
+        await asyncio.sleep(0)
+        assert not entered.is_set(), "migration must give lifespan startup a turn first"
+        assert await asyncio.to_thread(entered.wait, 2)
+        assert len(migration_threads) == 1
+        assert migration_threads[0] != loop_thread
+        assert not server._paper_boot_task.done()
+        # A blocked migration leaves the serving loop responsive.
+        await asyncio.sleep(0)
+    finally:
+        release.set()
+        await server._paper_boot_task
+        await shutdown()
+
+
 # The minimal record get_paper / search_papers return (no internal fields leak).
 MIN_FIELDS = {"key", "title", "authors", "year", "venue", "abstract",
               "doi", "arxiv_id", "citation_count", "text_path", "text_status"}

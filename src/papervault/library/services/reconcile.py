@@ -255,7 +255,8 @@ def _read_extract_head(library: Library, p, limit: int) -> str:
     if not rel:
         return ""
     try:
-        return (library.root / rel).read_text(encoding="utf-8", errors="replace")[:limit]
+        with (library.root / rel).open("r", encoding="utf-8", errors="replace") as f:
+            return f.read(limit)
     except Exception:
         return ""
 
@@ -309,7 +310,7 @@ async def _abstract_one(library: Library, p) -> str:
     # Priority: the paper's OWN labelled Abstract section (verbatim, safest) ->
     # an authoritative source by DOI (OpenAlex/SS) -> the opening prose paragraph
     # (riskiest, so it runs ONLY after the others miss).
-    section = _abstract_section(library, p)
+    section = await asyncio.to_thread(_abstract_section, library, p)
     if len(section) >= 60:
         return section
     doi = (p.doi or "").strip()
@@ -319,7 +320,7 @@ async def _abstract_one(library: Library, p) -> str:
             got = await asyncio.to_thread(fetch_abstract_by_doi, doi)
         if len((got or "").strip()) >= 60:
             return got.strip()
-    return _opening_paragraph(library, p)
+    return await asyncio.to_thread(_opening_paragraph, library, p)
 
 
 async def _abstract_sweep(library: Library, *, cap: int) -> int:

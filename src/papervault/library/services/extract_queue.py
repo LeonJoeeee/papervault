@@ -135,26 +135,15 @@ class ExtractQueue:
         if self._started:
             return
         from .extraction_registration import recover_completions
-        pending_identity = {paper.key for paper in self.library.all_papers()
-                            if pending_ocr_identity(paper, self.library)}
-        if pending_identity:
-            # Recovery may set completion_id, erasing an inferred scan obligation.
-            # Keep those records out of alias/registration recovery until OCR verifies them.
-            recovered_count = 0
-            for paper in self.library.all_papers():
-                if paper.key not in pending_identity:
-                    try:
-                        recovered = await asyncio.to_thread(
-                            recover_completions, self.library, key=paper.key)
-                    except (OSError, ValueError):
-                        # Match global recovery's isolation of invalid evidence.
-                        log.warning("extract queue: invalid retained evidence for %s", paper.key)
-                        continue
-                    recovered_count += recovered["recovered"]
-        else:
-            recovered = await asyncio.to_thread(recover_completions, self.library)
-            recovered_count = recovered["recovered"]
-        if recovered_count:
+        pending_identity = await asyncio.to_thread(
+            lambda: {paper.key for paper in self.library.all_papers()
+                     if pending_ocr_identity(paper, self.library)})
+        # Recovery may set completion_id, erasing an inferred scan obligation.
+        # Exclude those records until OCR verifies them, while scanning retained
+        # completions only once for the entire library.
+        recovered = await asyncio.to_thread(
+            recover_completions, self.library, exclude_keys=pending_identity or None)
+        if recovered["recovered"]:
             self.library.save(force=True, durable=True)
         self._started = True
 
@@ -163,10 +152,11 @@ class ExtractQueue:
 
         recovered_normal = 0
         recovered_low = 0
-        for paper in self.library.all_papers():
-            if classify(paper, self.library) != EXTRACT:
-                continue
-            pdf_path = self.library.pdf_path(paper.key)
+        extract_keys = await asyncio.to_thread(
+            lambda: [paper.key for paper in self.library.all_papers()
+                     if classify(paper, self.library) == EXTRACT])
+        for key in extract_keys:
+            pdf_path = self.library.pdf_path(key)
             # D10: page count comes from the isolated probe subprocess, never
             # an in-thread pypdf parse — one bad PDF must not wedge the
             # recovery scan at startup. A bad probe → n_pages 0 → normal lane
@@ -184,10 +174,10 @@ class ExtractQueue:
             n_pages = ((await asyncio.to_thread(pdf_probe, str(pdf_path))).n_pages
                        if pdf_path.exists() else 0)
             if n_pages > long_threshold:
-                self._enqueue(paper.key, concurrency.PRIORITY_LOW)
+                self._enqueue(key, concurrency.PRIORITY_LOW)
                 recovered_low += 1
             else:
-                self._enqueue(paper.key, concurrency.PRIORITY_NORMAL)
+                self._enqueue(key, concurrency.PRIORITY_NORMAL)
                 recovered_normal += 1
         log.info(
             "extract queue: recovered %d ok-without-md tasks "

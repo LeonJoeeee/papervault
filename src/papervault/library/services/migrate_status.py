@@ -141,12 +141,12 @@ def _delete_ungated_firecrawl_stub(library, paper) -> bool:
         return False
     if not library.has_extract(key, "md"):
         return False
-    if library.md_source(key) != "firecrawl":
-        return False
     if paper.firecrawl_pdf_hunt_exhausted:
         # A gate-PASS firecrawl md that legitimately coexists with a later PDF
         # (D5 no PDF-upgrade): the md is already gated, rule (2) TERMINAL is
         # correct, leave it. Only the UN-gated stub is the bug.
+        return False
+    if library.md_source(key) != "firecrawl":
         return False
 
     try:

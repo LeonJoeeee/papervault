@@ -52,6 +52,61 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def test_read_extract_head_bounds_disk_read(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    lib = Library(tmp_path)
+    paper = SimpleNamespace(md_path="extracts/md/Test.md", txt_path=None)
+    path = lib.root / paper.md_path
+    path.write_text("Scientific text. " * 10000)
+    original_open = Path.open
+    reads = []
+
+    @contextmanager
+    def observe_open(p, *args, **kwargs):
+        with original_open(p, *args, **kwargs) as stream:
+            def read(size=-1):
+                reads.append(size)
+                return stream.read(size)
+            yield SimpleNamespace(read=read)
+
+    monkeypatch.setattr(Path, "open", observe_open)
+    try:
+        assert len(reconcile._read_extract_head(lib, paper, 123)) == 123
+        assert reads == [123]
+    finally:
+        lib.close()
+
+
+@pytest.mark.parametrize("labelled", [False, True])
+async def test_abstract_extract_reads_run_off_loop(tmp_path, monkeypatch, labelled):
+    import threading
+    from types import SimpleNamespace
+
+    lib = Library(tmp_path)
+    paper = SimpleNamespace(md_path="extracts/md/Test.md", txt_path=None, doi="")
+    paragraph = "We measured the solar wind across the heliosphere and found coherent waves. " * 5
+    text = f"# Abstract\n{paragraph}\n# Introduction\nBody" if labelled else paragraph
+    (lib.root / paper.md_path).write_text(text)
+    original_read = reconcile._read_extract_head
+    threads = []
+    loop_thread = threading.get_ident()
+
+    def observe_read(*args):
+        threads.append(threading.get_ident())
+        return original_read(*args)
+
+    monkeypatch.setattr(reconcile, "_read_extract_head", observe_read)
+    try:
+        assert await reconcile._abstract_one(lib, paper) == paragraph.strip()
+        assert len(threads) == (1 if labelled else 2)
+        assert loop_thread not in threads
+    finally:
+        lib.close()
+
+
 @pytest.fixture
 def metadata_sweeps(monkeypatch):
     """Keep routing fixtures with synthetic DOIs off live metadata APIs."""

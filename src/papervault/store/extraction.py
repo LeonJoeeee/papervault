@@ -186,14 +186,19 @@ class ExtractionStore:
         for path in sorted(self.versions.glob("[!.]*/completion.json")):
             try:
                 completion = json.loads(path.read_bytes())
+                if (not isinstance(completion, dict)
+                        or not isinstance(completion.get("record_key"), str)
+                        or not completion["record_key"]):
+                    raise ValueError("invalid extraction record key")
+                if key is not None and completion["record_key"] != key:
+                    continue
                 self._validate_evidence(completion)
                 if path.parent.name != completion["completion_id"]:
                     raise ValueError("extraction completion directory identity differs")
             except (OSError, ValueError, KeyError, TypeError):
                 _log.warning("Skipping malformed extraction completion: %s", path)
                 continue
-            if key is None or completion["record_key"] == key:
-                yield completion
+            yield completion
 
     def completion(self, completion_id):
         if not isinstance(completion_id, str) or len(completion_id) != 32 or any(

@@ -248,11 +248,13 @@ def _registered_head_status(library, completion) -> bool | None:
         return bool(head and head["completion_id"] == completion["completion_id"])
 
 
-def recover_completions(library, *, key=None):
+def recover_completions(library, *, key=None, exclude_keys=None):
     from papervault.store.knowledge import ClaimRejected
 
     recovered, blocked = 0, []
     for completion in ExtractionStore(library.root).completions(key=key):
+        if exclude_keys is not None and completion["record_key"] in exclude_keys:
+            continue
         paper = library.get(completion["record_key"])
         if paper is None:
             continue

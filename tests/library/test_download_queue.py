@@ -38,6 +38,43 @@ class _Recorder:
         self.added.append(key)
 
 
+@pytest.mark.parametrize("status", ["pending", "failed"])
+async def test_start_yields_during_recovery_scan(tmp_path, monkeypatch, status):
+    from papervault.library.models import Paper
+
+    lib = Library(tmp_path)
+    lib._papers = {f"Paper{i}": Paper(key=f"Paper{i}", title=f"Scientific paper {i}",
+                                    download_status=status) for i in range(751)}
+    queue = DownloadQueue(lib, num_workers=0)
+    visited, checkpoints = [], []
+    papers = lib.all_papers()
+
+    def scan(**kwargs):
+        for paper in papers:
+            visited.append(paper.key)
+            yield paper
+
+    async def observer():
+        while True:
+            checkpoints.append(len(visited))
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(lib, "all_papers", scan)
+    heartbeat = asyncio.create_task(observer())
+    try:
+        await queue.start()
+        assert len(visited) == 751
+        assert len(checkpoints) >= 3
+        assert checkpoints[0] <= 251
+        assert all(b - a <= 250 for a, b in zip(checkpoints, checkpoints[1:] + [751]))
+        assert queue.qsize() == (751 if status == "pending" else 0)
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
+        await queue.stop()
+        lib.close()
+
+
 def _write_pdf(lib: Library, key: str) -> None:
     """Create a fake PDF on disk so ``library.has_pdf(key)`` returns True."""
     pdf_path = lib.pdf_path(key)

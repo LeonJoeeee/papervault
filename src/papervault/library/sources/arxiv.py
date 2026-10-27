@@ -44,6 +44,9 @@ def search_arxiv(query: str, max_results: int = 30, *,
     empty/429 is NOT an authoritative 0-hit). Entries missing a title or
     publication date are skipped; no remaining entries returns ``[]``.
     """
+    # fetch also imports this adapter for direct arXiv lookups.
+    from ..fetch import normalize_doi
+
     if not query:
         return []
 
@@ -96,7 +99,7 @@ def search_arxiv(query: str, max_results: int = 30, *,
         year = published[:4]
         url = entry.find("atom:id", NS).text.strip()
         arxiv_id = url.split("/abs/")[-1]
-        doi = (entry.findtext("arxiv:doi", "", NS) or "").strip()
+        doi = normalize_doi(entry.findtext("arxiv:doi", "", NS) or "")
         identity = source_identity(
             "arxiv", source_ids={"arxiv:paper": arxiv_id}, dois=doi, arxiv_ids=arxiv_id,
             urls=[url, *(link.get("href") for link in entry.findall("atom:link", NS))],

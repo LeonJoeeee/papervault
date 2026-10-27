@@ -41,21 +41,32 @@ _DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$")
 # Polite-pool User-Agent for scholarly APIs (Crossref/OpenAlex). The contact e-mail
 # is operator-configured (PAPERVAULT_CONTACT_EMAIL); never hardcode a personal address.
 _UA = f"papervault/0.1 (mailto:{config.CONTACT_EMAIL})"
-_ARXIV_RE = re.compile(r"^(?:arXiv:)?(\d{4}\.\d{4,5}|[a-z\-]+/\d{7})(v\d+)?$", re.I)
+_ARXIV_ID_PATTERN = r"(?:\d{4}\.\d{4,5}|[a-z\-]+(?:\.[a-z]{2})?/\d{7})"
+_ARXIV_URL_PREFIX = r"https?://(?:www\.|export\.)?arxiv\.org/(?:abs|pdf)/"
+_ARXIV_RE = re.compile(
+    rf"(?:arxiv:|oai:arxiv\.org:|{_ARXIV_URL_PREFIX})?({_ARXIV_ID_PATTERN})(v\d+)?", re.I,
+)
+_ARXIV_DOI_RE = re.compile(rf"10\.48550/arxiv\.({_ARXIV_ID_PATTERN})(?:v\d+)?", re.I)
 # Common copy-paste DOI wrappers: the ``doi:`` scheme and the resolver URL
 # (with or without the ``dx.`` host and the scheme). Stripped to the bare
 # ``10.xxxx/...`` form before the anchored ``_DOI_RE`` runs, so a pasted
 # ``doi:10.../`` or ``https://doi.org/10...`` resolves instead of falling
 # through to the fuzzy path (which would mis-resolve or not_found).
-_DOI_PREFIX_RE = re.compile(r"^(?:doi:|https?://(?:dx\.)?doi\.org/)", re.I)
+_DOI_PREFIX_RE = re.compile(r"^(?:doi:\s*)?(?:https?://(?:dx\.)?doi\.org/)?", re.I)
 
 
 def normalize_doi(s: str) -> str:
     """Strip a leading ``doi:`` / ``https://doi.org/`` / ``http://dx.doi.org/``
-    wrapper so the bare ``10.xxxx/...`` form is returned (for the regex + the
-    ``_by_doi`` index lookup). A bare DOI / non-DOI string is returned stripped
-    of surrounding whitespace, unchanged otherwise."""
-    return _DOI_PREFIX_RE.sub("", (s or "").strip())
+    wrapper and retain the first valid token in repeated/truncated metadata.
+    Non-DOI text is preserved after wrapper and surrounding whitespace removal.
+    """
+    value = _DOI_PREFIX_RE.sub("", (s or "").strip()).strip()
+    tokens = value.split()
+    if len(tokens) > 1:
+        first = tokens[0].rstrip(",;")
+        if _DOI_RE.fullmatch(first):
+            return first
+    return value
 
 
 def looks_like_doi(s: str) -> bool:
@@ -63,12 +74,43 @@ def looks_like_doi(s: str) -> bool:
 
 
 def looks_like_arxiv(s: str) -> bool:
-    return bool(_ARXIV_RE.match(s.strip()))
+    return bool(_ARXIV_RE.fullmatch(s.strip().removesuffix(".pdf")))
 
 
 def normalize_arxiv(s: str) -> str:
-    m = _ARXIV_RE.match(s.strip())
+    m = _ARXIV_RE.fullmatch(s.strip().removesuffix(".pdf"))
     return m.group(1) if m else s.strip()
+
+
+def is_valid_arxiv_id(s: str) -> bool:
+    """Validate external metadata, including the calendar in either ID format.
+
+    The permissive syntax helpers above deliberately still accept synthetic IDs.
+    """
+    m = _ARXIV_RE.fullmatch(s.strip().removesuffix(".pdf"))
+    if not m:
+        return False
+    identifier = m.group(1)
+    date = identifier.rsplit("/", 1)[-1]
+    year, month = int(date[:2]), int(date[2:4])
+    if not 1 <= month <= 12:
+        return False
+    return (year >= 91 or year <= 7) if "/" in identifier else (year, month) >= (7, 4)
+
+
+def extract_valid_arxiv_id(s: str) -> str:
+    """Return a version-stripped external ID, or empty for invalid metadata."""
+    return normalize_arxiv(s) if is_valid_arxiv_id(s) else ""
+
+
+def extract_arxiv_id_from_doi_or_url(doi: str = "", url: str = "") -> str:
+    """Extract only from an official arXiv DataCite DOI or an arXiv abs/pdf URL."""
+    match = _ARXIV_DOI_RE.fullmatch(normalize_doi(doi))
+    if match and (identifier := extract_valid_arxiv_id(match.group(1))):
+        return identifier
+    if re.match(_ARXIV_URL_PREFIX, (url or "").strip(), re.I):
+        return extract_valid_arxiv_id(url)
+    return ""
 
 
 # ----------------------------- internal helpers ----------------------------

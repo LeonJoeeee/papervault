@@ -668,3 +668,137 @@ def test_search_core_falls_back_publisher_when_no_journal(monkeypatch):
     assert len(out) == 1
     assert out[0]["venue"] == "Springer"
 
+
+
+_PUBLISHER_DOIS = [
+    "10.1109/TNS.2025.3528764",
+    "10.1109/RADECS.2011.61314xx",
+    "10.1111/j.1365-246X.2012.05554.x",
+    "10.1016/j.asr.2023.08.037",
+    "10.3389/fspas.2025.1585348",
+    "10.22541/essoar.171044314.43589112/v1",
+    "10.1000/2401.12345",  # Even a calendar-valid substring is not an arXiv ID.
+]
+_ADS_ARXIV_IDENTIFIERS = [
+    ("arXiv:2401.12345v2", "2401.12345"),
+    ("arXiv: 2401.12345v2", "2401.12345"),
+    ("arXiv:astro-ph/0009009", "astro-ph/0009009"),
+    ("arXiv:math.GT/0309136", "math.GT/0309136"),
+    ("oai:arxiv.org:hep-th/9901001", "hep-th/9901001"),
+    ("10.48550/arXiv.2401.12345", "2401.12345"),
+    ("10.48550/arXiv.astro-ph/0009009", "astro-ph/0009009"),
+    ("DOI: 10.48550/ARXIV.math.GT/0309136v2", "math.GT/0309136"),
+    ("https://dx.doi.org/10.48550/arXiv.2401.12345", "2401.12345"),
+    ("2401.12345v2", "2401.12345"),
+    ("math.GT/0309136v2", "math.GT/0309136"),
+]
+
+
+@pytest.mark.parametrize("identifier,expected", [
+    *[(doi, "") for doi in _PUBLISHER_DOIS],
+    *_ADS_ARXIV_IDENTIFIERS,
+    ("2024arXiv240112345A", ""),
+    ("prefix2401.12345", ""), ("2401.12345junk", ""),
+    ("arXiv:2413.12345", ""), ("arXiv:0703.0001", ""),
+    ("arXiv:hep-th/0801001", ""), ("arXiv:math.GT/0313001", ""),
+    ("arXiv:10.1109/RADECS.2011.61314xx", ""),
+    ("https://arxiv.org/abs/2401.12345", ""),  # ADS identifier tokens only.
+    (None, ""), ("", ""),
+])
+def test_ads_extracts_only_valid_identifier_tokens(identifier, expected):
+    assert ads_mod._extract_arxiv_id([identifier]) == expected
+
+
+@pytest.mark.parametrize("identifier,expected", [
+    *[(doi, "") for doi in _PUBLISHER_DOIS],
+    *_ADS_ARXIV_IDENTIFIERS,
+    ("arXiv:2413.12345", ""), ("", ""),
+])
+@responses.activate
+def test_ads_search_validates_source_arxiv_identities(monkeypatch, identifier, expected):
+    monkeypatch.setenv("ADS_API_TOKEN", "fake")
+    responses.get(ads_mod.API_URL, json={"response": {"docs": [{
+        "title": ["Identifier boundary"], "identifier": [identifier],
+        "bibcode": "2024ApJ...900....1A",
+    }]}})
+    # Observe the actual boundary so passing [""] cannot hide behind its cleanup.
+    captured = []
+    real_identity = ads_mod.source_identity
+
+    def capture(*args, **kwargs):
+        captured.append(kwargs["arxiv_ids"])
+        return real_identity(*args, **kwargs)
+
+    monkeypatch.setattr(ads_mod, "source_identity", capture)
+    paper = search_ads("test")[0]
+    assert paper["arxiv_id"] == expected
+    assert paper["source_identities"][0]["arxiv_ids"] == ([expected] if expected else [])
+    assert captured == [([expected] if expected else [])]
+
+
+@responses.activate
+def test_ads_retains_all_valid_arxiv_ids_and_skips_invalid_first(monkeypatch):
+    monkeypatch.setenv("ADS_API_TOKEN", "fake")
+    identifiers = [_PUBLISHER_DOIS[0], "arXiv:2413.12345", "arXiv:2401.12345v2",
+                   "oai:arxiv.org:math.GT/0309136", "10.48550/arXiv.2401.12345"]
+    responses.get(ads_mod.API_URL, json={"response": {"docs": [{
+        "title": ["Multiple identifiers"], "identifier": identifiers,
+    }]}})
+    paper = search_ads("test")[0]
+    assert paper["arxiv_id"] == "2401.12345"
+    assert paper["source_identities"][0]["arxiv_ids"] == ["2401.12345", "math.GT/0309136"]
+
+
+@responses.activate
+def test_ads_derives_arxiv_from_normalized_doi_field(monkeypatch):
+    monkeypatch.setenv("ADS_API_TOKEN", "fake")
+    responses.get(ads_mod.API_URL, json={"response": {"docs": [{
+        "title": ["DOI-only preprint"],
+        "doi": ["DOI: 10.48550/arXiv.math.GT/0309136 10.48550/arXiv.math.GT/0309136"],
+    }]}})
+    paper = search_ads("test")[0]
+    assert paper["doi"] == "10.48550/arXiv.math.GT/0309136"
+    assert paper["arxiv_id"] == "math.GT/0309136"
+    assert paper["source_identities"][0]["arxiv_ids"] == ["math.GT/0309136"]
+
+
+@pytest.mark.parametrize("fields,doi,arxiv", [
+    ({"doi": "DOI: 10.48550/arXiv.2401.12345v2"}, "10.48550/arXiv.2401.12345v2", "2401.12345"),
+    ({"downloadUrl": "https://arxiv.org/pdf/math.GT/0309136v2.pdf"}, "", "math.GT/0309136"),
+    ({"sourceFulltextUrls": ["https://arxiv.org/abs/astro-ph/0009009"]}, "", "astro-ph/0009009"),
+    ({"doi": "10.1109/RADECS.2011.61314xx", "arxivId": "2011.61314"},
+     "10.1109/RADECS.2011.61314xx", "2011.61314"),  # Valid supplied ID is independent evidence.
+    ({"doi": "10.1109/TNS.2025.3528764", "arxivId": "2025.35287"},
+     "10.1109/TNS.2025.3528764", ""),
+    ({"arxivId": "2413.12345"}, "", ""),
+    ({"arxivId": "arXiv:math.GT/0309136v2"}, "", "math.GT/0309136"),
+    ({"arxivId": "2413.12345", "doi": "10.48550/arXiv.2401.12345"},
+     "10.48550/arXiv.2401.12345", "2401.12345"),
+    ({"doi": "https://doi.org/10.1000/xyz 10.1000/xyz"}, "10.1000/xyz", ""),
+])
+@responses.activate
+def test_core_normalizes_external_identifiers(monkeypatch, fields, doi, arxiv):
+    monkeypatch.setenv("CORE_API_KEY", "fake")
+    responses.get("https://api.core.ac.uk/v3/search/works/",
+                  json={"results": [{"title": "CORE identifiers", **fields}]})
+    paper = search_core("test")[0]
+    assert paper["doi"] == doi
+    assert paper["arxiv_id"] == arxiv
+
+
+@responses.activate
+def test_arxiv_normalizes_wrapped_multitoken_doi():
+    body = _ATOM_RESPONSE.replace("<title>A Test Paper Title</title>",
+        "<title>A Test Paper Title</title>"
+        "<arxiv:doi>DOI: 10.1000/xyz 10.1000/xyz</arxiv:doi>")
+    responses.get("http://export.arxiv.org/api/query", body=body)
+    assert search_arxiv("test")[0]["doi"] == "10.1000/xyz"
+
+
+@responses.activate
+def test_semantic_scholar_normalizes_wrapped_multitoken_doi():
+    responses.get("https://api.semanticscholar.org/graph/v1/paper/search",
+                  json={"data": [{"title": "SS identifiers", "externalIds": {
+                      "DOI": "DOI: 10.1000/xyz 10.1000/xyz",
+                  }}]})
+    assert search_semantic_scholar("test")[0]["doi"] == "10.1000/xyz"

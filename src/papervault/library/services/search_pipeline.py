@@ -530,9 +530,8 @@ class SearchPipeline:
         trace.record("fusion", external_pool=len(external), local_pool=len(local))
         return FusedSearch(external, local, vouched, canonical_keys)
 
-    async def return_gate(self, query, plan, fused, llm, trace):
-        await self.progress(3, "judging new papers for ingest")
-        judgments, ingest_dropped = await self.judge_ingest(fused.external, llm=llm)
+    def _prepare_return_pool(self, plan, fused, judgments, trace):
+        """Run synchronous eligibility lookups and isolated previews off-loop."""
         eligible = []
         for idx, node in enumerate(fused.external):
             candidate = copy.deepcopy(node)
@@ -562,6 +561,14 @@ class SearchPipeline:
         external_keys = set(projections)
         pool = [n for n in fused.local if n["key"] not in external_keys] + external
         pool = [n for n in pool if plan.year_eligible(n)]
+        return pool, projections, registration
+
+    async def return_gate(self, query, plan, fused, llm, trace):
+        await self.progress(3, "judging new papers for ingest")
+        judgments, ingest_dropped = await self.judge_ingest(fused.external, llm=llm)
+        pool, projections, registration = await asyncio.to_thread(
+            self._prepare_return_pool, plan, fused, judgments, trace
+        )
         await self.progress(4, "scoring relevance")
         judgments, return_dropped = await self.judge_return(
             pool, query, search_terms=plan.terms, filters=plan.filters, llm=llm)
@@ -624,7 +631,7 @@ class SearchPipeline:
                     "reframe_hint": self.reframe_hint()}
         plan = self.plan(intent, trace, query=query)
         retrieved = await self.retrieval(plan, trace)
-        fused = self.fusion(plan, retrieved, trace)
+        fused = await asyncio.to_thread(self.fusion, plan, retrieved, trace)
         selection = await self.return_gate(query, plan, fused, llm, trace)
         results = await self.serving(selection, plan, trace)
         unconfigured, degraded = _derive_source_health(retrieved.degraded, len(plan.terms))

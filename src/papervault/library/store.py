@@ -195,20 +195,61 @@ def _title_similarity(a: str, b: str) -> float:
     return SequenceMatcher(None, na, nb).ratio()
 
 
+def _author_lastnames(names) -> set[str]:
+    out = set()
+    for name in names or ():
+        tokens = (name or "").strip().split()
+        if tokens:
+            out.add(tokens[-1].lower().strip(".,;"))
+    return out
+
+
 def _author_lastname_jaccard(authors_a: list[str], authors_b: list[str]) -> float:
     """Jaccard overlap on author last names. Tolerates name format
     variation between data sources (Crossref truncated, SS full)."""
-    def lastnames(names: list[str]) -> set[str]:
-        out = set()
-        for n in names or []:
-            toks = (n or "").strip().split()
-            if toks:
-                out.add(toks[-1].lower().strip(".,;"))
-        return out
-    a, b = lastnames(authors_a), lastnames(authors_b)
+    a, b = _author_lastnames(authors_a), _author_lastnames(authors_b)
     if not a or not b:
         return 0.0
     return len(a & b) / len(a | b)
+
+
+class _FieldLookup:
+    """Ordered token buckets, lazily reconciled against directly mutable Papers.
+
+    Raw-value inspection remains linear: callers may edit fields or the plain
+    _papers dict without notifying Library. Only changed values are normalized;
+    unchanged lookups reuse buckets instead of repeating expensive text work.
+    Buckets hold dictionary positions, never Paper objects or canonical keys, so
+    replacement, removal, reordering and alias precedence stay caller-owned.
+    """
+
+    def __init__(self):
+        self.raw = {}
+        self.tokens = {}
+        self.order = ()
+        self.buckets = {}
+
+    def matches(self, papers, field, tokenize, values):
+        raw = {
+            key: tuple(p.authors or ()) if field == "authors" else getattr(p, field)
+            for key, p in papers.items()
+        }
+        order = tuple(raw)
+        if raw != self.raw or order != self.order:
+            tokens, buckets = {}, {}
+            for position, (key, value) in enumerate(raw.items()):
+                tokens[key] = (
+                    self.tokens[key]
+                    if key in self.raw and value == self.raw[key]
+                    else tokenize(value)
+                )
+                for token in tokens[key]:
+                    buckets.setdefault(token, []).append(position)
+            self.raw, self.tokens, self.order, self.buckets = raw, tokens, order, buckets
+        positions = sorted(
+            {position for value in values for position in self.buckets.get(value, ())}
+        )
+        return [papers[self.order[position]] for position in positions]
 
 
 class Library:
@@ -267,6 +308,7 @@ class Library:
         self._by_doi: dict[str, str] = {}
         self._by_arxiv: dict[str, str] = {}
         self._by_title: dict[str, str] = {}
+        self._lookup_indexes: dict[str, _FieldLookup] = {}
         self._identity_reservations: set[tuple[str, str, str, object]] = set()
         # Save-cost controls (issue #34 root cause: per-item full-index writes starved
         # the event loop during boot sweeps). Debounce is safe because the boot
@@ -566,6 +608,15 @@ class Library:
         with self._merge_execution_lock:
             return self._find_current(doi=doi, arxiv_id=arxiv_id, title=title)
 
+    def _indexed_papers(self, field, tokenize, values):
+        # Both live lookups and off-thread previews may reconcile caches. Views
+        # own independent locks/indexes; support lazily constructed Libraries too.
+        with self._merge_execution_lock:
+            if not hasattr(self, "_lookup_indexes"):
+                self._lookup_indexes = {}
+            index = self._lookup_indexes.setdefault(field, _FieldLookup())
+            return index.matches(self._papers, field, tokenize, values)
+
     def _find_current(self, *, doi: str, arxiv_id: str, title: str) -> Optional[Paper]:
         for field, value, index, normalize in (
             ("doi", doi, self._by_doi, _normalize_doi),
@@ -581,8 +632,8 @@ class Library:
             reserved = paper is not None and not getattr(paper, field) and any(
                 claim[:3] == (field, normalized, paper.key) for claim in self._identity_reservations)
             if paper is None or (not reserved and normalize(getattr(paper, field)) != normalized):
-                paper = next((p for p in self._papers.values()
-                              if normalize(getattr(p, field)) == normalized), None)
+                matches = self._indexed_papers(field, lambda raw: (normalize(raw),), (normalized,))
+                paper = matches[0] if matches else None
                 if paper is None:
                     index.pop(normalized, None)
                     continue
@@ -1166,8 +1217,9 @@ class Library:
           ``llm=`` arg no caller passes, and ran a blocking sync LLM call on
           the event loop under the library write lock.)
 
-        The lookup is O(N) over the library. For 850 papers this is fine
-        (a few ms); if the library grows past 10K we'd want an index.
+        A reconciled author-lastname index limits candidate comparisons to rows
+        sharing a last name. Raw author values are checked for in-place edits;
+        identifiers, title, year and alias state are read live on those candidates.
         """
         new_doi = (paper_data.get("doi") or "").strip()
         new_arxiv = _normalize_arxiv(paper_data.get("arxiv_id") or "")
@@ -1183,7 +1235,10 @@ class Library:
         if has_doi == has_arxiv:  # both or neither
             return None
 
-        for cand in self._papers.values():
+        lastnames = _author_lastnames(new_authors)
+        if not lastnames:
+            return None
+        for cand in self._indexed_papers("authors", _author_lastnames, lastnames):
             if (merge_v2_enabled() or cand.merge_budget) and cand.acquisition_state.alias_key:
                 continue
             cand_doi = (cand.doi or "").strip()
@@ -1203,10 +1258,11 @@ class Library:
                 if abs(int(new_year) - int(cand.year)) > 2:
                     continue
 
+            if _author_lastname_jaccard(new_authors, cand.authors or []) < 0.7:
+                continue
             title_sim = _title_similarity(new_title, cand.title or "")
-            author_jac = _author_lastname_jaccard(new_authors, cand.authors or [])
 
-            if title_sim >= 0.85 and author_jac >= 0.7:
+            if title_sim >= 0.85:
                 return cand  # high-confidence auto-merge
             # else: below the auto-merge bar → conservatively skip (a
             # false-positive merge is data loss; a residual duplicate is safer).

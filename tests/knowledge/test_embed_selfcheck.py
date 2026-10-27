@@ -33,6 +33,7 @@ def _clean_env_and_task(monkeypatch):
     `start_background` early-returns if `_bg_task is not None`, so a task leaked from a prior
     test would mask the behaviour under test — reset it before, and cancel/clear after.
     """
+    monkeypatch.setattr(server, "_query_stopping", False)
     for var in (
         "KS_AUTO_INGEST_ENABLED",
         "KS_AUTO_INGEST_INTERVAL_SEC",

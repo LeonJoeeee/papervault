@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from papervault.store import knowledge_runtime
 
+import asyncio
 import hashlib
 import logging
 import re
@@ -310,6 +311,20 @@ async def record_duplicate(ingest_source: str, source_id: str, own_doc_id: str,
                         duplicate_of=twin_doc_id, duplicate_content_hash=content_hash)
 
 
+def _prepare_text(rec: PaperRecord, want_abstract: bool) -> tuple[str | None, str | None]:
+    """Read, clean and hash in a worker while preserving module-local reader injection."""
+    if want_abstract:
+        cleaned = build_abstract_doc(rec)
+        if not cleaned:
+            return None, None
+    else:
+        text = read_extract_raw(rec)
+        if not text or not text.strip():
+            return None, None
+        cleaned = clean(text)
+    return cleaned, _dedup_key(cleaned)
+
+
 async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
     """items = [(rec, fp)]. 两段式:批量 enqueue → 单次 process(§6.1)。"""
     knowledge_runtime.assert_knowledge_authority("legacy")
@@ -359,30 +374,21 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
             counters["replaced"] += 1
             log.info("distill_batch: %s replaced its %s doc (#144)", rec.key,
                      "full-text" if want_abstract else "abstract-only")
-        if want_abstract:
-            # One doc from title/authors/year/venue/ids/abstract; no extract, nothing to clean().
-            cleaned = build_abstract_doc(rec)
-            if not cleaned:
-                # The abstract vanished since fingerprint() ran → plain metadata state.
-                await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
-                counters["meta"] += 1
-                continue
-        else:
-            text = read_extract_raw(rec)
-            if not text or not text.strip():
-                # 路径有但文件缺/空 → 当元数据态(待全文就绪)
-                await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
-                counters["no_text"] += 1
-                continue
-            cleaned = clean(text)
-        dk = _dedup_key(cleaned)
+        cleaned, dk = await asyncio.to_thread(_prepare_text, rec, want_abstract)
+        if cleaned is None:
+            # The abstract or extract vanished since fingerprinting; retain metadata state.
+            await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
+            counters["meta" if want_abstract else "no_text"] += 1
+            continue
         if dk in seen_clean:
             # F16: 与本批先到的一篇正文(sanitize 后)字节相同 → LightRAG enqueue 会静默丢这个 doc_id。
             # 不留 processing(否则永卡):标 done_meta(dup),指向同内容已入队那篇。
             # ★指纹写 *真实 fp*(不是 META):本篇有全文,fingerprint(rec) 下轮恒返真实 hash;
             #   若这里写 META,下轮 diff(fp != META)会判 to_redistill 永久 churn(SDD §6.1 line 221 口径)。
+            content_hash = await asyncio.to_thread(
+                lambda: compute_text_content_hash(sanitize_text_for_encoding(cleaned)))
             await record_duplicate("paper", rec.key, doc_id(rec.key), doc_id(seen_clean[dk]),
-                                   compute_text_content_hash(sanitize_text_for_encoding(cleaned)), fp)
+                                   content_hash, fp)
             counters["dup"] += 1
             log.info("distill_batch: content-dup %s == %s → done_meta(dup)", rec.key, seen_clean[dk])
             continue

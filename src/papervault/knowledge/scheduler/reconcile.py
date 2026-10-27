@@ -34,6 +34,7 @@ writes it back `done` before this diff runs.)
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Mapping, Optional
 
@@ -98,6 +99,13 @@ def diff(
     return d
 
 
+def _source_content_hash(rec) -> str | None:
+    """Prepare fallback evidence in a worker, retaining this module's reader hooks."""
+    raw = read_extract_raw(rec)
+    text = clean(raw) if raw and raw.strip() else build_abstract_doc(rec)
+    return compute_text_content_hash(sanitize_text_for_encoding(text)) if text else None
+
+
 async def reconcile_library(rag, idx: Mapping, *, only_keys=None) -> dict:
     """Re-open terminal papers with available content but no graph doc; adopt content twins.
 
@@ -127,8 +135,8 @@ async def reconcile_library(rag, idx: Mapping, *, only_keys=None) -> dict:
             return st["content_hash"]
         doc = await rag.full_docs.get_by_id(did)
         if isinstance(doc, dict) and doc.get("content"):
-            return compute_text_content_hash(strip_lightrag_doc_prefix(
-                doc["content"], doc.get("parse_format")))
+            return await asyncio.to_thread(lambda: compute_text_content_hash(
+                strip_lightrag_doc_prefix(doc["content"], doc.get("parse_format"))))
         return None
 
     async def clear_rejection(r, own):
@@ -177,11 +185,7 @@ async def reconcile_library(rag, idx: Mapping, *, only_keys=None) -> dict:
             # rejection is no longer proof of representation after that twin is rebuilt.
             rejected_hash = marker.get("content_hash")
             if not rejected_hash and r.ingest_source == "paper" and r.source_id in idx:
-                rec = idx[r.source_id]
-                raw = read_extract_raw(rec)
-                text = clean(raw) if raw and raw.strip() else build_abstract_doc(rec)
-                if text:
-                    rejected_hash = compute_text_content_hash(sanitize_text_for_encoding(text))
+                rejected_hash = await asyncio.to_thread(_source_content_hash, idx[r.source_id])
             same_fingerprint = any(t.doc_id == original for t in twins.get(r.fingerprint, []))
             if ((rejected_hash and rejected_hash == await twin_hash(original)) or
                     (not rejected_hash and same_fingerprint)):
@@ -201,7 +205,7 @@ async def reconcile_library(rag, idx: Mapping, *, only_keys=None) -> dict:
             continue
         if r.status not in ("done", "done_meta", "done_abstract", "error_parked") or r.attempts != 0:
             continue
-        fp = fingerprint(idx[r.source_id])
+        fp = await asyncio.to_thread(fingerprint, idx[r.source_id])
         if fp != META:
             # Queue directly without deleting a nonexistent doc or counting a failure.
             # distill_batch persists processing only when this round can actually build.

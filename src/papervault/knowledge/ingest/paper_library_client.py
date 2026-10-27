@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Optional
@@ -189,7 +189,18 @@ def load_vault_index(
     Version-checks the index so a paper-library export-format change is loud (a
     warning) rather than silently mapping every field to its default.
     """
-    index_file = vault_path / "index.json"
+    index_file = (vault_path / "index.json").resolve()
+    stat = index_file.stat()
+    cached = _load_vault_index(str(index_file), stat.st_mtime_ns, stat.st_size,
+                               bool(include_quarantined))
+    return {key: replace(rec) for key, rec in cached.items()}
+
+
+@lru_cache(maxsize=4)
+def _load_vault_index(
+    index_file: str, mtime_ns: int, size: int, include_quarantined: bool,
+) -> dict[str, PaperRecord]:
+    """Keep a bounded set of parsed snapshots, including their eligibility decisions."""
     with open(index_file) as f:
         index = json.load(f)
     version = index.get("version")

@@ -28,11 +28,17 @@ def load_clean_index(vault_path: Path = DEFAULT_VAULT) -> dict[str, PaperRecord]
     return load_vault_index(vault_path)
 
 
-def read_extract_raw(rec: PaperRecord, vault_path: Path = DEFAULT_VAULT) -> Optional[str]:
-    """RAW md|txt 全文(md 优先);两者皆无/缺文件 → None。供 fingerprint 用,不剥引用。"""
+def extract_path(rec: PaperRecord, vault_path: Path = DEFAULT_VAULT) -> Optional[Path]:
+    """Select the existing, vault-contained extract, preferring markdown."""
     for rel in (rec.md_path, rec.txt_path):
         if rel:
             full = resolve_extract_path(vault_path, rel)
             if full.exists():
-                return full.read_text(encoding="utf-8", errors="replace")
+                return full
     return None
+
+
+def read_extract_raw(rec: PaperRecord, vault_path: Path = DEFAULT_VAULT) -> Optional[str]:
+    """RAW md|txt 全文(md 优先);两者皆无/缺文件 → None。供 fingerprint 用,不剥引用。"""
+    full = extract_path(rec, vault_path)
+    return full.read_text(encoding="utf-8", errors="replace") if full is not None else None

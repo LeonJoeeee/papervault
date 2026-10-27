@@ -7,6 +7,9 @@ delete-then-insert ordering (§6.6), terminal writeback mapping (F9/F10) + stuck
 """
 from __future__ import annotations
 
+import asyncio
+import threading
+
 import pytest
 
 import papervault.knowledge.ingest.distill as distill
@@ -182,6 +185,87 @@ def fake_ledger(monkeypatch):
 
 def _rec(key: str) -> PaperRecord:
     return PaperRecord(key=key, md_path=f"extracts/md/{key}.md")
+
+
+@pytest.fixture
+def off_loop_probe():
+    """A synchronous stage must let the serving loop release its worker barrier."""
+    def observe(fn):
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        calls = []
+
+        def checked(*args, **kwargs):
+            assert threading.get_ident() != loop_thread, "synchronous stage ran on the event loop"
+            released = threading.Event()
+            loop.call_soon_threadsafe(released.set)
+            assert released.wait(5), "event loop could not run while the worker was waiting"
+            calls.append(True)
+            return fn(*args, **kwargs)
+
+        return checked, calls
+    return observe
+
+
+@pytest.mark.parametrize("stage", ["load_clean_index", "diff", "fingerprint"])
+async def test_round_preparation_runs_off_loop(fake_ledger, monkeypatch, off_loop_probe, stage):
+    idx = {"A": _rec("A"), "outside": _rec("outside")}
+    fake_ledger.rows["A"] = LedgerRecord("l0_probe", "paper", "A", "fp", "paper:A", "done")
+    monkeypatch.setattr(rnd, "load_clean_index", lambda: idx)
+    monkeypatch.setattr(rnd, "fingerprint", lambda rec: "fp")
+    checked, calls = off_loop_probe(getattr(rnd, stage))
+    monkeypatch.setattr(rnd, stage, checked)
+    rag = FakeRag(doc_statuses={"paper:A": "processed"})
+    result = await rnd.run_round(rag, only_keys={"A"})
+    assert calls
+    assert result["to_distill"] == result["to_redistill"] == result["to_remove"] == 0
+    assert set(fake_ledger.rows) == {"A"}
+
+
+@pytest.mark.parametrize("stage", ["read_extract_raw", "clean", "_dedup_key",
+                                   "sanitize_text_for_encoding", "compute_text_content_hash"])
+async def test_distill_preparation_runs_off_loop(fake_ledger, monkeypatch, off_loop_probe, stage):
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec: "Shared body.\n\n# References\nCitation.")
+    checked, calls = off_loop_probe(getattr(distill, stage))
+    monkeypatch.setattr(distill, stage, checked)
+    result = await distill.distill_batch(FakeRag(), [(_rec("A"), "fpA"), (_rec("B"), "fpB")])
+    assert calls
+    assert result["queued"] == 1 and result["dup"] == 1
+    assert fake_ledger.rows["A"].status == "processing"
+    duplicate = fake_ledger.rows["B"]
+    assert duplicate.status == "done_meta" and duplicate.duplicate_of == "paper:A"
+    assert duplicate.fingerprint == "fpB" and duplicate.duplicate_content_hash
+
+
+@pytest.mark.parametrize("stage", ["read_extract_raw", "clean", "sanitize_text_for_encoding",
+                                   "compute_text_content_hash"])
+async def test_reconcile_fallback_preparation_runs_off_loop(
+    fake_ledger, monkeypatch, off_loop_probe, stage,
+):
+    from papervault.knowledge.scheduler import reconcile
+
+    fake_ledger.rows["B"] = LedgerRecord("l0_probe", "paper", "B", "old-fp", "paper:B", "error")
+    marker = _marker("B", "paper:A")
+    marker["metadata"]["duplicate_kind"] = "content_hash"
+    rag = FakeRag(doc_statuses={"paper:A": "processed"}, markers={"dup-B": marker},
+                  full_docs_ids={"paper:A"})
+    rag.contents["paper:A"] = "Shared body."
+    monkeypatch.setattr(reconcile, "read_extract_raw", lambda rec: "Shared body.")
+    checked, calls = off_loop_probe(getattr(reconcile, stage))
+    monkeypatch.setattr(reconcile, stage, checked)
+    result = await reconcile.reconcile_library(rag, {"B": _rec("B")})
+    assert calls and result["duplicates"] == 1
+    assert fake_ledger.rows["B"].duplicate_of == "paper:A"
+
+
+async def test_reconcile_fingerprint_runs_off_loop(fake_ledger, monkeypatch, off_loop_probe):
+    from papervault.knowledge.scheduler import reconcile
+
+    fake_ledger.rows["A"] = LedgerRecord("l0_probe", "paper", "A", "META", "paper:A", "done_meta")
+    checked, calls = off_loop_probe(lambda rec: "new-fingerprint")
+    monkeypatch.setattr(reconcile, "fingerprint", checked)
+    result = await reconcile.reconcile_library(FakeRag(), {"A": _rec("A")})
+    assert calls and result["to_distill"] == [("A", "new-fingerprint")]
 
 
 # ---------------------------------------------------------------- distill_batch

@@ -213,7 +213,7 @@ async def run_round(
     knowledge_runtime.assert_knowledge_authority("legacy")
     only = set(only_keys) if only_keys is not None else None
 
-    idx = load_clean_index()
+    idx = await asyncio.to_thread(load_clean_index)
     library = await reconcile_library(rag, idx, only_keys=only)
 
     # 阶段0(b):先收口上一轮/重启遗留的 processing(subset 时只扫 subset 行)。
@@ -232,7 +232,7 @@ async def run_round(
 
     # 阶段1:纯 KS diff(含 status 维度,error 行重投)。subset 时 idx+led 都先裁到 only。
     led = await ledger.load(PAPER)
-    d: Diff = diff(idx, led, fp_of=fingerprint, only_keys=only)
+    d: Diff = await asyncio.to_thread(diff, idx, led, fp_of=fingerprint, only_keys=only)
     reopened = {k for k, _ in library["to_distill"]}
     d.to_redistill = [(k, fp) for k, fp in d.to_redistill if k not in reopened]
     d.to_distill.extend(library["to_distill"])

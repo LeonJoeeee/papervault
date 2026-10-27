@@ -36,9 +36,12 @@ import asyncio
 import logging
 import math
 import os
+import re
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from typing import Any, AsyncIterator, Optional
+from uuid import uuid4
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -239,6 +242,10 @@ async def start_background() -> None:
     """
     knowledge_runtime.knowledge_jobs_mode()  # Validate the local selector without database I/O.
     global _startup_task
+    # Also called per HTTP session: it must never reopen serving while shutdown
+    # is draining its fixed task snapshot. A restarted process gets fresh state.
+    if _query_stopping:
+        return
     if _bg_task is not None or _startup_task is not None:
         return
     if _authority_task is not None and (not _auto_ingest_enabled() or
@@ -272,8 +279,15 @@ async def start_background() -> None:
 
 async def stop_background() -> None:
     """Graceful SERVER-shutdown cleanup (called once from the app-lifespan shutdown, NOT per session):
-    cancel the scheduler + close the graph/pool."""
-    global _bg_task, _startup_task, _embed_probe_task
+    drain retained queries, cancel the scheduler + close the graph/pool."""
+    global _bg_task, _startup_task, _embed_probe_task, _query_stopping
+    _query_stopping = True
+    queries = [entry.task for entry in _queries_by_id.values()]
+    for task in queries:
+        task.cancel()
+    await asyncio.gather(*queries, return_exceptions=True)
+    _queries_by_id.clear()
+    _queries_by_intent.clear()
     if _startup_task is not None:
         startup = _startup_task
         startup.cancel()
@@ -344,6 +358,89 @@ Design: docs/architecture.md.
 # notification every ~45s resets the client's idle timer. Interval env-tunable
 # (KS_PROGRESS_HEARTBEAT_S; <=0 disables).
 _HEARTBEAT_INTERVAL_S = float(os.getenv("KS_PROGRESS_HEARTBEAT_S", "45"))
+
+
+@dataclass
+class _QueryEntry:
+    query_id: str
+    intent: str
+    task: asyncio.Task
+    started_at: float
+    completed_at: float | None = None
+
+
+# Process-local, single-serving-loop state. Active work is never evicted: when
+# every slot is active, new questions get a busy answer. Completed detached work
+# expires lazily after retention or earlier if capacity is needed for new work.
+_QUERY_CAPACITY = 128
+_queries_by_id: dict[str, _QueryEntry] = {}
+_queries_by_intent: dict[str, _QueryEntry] = {}
+_query_stopping = False
+
+
+def _query_setting(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+        if not math.isfinite(value):
+            raise ValueError("query setting must be finite")
+        return value
+    except ValueError:
+        log.warning("Invalid %s; using default %ss", name, default)
+        return default
+
+
+def _forget_query(entry: _QueryEntry) -> None:
+    if _queries_by_id.get(entry.query_id) is entry:
+        _queries_by_id.pop(entry.query_id)
+    if _queries_by_intent.get(entry.intent) is entry:
+        _queries_by_intent.pop(entry.intent)
+
+
+def _find_query(intent: str) -> _QueryEntry | None:
+    """Shared with admission: resume/collect calls need no new executing permit."""
+    now = time.monotonic()
+    retention = max(0.0, _query_setting("KS_MCP_QUERY_RETENTION_S", 900.0))
+    for entry in list(_queries_by_id.values()):
+        if entry.completed_at is not None and now - entry.completed_at >= retention:
+            _forget_query(entry)
+    key = intent.strip()
+    return _queries_by_id.get(key) or _queries_by_intent.get(key)
+
+
+def _query_finished(entry: _QueryEntry) -> None:
+    entry.completed_at = time.monotonic()
+    if not entry.task.cancelled():
+        entry.task.exception()  # Detached failures are delivered on collection.
+
+
+async def _execute_query(intent: str) -> dict[str, Any]:
+    from papervault.knowledge.query.aquery import query as _query
+
+    await _ensure_knowledge_authority()
+    result = await _query(intent=intent)
+    receipt = result.get("query_receipt")
+    if receipt is not None:
+        log.info("query_receipt %s", receipt, extra={"query_receipt": receipt})
+    return result
+
+
+def _new_query(intent: str) -> _QueryEntry | None:
+    from papervault.mcp.admission import _retain_query_task
+
+    if len(_queries_by_id) >= _QUERY_CAPACITY:
+        completed = [entry for entry in _queries_by_id.values() if entry.task.done()]
+        if not completed:
+            return None
+        _forget_query(min(completed, key=lambda entry: entry.completed_at or entry.started_at))
+    query_id = f"q-{uuid4().hex[:12]}"
+    task = asyncio.create_task(_execute_query(intent), name=f"ks-query-{query_id}")
+    entry = _QueryEntry(query_id, intent, task, time.monotonic())
+    # Register synchronously before any await, so concurrent normalized intents
+    # cannot dispatch duplicate retrieval/synthesis work on the serving loop.
+    _queries_by_id[query_id] = _queries_by_intent[intent] = entry
+    task.add_done_callback(lambda _: _query_finished(entry))
+    _retain_query_task(task)
+    return entry
 
 
 async def _progress_heartbeat(ctx: Context, stop: asyncio.Event) -> None:
@@ -434,33 +531,79 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     paper-library `search_papers` for fresher external literature.
 
     Latency: minutes, not seconds — p50 ~4 min under load (p90 ~7 min); plan other
-    work around the call. When the service is saturated the call returns a
+    work around the call. After KS_MCP_QUERY_WAIT_S (default 150 seconds), unfinished
+    work returns {"status": "running", "query_id": "q-...", "retry_after_s": 5, ...}.
+    Call query again with the SAME intent or intent="<query_id>" to collect the
+    answer without restarting work. Detached results are retained for
+    KS_MCP_QUERY_RETENTION_S (default 900 seconds) after completion, subject to
+    bounded capacity. KS_MCP_QUERY_WAIT_S <= 0 waits until completion.
+    When the service is saturated the call returns a
     normal result {"status": "busy", "busy": true, "retry_after_s": N, ...}
     instead of an answer: nothing is wrong — wait retry_after_s seconds, then
     retry, rather than treating papervault as down or retrying at once.
     """
-    if ctx:
-        await ctx.info(f"query intent={intent!r}")
+    if _query_stopping:
+        return {"status": "busy", "busy": True, "retry_after_s": 5,
+                "reason": "Knowledge server is shutting down; retry after restart."}
+    entry = _find_query(intent)
+    if entry is None:
+        intent = intent.strip()
+        if re.fullmatch(r"q-[0-9a-f]{12}", intent):
+            return {"status": "not_found", "query_id": intent,
+                    "reason": "Query expired or server restarted; resubmit the original intent."}
+        entry = _new_query(intent)
+        if entry is None:
+            return {"status": "busy", "busy": True, "retry_after_s": 5,
+                    "reason": "Query registry is at capacity; retry after running work finishes."}
 
-    from papervault.knowledge.query.aquery import query as _query
+    return await _wait_query(entry, ctx)
 
-    # S17: heartbeat keeps idle-timeout clients alive for the multi-minute pipeline.
+
+async def _wait_query(entry: _QueryEntry, ctx: Optional[Context] = None) -> dict[str, Any]:
+    """Wait on an already selected entry, including admission's atomic resumes."""
+    # Heartbeats belong to this waiter, never to the detached execution: a lost
+    # request must not keep trying to notify a dead session in the background.
     stop = asyncio.Event()
     heartbeat = asyncio.create_task(_progress_heartbeat(ctx, stop)) if ctx else None
+    collected = False
     try:
-        await _ensure_knowledge_authority()
-        result = await _query(intent=intent)
-        receipt = result.get("query_receipt")
-        if receipt is not None:
-            log.info("query_receipt %s", receipt, extra={"query_receipt": receipt})
+        if ctx:
+            try:
+                await ctx.info(f"query intent={entry.intent!r}")
+            except Exception:
+                log.debug("query log notification failed; execution remains collectable", exc_info=True)
+        wait = _query_setting("KS_MCP_QUERY_WAIT_S", 150.0)
+        if wait <= 0:
+            result = await asyncio.shield(entry.task)
+        else:
+            try:
+                result = await asyncio.wait_for(asyncio.shield(entry.task), timeout=wait)
+            except asyncio.TimeoutError:
+                if entry.task.done():
+                    result = entry.task.result()  # Includes an underlying TimeoutError.
+                else:
+                    return {"status": "running", "running": True, "query_id": entry.query_id,
+                            "elapsed_s": int(time.monotonic() - entry.started_at), "retry_after_s": 5,
+                            "reason": f'Query continues in the background. Call query with the same intent '
+                                      f'or intent="{entry.query_id}" to collect the answer.'}
+        collected = True
         return result
+    except asyncio.CancelledError:
+        # Shutdown owns cancellation/drain; a disconnected caller only stops its
+        # own wait. The registered task and its execution permit remain alive.
+        raise
+    except Exception:
+        collected = entry.task.done()
+        raise
     finally:
         if heartbeat is not None:
             stop.set()
-            try:
-                await asyncio.wait_for(heartbeat, timeout=10)
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 — CancelledError is BaseException
-                heartbeat.cancel()
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        # No await may follow consumption: cancellation during notification
+        # teardown must leave even a completed answer available for resume.
+        if collected:
+            _forget_query(entry)
 
 
 # NOTE: propose_ideas / idea-engine is SDD §1/§3/§5.4【defer】 — confirmed要、不进 v1

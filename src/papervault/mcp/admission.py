@@ -27,6 +27,11 @@ its own session frees a slot, so the session never holds more than its cap of
 executing calls. (The cap is shared by both heavy tools while the depth is
 per-tool, so a slot a ``search_papers`` call frees may start a queued ``query``.)
 
+Resumable knowledge queries transfer their session permit, executing depth and
+service timer to the underlying task. A soft return or client disconnect does
+not release capacity. Resumes attach to the existing task before either layer,
+and only actual task completion releases the permit and records one duration.
+
 An LLM caller reschedules itself well on such an answer; an opaque 20-minute
 stall it handles badly. The rolling average is fed by real completions (last
 20 per tool, seeded conservatively before data exists).
@@ -44,6 +49,7 @@ import logging
 import os
 import time
 from collections import deque
+from contextvars import ContextVar
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -64,6 +70,23 @@ _session_sems: dict[int, asyncio.Semaphore] = {}
 _session_active: dict[int, int] = {}             # tasks inside the wrapper per session key
 _depth: dict[str, int] = {}                      # per-tool EXECUTING (queued excluded, #99)
 _recent: dict[str, deque] = {}                   # per-tool completed durations
+_query_task_hook: ContextVar[Any] = ContextVar("query_task_hook", default=None)
+
+
+def _retain_query_task(task: asyncio.Task) -> None:
+    """Transfer the current admission lease to a newly registered query task."""
+    hook = _query_task_hook.get()
+    if hook is not None:
+        hook(task)
+
+
+def _leave_session(skey: int) -> None:
+    n = _session_active.get(skey, 1) - 1
+    if n <= 0:
+        _session_active.pop(skey, None)
+        _session_sems.pop(skey, None)
+    else:
+        _session_active[skey] = n
 
 
 def _session_key(kwargs: dict[str, Any]) -> int:
@@ -105,7 +128,14 @@ def _busy_answer(tool: str, depth: int, expected_wait_s: float) -> dict[str, Any
 
 
 def _wrap(name: str, fn):
+    # Only the knowledge tool implements task retention; ordinary heavy tools
+    # keep their existing caller-lifetime cancellation and queueing behavior.
+    from papervault.knowledge.mcp import server as knowledge
+    resumable = name == "query" and fn is knowledge.query
+
     async def admitted(**kwargs):
+        if resumable and (entry := knowledge._find_query(kwargs["intent"])) is not None:
+            return await knowledge._wait_query(entry, kwargs.get("ctx"))
         skey = _session_key(kwargs)
         # A session already at its cap queues this call behind ITSELF (layer 1): it
         # adds nothing to the executing depth, so layer 2 does not judge it (#137).
@@ -120,29 +150,50 @@ def _wrap(name: str, fn):
                 return _busy_answer(name, depth, projected)
         _session_active[skey] = _session_active.get(skey, 0) + 1
         t_enter = time.monotonic()
+        sem = _session_sems.setdefault(skey, asyncio.Semaphore(_SESSION_INFLIGHT))
+        acquired = executing = transferred = False
+
+        def release():
+            if executing:
+                _depth[name] = _depth.get(name, 1) - 1
+            if acquired:
+                sem.release()
+            _leave_session(skey)
+
+        def transfer(task):
+            nonlocal transferred
+            transferred = True
+            def finished(_):
+                _record(name, time.monotonic() - t0)
+                release()
+            task.add_done_callback(finished)
+
         try:
-            sem = _session_sems.setdefault(skey, asyncio.Semaphore(_SESSION_INFLIGHT))
-            async with sem:
-                waited = time.monotonic() - t_enter
-                if waited > 1.0:
-                    log.info("ADMISSION wait tool=%s waited=%.0fs (session cap)", name, waited)
-                _depth[name] = _depth.get(name, 0) + 1
-                try:
-                    t0 = time.monotonic()
-                    result = await fn(**kwargs)
+            await sem.acquire()
+            acquired = True
+            # An identical query may have started while this call queued behind
+            # its session. Attach without counting another execution or permit.
+            if resumable and (entry := knowledge._find_query(kwargs["intent"])) is not None:
+                release()
+                transferred = True  # Already released; the finally owns nothing.
+                return await knowledge._wait_query(entry, kwargs.get("ctx"))
+            waited = time.monotonic() - t_enter
+            if waited > 1.0:
+                log.info("ADMISSION wait tool=%s waited=%.0fs (session cap)", name, waited)
+            _depth[name] = _depth.get(name, 0) + 1
+            executing = True
+            t0 = time.monotonic()
+            token = _query_task_hook.set(transfer if resumable else None)
+            try:
+                result = await fn(**kwargs)
+                if not transferred and not resumable:
                     _record(name, time.monotonic() - t0)
-                    return result
-                finally:
-                    _depth[name] = _depth.get(name, 1) - 1
+                return result
+            finally:
+                _query_task_hook.reset(token)
         finally:
-            # Evict the session's semaphore once NOTHING (holder or waiter) references
-            # its key — long-lived servers must not accumulate one entry per dead session.
-            n = _session_active.get(skey, 1) - 1
-            if n <= 0:
-                _session_active.pop(skey, None)
-                _session_sems.pop(skey, None)
-            else:
-                _session_active[skey] = n
+            if not transferred:
+                release()
 
     return admitted
 

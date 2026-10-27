@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+from functools import lru_cache
+from pathlib import Path
 
 from papervault.knowledge.ingest.abstract_doc import (
     abstract_docs_enabled,
@@ -25,10 +27,11 @@ from papervault.knowledge.ingest.abstract_doc import (
     build_abstract_doc,
 )
 from papervault.knowledge.ingest.paper_library_client import PaperRecord
-from papervault.knowledge.ingest.vault import read_extract_raw
+from papervault.knowledge.ingest.vault import extract_path, read_extract_raw
 
 META = "META"
 _WS = re.compile(r"\s+")
+_DEFAULT_READ_EXTRACT_RAW = read_extract_raw
 
 
 def _normalize(text: str) -> str:
@@ -50,10 +53,27 @@ def _metadata_state_fp(rec: PaperRecord) -> str:
     return META
 
 
+def _text_fingerprint(text: str | None) -> str | None:
+    normalized = _normalize(text) if text else ""
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest() if normalized else None
+
+
+@lru_cache(maxsize=65536)
+def _extract_fingerprint(path: str, mtime_ns: int, size: int) -> str | None:
+    """Cache only extract content; empty files still use the record's current metadata."""
+    return _text_fingerprint(Path(path).read_text(encoding="utf-8", errors="replace"))
+
+
 def fingerprint(rec: PaperRecord) -> str:
     if is_metadata_only(rec):
         return _metadata_state_fp(rec)
-    text = read_extract_raw(rec)
-    if not text or not text.strip():
-        return _metadata_state_fp(rec)  # 路径有但文件缺/空 → 当元数据态(待全文就绪)
-    return hashlib.sha256(_normalize(text).encode("utf-8")).hexdigest()
+    if read_extract_raw is _DEFAULT_READ_EXTRACT_RAW:
+        path = extract_path(rec)
+        if path is None:
+            return _metadata_state_fp(rec)
+        stat = path.stat()
+        digest = _extract_fingerprint(str(path), stat.st_mtime_ns, stat.st_size)
+    else:
+        # Injected readers may supply text without a file or change it independently of stat.
+        digest = _text_fingerprint(read_extract_raw(rec))
+    return digest if digest is not None else _metadata_state_fp(rec)

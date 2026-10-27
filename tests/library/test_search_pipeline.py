@@ -121,6 +121,56 @@ async def test_retrieval_runs_kg_off_loop_against_the_local_snapshot(tmp_path, m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["all_papers", "model_copy", "_view"])
+async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypatch, stage):
+    import asyncio
+    import threading
+    from papervault.library.services import search_pipeline as pipeline
+    from papervault.library.services.registration import ServingTrace
+
+    lib = Library(tmp_path)
+    paper = add_record(lib, **node("Local", "Original detector measurements"))
+    loop = asyncio.get_running_loop()
+    loop_thread = threading.get_ident()
+    owner = {"all_papers": Library, "model_copy": Paper, "_view": pipeline}[stage]
+    original = getattr(owner, stage)
+    calls = []
+
+    def checked(*args, **kwargs):
+        assert threading.get_ident() != loop_thread, "snapshot preparation ran on the event loop"
+        released = threading.Event()
+        loop.call_soon_threadsafe(released.set)
+        assert released.wait(5), "event loop could not run while snapshot worker was waiting"
+        calls.append(kwargs)
+        return original(*args, **kwargs)
+
+    async def external(*args, **kwargs):
+        paper.authors.append("Changed during retrieval")
+        return [], {}
+
+    async def progress(*args):
+        pass
+
+    def kg_search(query, plan, view, **kwargs):
+        assert view.get("Local").authors == ["Tester, A."]
+        view.get("Local").authors.append("View-only change")
+        return ["Local"]
+
+    monkeypatch.setattr(owner, stage, checked)
+    monkeypatch.setattr(pipeline, "kg_local_search", kg_search)
+    searcher = pipeline.SearchPipeline(lib, None, None, None, external, None, None,
+                                       None, None, progress)
+    plan = pipeline.PlannedSearch({}, ["detector measurements"], {}, 10, "by_relevance")
+    result = await searcher.retrieval(plan, ServingTrace(lib))
+    assert calls
+    if stage == "model_copy":
+        assert all(call.get("deep") is True for call in calls)
+    assert result.local[0].authors == ["Tester, A."]
+    assert paper.authors == ["Tester, A.", "Changed during retrieval"]
+    assert result.kg_ranks == ["Local"]
+
+
+@pytest.mark.asyncio
 async def test_pipeline_lets_intent_parser_select_its_own_role(tmp_path):
     from papervault.library.services.search_pipeline import SearchPipeline
 

@@ -177,7 +177,7 @@ def test_fusion_excludes_legacy_garbage_from_all_candidate_pools(tmp_path, field
     assert lib.find(doi=paper.doi) is paper
 
 
-@pytest.mark.parametrize("match", ["arxiv", "title", "alias"])
+@pytest.mark.parametrize("match", ["arxiv", "title", "alias", "alias_chain", "preprint"])
 def test_fusion_blocks_secondary_matches_to_excluded_canonical_records(tmp_path, match):
     from papervault.library.state_v2 import Merge, TerminalState
 
@@ -188,14 +188,324 @@ def test_fusion_blocks_secondary_matches_to_excluded_canonical_records(tmp_path,
         incoming.update(doi="", arxiv_id=paper.arxiv_id, title="A different source title")
     elif match == "title":
         incoming.update(doi="", arxiv_id="")
+    elif match == "preprint":
+        paper.doi = ""
+        incoming["title"] += " revised"
     else:
         alias = add_record(lib, **node("Alias", "Other detector measurements"))
         alias.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key=paper.key, quarantine=True)
         incoming = node("Alias", alias.title)
+        if match == "alias_chain":
+            middle = add_record(lib, **node("Middle", "Intermediate detector measurements"))
+            middle.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key=paper.key)
+            alias.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key=middle.key)
+            alias.arxiv_id = "2402.54321v2"
+            incoming.update(doi="", arxiv_id=alias.arxiv_id, title="Changed source title")
     fused = fuse_library(lib, [incoming])
     assert fused.external == []
     assert fused.vouched == []
     assert all(n["key"] != paper.key for n in fused.local)
+
+
+@pytest.mark.parametrize("catalog_size", [0, 200])
+def test_fusion_full_snapshot_skips_unrelated_author_comparisons(
+    tmp_path, monkeypatch, catalog_size
+):
+    from papervault.library import store
+
+    lib = Library(tmp_path)
+    for i in range(catalog_size):
+        add_record(
+            lib,
+            key=f"Allowed{i}",
+            title=f"Unrelated observations {i}",
+            arxiv_id=f"2401.{i:05}",
+            authors=[f"Other Family{i}"],
+        )
+    add_record(
+        lib,
+        key="Blocked",
+        title="Excluded observations",
+        arxiv_id="2402.12345",
+        domain_status="off_domain",
+        authors=["Alice Smith"],
+    )
+    comparisons = []
+    original = store._author_lastname_jaccard
+
+    def observe(left, right):
+        comparisons.append(right)
+        return original(left, right)
+
+    monkeypatch.setattr(store, "_author_lastname_jaccard", observe)
+    incoming = dict(node("New", "New detector measurements"), authors=["Alice Smith"])
+    fused = fuse_library(lib, [incoming])
+    assert [n["key"] for n in fused.external] == ["New"]
+    assert comparisons == [["Alice Smith"]]
+
+
+def test_fusion_false_positive_exact_doi(tmp_path):
+    lib = Library(tmp_path)
+    add_record(
+        lib, key="Allowed", title="Shared title", doi="10.1234/allowed", authors=["Alice Smith"]
+    )
+    add_record(
+        lib,
+        key="Blocked",
+        title="Shared title",
+        domain_status="off_domain",
+        authors=["Other Author"],
+    )
+    fused = fuse_library(
+        lib,
+        [dict(node("External", "Shared title", doi="10.1234/allowed"), authors=["Alice Smith"])],
+    )
+    assert fused.external == []
+    assert [n["key"] for n in fused.vouched] == ["Allowed"]
+
+
+def test_fusion_false_negative_alias_title(tmp_path, monkeypatch):
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    lib = Library(tmp_path)
+    add_record(lib, key="BlockedPoor", title="Shared title", domain_status="off_domain")
+    add_record(
+        lib,
+        key="BlockedDoi",
+        title="Shared title",
+        doi="10.1234/blocked",
+        domain_status="off_domain",
+    )
+    add_record(lib, key="Allowed", title="Different title", doi="10.1234/allowed")
+    add_record(
+        lib,
+        key="Alias",
+        title="Shared title",
+        doi="10.1234/alias",
+        terminal_state=TerminalState(merge=Merge.ALIAS, alias_key="Allowed"),
+    )
+    fused = fuse_library(lib, [node("External", "Shared title", doi="10.1234/new")])
+    assert fused.external == []
+    assert fused.vouched == []
+
+
+@pytest.mark.parametrize(
+    "field,normalizer,value",
+    [
+        ("doi", "_normalize_doi", "10.1234/missing"),
+        ("arxiv_id", "_normalize_arxiv", "2401.99999"),
+        ("title", "normalize_title", "Missing title"),
+    ],
+)
+def test_lookup_misses_do_not_renormalize_unchanged_catalog(
+    tmp_path, monkeypatch, field, normalizer, value
+):
+    from papervault.library import store
+
+    lib = Library(tmp_path)
+    for i in range(100):
+        add_record(
+            lib,
+            key=f"Paper{i}",
+            title=f"Retained title {i}",
+            doi=f"10.1234/{i}",
+            arxiv_id=f"2401.{i:05}",
+        )
+    assert lib.find(**{field: value}) is None  # warm the lazy fallback index
+    calls = []
+    original = getattr(store, normalizer)
+
+    def observe(raw):
+        calls.append(raw)
+        return original(raw)
+
+    monkeypatch.setattr(store, normalizer, observe)
+    for _ in range(3):
+        assert lib.find(**{field: value}) is None
+    assert all(raw in ("", value) for raw in calls)
+
+
+@pytest.mark.parametrize(
+    "field,value,changed",
+    [
+        ("doi", "10.1234/shared", "10.1234/changed"),
+        ("arxiv_id", "2401.12345", "2402.12345"),
+        ("title", "Shared title", "Changed title"),
+    ],
+)
+def test_lookup_index_reconciles_mutation_replacement_removal_and_order(
+    tmp_path, field, value, changed
+):
+    lib = Library(tmp_path)
+    first = add_record(lib, key="First", **{field: value})
+    second = add_record(lib, key="Second", **{field: value})
+    index = getattr(lib, {"doi": "_by_doi", "arxiv_id": "_by_arxiv", "title": "_by_title"}[field])
+    assert lib.find(**{field: value}) is second  # primary index retains last-writer precedence
+    index.clear()
+    assert lib.find(**{field: value}) is first  # fallback uses dictionary order
+    setattr(first, field, changed)
+    assert lib.find(**{field: value}) is second
+    del lib._papers[second.key]
+    assert lib.find(**{field: value}) is None
+    replacement = Paper(key="First", **{field: value})
+    lib._papers["First"] = replacement
+    assert lib.find(**{field: value}) is replacement
+    lib._papers["Second"] = second
+    lib._papers["First"] = lib._papers.pop("First")
+    index.clear()
+    assert lib.find(**{field: value}) is second
+
+
+def test_lookup_alias_fallback_reuses_tokens_and_reads_mutations(tmp_path, monkeypatch):
+    from papervault.library import store
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    lib = Library(tmp_path)
+    first = add_record(lib, key="First", title="Shared title")
+    target = add_record(lib, key="Target", title="Different title")
+    alias = add_record(
+        lib,
+        key="Alias",
+        title="Shared title",
+        terminal_state=TerminalState(merge=Merge.ALIAS, alias_key="Target"),
+    )
+    assert lib.find(title="Shared title") is first
+    calls = []
+    original = store.normalize_title
+
+    def observe(raw):
+        calls.append(raw)
+        return original(raw)
+
+    monkeypatch.setattr(store, "normalize_title", observe)
+    lib._reindex(alias)  # reinstate alias-target mismatch on the primary index
+    assert lib.find(title="Shared title") is first
+    assert calls.count("Shared title") == 2  # reindex and query, no catalog renormalization
+    first.title = "Changed title"
+    assert lib.find(title="Shared title") is target
+
+
+@pytest.mark.parametrize("change", ["authors", "doi", "arxiv_id", "title", "year", "alias"])
+def test_preprint_index_reads_in_place_mutations(tmp_path, monkeypatch, change):
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    lib = Library(tmp_path)
+    paper = add_record(
+        lib,
+        key="Preprint",
+        title="Detector measurements of cosmic particles",
+        authors=["Alice Smith"],
+        arxiv_id="2401.12345",
+        year=2024,
+    )
+    incoming = dict(title=paper.title, authors=["A. Smith"], doi="10.1234/journal", year=2024)
+    assert lib._find_preprint_journal_dup(incoming) is paper
+    if change == "authors":
+        paper.authors[:] = ["Bob Jones"]
+    elif change == "alias":
+        paper.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key="Other")
+    else:
+        setattr(
+            paper,
+            change,
+            {"doi": "10.1234/existing", "arxiv_id": "", "title": "Unrelated", "year": 2010}[change],
+        )
+    assert lib._find_preprint_journal_dup(incoming) is None
+
+
+def test_preprint_index_reconciles_order_and_author_edits(tmp_path):
+    lib = Library(tmp_path)
+    first = add_record(
+        lib,
+        key="First",
+        title="Detector measurements",
+        authors=["Alice Smith"],
+        arxiv_id="2401.12345",
+    )
+    second = add_record(
+        lib, key="Second", title=first.title, authors=["Bob Jones"], arxiv_id="2401.54321"
+    )
+    incoming = dict(title=first.title, authors=["A. Smith"], doi="10.1234/journal")
+    assert lib._find_preprint_journal_dup(incoming) is first
+    first.authors[:] = ["Bob Jones"]
+    second.authors[:] = ["Alice Smith"]
+    assert lib._find_preprint_journal_dup(incoming) is second
+    lib._papers["First"] = first.model_copy(update={"authors": ["Alice Smith"]})
+    assert lib._find_preprint_journal_dup(incoming) is lib._papers["First"]
+    lib._papers["First"] = lib._papers.pop("First")
+    assert lib._find_preprint_journal_dup(incoming) is second
+    del lib._papers["Second"]
+    assert lib._find_preprint_journal_dup(incoming) is lib._papers["First"]
+
+
+@pytest.mark.parametrize("stage", ["fusion", "eligibility", "preview"])
+async def test_run_performs_cpu_passes_off_event_loop(tmp_path, monkeypatch, stage):
+    import threading
+    from papervault.library.services import search_pipeline as pipeline
+
+    lib = Library(tmp_path)
+    retained = add_record(lib, **node("Retained", "Unrelated observations"))
+    before = retained.model_dump()
+    event_thread = threading.get_ident()
+    threads = []
+    owner, name = {
+        "fusion": (pipeline.SearchPipeline, "fusion"),
+        "eligibility": (pipeline, "registration_rejection"),
+        "preview": (pipeline, "preview_candidates"),
+    }[stage]
+    original = getattr(owner, name)
+
+    def observe(*args, **kwargs):
+        threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, observe)
+    result, seen, _ = await run_search(monkeypatch, lib, [node("New", "Detector measurements")])
+    assert result["status"] == "ok"
+    assert any(n["doi"] == "10.1234/New" for n in seen["pool"])
+    assert retained.model_dump() == before
+    assert lib.keys() == ["Retained"]
+    assert threads and all(thread != event_thread for thread in threads)
+
+
+@pytest.mark.parametrize("overlap", [6, 7])
+@pytest.mark.parametrize("incoming_identifier", ["doi", "arxiv_id"])
+def test_preprint_match_checks_author_threshold_before_title(
+    tmp_path, monkeypatch, overlap, incoming_identifier
+):
+    from papervault.library import store
+
+    lib = Library(tmp_path)
+    authors = [f"A. Lastname{i}" for i in range(10)]
+    identifiers = {"doi": "10.1234/journal", "arxiv_id": "2401.12345"}
+    retained_identifier = "arxiv_id" if incoming_identifier == "doi" else "doi"
+    retained = add_record(
+        lib,
+        key="Retained",
+        title="Detector measurements of cosmic particles",
+        authors=authors[:overlap],
+        year=2024,
+        **{retained_identifier: identifiers[retained_identifier]},
+    )
+    incoming = dict(
+        title=retained.title,
+        authors=authors,
+        year=2026,
+        **{incoming_identifier: identifiers[incoming_identifier]},
+    )
+    comparisons = []
+    original = store._title_similarity
+
+    def observe(left, right):
+        comparisons.append((left, right))
+        return original(left, right)
+
+    monkeypatch.setattr(store, "_title_similarity", observe)
+    assert lib._find_preprint_journal_dup(incoming) is (retained if overlap == 7 else None)
+    assert comparisons == ([(retained.title, retained.title)] if overlap == 7 else [])
 
 
 def test_fusion_distinguishes_unresolved_alias_from_serving_exclusion(tmp_path):
@@ -780,3 +1090,53 @@ def test_vouched_authority_normalizes_age_and_venue(vouched_authority_fusion):
     searcher.authority_enabled = True
     keys = [n["key"] for n in fuse_local(searcher, plan, retrieved).local]
     assert keys[-3:] == ["VouchNative", "VouchRepeated", "VouchLandmark"]
+
+
+def test_preprint_index_does_not_renormalize_unchanged_authors(tmp_path, monkeypatch):
+    from papervault.library import store
+
+    lib = Library(tmp_path)
+    for i in range(100):
+        add_record(
+            lib,
+            key=f"Paper{i}",
+            title=f"Retained title {i}",
+            authors=[f"Alice Family{i}"],
+            arxiv_id=f"2401.{i:05}",
+        )
+    incoming = dict(title="New title", doi="10.1234/new", authors=["Bob Newname"])
+    assert lib._find_preprint_journal_dup(incoming) is None
+    calls = []
+    original = store._author_lastnames
+
+    def observe(names):
+        calls.append(tuple(names))
+        return original(names)
+
+    monkeypatch.setattr(store, "_author_lastnames", observe)
+    for _ in range(3):
+        assert lib._find_preprint_journal_dup(incoming) is None
+    assert calls == [("Bob Newname",)] * 3
+
+
+def test_lookup_caches_are_isolated_in_preview_views(tmp_path, monkeypatch):
+    from papervault.library import store
+    from papervault.library.services.registration import _view
+
+    lib = Library(tmp_path)
+    paper = add_record(lib, key="Retained", title="Original title", authors=["Alice Smith"])
+    assert lib.find(title="Missing") is None
+    view = _view(lib, lib._papers)
+    view._papers[paper.key].title = "Preview title"
+    assert view.find(title="Preview title").title == "Preview title"
+    calls = []
+    original = store.normalize_title
+
+    def observe(raw):
+        calls.append(raw)
+        return original(raw)
+
+    monkeypatch.setattr(store, "normalize_title", observe)
+    assert lib.find(title="Preview title") is None
+    assert paper.title == "Original title"
+    assert "Original title" not in calls

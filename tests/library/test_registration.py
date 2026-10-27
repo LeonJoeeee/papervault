@@ -74,6 +74,22 @@ def admitted(**fields):
     return candidate(_registration={"ingest_ok": True, "llm_is_paper": True, "tier": "1A"}, **fields)
 
 
+def test_identifier_free_find_does_not_enumerate_aliases(tmp_path):
+    from papervault.library.services.registration import _find
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Retained", title="Detector measurements")
+    lib._papers[paper.key] = paper
+    lib._reindex(paper)
+
+    class IndexedOnly(dict):
+        def values(self):
+            pytest.fail("Identifier-free indexed lookup must not scan the catalog for aliases")
+
+    lib._papers = IndexedOnly(lib._papers)
+    assert _find(lib, {"title": paper.title}) is paper
+
+
 LEGACY_GARBAGE_FIELDS = [
     pytest.param({"venue": venue}, id=venue) for venue in [
         "AGU Fall Meeting Abstracts", "AGU Spring Meeting", "Meeting Abstracts",

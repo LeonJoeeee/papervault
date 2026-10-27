@@ -165,6 +165,7 @@ def _view(library, papers):
     view = copy.copy(library)
     view._papers = {key: paper.model_copy(deep=True) for key, paper in papers.items()}
     view._by_doi, view._by_arxiv, view._by_title = {}, {}, {}
+    view._lookup_indexes = {}
     view._merge_execution_lock = threading.RLock()
     view._identity_reservations = set()
     for paper in view._papers.values():
@@ -207,7 +208,11 @@ def _find(library, candidate):
     from ..merge_v2 import resolve_alias
     from ..store import _normalize_arxiv, _normalize_doi
 
-    aliases = [paper for paper in library._papers.values() if paper.acquisition_state.alias_key]
+    aliases = (
+        [paper for paper in library._papers.values() if paper.acquisition_state.alias_key]
+        if candidate.get("doi") or candidate.get("arxiv_id")
+        else []
+    )
     for name, normalize in (("doi", _normalize_doi), ("arxiv_id", _normalize_arxiv),
                             ("title", normalize_title)):
         value = candidate.get(name) or ""

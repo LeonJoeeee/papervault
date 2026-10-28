@@ -536,18 +536,21 @@ class SearchPipeline:
 
     def _prepare_return_pool(self, plan, fused, judgments, trace):
         """Run synchronous eligibility lookups and isolated previews off-loop."""
+        with self.library._merge_execution_lock:
+            live_view = _view(self.library, self.library._papers, deep_copy=False, frozen=True)
+            live_view._identity_reservations = set(self.library._identity_reservations)
         eligible = []
         for idx, node in enumerate(fused.external):
             candidate = copy.deepcopy(node)
             candidate["_registration"] = judgments.get(idx)
-            known = self.library.find(doi=candidate.get("doi") or "", arxiv_id=candidate.get("arxiv_id") or "",
-                                      title=candidate.get("title") or "") or self.library._find_preprint_journal_dup(candidate)
+            known = live_view.find(doi=candidate.get("doi") or "", arxiv_id=candidate.get("arxiv_id") or "",
+                                   title=candidate.get("title") or "") or live_view._find_preprint_journal_dup(candidate)
             rejection = registration_rejection(candidate, known_identity=known is not None)
             trace.record("gate", candidate=candidate, decision="skipped" if rejection else "eligible", reason=rejection)
             if not rejection:
                 eligible.append(candidate)
         registration = eligible + [dict(n, _registration_known_key=n["key"]) for n in fused.vouched]
-        external, projections = preview_candidates(self.library, eligible, canonical_keys=fused.canonical_keys)
+        external, projections = preview_candidates(live_view, eligible, canonical_keys=fused.canonical_keys)
         # Preview may resolve a new identity to a local row suppressed by fusion.
         # Its canonical snapshot already carries the preview hits' rank evidence;
         # combine that with direct external folds before replacing the local row.

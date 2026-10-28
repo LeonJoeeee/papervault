@@ -293,9 +293,14 @@ def preview_candidates(library, candidates, *, canonical_keys=None):
                 paper = _compatible(owner.get(canonical_key), candidate)
         return paper
 
-    view, snapshots = _view(library, {}), {}
+    live_view = library
+    if getattr(library, "_frozen_aliases", None) is None:
+        with library._merge_execution_lock:
+            live_view = _view(library, library._papers, deep_copy=False, frozen=True)
+            live_view._identity_reservations = set(library._identity_reservations)
+    view, snapshots = _view(library, {}, deep_copy=False, frozen=True), {}
     for candidate in candidates:
-        live = preview_find(library, candidate)
+        live = preview_find(live_view, candidate)
         if live is not None and serving_excluded(live):
             continue
         paper = view.get(live.key) if live else None

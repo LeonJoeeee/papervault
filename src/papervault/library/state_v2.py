@@ -10,12 +10,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import lru_cache
+from os import fstat
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .compat_v2 import INDEX_FORMAT_VERSION, check_readable, check_versions
 
 if TYPE_CHECKING:
     from .models import Paper
+
+
+def _index_file_stamp(path: Path):
+    """Detect rewrites/truncation without reading the full catalog on each hit."""
+    try:
+        with path.open("rb") as stream:
+            stat = fstat(stream.fileno())
+            head = stream.read(4096)
+            stream.seek(max(0, stat.st_size - 4096))
+            tail = stream.read(4096)
+        return stat.st_mtime_ns, stat.st_size, head, tail
+    except OSError:
+        return None
+
+
+@lru_cache(maxsize=64)
+def _index_header(reader, root: Path, primary_stamp, backup_stamp):
+    # Stamps and reader identity are cache keys; retain only the small header.
+    data = reader(root / "index.json") or reader(root / "index.json.bak")
+    if data is None:
+        return None
+    return data.get("version", INDEX_FORMAT_VERSION), data.get("acquisition_versions", {})
 
 
 def check_index_readable(root) -> None:
@@ -25,15 +50,16 @@ def check_index_readable(root) -> None:
     before typed records are used also prevents an unsupported v2 field from
     being treated as a corrupt row and silently omitted by the legacy loader.
     """
-    from pathlib import Path
     from .store import Library
     root = Path(root)
-    data = (Library._read_index_file(root / "index.json")
-            or Library._read_index_file(root / "index.json.bak"))
-    if data is None:
+    header = _index_header(Library._read_index_file, root,
+                           _index_file_stamp(root / "index.json"),
+                           _index_file_stamp(root / "index.json.bak"))
+    if header is None:
         return  # absence/corruption remains the existing reader's responsibility
-    check_readable(data.get("version", INDEX_FORMAT_VERSION), surface="index")
-    check_versions(data.get("acquisition_versions", {}))
+    version, versions = header
+    check_readable(version, surface="index")
+    check_versions(versions)
 
 
 class Retrieval(str, Enum):

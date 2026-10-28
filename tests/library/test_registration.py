@@ -124,6 +124,61 @@ def test_frozen_view_reindexes_added_and_replaced_papers(tmp_path):
     assert view._identifier_owner("doi", "10.1234/new") is replacement
 
 
+@pytest.mark.parametrize("already_frozen", [False, True])
+def test_preview_uses_frozen_views_and_preserves_reservations(tmp_path, monkeypatch, already_frozen):
+    from papervault.library.services import registration
+
+    lib = Library(tmp_path)
+    retained = Paper(key="Retained", title=candidate()["title"], arxiv_id="2401.00001",
+                     authors=["Tester, A."])
+    lib._papers[retained.key] = retained
+    lib._reindex(retained)
+    reservation = ("doi", "10.1234/reserved", retained.key, object())
+    lib._identity_reservations.add(reservation)
+    owner = lib
+    if already_frozen:
+        owner = registration._view(lib, lib._papers, deep_copy=False, frozen=True)
+        owner._identity_reservations = set(lib._identity_reservations)
+    original_find, original_view = registration._find, registration._view
+    owners, views = [], []
+
+    def checked_find(view, incoming):
+        assert getattr(view, "_frozen_aliases", None) is not None
+        owners.append(view)
+        return original_find(view, incoming)
+
+    def checked_view(library, papers, **kwargs):
+        if papers is lib._papers:
+            assert lib._merge_execution_lock._is_owned()
+        view = original_view(library, papers, **kwargs)
+        assert view._frozen_aliases is not None
+        views.append(view)
+        return view
+
+    monkeypatch.setattr(registration, "_find", checked_find)
+    monkeypatch.setattr(registration, "_view", checked_view)
+    nodes, projections = registration.preview_candidates(owner, [
+        candidate(doi="10.1234/enriched", arxiv_id=retained.arxiv_id),
+        candidate(doi="10.1234/enriched", title=""),
+    ])
+    live_view = owners[0]
+    assert live_view._identity_reservations == {reservation}
+    assert live_view.get(retained.key) is retained
+    if already_frozen:
+        assert live_view is owner
+        assert len(views) == 1  # only the working view needs constructing
+    else:
+        assert live_view is not lib
+        assert live_view._identity_reservations is not lib._identity_reservations
+        assert len(views) == 2
+    assert [n["key"] for n in nodes] == [retained.key]
+    assert nodes[0]["_source_origin"] == "library"
+    assert projections[retained.key].doi == "10.1234/enriched"
+    assert projections[retained.key] is not retained
+    assert retained.doi == ""
+    assert lib.keys() == [retained.key]
+
+
 def test_frozen_view_reindexes_alias_membership_and_targets(tmp_path, monkeypatch):
     from papervault.library.services.registration import _find, _view
     from papervault.library.state_v2 import Merge, TerminalState

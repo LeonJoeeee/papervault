@@ -600,6 +600,63 @@ def test_preprint_index_reconciles_order_and_author_edits(tmp_path):
     assert lib._find_preprint_journal_dup(incoming) is lib._papers["First"]
 
 
+def test_return_pool_reuses_one_frozen_live_view_with_reservations(tmp_path, monkeypatch):
+    from papervault.library.services import search_pipeline as pipeline
+    from papervault.library.services.registration import ServingTrace
+
+    lib = Library(tmp_path)
+    retained = add_record(lib, **node("Retained", "Retained detector measurements"))
+    reservation = ("doi", "10.1234/reserved", retained.key, object())
+    lib._identity_reservations.add(reservation)
+    incoming = dict(node("Hit", "Alternative metadata", doi=retained.doi), authors=[])
+    external = [incoming, node("New", "Independent cosmic observations")]
+    fused = pipeline.FusedSearch(external, [], [], {})
+    judgments = {i: dict(ingest_ok=True, llm_is_paper=True, tier="1A") for i in range(2)}
+    plan = pipeline.PlannedSearch({}, ["detector measurements"], {}, 10, "by_relevance")
+    searcher = pipeline.SearchPipeline(lib, None, None, None, None, None, None, None, None, None)
+    original_find, original_dup = Library.find, Library._find_preprint_journal_dup
+    original_preview, original_view = pipeline.preview_candidates, pipeline._view
+    eligibility_owners, preview_owners, views = [], [], []
+
+    def checked_find(view, **kwargs):
+        assert getattr(view, "_frozen_aliases", None) is not None
+        if not preview_owners:
+            eligibility_owners.append(view)
+        return original_find(view, **kwargs)
+
+    def checked_dup(view, candidate):
+        assert getattr(view, "_frozen_aliases", None) is not None
+        return original_dup(view, candidate)
+
+    def checked_view(library, papers, **kwargs):
+        assert lib._merge_execution_lock._is_owned()
+        view = original_view(library, papers, **kwargs)
+        views.append(view)
+        return view
+
+    def checked_preview(view, candidates, **kwargs):
+        assert view._identity_reservations == {reservation}
+        assert view._identity_reservations is not lib._identity_reservations
+        assert view.get(retained.key) is retained
+        preview_owners.append(view)
+        return original_preview(view, candidates, **kwargs)
+
+    monkeypatch.setattr(Library, "find", checked_find)
+    monkeypatch.setattr(Library, "_find_preprint_journal_dup", checked_dup)
+    monkeypatch.setattr(pipeline, "_view", checked_view)
+    monkeypatch.setattr(pipeline, "preview_candidates", checked_preview)
+    pool, projections, registration = searcher._prepare_return_pool(plan, fused, judgments, ServingTrace(lib))
+    assert len(views) == 1
+    assert eligibility_owners == [views[0]] * 2
+    assert preview_owners == views
+    assert [p["key"] for p in pool] == [retained.key, "doi:10.1234/new"]
+    assert [p["_source_origin"] for p in pool] == ["library", "external"]
+    assert set(projections) == {retained.key, "doi:10.1234/new"}
+    assert len(registration) == 2  # retained identity exempts the author-poor hit
+    assert retained.title == "Retained detector measurements"
+    assert lib.keys() == [retained.key]
+
+
 @pytest.mark.parametrize("stage", ["fusion", "eligibility", "preview"])
 async def test_run_performs_cpu_passes_off_event_loop(tmp_path, monkeypatch, stage):
     import threading

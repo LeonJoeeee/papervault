@@ -1,6 +1,7 @@
 """A5 format fences stop v2 writers before touching unsupported durable data."""
 
 import json
+import os
 
 import pytest
 
@@ -254,6 +255,149 @@ def test_backup_versions_are_checked_when_primary_is_unreadable(vault):
     with pytest.raises(CompatibilityError, match="index"):
         check_index_readable(vault.root)
     assert tree_bytes(vault.root) == before
+
+
+@pytest.fixture
+def index_reads(vault, monkeypatch):
+    read = Library._read_index_file
+    calls = []
+
+    def counted(path):
+        calls.append(path)
+        return read(path)
+
+    monkeypatch.setattr(Library, "_read_index_file", staticmethod(counted))
+    return calls
+
+
+def test_index_header_cache_reuses_parse_but_rechecks_versions(vault, index_reads, monkeypatch):
+    from papervault.library import state_v2
+
+    vault.index_path.write_text(json.dumps({"version": 1, "acquisition_versions": {"index": 1}}))
+    readable, versions = state_v2.check_readable, state_v2.check_versions
+    readable_calls, version_calls = [], []
+
+    def checked_readable(version, *, surface):
+        readable_calls.append((version, surface))
+        return readable(version, surface=surface)
+
+    def checked_versions(header):
+        version_calls.append(header)
+        return versions(header)
+
+    monkeypatch.setattr(state_v2, "check_readable", checked_readable)
+    monkeypatch.setattr(state_v2, "check_versions", checked_versions)
+    for _ in range(3):
+        state_v2.check_index_readable(vault.root)
+    assert index_reads == [vault.index_path]
+    assert readable_calls == [(1, "index")] * 3
+    assert version_calls == [{"index": 1}] * 3
+
+
+@pytest.mark.parametrize("filename", ["index.json", "index.json.bak"])
+@pytest.mark.parametrize("change", ["mtime", "size", "head", "tail"])
+def test_index_header_cache_invalidates_each_stamp_component(vault, index_reads, filename, change):
+    from papervault.library.compat_v2 import CompatibilityError
+    from papervault.library.state_v2 import check_index_readable
+
+    padding = "x" * 8192
+    if change == "head":
+        data = {"version": 1, "padding": padding}
+    elif change == "tail":
+        data = {"padding": padding, "version": 1}
+    else:
+        data = {"before": padding, "version": 1, "after": padding}
+    path = vault.root / filename
+    if path == vault.index_bak_path:
+        vault.index_path.write_text("{")
+    path.write_text(json.dumps(data))
+    check_index_readable(vault.root)
+    initial_reads = list(index_reads)
+    stamp = path.stat()
+    data["version"] = 2
+    changed = json.dumps(data)
+    if change == "size":
+        changed = changed.replace('"version": 2', '"version":  2')
+    path.write_text(changed)
+    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + (1 if change == "mtime" else 0)))
+
+    with pytest.raises(CompatibilityError, match="index"):
+        check_index_readable(vault.root)
+    assert index_reads == initial_reads * 2
+    # Unsupported cached headers must keep refusing without another full parse.
+    with pytest.raises(CompatibilityError, match="index"):
+        check_index_readable(vault.root)
+    assert index_reads == initial_reads * 2
+
+
+@pytest.mark.parametrize("corrupt", [b"{", b"", b"[]"])
+def test_index_header_cache_primary_corruption_checks_backup(vault, index_reads, corrupt):
+    from papervault.library.compat_v2 import CompatibilityError
+    from papervault.library.state_v2 import check_index_readable
+
+    vault.index_bak_path.write_text(json.dumps({"acquisition_versions": {"lease": 2}}))
+    check_index_readable(vault.root)
+    assert index_reads == [vault.index_path]
+    vault.index_path.write_bytes(corrupt)
+    for _ in range(2):
+        with pytest.raises(CompatibilityError, match="lease"):
+            check_index_readable(vault.root)
+    assert index_reads == [vault.index_path, vault.index_path, vault.index_bak_path]
+
+
+def test_index_header_cache_tracks_backup_even_with_valid_primary(vault, index_reads):
+    from papervault.library.state_v2 import check_index_readable
+
+    check_index_readable(vault.root)
+    vault.index_bak_path.write_text('{"version": 2}')
+    check_index_readable(vault.root)  # readable primary still takes precedence
+    check_index_readable(vault.root)
+    assert index_reads == [vault.index_path] * 2
+
+
+@pytest.mark.parametrize("contents", [None, b"{", b"[]", b"{}"])
+def test_index_header_cache_remembers_absence_and_recovers(vault, index_reads, contents):
+    from papervault.library.compat_v2 import CompatibilityError
+    from papervault.library.state_v2 import check_index_readable
+
+    vault.index_path.unlink()
+    if contents is not None:
+        vault.index_path.write_bytes(contents)
+    if vault.index_bak_path.exists():
+        vault.index_bak_path.unlink()
+    for _ in range(2):
+        check_index_readable(vault.root)
+    assert index_reads == [vault.index_path, vault.index_bak_path]
+    vault.index_path.write_text('{"version": 2}')
+    with pytest.raises(CompatibilityError, match="index"):
+        check_index_readable(vault.root)
+    assert index_reads[-1] == vault.index_path
+
+
+def test_index_header_cache_keys_include_reader(vault, index_reads, monkeypatch):
+    from papervault.library.compat_v2 import CompatibilityError
+    from papervault.library.state_v2 import check_index_readable
+
+    check_index_readable(vault.root)
+    monkeypatch.setattr(Library, "_read_index_file", staticmethod(lambda path: {"version": 2}))
+    with pytest.raises(CompatibilityError, match="index"):
+        check_index_readable(vault.root)
+    assert index_reads == [vault.index_path]
+
+
+def test_index_header_cache_evicts_old_roots(vault, index_reads, tmp_path):
+    from papervault.library.state_v2 import check_index_readable
+
+    roots = [tmp_path / str(i) for i in range(65)]
+    for root in roots:
+        root.mkdir()
+        (root / "index.json").write_text('{"version": 1}')
+        check_index_readable(root)
+    index_reads.clear()
+    check_index_readable(roots[-1])
+    assert index_reads == []
+    check_index_readable(roots[0])
+    assert index_reads == [roots[0] / "index.json"]
 
 
 @pytest.mark.parametrize("versions", [{"future_surface": 1}, None, [], {"lease": True}])

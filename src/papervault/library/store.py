@@ -477,10 +477,12 @@ class Library:
         nt = normalize_title(p.title)
         if nt:
             self._by_title[nt] = key
-        for field, index in getattr(self, "_lookup_indexes", {}).items():
-            index.reindex(p, field)
         aliases = getattr(self, "_frozen_aliases", None)
         if aliases is not None:
+            # Frozen views predeclare their field indexes. Live registries can
+            # grow in concurrent readers and reconcile mutable rows on lookup.
+            for field, index in self._lookup_indexes.items():
+                index.reindex(p, field)
             self._frozen_order.setdefault(p.key, len(self._frozen_order))
             if p.acquisition_state.alias_key:
                 aliases[p.key] = p

@@ -205,6 +205,37 @@ def test_frozen_reindex_only_tokenizes_changed_rows(tmp_path, monkeypatch):
     assert not any(value.isdigit() for _, value, _ in tokenized)
 
 
+def test_live_reindex_allows_concurrent_lazy_lookup_creation(tmp_path):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Retained", title="Detector observations", doi="10.1234/retained")
+    lib._papers[paper.key] = paper
+    lib._reindex(paper)
+    assert lib.find(doi="10.1234/missing") is None
+    entered, release = threading.Event(), threading.Event()
+
+    class PausedIndexes(dict):
+        def items(self):
+            for item in super().items():
+                entered.set()
+                assert release.wait(5)
+                yield item
+
+    lib._lookup_indexes = PausedIndexes(lib._lookup_indexes)
+    with ThreadPoolExecutor(max_workers=1) as workers:
+        writing = workers.submit(lib._reindex, paper)
+        try:
+            if not writing.done():
+                entered.wait(1)
+            assert lib.find(title="Unseen title") is None
+        finally:
+            release.set()
+        writing.result(timeout=5)
+    assert lib.find(doi=paper.doi) is paper
+
+
 def test_stage_caches_live_claims_and_keeps_new_identities_indexed(tmp_path, monkeypatch):
     from papervault.library.services.registration import RegistrationService, _view
 

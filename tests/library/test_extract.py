@@ -386,6 +386,30 @@ def test_extract_md_is_coroutine():
     assert asyncio.iscoroutinefunction(extract.extract_md)
 
 
+def test_extract_md_probe_runs_off_loop_while_loop_can_make_progress(tmp_path, monkeypatch):
+    import threading
+
+    lib, paper = _pdf_paper(tmp_path)
+
+    async def drive():
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+
+        def probe(path):
+            assert path == str(lib.pdf_path(paper.key))
+            assert threading.get_ident() != loop_thread
+            tick = threading.Event()
+            loop.call_soon_threadsafe(tick.set)
+            assert tick.wait(2), "PDF probe prevented event-loop progress"
+            return extract.PDFProbe(bad=True, n_pages=0, reason="bad fixture PDF")
+
+        monkeypatch.setattr(extract, "pdf_probe", probe)
+        assert await extract.extract_md(paper, lib, llm=object()) is None
+
+    asyncio.run(drive())
+    assert paper.extract_attempts == 1
+
+
 def test_extract_md_gate_pass_saves_and_sets_ok(tmp_path, monkeypatch):
     """A complete md → both judges pass → md saved (mineru2.5-pro) + status ok."""
     lib, p = _pdf_paper(tmp_path)

@@ -111,12 +111,21 @@ async def _call_with_retry(system_prompt: str, user_prompt: str, llm: Any) -> st
     last: Optional[Exception] = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            async with concurrency.llm_sem:  # per-CALL LLM concurrency cap (§0/§6/§7)
-                return await asyncio.to_thread(
-                    llm.call,
-                    [{"role": "system", "content": system_prompt},
-                     {"role": "user", "content": user_prompt}],
-                )
+            sem = concurrency.llm_sem  # per-CALL cap includes cancelled callers' workers
+            await sem.acquire()
+            worker = asyncio.create_task(asyncio.to_thread(
+                llm.call,
+                [{"role": "system", "content": system_prompt},
+                 {"role": "user", "content": user_prompt}],
+            ))
+
+            def finished(task):
+                sem.release()
+                if not task.cancelled():
+                    task.exception()  # Retrieve failures even after caller cancellation.
+
+            worker.add_done_callback(finished)
+            return await asyncio.shield(worker)
         except Exception as e:  # noqa: BLE001 — transient LLM hiccup; retry
             last = e
             if attempt < MAX_RETRIES:

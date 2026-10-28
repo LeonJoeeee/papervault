@@ -228,8 +228,17 @@ async def _bge_embed(texts: list[str]):
     lever — it is the pre-#31 bug)."""
     if not _EMBED_OFFLOAD:
         return _bge_encode_sync(texts)
-    async with _get_embed_sem():
-        return await asyncio.to_thread(_bge_encode_sync, texts)
+    sem = _get_embed_sem()
+    await sem.acquire()
+    worker = asyncio.create_task(asyncio.to_thread(_bge_encode_sync, texts))
+
+    def finished(task):
+        sem.release()
+        if not task.cancelled():
+            task.exception()  # A cancelled caller no longer observes worker failures.
+
+    worker.add_done_callback(finished)
+    return await asyncio.shield(worker)
 
 
 def _get_bge_reranker() -> object:
@@ -393,17 +402,26 @@ async def _bge_rerank(
         with _model_activity():
             return _predict_with_oom_retry(_get_bge_reranker(), _pairs)
 
-    async with _get_rerank_sem():
-        try:
-            scores = await asyncio.to_thread(_load_and_predict, pairs)
-        except Exception as e:  # noqa: BLE001 — terminal: record + loud, never silently degrade
-            _RERANK_FAILURES += 1
-            log.error(
-                "bge rerank FAILED on %d docs (%s: %s) — chunks returned UNRANKED; this run's "
-                "rerank is DEGRADED (failure #%d). Lower KS_RERANK_MAX_ASYNC or free GPU0.",
-                len(documents), type(e).__name__, str(e)[:120], _RERANK_FAILURES,
-            )
-            return []
+    sem = _get_rerank_sem()
+    await sem.acquire()
+    worker = asyncio.create_task(asyncio.to_thread(_load_and_predict, pairs))
+
+    def finished(task):
+        sem.release()
+        if not task.cancelled():
+            task.exception()
+
+    worker.add_done_callback(finished)
+    try:
+        scores = await asyncio.shield(worker)
+    except Exception as e:  # noqa: BLE001 — terminal: record + loud, never silently degrade
+        _RERANK_FAILURES += 1
+        log.error(
+            "bge rerank FAILED on %d docs (%s: %s) — chunks returned UNRANKED; this run's "
+            "rerank is DEGRADED (failure #%d). Lower KS_RERANK_MAX_ASYNC or free GPU0.",
+            len(documents), type(e).__name__, str(e)[:120], _RERANK_FAILURES,
+        )
+        return []
     ranked = sorted(range(len(documents)), key=lambda i: scores[i], reverse=True)
     if top_n:  # falsy (0/None) → keep all; real caller always passes a positive int (test codifies this)
         ranked = ranked[:top_n]

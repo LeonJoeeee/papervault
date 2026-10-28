@@ -32,6 +32,41 @@ from papervault.library import Library
 from papervault.library.state_v2 import Policy, Retrieval, TerminalState
 
 
+@pytest.mark.parametrize("token", ["search-progress", 0])
+async def test_progress_routes_notification_to_request_stream(token):
+    from mcp.server.fastmcp import Context, FastMCP
+    from mcp.shared.context import RequestContext
+    from mcp.types import RequestParams
+    from papervault.library.mcp.server import _maybe_progress
+
+    notifications = []
+
+    async def send_progress_notification(**kwargs):
+        notifications.append(kwargs)
+
+    request = RequestContext(request_id="request-42", meta=RequestParams.Meta(progressToken=token),
+                             session=SimpleNamespace(send_progress_notification=send_progress_notification),
+                             lifespan_context=None)
+    ctx = Context(request_context=request, fastmcp=FastMCP("progress-test"))
+    await _maybe_progress(ctx, 2, 10, "searching sources")
+    assert notifications == [{"progress_token": token, "progress": 2.0, "total": 10.0,
+                              "message": "searching sources", "related_request_id": "request-42"}]
+
+
+async def test_progress_falls_back_for_simple_contexts_and_ignores_transport_errors():
+    from papervault.library.mcp.server import _maybe_progress
+
+    reports = []
+
+    async def report_progress(*args):
+        reports.append(args)
+        raise RuntimeError("closed progress stream")
+
+    await _maybe_progress(SimpleNamespace(report_progress=report_progress), 1, 3, "starting")
+    await _maybe_progress(None, 1, 3, "starting")
+    assert reports == [(1, 3, "starting")]
+
+
 # ---------------- fixtures --------------------------------------------------
 
 

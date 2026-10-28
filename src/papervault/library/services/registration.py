@@ -26,7 +26,7 @@ from papervault.library.models import Paper, normalize_title
 from papervault.library.sources.identity import normalized_source_identities, merge_source_identities
 from papervault.library.sources.inspire import merge_inspire_fields, retained_inspire_fields
 from papervault.library.state_v2 import Policy, Retrieval, TerminalState, admission, effective_policy
-from papervault.library.store import _validate_paper_metadata
+from papervault.library.store import _FieldLookup, _validate_paper_metadata
 from papervault.library.services.bm25_search import paper_to_dict
 from papervault.store.persistence import _overlay
 from papervault.store.repository import AuditEvent, PendingJob, Record, payload_hash
@@ -160,12 +160,20 @@ class ServingTrace:
         })
 
 
-def _view(library, papers):
-    """Reuse #267's current-field lookup without sharing mutable paper/index state."""
+def _view(library, papers, *, deep_copy: bool = True, frozen: bool = False):
+    """Isolate lookup state; frozen readers may reuse an already isolated snapshot."""
     view = copy.copy(library)
-    view._papers = {key: paper.model_copy(deep=True) for key, paper in papers.items()}
+    view._papers = {key: paper.model_copy(deep=True) if deep_copy else paper
+                    for key, paper in papers.items()}
     view._by_doi, view._by_arxiv, view._by_title = {}, {}, {}
     view._lookup_indexes = {}
+    if frozen:
+        view._lookup_indexes = {field: _FieldLookup(frozen=True)
+                                for field in ("doi", "arxiv_id", "title", "authors")}
+    view._frozen_aliases = (
+        [paper for paper in view._papers.values() if paper.acquisition_state.alias_key]
+        if frozen else None
+    )
     view._merge_execution_lock = threading.RLock()
     view._identity_reservations = set()
     for paper in view._papers.values():
@@ -208,11 +216,11 @@ def _find(library, candidate):
     from ..merge_v2 import resolve_alias
     from ..store import _normalize_arxiv, _normalize_doi
 
-    aliases = (
-        [paper for paper in library._papers.values() if paper.acquisition_state.alias_key]
-        if candidate.get("doi") or candidate.get("arxiv_id")
-        else []
-    )
+    aliases = []
+    if candidate.get("doi") or candidate.get("arxiv_id"):
+        aliases = getattr(library, "_frozen_aliases", None)
+        if aliases is None:
+            aliases = [paper for paper in library._papers.values() if paper.acquisition_state.alias_key]
     for name, normalize in (("doi", _normalize_doi), ("arxiv_id", _normalize_arxiv),
                             ("title", normalize_title)):
         value = candidate.get(name) or ""

@@ -234,12 +234,20 @@ from papervault.library.services.search_pipeline import (  # noqa: E402, F401
 
 async def _maybe_progress(ctx: Optional[Context], progress: float,
                           total: float, message: str) -> None:
-    """ctx.report_progress is a no-op outside an MCP request, but it can
-    still raise if the framework is misconfigured. Defensive guard."""
+    """Route progress to this request's stream; notification failures stay non-fatal."""
     if ctx is None:
         return
     try:
-        await ctx.report_progress(progress, total, message)
+        meta = getattr(getattr(ctx, "request_context", None), "meta", None)
+        token = getattr(meta, "progressToken", None)
+        session = getattr(ctx, "session", None)
+        if token is not None and hasattr(session, "send_progress_notification"):
+            await session.send_progress_notification(
+                progress_token=token, progress=float(progress), total=float(total),
+                message=message, related_request_id=ctx.request_id,
+            )
+        else:
+            await ctx.report_progress(progress, total, message)
     except Exception:
         pass
 

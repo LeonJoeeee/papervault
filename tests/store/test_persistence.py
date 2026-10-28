@@ -14,6 +14,65 @@ from papervault.library.store import Library
 from papervault.store.repository import AuditEvent, Record, PendingJob
 
 
+def test_catalog_save_reindexes_without_json_fingerprinting(tmp_path, monkeypatch):
+    lib = Library(tmp_path)
+    paper = Paper(key="A", title="Retained catalog row", doi="10.1234/before")
+    lib._papers[paper.key] = paper
+    lib._reindex(paper)
+
+    def save(papers):
+        assert papers["A"] is paper
+        paper.doi = "10.1234/after"
+        return []
+
+    def unexpected_json(*args, **kwargs):
+        pytest.fail("PG save serialized JSON-authority fingerprints")
+
+    monkeypatch.setattr(lib, "_catalog_backend", SimpleNamespace(save=save))
+    monkeypatch.setattr(Paper, "model_dump_json", unexpected_json)
+    lib._save_catalog()
+    assert lib._by_doi == {"10.1234/after": "A"}
+
+
+def test_postgres_save_captures_only_changed_records(monkeypatch):
+    from papervault.store.persistence import PostgresPersistence
+
+    backend = PostgresPersistence("unused")
+    papers = {key: Paper(key=key, title=key) for key in ("Changed", "Untouched")}
+    backend.normalized = {key: paper.model_dump(mode="json") for key, paper in papers.items()}
+    backend.persisted = {key: Record.from_payload(key, payload)
+                         for key, payload in backend.normalized.items()}
+    papers["Changed"].title = "Updated title"
+
+    class Repository:
+        @contextmanager
+        def _write(self, event):
+            yield
+
+        def flush(self, records, *, expected_revisions, audit):
+            assert [r.key for r in records] == ["Changed"]
+            return {"Changed": 1}
+
+    @contextmanager
+    def repository():
+        yield Repository()
+
+    accept = backend._accept
+    captured_keys = []
+
+    def accept_changed(records, revisions, current, captured):
+        captured_keys.extend(captured)
+        return accept(records, revisions, current, captured)
+
+    monkeypatch.setattr(backend, "repository", repository)
+    monkeypatch.setattr(backend, "_accept", accept_changed)
+    assert backend.save(papers) == []
+    assert captured_keys == ["Changed"]
+    assert backend.normalized["Changed"]["title"] == "Updated title"
+    assert backend.persisted["Untouched"].revision == 0
+    assert not backend.dirty(papers)
+
+
 @pytest.fixture(params=[
     ("0", "0", "0"),
     ("1", "0", "0"),

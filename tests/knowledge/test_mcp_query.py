@@ -53,25 +53,32 @@ async def _running(intent="question"):
     return result
 
 
-async def test_fast_completions_are_not_cached(pipeline):
+async def test_fast_completions_retain_ids_but_same_intent_executes_again(pipeline):
     pipeline.release.set()
     for _ in range(2):
         assert await server.query(" question ") == {
             "answer": "question", "cited_papers": ["Paper2026"]}
-        assert server._queries_by_id == {} and server._queries_by_intent == {}
+        assert server._queries_by_intent == {}
+    assert len(server._queries_by_id) == 2
+    for query_id in server._queries_by_id:
+        assert (await server.query(query_id))["answer"] == "question"
     assert pipeline.calls == ["question", "question"]
     assert pipeline.checks == 2
 
 
 @pytest.mark.parametrize("by_id", [False, True])
-async def test_soft_wait_resume_collects_once_without_restarting(pipeline, by_id):
+async def test_soft_wait_resume_replays_completed_answer_without_restarting(pipeline, by_id):
     running = await _running(" question ")
     retry = running["query_id"] if by_id else "question"
     assert (await _running(retry))["query_id"] == running["query_id"]
     pipeline.release.set()
     assert await server.query(retry) == {"answer": "question", "cited_papers": ["Paper2026"]}
     assert pipeline.calls == ["question"] and pipeline.checks == 1
-    assert server._queries_by_id == {} and server._queries_by_intent == {}
+    assert list(server._queries_by_id) == [running["query_id"]]
+    assert server._queries_by_intent == {}
+    assert await server.query(running["query_id"]) == {
+        "answer": "question", "cited_papers": ["Paper2026"]}
+    assert pipeline.calls == ["question"] and pipeline.checks == 1
 
 
 @pytest.mark.parametrize("wait", ["0", "-1"])
@@ -83,7 +90,63 @@ async def test_nonpositive_wait_blocks_until_completion(pipeline, monkeypatch, w
     assert not caller.done()
     pipeline.release.set()
     assert (await caller)["answer"] == "question"
-    assert server._queries_by_id == {}
+    assert len(server._queries_by_id) == 1 and server._queries_by_intent == {}
+
+
+@pytest.mark.parametrize("setting", [None, "invalid"])
+async def test_default_soft_wait_leaves_client_timeout_headroom(pipeline, monkeypatch, setting):
+    if setting is None:
+        monkeypatch.delenv("KS_MCP_QUERY_WAIT_S")
+    else:
+        monkeypatch.setenv("KS_MCP_QUERY_WAIT_S", setting)
+    wait_for = asyncio.wait_for
+    timeouts = []
+
+    async def bounded_wait(awaitable, timeout):
+        timeouts.append(timeout)
+        return await wait_for(awaitable, 0.001)
+
+    monkeypatch.setattr(server.asyncio, "wait_for", bounded_wait)
+    assert (await server.query("question"))["status"] == "running"
+    assert timeouts == [90.0]
+
+
+async def test_old_id_replay_preserves_new_same_intent_execution(pipeline):
+    first = await _running()
+    pipeline.release.set()
+    assert (await server.query(first["query_id"]))["answer"] == "question"
+    pipeline.release.clear()
+    second = await _running()
+    new_entry = server._queries_by_id[second["query_id"]]
+    assert first["query_id"] != second["query_id"]
+    assert (await server.query(first["query_id"]))["answer"] == "question"
+    assert server._queries_by_intent["question"] is new_entry
+    assert (await _running())["query_id"] == second["query_id"]
+    assert pipeline.calls == ["question", "question"]
+
+
+async def test_collected_result_expires_after_retention(pipeline):
+    running = await _running()
+    entry = server._queries_by_id[running["query_id"]]
+    pipeline.release.set()
+    assert (await server.query(entry.query_id))["answer"] == "question"
+    assert entry.query_id in server._queries_by_id
+    entry.completed_at -= 901
+    assert (await server.query(entry.query_id))["status"] == "not_found"
+    assert server._queries_by_id == {} and server._queries_by_intent == {}
+
+
+async def test_capacity_evicts_collected_before_older_uncollected_results(pipeline, monkeypatch):
+    monkeypatch.setattr(server, "_QUERY_CAPACITY", 2)
+    first = await _running("uncollected")
+    pipeline.release.set()
+    await server._queries_by_id[first["query_id"]].task
+    assert (await server.query("collected"))["answer"] == "collected"
+    collected_id = next(key for key in server._queries_by_id if key != first["query_id"])
+    assert (await server.query("new"))["answer"] == "new"
+    assert first["query_id"] in server._queries_by_id
+    assert collected_id not in server._queries_by_id
+    assert len(server._queries_by_id) == 2
 
 
 @pytest.mark.parametrize("by_id", [False, True])

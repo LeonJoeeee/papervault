@@ -367,6 +367,7 @@ class _QueryEntry:
     task: asyncio.Task
     started_at: float
     completed_at: float | None = None
+    collected: bool = False
 
 
 # Process-local, single-serving-loop state. Active work is never evicted: when
@@ -431,7 +432,9 @@ def _new_query(intent: str) -> _QueryEntry | None:
         completed = [entry for entry in _queries_by_id.values() if entry.task.done()]
         if not completed:
             return None
-        _forget_query(min(completed, key=lambda entry: entry.completed_at or entry.started_at))
+        victim = min(completed, key=lambda entry: (
+            not entry.collected, entry.completed_at or entry.started_at))
+        _forget_query(victim)
     query_id = f"q-{uuid4().hex[:12]}"
     task = asyncio.create_task(_execute_query(intent), name=f"ks-query-{query_id}")
     entry = _QueryEntry(query_id, intent, task, time.monotonic())
@@ -531,10 +534,11 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     paper-library `search_papers` for fresher external literature.
 
     Latency: minutes, not seconds — p50 ~4 min under load (p90 ~7 min); plan other
-    work around the call. After KS_MCP_QUERY_WAIT_S (default 150 seconds), unfinished
+    work around the call. After KS_MCP_QUERY_WAIT_S (default 90 seconds), unfinished
     work returns {"status": "running", "query_id": "q-...", "retry_after_s": 5, ...}.
     Call query again with the SAME intent or intent="<query_id>" to collect the
-    answer without restarting work. Detached results are retained for
+    answer without restarting work. Completed answers can be replayed by ID;
+    after collection, the same intent starts fresh work. Results are retained for
     KS_MCP_QUERY_RETENTION_S (default 900 seconds) after completion, subject to
     bounded capacity. KS_MCP_QUERY_WAIT_S <= 0 waits until completion.
     When the service is saturated the call returns a
@@ -572,7 +576,7 @@ async def _wait_query(entry: _QueryEntry, ctx: Optional[Context] = None) -> dict
                 await ctx.info(f"query intent={entry.intent!r}")
             except Exception:
                 log.debug("query log notification failed; execution remains collectable", exc_info=True)
-        wait = _query_setting("KS_MCP_QUERY_WAIT_S", 150.0)
+        wait = _query_setting("KS_MCP_QUERY_WAIT_S", 90.0)
         if wait <= 0:
             result = await asyncio.shield(entry.task)
         else:
@@ -603,7 +607,12 @@ async def _wait_query(entry: _QueryEntry, ctx: Optional[Context] = None) -> dict
         # No await may follow consumption: cancellation during notification
         # teardown must leave even a completed answer available for resume.
         if collected:
-            _forget_query(entry)
+            if entry.task.exception() is not None:
+                _forget_query(entry)
+            else:
+                entry.collected = True
+                if _queries_by_intent.get(entry.intent) is entry:
+                    _queries_by_intent.pop(entry.intent, None)
 
 
 # NOTE: propose_ideas / idea-engine is SDD §1/§3/§5.4【defer】 — confirmed要、不进 v1

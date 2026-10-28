@@ -314,6 +314,62 @@ def test_fusion_false_positive_exact_doi(tmp_path):
     assert [n["key"] for n in fused.vouched] == ["Allowed"]
 
 
+def test_fusion_exclusion_view_reuses_isolated_snapshot_without_copying(tmp_path, monkeypatch):
+    from papervault.library.services import search_pipeline as pipeline
+
+    lib = Library(tmp_path)
+    add_record(lib, **node("Blocked", "Excluded detector measurements"), domain_status="off_domain")
+    original = pipeline._view
+    views = []
+
+    def observe(library, snapshot, **kwargs):
+        def unexpected_copy(*args, **kw):
+            pytest.fail("fusion copied an already isolated snapshot")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(Paper, "model_copy", unexpected_copy)
+            view = original(library, snapshot, **kwargs)
+        assert all(view._papers[key] is paper for key, paper in snapshot.items())
+        views.append(view)
+        return view
+
+    monkeypatch.setattr(pipeline, "_view", observe)
+    fused = fuse_library(lib, [node("New", "New detector measurements")])
+    assert [n["key"] for n in fused.external] == ["New"]
+    assert len(views) == 1
+    assert all(index.frozen for index in views[0]._lookup_indexes.values())
+
+
+@pytest.mark.parametrize("empty", [False, True])
+def test_frozen_view_builds_field_buckets_and_alias_list_only_once(tmp_path, empty):
+    from papervault.library.services.registration import _find, _view
+
+    class CountedPapers(dict):
+        scans = 0
+        alias_scans = 0
+
+        def items(self):
+            self.scans += 1
+            return super().items()
+
+        def values(self):
+            self.alias_scans += 1
+            return super().values()
+
+    lib = Library(tmp_path)
+    if not empty:
+        add_record(lib, **node("Local", "Unrelated measurements"))
+    view = _view(lib, lib._papers, deep_copy=False, frozen=True)
+    view._papers = CountedPapers(view._papers)
+    for _ in range(4):
+        assert _find(view, dict(doi="10.1234/missing", title="Missing paper",
+                                authors=["Other Author"])) is None
+        assert _find(view, dict(arxiv_id="2401.99999", title="Other missing paper",
+                                authors=["Other Author"])) is None
+    assert view._papers.scans == 4  # DOI, arXiv, title and authors, including empty indexes
+    assert view._papers.alias_scans <= 1
+
+
 def test_fusion_false_negative_alias_title(tmp_path, monkeypatch):
     from papervault.library.state_v2 import Merge, TerminalState
 

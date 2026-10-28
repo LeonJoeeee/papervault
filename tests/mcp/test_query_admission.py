@@ -67,6 +67,7 @@ async def test_detached_query_holds_permit_and_records_total_service_once(query_
     # Collecting after completion also bypasses Layer 2 (even with zero lanes).
     admission._LANES = 0
     assert await query_tool.tool.run({"intent": "question"}) == {"answer": "question"}
+    assert await query_tool.tool.run({"intent": running["query_id"]}) == {"answer": "question"}
     assert list(admission._recent["query"]) == [375.0]
     assert query_tool.calls == ["question"]
 
@@ -131,7 +132,10 @@ async def test_fast_query_records_one_completion_and_preserves_public_schema(que
     query_tool.release.set()
     assert await query_tool.tool.run({"intent": "question"}) == {"answer": "question"}
     assert admission._depth["query"] == 0 and len(admission._recent["query"]) == 1
-    assert admission._session_active == {} and server._queries_by_id == {}
+    assert admission._session_active == {} and len(server._queries_by_id) == 1
+    query_id = next(iter(server._queries_by_id))
+    assert await query_tool.tool.run({"intent": query_id}) == {"answer": "question"}
+    assert len(admission._recent["query"]) == 1 and query_tool.calls == ["question"]
     tools = await query_tool.mcp.list_tools()
     schema = tools[0].inputSchema
     assert schema["required"] == ["intent"]

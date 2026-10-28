@@ -183,6 +183,43 @@ def test_path_backfill_noop_when_no_extract_on_disk(tmp_path):
     assert _run(reconcile._path_backfill_sweep(lib)) == 0
 
 
+@pytest.mark.parametrize("populated", [("md",), ("txt",), ("md", "txt")])
+def test_path_backfill_checks_disk_only_for_missing_paths(tmp_path, monkeypatch, populated):
+    lib = Library(tmp_path)
+    paper = _mk(lib, "IndexedPaths", "ok")
+    for fmt in populated:
+        setattr(paper, f"{fmt}_path", f"extracts/{fmt}/{paper.key}.{fmt}")
+    calls = []
+
+    def has_extract(key, fmt):
+        calls.append((key, fmt))
+        return False
+
+    monkeypatch.setattr(lib, "has_extract", has_extract)
+    assert _run(reconcile._path_backfill_sweep(lib)) == 0
+    assert calls == [(paper.key, fmt) for fmt in ("md", "txt") if fmt not in populated]
+
+
+@pytest.mark.asyncio
+async def test_path_backfill_yields_after_200_papers(tmp_path, monkeypatch):
+    from papervault.library.models import Paper
+
+    lib = Library(tmp_path)
+    lib._papers = {str(i): Paper(key=str(i)) for i in range(401)}
+    calls, observed = [], []
+
+    def has_extract(key, fmt):
+        calls.append((key, fmt))
+        return False
+
+    monkeypatch.setattr(lib, "has_extract", has_extract)
+    asyncio.get_running_loop().call_soon(lambda: observed.append(len(calls)))
+    assert await reconcile._path_backfill_sweep(lib) == 0
+    await asyncio.sleep(0)
+    assert observed == [400]  # first yield follows 200 papers, two missing paths each
+    assert len(calls) == 802
+
+
 def test_reconcile_routes_pending_no_pdf_to_download(tmp_path, metadata_sweeps):
     lib = Library(tmp_path)
     p = _mk(lib, "Pendingnopdf2024", "pending", pdf=False)

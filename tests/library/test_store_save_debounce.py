@@ -86,6 +86,29 @@ def test_flush_if_dirty_writes_only_when_dirty(tmp_path):
     assert _index_keys(tmp_path) == {"A1", "A2"}
 
 
+def test_dirty_flush_persists_index_while_respecting_bib_cadence(tmp_path):
+    lib = _lib(tmp_path)
+    _add(lib, "A1")
+    lib.save(force=True)
+    first_bib = lib.bib_path.read_bytes()
+    first_bib_save = lib._last_bib_save
+    _add(lib, "A2")
+    lib.save()  # debounced
+    assert lib.flush_if_dirty() is True
+    assert _index_keys(tmp_path) == {"A1", "A2"}
+    assert lib._index_dirty is False
+    assert lib.bib_path.read_bytes() == first_bib
+    assert lib._last_bib_save == first_bib_save
+    lib._last_bib_save -= 61
+    _add(lib, "A3")
+    lib.save()
+    assert lib.flush_if_dirty() is True
+    assert "A3" in lib.bib_path.read_text()
+    _add(lib, "A4")
+    lib.save(force=True)  # explicit force retains its original BibTeX behavior
+    assert "A4" in lib.bib_path.read_text()
+
+
 def test_out_of_band_corruption_never_clobbers_bak(tmp_path):
     lib = _lib(tmp_path, interval="0")
     _add(lib, "A1")

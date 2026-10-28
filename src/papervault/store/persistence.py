@@ -143,10 +143,10 @@ class PostgresPersistence:
         records, captured = [], {}
         for key, paper in papers.items():
             current = paper.model_dump(mode="json")
-            captured[key] = current
             before = normalized.get(key)
             if before == current:
                 continue
+            captured[key] = current
             raw = _overlay(persisted[key].payload, before, current) if before else current
             records.append(Record.from_payload(key, raw))
         rulings = list(self.operator_rulings)

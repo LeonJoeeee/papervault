@@ -84,3 +84,63 @@ def test_embed_offload_default_on():
         assert mod._EMBED_OFFLOAD is True
     finally:
         importlib.reload(mod)
+
+
+@pytest.mark.parametrize("operation", ["embed", "rerank"])
+@pytest.mark.parametrize("worker_fails", [False, True])
+async def test_cancelled_gpu_call_keeps_permit_until_thread_finishes(
+    monkeypatch, operation, worker_fails
+):
+    sem = asyncio.Semaphore(1)
+    monkeypatch.setattr(lightrag_init, "_EMBED_OFFLOAD", True)
+    monkeypatch.setattr(lightrag_init, "_get_embed_sem", lambda: sem)
+    monkeypatch.setattr(lightrag_init, "_get_rerank_sem", lambda: sem)
+    monkeypatch.setattr(lightrag_init, "_RERANK_FAILURES", 0)
+    started, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    calls = []
+
+    def compute(inputs):
+        calls.append(inputs)
+        if len(calls) == 1:
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5), "test failed to release GPU worker"
+            if worker_fails:
+                raise ValueError("cancelled worker failed")
+        return np.array([[1.0, 2.0]]) if operation == "embed" else [0.75]
+
+    monkeypatch.setattr(lightrag_init, "_bge_encode_sync", compute)
+    monkeypatch.setattr(lightrag_init, "_get_bge_reranker", lambda: object())
+    monkeypatch.setattr(lightrag_init, "_predict_with_oom_retry", lambda model, pairs: compute(pairs))
+
+    async def run():
+        if operation == "embed":
+            return await lightrag_init._bge_embed(["input"])
+        return await lightrag_init._bge_rerank("query", ["document"])
+
+    first = asyncio.create_task(run())
+    second = None
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        first.cancel()
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert sem.locked(), "cancelled caller released a running worker's permit"
+        second = asyncio.create_task(run())
+        await asyncio.sleep(0)
+        assert len(calls) == 1 and not second.done()
+    finally:
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        if second is not None:
+            result = await asyncio.wait_for(second, 2)
+            if operation == "embed":
+                np.testing.assert_array_equal(result, [[1.0, 2.0]])
+            else:
+                assert result == [{"index": 0, "relevance_score": 0.75}]
+        await asyncio.wait_for(sem.acquire(), 2)
+        sem.release()
+    assert len(calls) == 2
+    assert lightrag_init._RERANK_FAILURES == 0

@@ -15,7 +15,10 @@ handed, so we can assert on:
 
 from __future__ import annotations
 
+import asyncio
 import json
+import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -26,6 +29,58 @@ from papervault.library.services.judge import (
     judge_ingest,
     judge_return,
 )
+
+
+@pytest.mark.parametrize("worker_fails", [False, True])
+async def test_cancelled_judge_keeps_permit_until_thread_finishes(monkeypatch, worker_fails):
+    sem = asyncio.Semaphore(1)
+    monkeypatch.setattr(judge.concurrency, "llm_sem", sem)
+    started, release = asyncio.Event(), threading.Event()
+    loop = asyncio.get_running_loop()
+    calls = []
+
+    def call(messages):
+        calls.append(messages)
+        if len(calls) == 1:
+            loop.call_soon_threadsafe(started.set)
+            assert release.wait(5), "test failed to release LLM worker"
+            if worker_fails:
+                raise ValueError("cancelled worker failed")
+        return "answer"
+
+    llm = SimpleNamespace(call=call)
+    first = asyncio.create_task(judge._call_with_retry("system", "first", llm))
+    second = None
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        first.cancel()
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert sem.locked(), "cancelled caller released a running worker's permit"
+        second = asyncio.create_task(judge._call_with_retry("system", "second", llm))
+        await asyncio.sleep(0)
+        assert len(calls) == 1 and not second.done()
+    finally:
+        release.set()
+        await asyncio.gather(first, return_exceptions=True)
+        if second is not None:
+            assert await asyncio.wait_for(second, 2) == "answer"
+        await asyncio.wait_for(sem.acquire(), 2)
+        sem.release()
+    assert len(calls) == 2  # cancellation must never retry the abandoned call
+
+
+async def test_cancelled_judge_waiter_does_not_start_worker_or_release_owned_permit(monkeypatch):
+    sem = asyncio.Semaphore(0)
+    monkeypatch.setattr(judge.concurrency, "llm_sem", sem)
+    caller = asyncio.create_task(judge._call_with_retry("system", "user", None))
+    await asyncio.sleep(0)
+    caller.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+    assert sem.locked()
 
 
 class _CaptureLLM:

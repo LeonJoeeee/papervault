@@ -357,11 +357,13 @@ async def _path_backfill_sweep(library: Library) -> int:
     canonical location is the truth; set the relative path. NEVER overwrites a
     non-null path. Save ONCE under the write lock."""
     fixes: list[tuple[str, str]] = []           # (key, fmt)
-    for p in library.all_papers():
-        if library.has_extract(p.key, "md") and not (p.md_path or "").strip():
+    for scanned, p in enumerate(library.all_papers(), 1):
+        if not (p.md_path or "").strip() and library.has_extract(p.key, "md"):
             fixes.append((p.key, "md"))
-        if library.has_extract(p.key, "txt") and not (p.txt_path or "").strip():
+        if not (p.txt_path or "").strip() and library.has_extract(p.key, "txt"):
             fixes.append((p.key, "txt"))
+        if scanned % _BATCH_SIZE == 0:
+            await asyncio.sleep(0)
     if not fixes:
         return 0
     n = 0

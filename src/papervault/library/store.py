@@ -224,29 +224,34 @@ class _FieldLookup:
     replacement, removal, reordering and alias precedence stay caller-owned.
     """
 
-    def __init__(self):
+    def __init__(self, *, frozen: bool = False):
+        self.frozen = frozen
+        self._built = False
         self.raw = {}
         self.tokens = {}
         self.order = ()
         self.buckets = {}
 
     def matches(self, papers, field, tokenize, values):
-        raw = {
-            key: tuple(p.authors or ()) if field == "authors" else getattr(p, field)
-            for key, p in papers.items()
-        }
-        order = tuple(raw)
-        if raw != self.raw or order != self.order:
-            tokens, buckets = {}, {}
-            for position, (key, value) in enumerate(raw.items()):
-                tokens[key] = (
-                    self.tokens[key]
-                    if key in self.raw and value == self.raw[key]
-                    else tokenize(value)
-                )
-                for token in tokens[key]:
-                    buckets.setdefault(token, []).append(position)
-            self.raw, self.tokens, self.order, self.buckets = raw, tokens, order, buckets
+        # Only explicitly frozen request snapshots can skip mutation detection.
+        if not self.frozen or not self._built:
+            raw = {
+                key: tuple(p.authors or ()) if field == "authors" else getattr(p, field)
+                for key, p in papers.items()
+            }
+            order = tuple(raw)
+            if raw != self.raw or order != self.order:
+                tokens, buckets = {}, {}
+                for position, (key, value) in enumerate(raw.items()):
+                    tokens[key] = (
+                        self.tokens[key]
+                        if key in self.raw and value == self.raw[key]
+                        else tokenize(value)
+                    )
+                    for token in tokens[key]:
+                        buckets.setdefault(token, []).append(position)
+                self.raw, self.tokens, self.order, self.buckets = raw, tokens, order, buckets
+            self._built = True
         positions = sorted(
             {position for value in values for position in self.buckets.get(value, ())}
         )
@@ -513,7 +518,6 @@ class Library:
         self._by_arxiv.clear()
         self._by_title.clear()
         for paper in self._papers.values():
-            self._state_v2_fingerprints[paper.key] = hash(paper.model_dump_json())
             self._reindex(paper)
 
     def catalog_completion(self, token):
@@ -549,7 +553,7 @@ class Library:
         """Force-persist iff a debounced save left state dirty. Returns True if it wrote."""
         if not self._index_dirty:
             return False
-        self.save(force=True, **kw)
+        self.save(force=True, force_bib=False, **kw)
         return True
 
     def _save_bib(self) -> None:
@@ -561,7 +565,8 @@ class Library:
                    if p.domain_status is None]
         _atomic_write(self.bib_path, "\n\n".join(entries) + "\n" if entries else "")
 
-    def save(self, *, force: bool = False, lock_timeout: float = 30.0, durable: bool = False) -> None:
+    def save(self, *, force: bool = False, force_bib: bool | None = None,
+             lock_timeout: float = 30.0, durable: bool = False) -> None:
         """Persist index (+ BibTeX on its own cadence) under a process write lock.
 
         Debounced (issue #34): within ``PAPERVAULT_SAVE_MIN_INTERVAL_S`` (default 5 s)
@@ -571,6 +576,8 @@ class Library:
         a crash catches unflushed is re-registered by the next boot reconcile.
         BibTeX is a convenience view and rebuilds at most every
         ``PAPERVAULT_BIB_MIN_INTERVAL_S`` (default 60 s) or on force.
+        ``force_bib`` defaults to ``force``; periodic dirty flushes pass False
+        to persist state immediately while keeping the BibTeX cadence.
 
         The lock prevents two MCP server instances (or pipeline + MCP) from
         racing on index.json. Reads are unsynchronized — they always see a
@@ -579,6 +586,8 @@ class Library:
         require a stable-storage acknowledgment for the index.
         """
         self._check_writer()
+        if force_bib is None:
+            force_bib = force
         now = time.monotonic()
         if (not force and self._save_min_interval > 0
                 and (now - self._last_index_save) < self._save_min_interval):
@@ -592,7 +601,7 @@ class Library:
                 self._save_index(durable=durable)
                 self._last_index_save = time.monotonic()
                 self._index_dirty = self._catalog_backend.dirty(self._papers) if self._catalog_backend else False
-                if force or (now - self._last_bib_save) >= self._bib_min_interval:
+                if force_bib or (now - self._last_bib_save) >= self._bib_min_interval:
                     self._save_bib()
                     self._last_bib_save = time.monotonic()
         except Timeout as exc:

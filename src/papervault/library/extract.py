@@ -625,7 +625,7 @@ async def extract_md(paper: Paper, library: Library, *,
     # daemon's main thread). A bad local file is a genuine per-doc defect →
     # charge an attempt; terminal at BUDGET only (the old `∨ single_chunk`
     # disjunct is dropped — there is no chunking).
-    probe = pdf_probe(str(pdf_path))
+    probe = await asyncio.to_thread(pdf_probe, str(pdf_path))
     if probe.bad:
         paper.extract_attempts += 1
         if paper.extract_attempts >= MAX_EXTRACT_ATTEMPTS:

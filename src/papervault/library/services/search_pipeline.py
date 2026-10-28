@@ -450,7 +450,8 @@ class SearchPipeline:
         buckets = collections.defaultdict(list)
         # Secondary identifiers/title and explicit aliases use preview's
         # version-compatible lookup, bound to this request's catalog snapshot.
-        exclusion_view = _view(self.library, snapshot) if excluded_identities and retrieved.external else None
+        exclusion_view = (_view(self.library, snapshot, deep_copy=False, frozen=True)
+                          if excluded_identities and retrieved.external else None)
         for node in retrieved.external:
             identity, term, rank = _identity_key(node), node.get("term_idx", 0), node.get("rank", 0)
             excluded_key = excluded_identities.get(identity)

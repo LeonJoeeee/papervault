@@ -229,17 +229,45 @@ class _FieldLookup:
         self._built = False
         self.raw = {}
         self.tokens = {}
-        self.order = ()
+        self.order = []
+        self.positions = {}
         self.buckets = {}
+        self._tokenize = None
+
+    @staticmethod
+    def _raw(paper, field):
+        if field == "authors":
+            return tuple(paper.authors or ())
+        if field == "paper_id":
+            return paper.paper_id, paper.source
+        return getattr(paper, field)
+
+    def reindex(self, paper, field):
+        """Update one notified row without rescanning an isolated frozen view."""
+        if not self.frozen or not self._built:
+            return
+        key, value = paper.key, self._raw(paper, field)
+        if key in self.raw and self.raw[key] == value:
+            return
+        if key not in self.positions:
+            self.positions[key] = len(self.order)
+            self.order.append(key)
+        position = self.positions[key]
+        for token in self.tokens.get(key, ()):
+            bucket = self.buckets[token]
+            bucket.discard(position)
+            if not bucket:
+                del self.buckets[token]
+        self.raw[key], self.tokens[key] = value, self._tokenize(value)
+        for token in self.tokens[key]:
+            self.buckets.setdefault(token, set()).add(position)
 
     def matches(self, papers, field, tokenize, values):
+        self._tokenize = tokenize
         # Only explicitly frozen request snapshots can skip mutation detection.
         if not self.frozen or not self._built:
-            raw = {
-                key: tuple(p.authors or ()) if field == "authors" else getattr(p, field)
-                for key, p in papers.items()
-            }
-            order = tuple(raw)
+            raw = {key: self._raw(paper, field) for key, paper in papers.items()}
+            order = list(raw)
             if raw != self.raw or order != self.order:
                 tokens, buckets = {}, {}
                 for position, (key, value) in enumerate(raw.items()):
@@ -249,8 +277,9 @@ class _FieldLookup:
                         else tokenize(value)
                     )
                     for token in tokens[key]:
-                        buckets.setdefault(token, []).append(position)
+                        buckets.setdefault(token, set()).add(position)
                 self.raw, self.tokens, self.order, self.buckets = raw, tokens, order, buckets
+                self.positions = {key: position for position, key in enumerate(order)}
             self._built = True
         positions = sorted(
             {position for value in values for position in self.buckets.get(value, ())}
@@ -448,6 +477,15 @@ class Library:
         nt = normalize_title(p.title)
         if nt:
             self._by_title[nt] = key
+        for field, index in getattr(self, "_lookup_indexes", {}).items():
+            index.reindex(p, field)
+        aliases = getattr(self, "_frozen_aliases", None)
+        if aliases is not None:
+            self._frozen_order.setdefault(p.key, len(self._frozen_order))
+            if p.acquisition_state.alias_key:
+                aliases[p.key] = p
+            else:
+                aliases.pop(p.key, None)
 
     def _save_index(self, *, durable: bool = False) -> None:
         self._check_writer()
@@ -643,7 +681,7 @@ class Library:
             reserved = paper is not None and not getattr(paper, field) and any(
                 claim[:3] == (field, normalized, paper.key) for claim in self._identity_reservations)
             if paper is None or (not reserved and normalize(getattr(paper, field)) != normalized):
-                matches = self._indexed_papers(field, lambda raw: (normalize(raw),), (normalized,))
+                matches = self._indexed_papers(field, lambda raw, norm=normalize: (norm(raw),), (normalized,))
                 paper = matches[0] if matches else None
                 if paper is None:
                     index.pop(normalized, None)
@@ -1060,10 +1098,17 @@ class Library:
 
     def _identifier_owner(self, name: str, token: str) -> Optional[Paper]:
         """Current adopted fields own identities; stale caches cannot grant one."""
-        for paper in self._papers.values():
-            if self._identifier_token(name, getattr(paper, name), paper.source) == token:
-                from .merge_v2 import resolve_alias
-                return (resolve_alias(self, paper.key) or paper) if merge_v2_enabled() or paper.merge_budget else paper
+        def tokenize(value):
+            return (self._identifier_token(name, *value) if name == "paper_id"
+                    else self._identifier_token(name, value),)
+
+        with self._merge_execution_lock:
+            for paper in self._indexed_papers(name, tokenize, (token,)):
+                # Even a frozen bucket cannot authorize a field cleared or
+                # changed in place since its last explicit _reindex().
+                if self._identifier_token(name, getattr(paper, name), paper.source) == token:
+                    from .merge_v2 import resolve_alias
+                    return (resolve_alias(self, paper.key) or paper) if merge_v2_enabled() or paper.merge_budget else paper
         return None
 
     def adopt_identifiers(self, key: str, *, provenance: dict | None = None, completion=None,

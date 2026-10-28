@@ -90,6 +90,209 @@ def test_identifier_free_find_does_not_enumerate_aliases(tmp_path):
     assert _find(lib, {"title": paper.title}) is paper
 
 
+def test_frozen_view_reindexes_added_and_replaced_papers(tmp_path):
+    from papervault.library.services.registration import _find, _view
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Existing", title="Old detector observations", doi="10.1234/old",
+                  arxiv_id="2401.00001", authors=["Alice Oldname"], source="core", paper_id="old")
+    view = _view(lib, {paper.key: paper}, frozen=True)
+    # Build every lookup before changing the snapshot, including empty buckets.
+    assert view.find(doi="10.1234/missing", arxiv_id="2401.99999", title="Missing") is None
+    assert view._find_preprint_journal_dup(dict(doi="10.1234/new", title="Missing",
+                                               authors=["Bob Newname"])) is None
+    assert view._identifier_owner("paper_id", "core:work:new") is None
+
+    replacement = Paper(key="Existing", title="New detector observations", doi="10.1234/new",
+                        authors=["Bob Newname"], year=2024, source="core", paper_id="new")
+    added = Paper(key="Added", title="Independent detector observations", arxiv_id="2401.00002",
+                  authors=["Carol Addedname"], year=2024, inspire_record_id="1412451")
+    for updated in (replacement, added):
+        view._papers[updated.key] = updated
+        view._reindex(updated)
+    assert view.find(doi="10.1234/old", arxiv_id="2401.00001", title=paper.title) is None
+    assert view.find(doi=replacement.doi) is replacement
+    assert view.find(title=replacement.title) is replacement
+    assert _find(view, {"arxiv_id": added.arxiv_id}) is added
+    assert _find(view, {"title": replacement.title}) is replacement
+    assert view._find_preprint_journal_dup(dict(arxiv_id="2501.12345", title=replacement.title,
+                                               authors=replacement.authors, year=2025)) is replacement
+    assert view._find_preprint_journal_dup(dict(doi="10.1234/added", title=added.title,
+                                               authors=added.authors, year=2025)) is added
+    assert view._identifier_owner("paper_id", "core:work:new") is replacement
+    assert view._identifier_owner("inspire_record_id", "1412451") is added
+    assert view._identifier_owner("doi", "10.1234/new") is replacement
+
+
+def test_frozen_view_reindexes_alias_membership_and_targets(tmp_path, monkeypatch):
+    from papervault.library.services.registration import _find, _view
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    lib = Library(tmp_path)
+    first = Paper(key="First", title="Canonical first", doi="10.1234/first")
+    second = Paper(key="Second", title="Canonical second", doi="10.1234/second")
+    alias = Paper(key="Alias", title="Earlier version", doi="10.1234/alias")
+    view = _view(lib, {p.key: p for p in (alias, first, second)}, frozen=True)
+    alias = view.get("Alias")
+    for target in ("First", "Second"):
+        alias.terminal_state = TerminalState(merge=Merge.ALIAS, alias_key=target)
+        view._reindex(alias)
+        assert _find(view, {"doi": "10.1234/alias"}) is view.get(target)
+        assert view.find(doi="10.1234/alias") is view.get(target)
+        assert view._identifier_owner("doi", "10.1234/alias") is view.get(target)
+    alias.terminal_state = TerminalState()
+    view._reindex(alias)
+    assert _find(view, {"doi": "10.1234/alias"}) is alias
+    assert view._identifier_owner("doi", "10.1234/alias") is alias
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_identifier_owner_checks_current_fields_and_source_namespace(tmp_path, frozen):
+    from papervault.library.services.registration import _view
+
+    lib = Library(tmp_path)
+    paper = Paper(key="Owner", doi="10.1234/old", arxiv_id="2401.00001v1",
+                  source="core", paper_id="123", inspire_record_id="1412451")
+    view = _view(lib, {paper.key: paper}, frozen=frozen)
+    paper = view.get("Owner")
+    assert view._identifier_owner("doi", "10.1234/old") is paper
+    assert view._identifier_owner("arxiv_id", "2401.00001") is paper
+    assert view._identifier_owner("paper_id", "core:work:123") is paper
+    assert view._identifier_owner("inspire_record_id", "1412451") is paper
+    paper.doi, paper.arxiv_id, paper.inspire_record_id = "10.1234/new", "2401.00002", "1412452"
+    paper.source = "openalex"
+    for name, stale in (("doi", "10.1234/old"), ("arxiv_id", "2401.00001"),
+                        ("paper_id", "core:work:123"), ("inspire_record_id", "1412451")):
+        assert view._identifier_owner(name, stale) is None
+    if frozen:
+        view._reindex(paper)
+    assert view._identifier_owner("doi", "10.1234/new") is paper
+    assert view._identifier_owner("arxiv_id", "2401.00002") is paper
+    assert view._identifier_owner("paper_id", "openalex:work:123") is paper
+    assert view._identifier_owner("inspire_record_id", "1412452") is paper
+
+
+def test_frozen_reindex_only_tokenizes_changed_rows(tmp_path, monkeypatch):
+    from papervault.library.services.registration import _view
+
+    lib = Library(tmp_path)
+    papers = {str(i): Paper(key=str(i), doi=f"10.1234/{i}", source="core", paper_id=str(i))
+              for i in range(30)}
+    view = _view(lib, papers, frozen=True)
+    assert view._identifier_owner("paper_id", "core:work:missing") is None
+    assert view.find(title="Missing", arxiv_id="2401.99999") is None
+    assert view._identifier_owner("doi", "10.1234/missing") is None
+    original = Library._identifier_token
+    tokenized = []
+
+    def counted(name, value, source=""):
+        tokenized.append((name, value, source))
+        return original(name, value, source)
+
+    class IndexedPapers(dict):
+        def items(self):
+            pytest.fail("frozen reindex rebuilt a full field index")
+
+    view._papers = IndexedPapers(view._papers)
+    monkeypatch.setattr(Library, "_identifier_token", staticmethod(counted))
+    for i in range(3):
+        paper = Paper(key=f"New{i}", doi=f"10.1234/new{i}", source="core", paper_id=f"new{i}")
+        view._papers[paper.key] = paper
+        view._reindex(paper)
+        assert view._identifier_owner("paper_id", f"core:work:new{i}") is paper
+        assert view._identifier_owner("doi", paper.doi) is paper
+    assert not any(value.isdigit() for _, value, _ in tokenized)
+
+
+def test_stage_caches_live_claims_and_keeps_new_identities_indexed(tmp_path, monkeypatch):
+    from papervault.library.services.registration import RegistrationService, _view
+
+    lib = Library(tmp_path)
+    for i in range(30):
+        paper = Paper(key=f"Unrelated{i}", title=f"Unrelated retained work {i}",
+                      source="core", paper_id=f"unrelated-{i}")
+        lib._papers[paper.key] = paper
+        lib._reindex(paper)
+    view = _view(lib, lib._papers, frozen=True)
+    original, unrelated_tokens = Library._identifier_token, []
+
+    def counted(name, value, source=""):
+        if value.startswith("unrelated-"):
+            unrelated_tokens.append(value)
+        return original(name, value, source)
+
+    monkeypatch.setattr(Library, "_identifier_token", staticmethod(counted))
+    candidates = [admitted(doi=f"10.1234/new{i}", paper_id=f"new-{i}",
+                           title=f"Independent cosmic ray measurements {i}") for i in range(8)]
+    candidates.append(candidates[0])
+    outcomes, changed = RegistrationService(lib, None)._stage(view, candidates)
+    assert [o["status"] for o in outcomes] == ["registered"] * 8 + ["duplicate"]
+    assert outcomes[-1]["key"] == outcomes[0]["key"]
+    assert len(changed) == 8
+    assert len(unrelated_tokens) <= 3 * 30  # bounded by snapshots, independent of batch length
+    assert len(lib.keys()) == 30
+
+
+def test_postgres_registration_dumps_only_changed_keys_from_isolated_snapshots(tmp_path, monkeypatch):
+    from contextlib import nullcontext
+    from dataclasses import replace
+
+    from papervault.library.services import registration
+    from papervault.store.persistence import PostgresPersistence
+    from papervault.store.repository import Record
+
+    lib = Library(tmp_path)
+    existing = Paper(key="Existing", title=candidate()["title"], doi=candidate()["doi"])
+    lib._papers = {"Existing": existing, **{
+        f"Unrelated{i}": Paper(key=f"Unrelated{i}", title=f"Independent catalog work {i}")
+        for i in range(20)}}
+    for paper in lib._papers.values():
+        lib._reindex(paper)
+    backend = PostgresPersistence("unused")
+    backend.normalized = {key: p.model_dump(mode="json") for key, p in lib._papers.items()}
+    records = {key: Record.from_payload(key, payload) for key, payload in backend.normalized.items()}
+    backend.persisted = dict(records)
+    committed = []
+
+    def upsert(record, *, expected_revision, audit):
+        assert expected_revision == records[record.key].revision
+        assert record.payload != records[record.key].payload
+        records[record.key] = replace(record, revision=expected_revision + 1)
+        committed.append(audit)
+        existing.download_status = "metadata_only"  # changed after snapshot capture
+        return True
+
+    repo = SimpleNamespace(_write=lambda event: nullcontext(), all=lambda: iter(records.values()),
+                           get=records.get, upsert=upsert)
+    monkeypatch.setattr(backend, "repository", lambda: nullcontext(repo))
+    monkeypatch.setattr(lib, "_catalog_backend", backend)
+    existing.abstract = "Worker metadata awaiting its own save"
+    dump, make_view = Paper.model_dump, registration._view
+    modes = []
+
+    def checked_dump(paper, **kwargs):
+        assert not paper.key.startswith("Unrelated"), "serialized an unaffected catalog row"
+        return dump(paper, **kwargs)
+
+    def observed_view(library, papers, **kwargs):
+        modes.append(kwargs)
+        return make_view(library, papers, **kwargs)
+
+    monkeypatch.setattr(Paper, "model_dump", checked_dump)
+    monkeypatch.setattr(registration, "_view", observed_view)
+    outcomes = registration.RegistrationService(lib, None)._register_postgres(
+        [admitted(citation_count=42)], actor="test", reason="bounded-capture")
+    assert outcomes[0]["status"] == "duplicate"
+    assert existing.citation_count == 42
+    assert existing.abstract == "Worker metadata awaiting its own save"
+    assert existing.download_status == "metadata_only"
+    assert len(committed) == 1
+    assert committed[0].event == "registration"
+    assert modes[0] == {"deep_copy": False, "frozen": True}
+    assert all(mode.get("frozen") for mode in modes)
+
+
 LEGACY_GARBAGE_FIELDS = [
     pytest.param({"venue": venue}, id=venue) for venue in [
         "AGU Fall Meeting Abstracts", "AGU Spring Meeting", "Meeting Abstracts",

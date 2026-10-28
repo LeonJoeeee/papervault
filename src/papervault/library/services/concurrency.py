@@ -148,6 +148,10 @@ def release_extract_slot(endpoint=None) -> None:
 # 4 is safe for free-tier rate limits.
 network_sem = asyncio.Semaphore(4)
 
+# Foreground discovery must progress while background PDF downloads hold all
+# acquisition permits. Backend-specific politeness still applies to searches.
+search_network_sem = asyncio.Semaphore(4)
+
 # Cap on concurrent text-LLM calls (MiMo via litellm). Used by the
 # remaining LLM paths inside paper-library: resolver fuzzy-match,
 # search rerank, and the extract clarity / completeness judges

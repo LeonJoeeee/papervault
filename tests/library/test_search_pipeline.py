@@ -120,6 +120,60 @@ async def test_retrieval_runs_kg_off_loop_against_the_local_snapshot(tmp_path, m
     assert result.local[0].title == "Original detector measurements"
 
 
+async def test_retrieval_uses_search_permits_while_download_permits_are_saturated(tmp_path, monkeypatch):
+    import asyncio
+    from papervault.library.services import concurrency, search_pipeline as pipeline
+    from papervault.library.services.registration import ServingTrace
+
+    lib = Library(tmp_path)
+    downloads, searches = asyncio.Semaphore(4), asyncio.Semaphore(1)
+    monkeypatch.setattr(concurrency, "network_sem", downloads)
+    monkeypatch.setattr(concurrency, "search_network_sem", searches, raising=False)
+    for _ in range(4):
+        await downloads.acquire()
+
+    async def external(*args, **kwargs):
+        assert searches.locked()
+        return [node("External", "Detector measurements")], {}
+
+    async def progress(*args):
+        pass
+
+    monkeypatch.setattr(pipeline, "kg_local_search", lambda *a, **k: [])
+    searcher = pipeline.SearchPipeline(lib, None, None, None, external, None, None,
+                                       None, None, progress)
+    plan = pipeline.PlannedSearch({}, ["detector measurements"], {}, 10, "by_relevance")
+    try:
+        result = await asyncio.wait_for(searcher.retrieval(plan, ServingTrace(lib)), 1)
+        assert [p["key"] for p in result.external] == ["External"]
+        assert searches.locked() is False
+    finally:
+        for _ in range(4):
+            downloads.release()
+
+
+def test_local_snapshot_copies_each_paper_once_and_reuses_it_in_frozen_view(tmp_path, monkeypatch):
+    from papervault.library.services.search_pipeline import SearchPipeline
+
+    lib = Library(tmp_path)
+    original = add_record(lib, **node("Local", "Detector measurements"))
+    copy_paper, copies = Paper.model_copy, []
+
+    def counted(paper, **kwargs):
+        copies.append((paper.key, kwargs))
+        return copy_paper(paper, **kwargs)
+
+    monkeypatch.setattr(Paper, "model_copy", counted)
+    searcher = SearchPipeline(lib, None, None, None, None, None, None, None, None, None)
+    local, view = searcher._local_snapshot()
+    assert copies == [("Local", {"deep": True})]
+    assert view.get("Local") is local[0]
+    assert local[0] is not original
+    assert all(index.frozen for index in view._lookup_indexes.values())
+    original.authors.append("A live edit")
+    assert local[0].authors == ["Tester, A."]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["all_papers", "model_copy", "_view"])
 async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypatch, stage):
@@ -153,7 +207,6 @@ async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypat
 
     def kg_search(query, plan, view, **kwargs):
         assert view.get("Local").authors == ["Tester, A."]
-        view.get("Local").authors.append("View-only change")
         return ["Local"]
 
     monkeypatch.setattr(owner, stage, checked)

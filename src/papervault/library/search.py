@@ -313,7 +313,7 @@ _BACKEND_TIMEOUT_SECONDS = 30.0
 # Per-backend min-interval pacing (mechanisms 2 & 3, §3). arXiv = one call per
 # unique term ≥3s apart; CORE ≥6s apart. Process-global so the limiters protect
 # the upstream rate limit across all concurrent ``search_papers`` calls (under
-# network_sem=4 this serializes arXiv/CORE across calls — accepted; the
+# search_network_sem=4 this serializes arXiv/CORE across calls — accepted; the
 # ``_pace`` wait is OUTSIDE the fetch ``wait_for``, so late calls do not
 # self-timeout). The lazy ``asyncio.Lock`` binds to the current running loop
 # (fine for the single long-lived server loop).

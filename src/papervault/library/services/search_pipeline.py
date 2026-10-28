@@ -381,13 +381,13 @@ class SearchPipeline:
     def _local_snapshot(self):
         local = self.library.all_papers(include_quarantined=True)
         local = [p.model_copy(deep=True) for p in local]
-        return local, _view(self.library, {p.key: p for p in local})
+        return local, _view(self.library, {p.key: p for p in local}, deep_copy=False, frozen=True)
 
     async def retrieval(self, plan, trace):
         await self.progress(2, "searching external sources")
         local, view = await asyncio.to_thread(self._local_snapshot)
         with observe_source_gates(trace.record_backend):
-            async with network_slot(concurrency.network_sem, self.library, actor="search"):
+            async with network_slot(concurrency.search_network_sem, self.library, actor="search"):
                 (external, degraded), kg_ranks = await asyncio.gather(
                     self.retrieve(plan.terms, year_min=plan.filters.get("year_min"),
                                   year_max=plan.filters.get("year_max"), ranking_hint=plan.ranking_hint),

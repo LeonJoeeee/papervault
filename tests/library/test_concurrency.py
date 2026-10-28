@@ -19,6 +19,23 @@ from papervault.library.services.concurrency import (
 # ---------- with_dedup ----------
 
 
+async def test_search_network_permits_are_bounded_and_independent():
+    from papervault.library.services import concurrency
+
+    search_sem = getattr(concurrency, "search_network_sem", None)
+    assert isinstance(search_sem, asyncio.Semaphore)
+    assert search_sem is not concurrency.network_sem
+    try:
+        for _ in range(4):
+            await asyncio.wait_for(search_sem.acquire(), 1)
+        assert search_sem.locked()
+        async with concurrency.network_sem:
+            assert concurrency.network_sem.locked() is False
+    finally:
+        for _ in range(4):
+            search_sem.release()
+
+
 @pytest.mark.asyncio
 async def test_with_dedup_runs_work_once_for_unique_key():
     counter = [0]

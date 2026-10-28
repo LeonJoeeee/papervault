@@ -169,11 +169,10 @@ def _view(library, papers, *, deep_copy: bool = True, frozen: bool = False):
     view._lookup_indexes = {}
     if frozen:
         view._lookup_indexes = {field: _FieldLookup(frozen=True)
-                                for field in ("doi", "arxiv_id", "title", "authors")}
-    view._frozen_aliases = (
-        [paper for paper in view._papers.values() if paper.acquisition_state.alias_key]
-        if frozen else None
-    )
+                                for field in ("doi", "arxiv_id", "title", "authors",
+                                              "paper_id", "inspire_record_id")}
+    view._frozen_aliases = {} if frozen else None
+    view._frozen_order = {key: position for position, key in enumerate(view._papers)} if frozen else {}
     view._merge_execution_lock = threading.RLock()
     view._identity_reservations = set()
     for paper in view._papers.values():
@@ -221,6 +220,8 @@ def _find(library, candidate):
         aliases = getattr(library, "_frozen_aliases", None)
         if aliases is None:
             aliases = [paper for paper in library._papers.values() if paper.acquisition_state.alias_key]
+        else:
+            aliases = sorted(aliases.values(), key=lambda paper: library._frozen_order[paper.key])
     for name, normalize in (("doi", _normalize_doi), ("arxiv_id", _normalize_arxiv),
                             ("title", normalize_title)):
         value = candidate.get(name) or ""
@@ -436,7 +437,8 @@ class RegistrationService:
             with repo._write(event):
                 records = {r.key: r for r in repo.all()}
                 papers = {key: Paper.model_validate(r.payload) for key, r in records.items()}
-                view = _view(lib, papers)
+                view = _view(lib, papers, deep_copy=False, frozen=True)
+                live_view = self._live_snapshot()
 
                 # Resolve routing keys, then reload their authoritative rows at
                 # acceptance before applying any candidate metadata. PG's write
@@ -445,7 +447,7 @@ class RegistrationService:
                 refreshed = set()
                 for candidate in candidates:
                     existing = _find(view, candidate)
-                    live = _find(lib, candidate)
+                    live = _find(live_view, candidate)
                     existing = existing or (view.get(live.key) if live else None)
                     if existing is None or existing.key in refreshed:
                         continue
@@ -458,9 +460,13 @@ class RegistrationService:
                     view._reindex(paper)
                     refreshed.add(row.key)
 
-                with lib._merge_execution_lock:
-                    captured = {key: p.model_dump(mode="json") for key, p in lib._papers.items()}
-                outcomes, changed = self._stage(view, candidates)
+                # Reload IO may overlap worker changes. Admission needs a fresh
+                # isolated live snapshot, which also supplies the acknowledgment
+                # baseline without serializing unrelated rows under the lock.
+                live_view = self._live_snapshot()
+                outcomes, changed = self._stage(view, candidates, live_view=live_view)
+                captured = {key: live_view.get(key).model_dump(mode="json")
+                            for key in changed if live_view.get(key) is not None}
                 accepted, revisions = [], {}
                 recorded_observations = None
                 for key, outcome in changed.items():
@@ -603,18 +609,13 @@ class RegistrationService:
                 and view._identifier_token(name, getattr(live, name), live.source)
                 != view._identifier_token(name, getattr(paper, name), paper.source)]
 
-    def _adopt(self, view, paper, incoming, live, live_view, *, existing):
+    def _adopt(self, view, paper, incoming, live, claims, *, existing):
         """Apply staged identities only through the common adoption arbiter.
 
         Its working set is authoritative; live owners/reservations are additional
         conservative claims, never a replacement for the authoritative row.
         """
-        claims = set(live_view._identity_reservations)
-        for current in live_view._papers.values():
-            for name in _IDENTIFIERS:
-                if token := view._identifier_token(name, getattr(current, name), current.source):
-                    claims.add((name, token, current.key, None))
-        view._identity_reservations = claims
+        view._identity_reservations = claims.copy()
         identifiers, conflicts = {}, []
         if not paper.source:
             paper.source = incoming.get("source") or ""
@@ -642,14 +643,23 @@ class RegistrationService:
                                   "decision": decision})
         return conflicts + self._local_identity_conflicts(view, paper, live)
 
-    def _stage(self, view, candidates):
+    def _live_snapshot(self):
+        with self.library._merge_execution_lock:
+            view = _view(self.library, self.library._papers, frozen=True)
+            view._identity_reservations = set(self.library._identity_reservations)
+        return view
+
+    def _stage(self, view, candidates, *, live_view=None):
         # Admission/adoption uses an isolated live snapshot. In particular the
         # shared adoption API may record correction evidence on disk; it must
         # never perform that IO under the lock search uses for identity reads.
         # Final reservation checks arbitrate intervening live worker adoptions.
-        with self.library._merge_execution_lock:
-            live_view = _view(self.library, self.library._papers)
-            live_view._identity_reservations = set(self.library._identity_reservations)
+        live_view = self._live_snapshot() if live_view is None else live_view
+        claims = set(live_view._identity_reservations)
+        for current in live_view._papers.values():
+            for name in _IDENTIFIERS:
+                if token := view._identifier_token(name, getattr(current, name), current.source):
+                    claims.add((name, token, current.key, None))
         outcomes, changed, downloads = [], {}, 0
         for index, candidate in enumerate(candidates):
             outcome = {"identity": candidate_identity(candidate), "status": "rejected",
@@ -726,7 +736,7 @@ class RegistrationService:
                               terminal_state=TerminalState(retrieval=Retrieval.ELIGIBLE, policy=Policy.CLEAR),
                               added_at=datetime.now(timezone.utc).isoformat())
                 view._papers[key] = paper
-            conflicts = self._adopt(view, paper, incoming, live, live_view, existing=bool(existing))
+            conflicts = self._adopt(view, paper, incoming, live, claims, existing=bool(existing))
             _fill(paper, incoming, identities=False)
             if conflicts:
                 observed["identity_conflicts"] = conflicts

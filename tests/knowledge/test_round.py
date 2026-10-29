@@ -988,3 +988,37 @@ async def test_paused_round_does_not_reconcile_papers_excluded_from_clean_index(
     assert result["paused"] is True
     assert fake_ledger.rows["blocked"].status == status
     assert not [call for call in rag.calls if call[0] == "get_docs_by_ids"]
+
+
+@pytest.mark.parametrize("operation", ["distill", "terminal", "healed"])
+@pytest.mark.parametrize("minimal", [False, True])
+async def test_status_reads_batch_and_preserve_minimal_fallback(fake_ledger, monkeypatch, operation, minimal):
+    from unittest.mock import AsyncMock
+
+    rag = FakeRag(doc_statuses={"paper:A": "processed"})
+    rag.aget_docs_by_ids = AsyncMock(wraps=rag.aget_docs_by_ids)
+    batch = AsyncMock(wraps=rag.doc_status.get_by_ids)
+    rag.doc_status.get_by_ids = batch
+    if minimal:
+        del rag.doc_status
+    if operation == "distill":
+        monkeypatch.setattr(distill, "read_extract_raw", lambda rec: "Body of " + rec.key)
+        # Existing A is adopted; absent B takes the ordinary enqueue path.
+        if minimal:
+            # The minimal legacy fake only exercises an already-known doc.
+            records = [(_rec("A"), "fpA")]
+        else:
+            records = [(_rec("A"), "fpA"), (_rec("B"), "fpB")]
+        await distill.distill_batch(rag, records)
+    else:
+        status = "processing" if operation == "terminal" else "error"
+        fake_ledger.rows.update({key: LedgerRecord("l0_probe", "paper", key, "fp", f"paper:{key}", status)
+                                 for key in ("A", "B")})
+        await getattr(rnd, "reconcile_" + operation)(rag)
+    assert fake_ledger.rows["A"].status == "done"
+    if minimal:
+        rag.aget_docs_by_ids.assert_awaited_once()
+        batch.assert_not_awaited()
+    else:
+        rag.aget_docs_by_ids.assert_not_awaited()
+        batch.assert_awaited_once_with(["paper:A", "paper:B"])

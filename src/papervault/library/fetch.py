@@ -20,6 +20,7 @@ metadata) — same as before.
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from difflib import SequenceMatcher
@@ -220,9 +221,11 @@ def _fetch_ss_by_doi(doi: str) -> Optional[dict]:
     Returns None on failure / 404."""
     try:
         url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
+        api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+        auth = {"headers": {"x-api-key": api_key}} if api_key else {}
         params = {"fields": ("title,authors,year,abstract,citationCount,externalIds,"
                              "publicationTypes,venue,publicationVenue,url")}
-        r = polite_get(requests.get, url, params=params, timeout=30)
+        r = polite_get(requests.get, url, params=params, timeout=30, **auth)
         if not r.ok:
             return None
         paper = r.json()
@@ -418,8 +421,10 @@ def fetch_by_arxiv(arxiv_id: str) -> Optional[dict]:
     # Fallback: also try Semantic Scholar's arxiv prefix
     try:
         url = f"https://api.semanticscholar.org/graph/v1/paper/ARXIV:{base}"
+        api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+        auth = {"headers": {"x-api-key": api_key}} if api_key else {}
         r = polite_get(requests.get, url, timeout=30,
-                         params={"fields": "title,authors,year,abstract,citationCount,externalIds,venue,url"})
+                         params={"fields": "title,authors,year,abstract,citationCount,externalIds,venue,url"}, **auth)
         if r.ok:
             paper = r.json()
             authors = [a.get("name", "") for a in paper.get("authors", [])]

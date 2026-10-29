@@ -386,9 +386,10 @@ async def _reconcile_sections(rag, ingest_source: str, sections: list[DocSection
     pass collapses that to 'not PROCESSED now → error'."""
     await asyncio.to_thread(knowledge_runtime.assert_knowledge_authority, "legacy")
     from lightrag.base import DocStatus
+    from papervault.knowledge.ingest.distill import docs_by_ids
 
     by_doc = {s.doc_id: s for s in sections}
-    statuses = await rag.aget_docs_by_ids(list(by_doc))
+    statuses = await docs_by_ids(rag, list(by_doc))
     counts = {"done": 0, "error": 0, "pending": 0}
     for doc_id, s in by_doc.items():
         st = statuses.get(doc_id)

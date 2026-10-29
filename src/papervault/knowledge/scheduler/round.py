@@ -48,7 +48,7 @@ from typing import Iterable, Optional
 from lightrag.base import DocStatus
 
 from papervault.knowledge.ingest.abstract_doc import done_status_for
-from papervault.knowledge.ingest.distill import distill_batch, doc_status_of, remove_one
+from papervault.knowledge.ingest.distill import distill_batch, doc_status_of, docs_by_ids, remove_one
 from papervault.knowledge.ingest.fingerprint import fingerprint
 from papervault.knowledge.ingest.vault import load_clean_index
 from papervault.knowledge.ledger import store as ledger
@@ -93,7 +93,7 @@ async def reconcile_terminal(
         return counters
 
     by_doc_id = {r.doc_id: r for r in proc}
-    statuses = await rag.aget_docs_by_ids(list(by_doc_id.keys()))  # {doc_id: DocProcessingStatus}; 未命中省略
+    statuses = await docs_by_ids(rag, list(by_doc_id))
 
     seen_terminal: set[str] = set()
     for doc_id, rec in by_doc_id.items():
@@ -175,7 +175,7 @@ async def reconcile_healed(rag, *, only_keys: Optional[Iterable[str]] = None,
     counters = {"healed": 0}
     if not rows:
         return counters
-    statuses = await rag.aget_docs_by_ids([r.doc_id for r in rows])
+    statuses = await docs_by_ids(rag, [r.doc_id for r in rows])
     for rec in rows:
         if doc_status_of(statuses.get(rec.doc_id)) == DocStatus.PROCESSED:
             await ledger.upsert(rec.ingest_source, rec.source_id, doc_id=rec.doc_id,

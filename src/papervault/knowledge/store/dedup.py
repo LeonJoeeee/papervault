@@ -104,6 +104,59 @@ async def backup_members(rag, names: list[str], path: str) -> int:
     return backed
 
 
+async def _reconcile_document_indexes(rag, merged: dict[str, str]) -> None:
+    """Keep deletion's document discovery indexes aligned with native merges."""
+    from lightrag.base import DocStatus
+
+    stores = [(getattr(rag, name, None), field) for name, field in (
+        ("full_entities", "entity_names"), ("full_relations", "relation_pairs"))]
+    if not merged or not any(store is not None for store, _ in stores):
+        return
+
+    def canonical(name):
+        while name in merged:
+            name = merged[name]
+        return name
+
+    # KV stores have no portable scan API. Document status enumerates deletion's
+    # document IDs; strict reads must raise rather than silently omit documents.
+    ids = list(await rag.doc_status.get_docs_by_statuses(list(DocStatus), strict=True))
+    for store, field in stores:
+        if store is None:
+            continue
+        changed = False
+        for start in range(0, len(ids), 200):
+            batch = ids[start:start + 200]
+            updates = {}
+            for did, row in zip(batch, await store.get_by_ids(batch)):
+                if row is None:
+                    continue
+                old = row[field]
+                if field == "entity_names":
+                    if not any(name in merged for name in old):
+                        continue
+                    new = list(dict.fromkeys(canonical(name) for name in old))
+                else:
+                    if not any(a in merged or b in merged for a, b in old):
+                        continue
+                    new, seen = [], set()
+                    for a, b in old:
+                        a, b = canonical(a), canonical(b)
+                        # Native relations are undirected; retain the first
+                        # pair's orientation as well as its position.
+                        key = tuple(sorted((a, b)))
+                        if a != b and key not in seen:
+                            new.append([a, b])
+                            seen.add(key)
+                if new != old or row.get("count") != len(new):
+                    updates[did] = {**row, field: new, "count": len(new)}
+            if updates:
+                await store.upsert(updates)
+                changed = True
+        if changed and (callback := getattr(store, "index_done_callback", None)):
+            await callback()
+
+
 async def sweep(rag, *, min_key_len: int = MIN_KEY_LEN, backup_path: str | None = None,
                 deferred_path: str | None = None, dry_run: bool = True,
                 only_names: set[str] | None = None,
@@ -152,6 +205,7 @@ async def sweep(rag, *, min_key_len: int = MIN_KEY_LEN, backup_path: str | None 
         if backed != len(touch):
             raise RuntimeError(f"backup incomplete {backed}!={len(touch)} — aborting before any merge")
 
+    merged = {}
     for (_k, members, types) in single:
         target = max(members, key=lambda m: 0)  # placeholder; replaced below by degree
         # choose highest-degree member as canonical target
@@ -163,9 +217,11 @@ async def sweep(rag, *, min_key_len: int = MIN_KEY_LEN, backup_path: str | None 
             await rag.amerge_entities(source_entities=sources, target_entity=target,
                                       target_entity_data={"entity_type": the_type})
             st.single_type_merged += 1
+            merged.update({source: target for source in sources})
         except Exception:
             st.merge_errors += 1
 
+    await _reconcile_document_indexes(rag, merged)
     after = await _all_nodes(rag)
     st.nodes_after = len(after)
     st.collision_after = _collision_rate(after, min_key_len)

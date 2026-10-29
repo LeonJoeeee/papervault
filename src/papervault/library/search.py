@@ -129,13 +129,15 @@ def fetch_references(paper_id_or_doi: str, *, limit: int = 200) -> list[dict]:
         return []
     pid = paper_id_or_doi
     url = f"{_SS_BASE}/{pid}/references"
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+    auth = {"headers": {"x-api-key": api_key}} if api_key else {}
     try:
         r = polite_get(requests.get, url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
-                         timeout=30)
+                         timeout=30, **auth)
         if r.status_code == 429:
             time.sleep(5.0)
             r = polite_get(requests.get, url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
-                             timeout=30)
+                             timeout=30, **auth)
         r.raise_for_status()
     except Exception:
         return []
@@ -245,13 +247,15 @@ def fetch_citations(paper_id_or_doi: str, *, limit: int = 200) -> list[dict]:
     if not paper_id_or_doi:
         return []
     url = f"{_SS_BASE}/{paper_id_or_doi}/citations"
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+    auth = {"headers": {"x-api-key": api_key}} if api_key else {}
     try:
         r = polite_get(requests.get, url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
-                         timeout=30)
+                         timeout=30, **auth)
         if r.status_code == 429:
             time.sleep(5.0)
             r = polite_get(requests.get, url, params={"fields": _SS_FIELDS, "limit": min(limit, 1000)},
-                             timeout=30)
+                             timeout=30, **auth)
         r.raise_for_status()
     except Exception:
         return []
@@ -685,13 +689,18 @@ async def _fetch_one_backend(
             retry_after_s=error.retry_after_s if error else None,
         ))
 
-    if _breaker_is_open(backend_name):
+    def skip_open_circuit():
+        if not _breaker_is_open(backend_name):
+            return False
         if degraded_map is not None:
             degraded_map[backend_name] += 1
         observe("skipped", error=BackendDegraded(
             "Source circuit open", code="circuit_open",
             retry_after_s=max(0.0, _BREAKER_OPEN_UNTIL[backend_name] - _breaker_now()),
         ))
+        return True
+
+    if skip_open_circuit():
         return []
     backend_fn = globals()[f"search_{backend_name}"]
     fn_kwargs = {"max_results": max_n}
@@ -706,14 +715,24 @@ async def _fetch_one_backend(
             if lock is None:
                 lock = _POLITE_FETCH_LOCKS[key] = asyncio.Lock()
             async with lock:
+                if skip_open_circuit():
+                    return []
                 await _wait_for_search_admission(backend_name)
+                if skip_open_circuit():
+                    return []
                 interval = _interval_for(backend_name)
                 await _pace(backend_name, interval)
+                if skip_open_circuit():
+                    return []
                 if interval > 0:
                     await _wait_for_search_admission(backend_name)
+                if skip_open_circuit():
+                    return []
                 raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
         else:
             await _pace(backend_name, _interval_for(backend_name))
+            if skip_open_circuit():
+                return []
             raw = await _run_fetch(backend_fn, query, fn_kwargs, timeout)
         if not isinstance(raw, list) or any(not isinstance(paper, dict) for paper in raw):
             raise backend_degraded(ValueError("invalid backend results"))
@@ -730,10 +749,11 @@ async def _fetch_one_backend(
         return []
     except Exception as error:
         failure = backend_degraded(error)
-        logger.warning("search: backend %s DEGRADED: %s", backend_name, failure.code)
+        local_denial = isinstance(error, PolitenessDenied) or isinstance(error.__cause__, PolitenessDenied)
+        log_failure = logger.info if local_denial else logger.warning
+        log_failure("search: backend %s DEGRADED: %s", backend_name, failure.code)
         if degraded_map is not None:
             degraded_map[backend_name] += 1
-        local_denial = isinstance(error, PolitenessDenied) or isinstance(error.__cause__, PolitenessDenied)
         if failure.scope == "service" and not local_denial:
             _breaker_record_degraded(backend_name)
         observe("degraded", error=failure)

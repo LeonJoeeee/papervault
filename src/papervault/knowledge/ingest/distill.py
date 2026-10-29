@@ -57,6 +57,16 @@ def file_path(key: str) -> str:
     return f"paper/{key}"
 
 
+async def docs_by_ids(rag, ids: list[str]) -> dict:
+    """Batch status reads without warning about expected absent documents."""
+    if not ids:
+        return {}
+    if not hasattr(rag, "doc_status"):
+        return await rag.aget_docs_by_ids(ids)
+    return {did: st for did, st in zip(ids, await rag.doc_status.get_by_ids(ids))
+            if st is not None}
+
+
 def doc_status_of(st) -> object | None:
     """Pull `.status` out of an aget_docs_by_ids / doc_status entry (SDD §6.6 ★ contract).
 
@@ -340,7 +350,7 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
     # #131 Bound 1: a doc_id doc_status already holds is never enqueued again (LightRAG would only
     # reject it and record a `dup-*` marker). One batched lookup for every would-be insert.
     want = [doc_id(rec.key) for rec, fp in items if fp != META]
-    existing = await rag.aget_docs_by_ids(want) if want else {}
+    existing = await docs_by_ids(rag, want)
 
     for rec, fp in items:
         if fp == META:

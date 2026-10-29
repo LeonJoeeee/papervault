@@ -11,6 +11,8 @@ from typing import Literal
 
 import requests
 
+from ..polite_http import PolitenessDenied, PolitenessUnavailable
+
 Scope = Literal["item", "service"]
 Retryability = Literal["permanent", "transient_with_delay", "transient_no_delay"]
 DEFAULT_RETRY_AFTER_S = 5.0
@@ -92,6 +94,12 @@ def backend_degraded(error: Exception | None = None, *, response=None,
     if isinstance(error, (requests.Timeout, TimeoutError)):
         return BackendDegraded("Source timeout", code="timeout",
                                retryability="transient_no_delay")
+    if isinstance(error, PolitenessDenied):
+        return BackendDegraded("Source politeness denied", code="politeness_denied",
+                               retryability="transient_with_delay")
+    if isinstance(error, PolitenessUnavailable):
+        return BackendDegraded("Source politeness unavailable", code="politeness_unavailable",
+                               retryability="transient_with_delay")
     if isinstance(error, requests.ConnectionError):
         return BackendDegraded("Source transport failure", code="transport_error",
                                retryability="transient_no_delay")

@@ -8,6 +8,7 @@ the MCP surface:
     python -m papervault.knowledge.cli stats                        # §6.5 step5 acceptance + ops truth view
     python -m papervault.knowledge.cli get paper:Reames2023         # by-id LightRAG doc_status row
     python -m papervault.knowledge.cli rollback-abstracts           # #144 undo, dry-run by default
+    python -m papervault.knowledge.cli scrub-ghost-chunks           # legacy chunk repair, dry-run by default
 
 Legacy knowledge reads are workspace-gated via assert_safe_workspace() (SDD §6.0): hitting prod 'l0'
 without KS_ALLOW_PROD_WORKSPACE=1 refuses to run = explicit failure, never a silent
@@ -283,6 +284,30 @@ def rollback_abstracts(apply: bool, json_out: bool) -> None:
     click.echo("Set KS_ABSTRACT_DOCS=0 in the service env before restarting papervault.service, "
                "or the scheduler re-ingests these papers as abstract docs."
                + ("" if result["abstract_docs_enabled"] else " (KS_ABSTRACT_DOCS=0 is set here.)"))
+
+
+@cli.command("scrub-ghost-chunks")
+@click.option("--apply", is_flag=True, help="Repair ghost references (default: read-only dry run)")
+@click.option("--json", "json_out", is_flag=True, help="Output raw JSON")
+def scrub_ghost_chunks(apply: bool, json_out: bool) -> None:
+    """Remove ghost chunk references from a guarded legacy workspace."""
+    from papervault.knowledge.store.scrub import scrub_ghost_chunks as scrub
+
+    if apply and (running := _active_service()):
+        click.echo(f"ABORT: {', '.join(running)} is running and would race this scrub.", err=True)
+        sys.exit(2)
+    try:
+        result = scrub(apply=apply)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if json_out:
+        click.echo(json.dumps(result, indent=2))
+        return
+    mode = "APPLY" if apply else "DRY-RUN (nothing written)"
+    click.echo(f"scrub-ghost-chunks [{mode}], workspace={result['workspace']}")
+    for key, value in result.items():
+        if key not in {"workspace", "dry_run"}:
+            click.echo(f"  {key}: {value}")
 
 
 def _extract_target_options(function):

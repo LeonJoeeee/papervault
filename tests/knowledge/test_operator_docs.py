@@ -679,3 +679,22 @@ def test_mixed_operator_purge_clears_only_successful_deletions(monkeypatch):
     counts = _run(od.purge_key(MixedRag(), "textbook", "textbook:Fixture2020"))
     assert counts == {"docs_deleted": 1, "docs_failed": 1, "ledger_rows_deleted": 1}
     assert set(_run(od.ledger.load("textbook"))) == {"Fixture2020#s1"}
+
+
+def test_operator_section_reconcile_batches_status_reads(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from papervault.knowledge.ingest import operator_docs
+
+    sections = [SimpleNamespace(doc_id='book#s0', source_id='book#s0'),
+                SimpleNamespace(doc_id='book#s1', source_id='book#s1')]
+    statuses = AsyncMock(return_value=[{'status': 'processed'}, None])
+    rag = SimpleNamespace(doc_status=SimpleNamespace(get_by_ids=statuses),
+                          aget_docs_by_ids=AsyncMock(side_effect=AssertionError('sequential lookup')))
+    upsert = AsyncMock()
+    monkeypatch.setattr(operator_docs.ledger, 'upsert', upsert)
+    counts = _run(operator_docs._reconcile_sections(rag, 'textbook', sections))
+    assert counts == {'done': 1, 'error': 1, 'pending': 0}
+    statuses.assert_awaited_once_with(['book#s0', 'book#s1'])
+    assert [call.kwargs['status'] for call in upsert.await_args_list] == ['done', 'error']
+    rag.aget_docs_by_ids.assert_not_awaited()

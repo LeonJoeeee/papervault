@@ -1398,7 +1398,7 @@ def test_fusion_traces_only_active_contenders_and_relevant_local_diagnostics(tmp
         lib._reindex(paper)
     before = [p.model_dump() for p in papers]
     incoming = [node("Vouch", "Stellar spectra", doi="10.1234/other2"),
-                node("Blocked", "No lexical overlap", doi="10.1234/excluded0"),
+                dict(node("Blocked", "No lexical overlap", doi="10.1234/excluded0"), abstract="Stellar spectra."),
                 node("External", "Detector measurements", rank=1)]
     trace = ServingTrace(lib)
     searcher = SearchPipeline(lib, None, None, None, None, None, None, None, None, None,
@@ -1445,7 +1445,8 @@ def test_fusion_caps_each_local_diagnostic_without_capping_external_exclusions(t
             (f"ZZDuplicate{i:03d}", {"doi": f"10.1234/dup{i}"}),
         ):
             add_record(lib, key, title="Detector measurements", **fields)
-    incoming = [node("Blocked", "Stellar spectra", doi="10.1234/excluded149", rank=0)]
+    incoming = [dict(node("Blocked", "Stellar spectra", doi="10.1234/excluded149", rank=0),
+                     abstract="Stellar spectra.")]
     # Suppression beyond the trace cap must still populate the exclusion identities.
     fused = fuse_library(lib, incoming)
     events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]

@@ -1,5 +1,6 @@
 """Semantic Scholar API search tool."""
 
+import os
 import random
 import time
 from typing import Any
@@ -39,10 +40,12 @@ def search_semantic_scholar(query: str, max_results: int = 30) -> list[dict[str,
         "fields": FIELDS,
     }
 
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+    auth = {"headers": {"x-api-key": api_key}} if api_key else {}
     failure = BackendDegraded("S2 no response")
     for attempt in range(3):
         try:
-            resp = polite_get(requests.get, API_URL, params=params, timeout=30)
+            resp = polite_get(requests.get, API_URL, params=params, timeout=30, **auth)
             if resp.status_code == 429:
                 failure = backend_degraded(response=resp)
                 if polite_v2_enabled():

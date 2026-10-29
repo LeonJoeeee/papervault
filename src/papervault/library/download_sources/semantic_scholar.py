@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import requests
@@ -22,9 +23,13 @@ def _try_semantic_scholar_oa(paper: Paper) -> Optional[bytes]:
         f"https://api.semanticscholar.org/graph/v1/paper/DOI:{paper.doi}"
         "?fields=openAccessPdf"
     )
+    api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+    headers = {"User-Agent": USER_AGENT}
+    if api_key:
+        headers["x-api-key"] = api_key
     try:
         r = polite_get(requests.get, api, timeout=TIMEOUT,
-                         headers={"User-Agent": USER_AGENT})
+                         headers=headers)
         if not r.ok:
             return None
         oa = (r.json().get("openAccessPdf") or {})

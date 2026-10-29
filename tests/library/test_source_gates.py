@@ -240,3 +240,15 @@ def test_ads_receipt_reports_actual_empty_http_result_even_for_whitespace_token(
     with search.observe_source_gates(events.append):
         asyncio.run(search._fetch_one_backend("term", "ads", 5, term_idx=0))
     assert (events[0].status, events[0].hit_count, events[0].code) == ("success", 0, None)
+
+
+@pytest.mark.parametrize('exception,code', [('PolitenessDenied', 'politeness_denied'),
+                                           ('PolitenessUnavailable', 'politeness_unavailable')])
+def test_local_politeness_is_not_a_transport_error(exception, code):
+    from papervault.library import polite_http
+    from papervault.library.sources.exceptions import backend_degraded
+
+    error = backend_degraded(getattr(polite_http, exception)('private accounting details'))
+    assert error.code == code
+    assert error.retryability == 'transient_with_delay'
+    assert 'private' not in str(error)

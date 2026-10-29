@@ -1120,7 +1120,9 @@ def test_fetch_queue_timeout_env_is_parsed_defensively(monkeypatch, raw, expecte
 
 
 @pytest.mark.parametrize("wrapped", [False, True])
-def test_local_politeness_denial_does_not_feed_breaker(monkeypatch, wrapped):
+def test_local_politeness_denial_does_not_feed_breaker(monkeypatch, wrapped, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger=search.logger.name)
     def denied(*args, **kwargs):
         error = polite_http.PolitenessDenied("local admission denied")
         if wrapped:
@@ -1144,7 +1146,9 @@ def test_local_politeness_denial_does_not_feed_breaker(monkeypatch, wrapped):
     asyncio.run(run())
     assert degraded == {"semantic_scholar": 4}
     assert [o.status for o in observations] == ["degraded"] * 4
-    assert [o.code for o in observations] == ["transport_error"] * 4
+    assert [o.code for o in observations] == ["politeness_denied"] * 4
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("politeness_denied" in r.message for r in caplog.records)
     assert search._BREAKER_FAILS == {"semantic_scholar": 2}
     assert search._BREAKER_OPEN_UNTIL == {}
 
@@ -1176,7 +1180,7 @@ def test_polite_v2_terminal_gate_denial_never_submits_fetch(
     assert asyncio.run(run()) == []
     assert calls == []
     assert degraded == {backend: 1}
-    assert [(o.status, o.code) for o in observations] == [("degraded", "transport_error")]
+    assert [(o.status, o.code) for o in observations] == [("degraded", "politeness_denied")]
     assert search._BREAKER_FAILS == {}
     assert search._BREAKER_OPEN_UNTIL == {}
 
@@ -1315,7 +1319,7 @@ def test_adapter_politeness_denial_stops_retries_and_preserves_prior_failure(
         getattr(adapter, f"search_{backend}")("solar wind")
     assert len(attempts) == (2 if prior_failure else 1)
     assert len(sleeps) == (1 if prior_failure else 0)
-    assert caught.value.code == ("rate_limited" if prior_failure else "transport_error")
+    assert caught.value.code == ("rate_limited" if prior_failure else "politeness_denied")
     assert isinstance(caught.value.__cause__, polite_http.PolitenessDenied)
     if prior_failure:
         assert caught.value.retry_after_s == 23.0
@@ -1423,3 +1427,88 @@ def test_polite_v2_rechecks_gate_after_arxiv_pacing(monkeypatch, polite_search, 
     assert asyncio.run(search._fetch_one_backend("solar", "arxiv", 5, term_idx=0)) == []
     assert polite_search.sleeps == [3.0]
     assert search._BREAKER_FAILS == {}
+
+
+async def test_queued_polite_terms_skip_after_first_failure_opens_breaker(monkeypatch):
+    started, release, queued = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    calls, admissions, paces, observations = [], [], [], []
+
+    def backend(*args, **kwargs):
+        raise AssertionError('fetch boundary is stubbed')
+
+    async def fetch(*args, **kwargs):
+        calls.append(args)
+        started.set()
+        await release.wait()
+        raise BackendDegraded('upstream unavailable', code='provider_unavailable')
+
+    async def admit(name):
+        admissions.append(name)
+
+    async def pace(*args):
+        paces.append(args)
+
+    monkeypatch.setattr(search, 'polite_v2_enabled', lambda: True)
+    monkeypatch.setattr(search, 'search_semantic_scholar', backend)
+    monkeypatch.setitem(search._DEFAULT_BACKEND_FNS, 'semantic_scholar', backend)
+    monkeypatch.setattr(search, '_run_fetch', fetch)
+    monkeypatch.setattr(search, '_wait_for_search_admission', admit)
+    monkeypatch.setattr(search, '_pace', pace)
+    monkeypatch.setattr(search, '_interval_for', lambda _: 0)
+    monkeypatch.setattr(search, 'BREAKER_TRIPS', 1)
+    degraded = collections.Counter()
+
+    async def second():
+        queued.set()
+        return await search._fetch_one_backend('second', 'semantic_scholar', 5, term_idx=1, degraded_map=degraded)
+
+    with search.observe_source_gates(observations.append):
+        first = asyncio.create_task(search._fetch_one_backend('first', 'semantic_scholar', 5, term_idx=0,
+                                                             degraded_map=degraded))
+        await started.wait()
+        pending = asyncio.create_task(second())
+        await queued.wait()
+        release.set()
+        assert await asyncio.gather(first, pending) == [[], []]
+    assert len(calls) == len(admissions) == len(paces) == 1
+    assert degraded == {'semantic_scholar': 2}
+    assert [(o.status, o.code) for o in observations] == [
+        ('degraded', 'provider_unavailable'), ('skipped', 'circuit_open')]
+
+
+@pytest.mark.parametrize('polite,opens_during', [(False, 'pace'), (True, 'pace'),
+                                               (True, 'admission'), (True, 'second_admission')])
+async def test_breaker_opening_during_wait_skips_fetch(monkeypatch, polite, opens_during):
+    from unittest.mock import AsyncMock
+
+    async def wait(stage):
+        await asyncio.sleep(0)
+        if stage == opens_during:
+            search._breaker_record_degraded('semantic_scholar')
+
+    admission_count = 0
+
+    async def admission(name):
+        nonlocal admission_count
+        admission_count += 1
+        await wait('admission' if admission_count == 1 else 'second_admission')
+
+    async def pace(*args):
+        await wait('pace')
+
+    backend = lambda *args, **kwargs: []
+    monkeypatch.setattr(search, 'polite_v2_enabled', lambda: polite)
+    monkeypatch.setattr(search, 'search_semantic_scholar', backend)
+    monkeypatch.setitem(search._DEFAULT_BACKEND_FNS, 'semantic_scholar', backend)
+    monkeypatch.setattr(search, '_wait_for_search_admission', admission)
+    monkeypatch.setattr(search, '_pace', pace)
+    monkeypatch.setattr(search, '_interval_for', lambda _: 1)
+    fetch = AsyncMock(return_value=[])
+    monkeypatch.setattr(search, '_run_fetch', fetch)
+    monkeypatch.setattr(search, 'BREAKER_TRIPS', 1)
+    observations, degraded = [], collections.Counter()
+    with search.observe_source_gates(observations.append):
+        assert await search._fetch_one_backend('term', 'semantic_scholar', 5, term_idx=0, degraded_map=degraded) == []
+    fetch.assert_not_awaited()
+    assert [(o.status, o.code) for o in observations] == [('skipped', 'circuit_open')]
+    assert degraded == {'semantic_scholar': 1}

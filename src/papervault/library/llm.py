@@ -490,7 +490,7 @@ def _get_llm_via_gateway(mt: int, model: str | None):
 
 
 def get_llm(*, max_tokens: int | None = None, model: str | None = None):
-    """Shared LLM handle, defaulting library judges/intent/search to standard.
+    """Shared LLM handle, defaulting to judge (standard); intent selects its own pro role.
 
     ``model`` is the requested level. LiteLLM's openai/ prefix is transport syntax;
     both the gateway and direct endpoint receive the bare level unchanged. Direct

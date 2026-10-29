@@ -18,9 +18,9 @@ def gateway_model(level: str) -> str:
     return f"{_GATEWAY_PREFIX}{level}"
 _DEFAULT_LEVELS = {
     "intent": "pro",
-    "build": "standard",
+    "build": "max",
     "keyword": "flash",
-    "synth": "max",
+    "synth": "ultra",
     "gate": "flash",
     "verify": "flash",
     "judge": "standard",

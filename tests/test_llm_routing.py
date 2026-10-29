@@ -7,7 +7,7 @@ from papervault import config
 from papervault.llm_routing import route
 
 ROLE_LEVELS = [
-    ("build", "standard"), ("keyword", "flash"), ("synth", "max"),
+    ("build", "max"), ("keyword", "flash"), ("synth", "ultra"),
     ("gate", "flash"), ("verify", "flash"), ("judge", "standard"),
     ("decompose", "pro"), ("eval_judge", "standard"), ("intent", "pro"),
 ]
@@ -61,7 +61,7 @@ def test_retired_model_overrides_cannot_replace_levels(monkeypatch):
     for var in ("PAPERVAULT_MODEL", "PAPERVAULT_BUILD_MODEL", "KS_BUILD_MODEL",
                 "PAPER_PIPELINE_VERIFY_MODEL", "MIMO_MODEL"):
         monkeypatch.setenv(var, "provider-model")
-    assert route("build") == "standard"
+    assert route("build") == "max"
     assert route("keyword") == "flash"
     assert route("verify") == "flash"
     assert route("eval_judge") == "standard"
@@ -106,7 +106,8 @@ def test_doctor_accepts_level_defaults_without_model_slots(tmp_path, monkeypatch
     cli._check_config(report)
     assert report.failures == 0
     output = capsys.readouterr().out
-    assert "synth=max" in output
+    assert "build=max" in output
+    assert "synth=ultra" in output
     assert "decompose=pro" in output
 
 

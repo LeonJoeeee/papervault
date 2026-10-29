@@ -39,7 +39,7 @@ corpus, so the harness splits into what CI can prove and what only reference har
   above and populate it with the corpus you want scored.
 
 Production `KS_QUERY_VARIANT` defaults to `multiquery`, whose decomposition uses
-`PAPERVAULT_LLM_DECOMPOSE` (default `standard`), as does eval's `--variant multiquery`.
+`PAPERVAULT_LLM_DECOMPOSE` (default `pro`), as does eval's `--variant multiquery`.
 Eval selects its variant with `--variant` (`baseline` by default, also `multiquery`
 and `standard`); `KS_QUERY_VARIANT` does not override that CLI choice. Specify the
 variant explicitly when comparing production retrieval. Most query settings below
@@ -150,7 +150,8 @@ held constant between arms:
 | `KS_RERANK_MAX_ASYNC` / `RERANK_TIMEOUT` | `1` / `480` | Concurrent rerank calls and LightRAG worker timeout in seconds. |
 | `PAPERVAULT_EVAL_DIR` | `/data/paper-vault/eval-results` | Root for raw runs and judge artifacts; never a source directory. |
 | `KS_EVAL_ALLOW_COTENANCY` | unset | Exact `1` bypasses the stopped-service guard; workspace checks still apply. |
-| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `standard` / `standard` | Decomposition and judge role levels; the latter is shared by eval judge utilities. |
+| `PAPERVAULT_LLM_SYNTH` | `ultra` | Evidence-grounded synthesis role level, shared by production and eval. |
+| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `pro` / `standard` | Decomposition and judge role levels; the latter is shared by eval judge utilities. |
 
 The retained standalone `judge_mimo` utility uses `KS_GATEWAY_URL` (default
 `http://127.0.0.1:4000/v1`) and requires `KS_VIRTUAL_KEY`; these utility names are

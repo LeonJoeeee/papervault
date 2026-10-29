@@ -100,7 +100,7 @@ def _execution_model(role):
     recipe = current_execution_recipe()
     return recipe["configured_models"][role] if recipe is not None else route(role)
 
-# Graph extraction/merge use standard; query keywords use flash. The endpoint owns effort.
+# Graph extraction/merge default to max; query keywords to flash. The endpoint owns effort.
 async def build_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
     """LightRAG's ``llm_model_func``: route by role, and gate the BUILD role on the build-path
     breaker (#143) — while it is open a build call fails fast with ``BuildPausedError`` without

@@ -425,7 +425,7 @@ async def test_main_loop_defers_operator_doc_pickup_while_open(breaker, fake_led
     assert seen == {"rounds": 2, "drains": 1}
 
 
-@pytest.mark.parametrize("keyword,want", [(False, "standard"), (True, "flash")])
+@pytest.mark.parametrize("keyword,want", [(False, "max"), (True, "flash")])
 async def test_graph_uses_role_level_over_inherited_model(breaker, monkeypatch, keyword, want):
     for role in ("BUILD", "KEYWORD"):
         monkeypatch.delenv(f"PAPERVAULT_LLM_{role}", raising=False)

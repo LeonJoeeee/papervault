@@ -133,6 +133,35 @@ class ServingTrace:
     def __init__(self, library, trace_id: str | None = None):
         self.library = library
         self.trace_id = trace_id or uuid4().hex
+        self._batch_events = None
+
+    @contextmanager
+    def batch(self):
+        """Flush one synchronous stage on exit, including exceptional exits."""
+        if self._batch_events is not None:
+            yield
+            return
+        self._batch_events = []
+        try:
+            yield
+        finally:
+            events, self._batch_events = self._batch_events, None
+            if events:
+                log_many = getattr(self.library, "log_many", None)
+                if callable(log_many):
+                    try:
+                        log_many(events)
+                    except Exception:
+                        logger.warning("serving trace unavailable (batch)")
+                else:
+                    for event in events:
+                        self._record_event(event)
+
+    def _record_event(self, event):
+        try:
+            self.library.log(event)
+        except Exception:
+            logger.warning("serving trace unavailable (%s)", event["stage"])
 
     def record(self, stage: str, *, candidate: dict | None = None, **fields):
         event = {"event": "serving_trace", "trace_id": self.trace_id, "stage": stage,
@@ -141,10 +170,10 @@ class ServingTrace:
             event["candidate"] = candidate_identity(candidate)[:256]
         event.update({k: v[:256] if isinstance(v, str) else v for k, v in fields.items()
                       if v is None or isinstance(v, (str, bool, int, float))})
-        try:
-            self.library.log(event)
-        except Exception:
-            logger.warning("serving trace unavailable (%s)", stage)
+        if self._batch_events is not None:
+            self._batch_events.append(event)
+        else:
+            self._record_event(event)
 
     def record_intent(self, observation):
         self.record("intent", **{name: getattr(observation, name) for name in (
@@ -800,45 +829,51 @@ class RegistrationQueue:
         elif len(json.dumps(candidates).encode()) > MAX_REQUEST_BYTES:
             rejection = "registration_request_bytes"
         if rejection:
-            for candidate in candidates[:MAX_CANDIDATES]:
-                trace.record("registration", candidate=candidate, decision="rejected", reason=rejection)
+            with trace.batch():
+                for candidate in candidates[:MAX_CANDIDATES]:
+                    trace.record("registration", candidate=candidate, decision="rejected", reason=rejection)
             return
         snapshot = copy.deepcopy(candidates)
         self._queue.put_nowait((snapshot, actor, reason, trace))
-        for candidate in snapshot:
-            trace.record("registration", candidate=candidate, decision="submitted")
+        with trace.batch():
+            for candidate in snapshot:
+                trace.record("registration", candidate=candidate, decision="submitted")
 
     async def _worker(self):
         while True:
             candidates, actor, reason, trace = await self._queue.get()
             try:
-                for candidate in candidates:
-                    trace.record("registration", candidate=candidate, decision="accepted")
+                with trace.batch():
+                    for candidate in candidates:
+                        trace.record("registration", candidate=candidate, decision="accepted")
                 outcomes = await self.service.register_candidates(candidates, actor=actor, reason=reason)
                 self._record_outcomes(trace, candidates, outcomes)
             except _RegistrationCancelled as exc:
                 self._record_outcomes(trace, candidates, exc.outcomes)
                 raise
             except asyncio.CancelledError:
-                for candidate in candidates:
-                    trace.record("registration", candidate=candidate, decision="failed", reason="shutdown")
+                with trace.batch():
+                    for candidate in candidates:
+                        trace.record("registration", candidate=candidate, decision="failed", reason="shutdown")
                 raise
             except Exception:
                 logger.exception("registration command failed (%s)", trace.trace_id)
-                for candidate in candidates:
-                    trace.record("registration", candidate=candidate, decision="failed", reason="command_failed")
+                with trace.batch():
+                    for candidate in candidates:
+                        trace.record("registration", candidate=candidate, decision="failed", reason="command_failed")
             finally:
                 self._queue.task_done()
 
     @staticmethod
     def _record_outcomes(trace, candidates, outcomes):
-        for candidate, outcome in zip(candidates, outcomes):
-            trace.record("registration", candidate=candidate, decision=outcome["status"],
-                         reason=outcome["reason"], key=outcome["key"], download=outcome["download"],
-                         identity_conflicts=len(outcome.get("identity_conflicts", [])))
-        trace.record("registration_summary", **{
-            status: sum(o["status"] == status for o in outcomes)
-            for status in ("registered", "duplicate", "rejected", "failed")})
+        with trace.batch():
+            for candidate, outcome in zip(candidates, outcomes):
+                trace.record("registration", candidate=candidate, decision=outcome["status"],
+                             reason=outcome["reason"], key=outcome["key"], download=outcome["download"],
+                             identity_conflicts=len(outcome.get("identity_conflicts", [])))
+            trace.record("registration_summary", **{
+                status: sum(o["status"] == status for o in outcomes)
+                for status in ("registered", "duplicate", "rejected", "failed")})
 
     async def stop(self):
         self._started = False
@@ -848,6 +883,7 @@ class RegistrationQueue:
         self._workers.clear()
         while not self._queue.empty():
             candidates, _, _, trace = self._queue.get_nowait()
-            for candidate in candidates:
-                trace.record("registration", candidate=candidate, decision="rejected", reason="shutdown")
+            with trace.batch():
+                for candidate in candidates:
+                    trace.record("registration", candidate=candidate, decision="rejected", reason="shutdown")
             self._queue.task_done()

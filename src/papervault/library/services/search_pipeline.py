@@ -26,7 +26,7 @@ from ..sources.identity import merge_source_identities, normalized_source_identi
 from ..sources.inspire import merge_inspire_fields
 from . import concurrency
 from .bm25_search import (
-    RRF_K, _node_key, bm25_per_term_ranklists, paper_to_dict,
+    RRF_K, _node_key, _paper_text, _tokenize, bm25_per_term_ranklists, paper_to_dict,
     reorder_ranklists_by_rrf, round_robin, rrf_fuse,
 )
 from .intent_parser import named_entity_groups, observe_intent
@@ -402,137 +402,158 @@ class SearchPipeline:
         excluded_identities = {}
         bibliography = collections.defaultdict(list)
         snapshot = {p.key: p for p in retrieved.local}
-        # Register identified versions first so an identifier-poor observation
-        # cannot bridge two different DOIs or displace the identified record.
-        for paper in sorted(retrieved.local, key=lambda p: (-bool(p.doi), -bool(p.arxiv_id), p.key)):
-            path, canonical = set(), paper
-            while canonical.acquisition_state.alias_key and canonical.key not in path:
-                path.add(canonical.key)
-                canonical = snapshot.get(canonical.acquisition_state.alias_key)
-                if canonical is None:
-                    break
-            if canonical is None or canonical.key in path:
-                trace.record("fusion", key=paper.key, decision="dropped", reason="unresolved_alias")
-                continue
-            if serving_excluded(canonical):
-                excluded_identities[_identity_key(paper_to_dict(paper))] = canonical.key
-                excluded_identities[_identity_key(paper_to_dict(canonical))] = canonical.key
-                trace.record("fusion", key=paper.key, decision="dropped", reason="serving_excluded")
-                continue
-            node = paper_to_dict(canonical)
-            identity = _identity_key(node)
-            bib_key = serving_bibliographic_key(node)
-            matches = bibliography.get(bib_key, [])
-            if (identity not in seen and not (node.get("doi") or node.get("arxiv_id"))
-                    and len(matches) == 1):
-                seen[identity] = matches[0]
-            if identity in seen:
-                canonical_keys[paper.key] = seen[identity]["key"]
+        query_tokens = {token for term in plan.terms for token in _tokenize(term)}
+        kg_trace_keys = set(retrieved.kg_ranks)
+        local_trace_counts = collections.Counter()
+
+        def trace_local(paper, canonical, reason, **fields):
+            # Trace relevance only: all catalog identity/exclusion state below
+            # must still be populated, even after a diagnostic reaches its cap.
+            if local_trace_counts[reason] >= LIB_CAP * 2:
+                return
+            records = (paper, canonical) if canonical is not None and canonical is not paper else (paper,)
+            if not any(record.key in kg_trace_keys or query_tokens.intersection(
+                    _tokenize(_paper_text(paper_to_dict(record)))) for record in records):
+                return
+            local_trace_counts[reason] += 1
+            trace.record("fusion", key=paper.key, reason=reason, **fields)
+
+        with trace.batch():
+            # Register identified versions first so an identifier-poor observation
+            # cannot bridge two different DOIs or displace the identified record.
+            for paper in sorted(retrieved.local, key=lambda p: (-bool(p.doi), -bool(p.arxiv_id), p.key)):
+                path, canonical = set(), paper
+                while canonical.acquisition_state.alias_key and canonical.key not in path:
+                    path.add(canonical.key)
+                    canonical = snapshot.get(canonical.acquisition_state.alias_key)
+                    if canonical is None:
+                        break
+                if canonical is None or canonical.key in path:
+                    trace_local(paper, canonical, "unresolved_alias", decision="dropped")
+                    continue
+                if serving_excluded(canonical):
+                    excluded_identities[_identity_key(paper_to_dict(paper))] = canonical.key
+                    excluded_identities[_identity_key(paper_to_dict(canonical))] = canonical.key
+                    trace_local(paper, canonical, "serving_excluded", decision="dropped")
+                    continue
+                node = paper_to_dict(canonical)
+                identity = _identity_key(node)
+                bib_key = serving_bibliographic_key(node)
+                matches = bibliography.get(bib_key, [])
+                if (identity not in seen and not (node.get("doi") or node.get("arxiv_id"))
+                        and len(matches) == 1):
+                    seen[identity] = matches[0]
+                if identity in seen:
+                    canonical_keys[paper.key] = seen[identity]["key"]
+                    if paper.key != canonical.key:
+                        seen[_identity_key(paper_to_dict(paper))] = seen[identity]
+                    trace_local(paper, snapshot[seen[identity]["key"]], "local_duplicate", candidate=paper_to_dict(paper),
+                                decision="folded", canonical_key=seen[identity]["key"])
+                    continue
+                seen[identity] = node
+                canonical_keys[paper.key] = node["key"]
                 if paper.key != canonical.key:
-                    seen[_identity_key(paper_to_dict(paper))] = seen[identity]
-                trace.record("fusion", candidate=paper_to_dict(paper), key=paper.key,
-                             decision="folded", canonical_key=seen[identity]["key"], reason="local_duplicate")
-                continue
-            seen[identity] = node
-            canonical_keys[paper.key] = node["key"]
-            if paper.key != canonical.key:
-                seen[_identity_key(paper_to_dict(paper))] = node
-            local_by_key[node["key"]] = node
-            if bib_key is not None and (node.get("doi") or node.get("arxiv_id")):
-                bibliography[bib_key].append(node)
-        corpus = [node for node in local_by_key.values() if plan.year_eligible(node)]
-        local_ranks = bm25_per_term_ranklists(corpus, plan.terms)
-        # Resolve KG evidence against this same canonical, year-eligible snapshot.
-        # An alias or several matching chunks can grant only one vote per track.
-        eligible_keys = {node["key"] for node in corpus}
-        kg_keys = dict.fromkeys(canonical_keys.get(key, key) for key in retrieved.kg_ranks)
-        kg_ranks = [local_by_key[key] for key in kg_keys if key in eligible_keys]
-        buckets = collections.defaultdict(list)
-        # Secondary identifiers/title and explicit aliases use preview's
-        # version-compatible lookup, bound to this request's catalog snapshot.
-        exclusion_view = (_view(self.library, snapshot, deep_copy=False, frozen=True)
-                          if excluded_identities and retrieved.external else None)
-        for node in retrieved.external:
-            identity, term, rank = _identity_key(node), node.get("term_idx", 0), node.get("rank", 0)
-            excluded_key = excluded_identities.get(identity)
-            if not excluded_key and exclusion_view is not None:
-                matched = _find(exclusion_view, node)
-                if matched is not None and serving_excluded(matched):
-                    excluded_key = matched.key
-            if excluded_key:
-                trace.record("fusion", candidate=node, key=excluded_key, arm="external",
-                             decision="dropped", reason="serving_excluded")
-                continue
-            hit = seen.get(identity)
-            if hit is None:
-                seen[identity] = hit = node
-                hit["term_ranks"] = {}
+                    seen[_identity_key(paper_to_dict(paper))] = node
+                local_by_key[node["key"]] = node
+                if bib_key is not None and (node.get("doi") or node.get("arxiv_id")):
+                    bibliography[bib_key].append(node)
+            corpus = [node for node in local_by_key.values() if plan.year_eligible(node)]
+            local_ranks = bm25_per_term_ranklists(corpus, plan.terms)
+            # Resolve KG evidence against this same canonical, year-eligible snapshot.
+            # An alias or several matching chunks can grant only one vote per track.
+            eligible_keys = {node["key"] for node in corpus}
+            kg_keys = dict.fromkeys(canonical_keys.get(key, key) for key in retrieved.kg_ranks)
+            kg_ranks = [local_by_key[key] for key in kg_keys if key in eligible_keys]
+            buckets = collections.defaultdict(list)
+            # Secondary identifiers/title and explicit aliases use preview's
+            # version-compatible lookup, bound to this request's catalog snapshot.
+            exclusion_view = (_view(self.library, snapshot, deep_copy=False, frozen=True)
+                              if excluded_identities and retrieved.external else None)
+            for node in retrieved.external:
+                identity, term, rank = _identity_key(node), node.get("term_idx", 0), node.get("rank", 0)
+                excluded_key = excluded_identities.get(identity)
+                if not excluded_key and exclusion_view is not None:
+                    matched = _find(exclusion_view, node)
+                    if matched is not None and serving_excluded(matched):
+                        excluded_key = matched.key
+                if excluded_key:
+                    trace.record("fusion", candidate=node, key=excluded_key, arm="external",
+                                 decision="dropped", reason="serving_excluded")
+                    continue
+                hit = seen.get(identity)
+                if hit is None:
+                    seen[identity] = hit = node
+                    hit["term_ranks"] = {}
+                else:
+                    _merge_observations(hit, node)
+                    trace.record("fusion", candidate=node, decision="folded", canonical_key=hit.get("key"))
+                hit["best_external_rank"] = min(hit.get("best_external_rank", rank), rank)
+                hit["external_rrf_score"] = hit.get("external_rrf_score", 0) + 1 / (RRF_K + rank)
+                hit["_external_hit_count"] = hit.get("_external_hit_count", 0) + 1
+                if hit.get("_source_origin") == "library":
+                    hit["folded_vouch"] = hit.get("folded_vouch", 0) + 1
+                    continue
+                votes = hit.setdefault("term_ranks", {})
+                if term not in votes:
+                    buckets[term].append(hit)
+                votes[term] = min(votes.get(term, rank), rank)
+            external_ranks = [sorted(buckets.get(t, []), key=lambda n: (n["term_ranks"][t], _identity_key(n)))
+                              for t in range(len(plan.terms))]
+            ext_rrf = rrf_fuse(external_ranks, _identity_key)
+            external_ranks = reorder_ranklists_by_rrf(external_ranks, ext_rrf, _identity_key)
+            lib_key = lambda node: node["key"]
+            ranked_lists = [("local", ranks) for ranks in local_ranks] + [("kg", kg_ranks)]
+            pool_ranks = [ranks for _, ranks in ranked_lists]
+            lib_rrf = rrf_fuse(pool_ranks, lib_key)
+            authority_active = (self.authority_enabled and self.authority_weight > 0
+                                and plan.ranking_hint not in ("by_recency", "by_importance"))
+            now_year = datetime.now(timezone.utc).year
+            if authority_active:
+                top_cands = {node["key"] for rl in pool_ranks for node in rl[:800]}
+                if any(_authority_value(local_by_key[k], now_year) > 0 for k in top_cands):
+                    auth_order = sorted(top_cands, key=lambda k: (
+                        -_authority_value(local_by_key[k], now_year), -lib_rrf.get(k, 0.0), k))
+                    auth_rank = {k: i for i, k in enumerate(auth_order)}
+                    n_lists = max(1, sum(1 for rl in pool_ranks if rl))
+                    for k in auth_order:
+                        lib_rrf[k] = lib_rrf.get(k, 0.0) + (
+                            4.0 * self.authority_weight * n_lists / (RRF_K + auth_rank[k]))
+            pool_ranks = reorder_ranklists_by_rrf(pool_ranks, lib_rrf, lib_key)
+            for ranklist in external_ranks:
+                for node in ranklist:
+                    node["_rrf"] = ext_rrf.get(_identity_key(node), 0)
+            external = round_robin(external_ranks, EXT_CAP, _identity_key)
+            local = round_robin(pool_ranks, LIB_CAP, lib_key)
+            selected = {n["key"] for n in local}
+            vouched = [n for n in local_by_key.values() if n.get("folded_vouch")]
+            also_include = [n for n in vouched if n["key"] not in selected and plan.year_eligible(n)]
+            if authority_active:
+                v_auth_order = sorted(also_include, key=lambda n: (
+                    -_authority_value(n, now_year), -n["external_rrf_score"],
+                    -n["folded_vouch"], -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
+                v_auth_rank = {n["key"]: i for i, n in enumerate(v_auth_order)}
+                also_include.sort(key=lambda n: (
+                    -(n["external_rrf_score"] + 2.0 * self.authority_weight / (RRF_K + v_auth_rank[n["key"]])),
+                    -n["folded_vouch"], -_authority_value(n, now_year),
+                    -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
             else:
-                _merge_observations(hit, node)
-                trace.record("fusion", candidate=node, decision="folded", canonical_key=hit.get("key"))
-            hit["best_external_rank"] = min(hit.get("best_external_rank", rank), rank)
-            hit["external_rrf_score"] = hit.get("external_rrf_score", 0) + 1 / (RRF_K + rank)
-            hit["_external_hit_count"] = hit.get("_external_hit_count", 0) + 1
-            if hit.get("_source_origin") == "library":
-                hit["folded_vouch"] = hit.get("folded_vouch", 0) + 1
-                continue
-            votes = hit.setdefault("term_ranks", {})
-            if term not in votes:
-                buckets[term].append(hit)
-            votes[term] = min(votes.get(term, rank), rank)
-        external_ranks = [sorted(buckets.get(t, []), key=lambda n: (n["term_ranks"][t], _identity_key(n)))
-                          for t in range(len(plan.terms))]
-        ext_rrf = rrf_fuse(external_ranks, _identity_key)
-        external_ranks = reorder_ranklists_by_rrf(external_ranks, ext_rrf, _identity_key)
-        lib_key = lambda node: node["key"]
-        ranked_lists = [("local", ranks) for ranks in local_ranks] + [("kg", kg_ranks)]
-        pool_ranks = [ranks for _, ranks in ranked_lists]
-        lib_rrf = rrf_fuse(pool_ranks, lib_key)
-        authority_active = (self.authority_enabled and self.authority_weight > 0
-                            and plan.ranking_hint not in ("by_recency", "by_importance"))
-        now_year = datetime.now(timezone.utc).year
-        if authority_active:
-            top_cands = {node["key"] for rl in pool_ranks for node in rl[:800]}
-            if any(_authority_value(local_by_key[k], now_year) > 0 for k in top_cands):
-                auth_order = sorted(top_cands, key=lambda k: (
-                    -_authority_value(local_by_key[k], now_year), -lib_rrf.get(k, 0.0), k))
-                auth_rank = {k: i for i, k in enumerate(auth_order)}
-                n_lists = max(1, sum(1 for rl in pool_ranks if rl))
-                for k in auth_order:
-                    lib_rrf[k] = lib_rrf.get(k, 0.0) + (
-                        4.0 * self.authority_weight * n_lists / (RRF_K + auth_rank[k]))
-        pool_ranks = reorder_ranklists_by_rrf(pool_ranks, lib_rrf, lib_key)
-        for ranklist in external_ranks:
-            for node in ranklist:
-                node["_rrf"] = ext_rrf.get(_identity_key(node), 0)
-        external = round_robin(external_ranks, EXT_CAP, _identity_key)
-        local = round_robin(pool_ranks, LIB_CAP, lib_key)
-        selected = {n["key"] for n in local}
-        vouched = [n for n in local_by_key.values() if n.get("folded_vouch")]
-        also_include = [n for n in vouched if n["key"] not in selected and plan.year_eligible(n)]
-        if authority_active:
-            v_auth_order = sorted(also_include, key=lambda n: (
-                -_authority_value(n, now_year), -n["external_rrf_score"],
-                -n["folded_vouch"], -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
-            v_auth_rank = {n["key"]: i for i, n in enumerate(v_auth_order)}
-            also_include.sort(key=lambda n: (
-                -(n["external_rrf_score"] + 2.0 * self.authority_weight / (RRF_K + v_auth_rank[n["key"]])),
-                -n["folded_vouch"], -_authority_value(n, now_year),
-                -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
-        else:
-            also_include.sort(key=lambda n: (
-                -n["folded_vouch"], -n["external_rrf_score"], -(n.get("citation_count") or 0),
-                -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
-        local.extend(also_include[:ALSO_INCLUDE_CAP])
-        selected = {n["key"] for n in local}
-        ext_selected = {_identity_key(n) for n in external}
-        for node in {id(n): n for n in seen.values()}.values():
-            trace.record("fusion", candidate=node, key=node.get("key"),
-                         decision="pooled" if node.get("key") in selected or _identity_key(node) in ext_selected else "dropped",
-                         reason="pool_selection", folded_vouch=node.get("folded_vouch", 0),
-                         external_rrf_score=node.get("external_rrf_score"), best_external_rank=node.get("best_external_rank"))
-        trace.record("fusion", external_pool=len(external), local_pool=len(local))
-        return FusedSearch(external, local, vouched, canonical_keys)
+                also_include.sort(key=lambda n: (
+                    -n["folded_vouch"], -n["external_rrf_score"], -(n.get("citation_count") or 0),
+                    -(n.get("year") or _YEAR_NEUTRAL), n["key"]))
+            local.extend(also_include[:ALSO_INCLUDE_CAP])
+            selected = {n["key"] for n in local}
+            ext_selected = {_identity_key(n) for n in external}
+            contenders = selected | {node["key"] for ranks in pool_ranks for node in ranks[:LIB_CAP * 2]}
+            for node in {id(n): n for n in seen.values()}.values():
+                if (node.get("_source_origin") == "library" and not node.get("_external_hit_count")
+                        and not node.get("folded_vouch") and node.get("key") not in contenders):
+                    continue
+                trace.record("fusion", candidate=node, key=node.get("key"),
+                             decision="pooled" if node.get("key") in selected or _identity_key(node) in ext_selected else "dropped",
+                             reason="pool_selection", folded_vouch=node.get("folded_vouch", 0),
+                             external_rrf_score=node.get("external_rrf_score"), best_external_rank=node.get("best_external_rank"))
+            trace.record("fusion", external_pool=len(external), local_pool=len(local))
+            return FusedSearch(external, local, vouched, canonical_keys)
 
     def _prepare_return_pool(self, plan, fused, judgments, trace):
         """Run synchronous eligibility lookups and isolated previews off-loop."""
@@ -540,15 +561,16 @@ class SearchPipeline:
             live_view = _view(self.library, self.library._papers, deep_copy=False, frozen=True)
             live_view._identity_reservations = set(self.library._identity_reservations)
         eligible = []
-        for idx, node in enumerate(fused.external):
-            candidate = copy.deepcopy(node)
-            candidate["_registration"] = judgments.get(idx)
-            known = live_view.find(doi=candidate.get("doi") or "", arxiv_id=candidate.get("arxiv_id") or "",
-                                   title=candidate.get("title") or "") or live_view._find_preprint_journal_dup(candidate)
-            rejection = registration_rejection(candidate, known_identity=known is not None)
-            trace.record("gate", candidate=candidate, decision="skipped" if rejection else "eligible", reason=rejection)
-            if not rejection:
-                eligible.append(candidate)
+        with trace.batch():
+            for idx, node in enumerate(fused.external):
+                candidate = copy.deepcopy(node)
+                candidate["_registration"] = judgments.get(idx)
+                known = live_view.find(doi=candidate.get("doi") or "", arxiv_id=candidate.get("arxiv_id") or "",
+                                       title=candidate.get("title") or "") or live_view._find_preprint_journal_dup(candidate)
+                rejection = registration_rejection(candidate, known_identity=known is not None)
+                trace.record("gate", candidate=candidate, decision="skipped" if rejection else "eligible", reason=rejection)
+                if not rejection:
+                    eligible.append(candidate)
         registration = eligible + [dict(n, _registration_known_key=n["key"]) for n in fused.vouched]
         external, projections = preview_candidates(live_view, eligible, canonical_keys=fused.canonical_keys)
         # Preview may resolve a new identity to a local row suppressed by fusion.
@@ -601,29 +623,30 @@ class SearchPipeline:
     async def serving(self, selection, plan, trace):
         await self.progress(5, "building response")
         results = []
-        for position, (_, candidate) in enumerate(selection.scored):
-            trace.record("ranking", candidate=candidate, key=candidate.get("key"), position=position,
-                         decision="returned" if position < plan.limit else "limit")
-            if position >= plan.limit:
-                continue
-            key = candidate["key"]
-            paper = self.library.get(key)
-            if paper is not None:
-                if serving_excluded(paper):
+        with trace.batch():
+            for position, (_, candidate) in enumerate(selection.scored):
+                trace.record("ranking", candidate=candidate, key=candidate.get("key"), position=position,
+                             decision="returned" if position < plan.limit else "limit")
+                if position >= plan.limit:
                     continue
-                record = self.project(selection.projections.get(key, paper), self.library)
-            else:
-                record = {field: candidate.get(field) or default for field, default in (
-                    ("title", ""), ("authors", []), ("year", None), ("venue", ""),
-                    ("abstract", ""), ("doi", ""), ("arxiv_id", ""), ("citation_count", 0))}
-                record.update(key=key, text_status="pending", source_identities=normalized_source_identities(
-                    candidate, candidate.get("source") or ""))
-            if not plan.year_eligible(record):
-                continue
-            results.append(record)
-            trace.record("serving", candidate=record, key=record["key"], position=position, decision="served",
-                         text_status=record.get("text_status"), text_available="text_path" in record)
-        trace.record("serving", returned=len(results), eligible=len(selection.registration))
+                key = candidate["key"]
+                paper = self.library.get(key)
+                if paper is not None:
+                    if serving_excluded(paper):
+                        continue
+                    record = self.project(selection.projections.get(key, paper), self.library)
+                else:
+                    record = {field: candidate.get(field) or default for field, default in (
+                        ("title", ""), ("authors", []), ("year", None), ("venue", ""),
+                        ("abstract", ""), ("doi", ""), ("arxiv_id", ""), ("citation_count", 0))}
+                    record.update(key=key, text_status="pending", source_identities=normalized_source_identities(
+                        candidate, candidate.get("source") or ""))
+                if not plan.year_eligible(record):
+                    continue
+                results.append(record)
+                trace.record("serving", candidate=record, key=record["key"], position=position, decision="served",
+                             text_status=record.get("text_status"), text_available="text_path" in record)
+            trace.record("serving", returned=len(results), eligible=len(selection.registration))
         return results
 
     async def run(self, query, *, service_fields=None):
@@ -655,6 +678,7 @@ class SearchPipeline:
             self.registration_queue.submit(selection.registration, actor="search", reason=trace.trace_id, trace=trace)
         except Exception:
             logger.exception("registration submission failed (%s)", trace.trace_id)
-            for candidate in selection.registration[:120]:
-                trace.record("registration", candidate=candidate, decision="failed", reason="submission_failed")
+            with trace.batch():
+                for candidate in selection.registration[:120]:
+                    trace.record("registration", candidate=candidate, decision="failed", reason="submission_failed")
         return response

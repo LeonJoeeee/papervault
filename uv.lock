@@ -2023,7 +2023,7 @@ wheels = [
 
 [[package]]
 name = "papervault"
-version = "0.10.23"
+version = "0.10.24"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },

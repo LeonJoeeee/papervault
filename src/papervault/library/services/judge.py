@@ -106,8 +106,24 @@ def _candidate_to_item(i: int, c: dict) -> dict:
     }
 
 
-async def _call_with_retry(system_prompt: str, user_prompt: str, llm: Any) -> str:
-    """One LLM call, retried with exponential backoff. Raises if all attempts fail."""
+class _ZeroMatchedError(Exception):
+    """Reply parsed without exception, but matched zero expected candidate indices."""
+
+
+async def _call_with_retry(
+    system_prompt: str,
+    user_prompt: str,
+    llm: Any,
+    *,
+    validate: Optional[Callable[[str], Any]] = None,
+) -> Any:
+    """One LLM call, retried with exponential backoff. Raises if all attempts fail.
+
+    Direct 3-argument callers receive the raw ``str`` reply. When ``validate`` is
+    supplied, it runs inside the same ``MAX_RETRIES + 1`` attempt loop after the per-call
+    ``concurrency.llm_sem`` permit is released; any ``Exception`` from ``llm.call`` or
+    ``validate`` retries with backoff, while ``CancelledError`` propagates immediately.
+    """
     last: Optional[Exception] = None
     for attempt in range(MAX_RETRIES + 1):
         try:
@@ -125,12 +141,15 @@ async def _call_with_retry(system_prompt: str, user_prompt: str, llm: Any) -> st
                     task.exception()  # Retrieve failures even after caller cancellation.
 
             worker.add_done_callback(finished)
-            return await asyncio.shield(worker)
-        except Exception as e:  # noqa: BLE001 — transient LLM hiccup; retry
+            raw = await asyncio.shield(worker)
+            return raw if validate is None else validate(raw)
+        except Exception as e:  # noqa: BLE001 — transient LLM or parse/match hiccup; retry
             last = e
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(_BACKOFF_BASE * (2 ** attempt))
-    raise RuntimeError(f"judge batch failed after {MAX_RETRIES + 1} attempts: {last}")
+    if isinstance(last, _ZeroMatchedError):
+        raise last
+    raise RuntimeError(f"judge batch failed after {MAX_RETRIES + 1} attempts: {last}") from last
 
 
 async def _scored_judge(
@@ -143,13 +162,13 @@ async def _scored_judge(
     llm: Any,
 ) -> tuple[dict[int, dict], int]:
     """Batched + parallel scored judgment. Returns ``({global_idx: judgment},
-    dropped_batches)``. A batch that fails all retries — OR whose response parses
-    OK but matched ZERO expected indices (the index-rebasing silent-drop mode,
-    §6) — contributes NOTHING (conservative drop, never fail-open) and counts as
-    one DROPPED batch. The parse-OK-zero-matched case emits a ``logging.warning``
-    (it is otherwise invisible — un-retried, un-logged); ``dropped_batches`` is
-    threaded out to the caller and surfaced as ``judge_batches_dropped`` (§8) so a
-    silent recall loss is machine-visible."""
+    dropped_batches)``. A batch that fails all retries — including persistent
+    malformed replies or replies that parse OK but match ZERO expected indices
+    (the index-rebasing silent-drop mode, §6) — contributes NOTHING (conservative
+    drop, never fail-open) and counts as one DROPPED batch. When the final attempt
+    parses OK with zero matched indices, a ``logging.warning`` is emitted;
+    ``dropped_batches`` is threaded out to the caller and surfaced as
+    ``judge_batches_dropped`` (§8) so a silent recall loss is machine-visible."""
     if not candidates:
         return {}, 0
     indexed = list(enumerate(candidates))
@@ -158,22 +177,31 @@ async def _scored_judge(
     async def _one(batch: list[tuple[int, dict]]) -> tuple[dict[int, dict], int]:
         items = [_candidate_to_item(i, c) for i, c in batch]
         expected = {i for i, _ in batch}
-        try:
-            raw = await _call_with_retry(system_prompt, build_user_prompt(items), llm)
+        user_prompt = build_user_prompt(items)
+
+        def _parse_and_check(raw: str) -> dict[int, dict]:
             parsed = parse_items(raw, expected)
-        except Exception as e:  # noqa: BLE001 — persistent LLM failure OR unparseable response: DROP
-            # fail-CLOSED: a refusal / empty / truncated / malformed-JSON reply must
-            # be a conservative DROP (counted), NEVER an exception that crashes search.
-            logger.error("judge: dropping batch of %d (no fail-open): %s", len(batch), e)
-            return {}, 1
-        if not parsed:
-            # Parsed cleanly but nothing matched the expected global indices —
-            # the index-rebasing later-batch silent-drop mode (§6). Otherwise
-            # un-retried + un-logged; surface it as a WARN + a dropped batch.
+            if expected and not parsed:
+                raise _ZeroMatchedError()
+            return parsed
+
+        try:
+            parsed = await _call_with_retry(
+                system_prompt, user_prompt, llm, validate=_parse_and_check,
+            )
+        except _ZeroMatchedError:
+            # Final attempt parsed cleanly but nothing matched the expected global
+            # indices — the index-rebasing later-batch silent-drop mode (§6).
+            # Surface it as a WARN + a dropped batch rather than logger.error.
             logger.warning(
                 "judge: batch of %d parsed OK but 0 items matched expected idx "
                 "(possible index-rebasing); dropping", len(batch),
             )
+            return {}, 1
+        except Exception as e:  # noqa: BLE001 — persistent LLM failure OR unparseable response: DROP
+            # fail-CLOSED: a refusal / empty / truncated / malformed-JSON reply must
+            # be a conservative DROP (counted), NEVER an exception that crashes search.
+            logger.error("judge: dropping batch of %d (no fail-open): %s", len(batch), e)
             return {}, 1
         return parsed, 0
 

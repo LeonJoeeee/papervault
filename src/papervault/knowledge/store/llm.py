@@ -32,9 +32,9 @@ the returned str (``_create_completion``) — the relay behind the gateway kills
 silent for ~120 s, which a long extraction chunk routinely is; a stream is never silent. Accounting
 (LLMTOK) still gets real token counts via ``stream_options.include_usage``. ``KS_LLM_STREAM=0`` is
 the boot-time kill switch back to the plain call. Since issue #102 the gateway path also retries
-TRANSIENT failures a bounded number of times inside a wall-clock budget, and gives up on a stream
-whose first chunk does not arrive within ``KS_LLM_FIRST_CHUNK_S`` (the relay's idle timer also
-runs before the first token).
+TRANSIENT failures a bounded number of times inside a wall-clock budget, and when a positive
+``KS_LLM_FIRST_CHUNK_S`` is configured (default ``0``, disabled) gives up on a stream whose first
+chunk does not arrive within that deadline.
 
 Interface compatible with LightRAG's llm_model_func signature (DO NOT CHANGE):
     async def llm_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str
@@ -144,12 +144,12 @@ DEFAULT_LLM_TIMEOUT_S = 240
 _GW_TRANSIENT_RETRIES = int(os.getenv("KS_GATEWAY_TRANSIENT_RETRIES", "2"))      # -> 3 attempts
 _GW_TRANSIENT_BACKOFF_CAP = float(os.getenv("KS_GATEWAY_TRANSIENT_BACKOFF_CAP", "15"))
 # ABSOLUTE deadline, measured from the first attempt, within which a retry may still be STARTED
-# (with room for its first chunk): elapsed + backoff + _FIRST_CHUNK_S must fit. It defaults to
-# LightRAG's per-worker cap (2 x KS_LLM_TIMEOUT, the same derivation graph.py uses), so a retry
-# can still start after a transport timeout that consumed a whole attempt — provided
-# KS_LLM_CLIENT_TIMEOUT sits below that cap minus the first-chunk room (production: cap 1800,
-# client timeout 1500, room 100). The attempt itself runs under the caller's cap like any other;
-# sleeps are clipped to the remaining time; the gateway-unreachable loop honours the same deadline.
+# (with room for any opted-in first-chunk cutoff): elapsed + backoff + max(_FIRST_CHUNK_S, 0.0)
+# must fit. It defaults to LightRAG's per-worker cap (2 x KS_LLM_TIMEOUT, the same derivation
+# graph.py uses), so a retry can still start after a transport timeout that consumed a whole
+# attempt — provided KS_LLM_CLIENT_TIMEOUT sits below that cap minus any positive first-chunk room.
+# The attempt itself runs under the caller's cap like any other; sleeps are clipped to the
+# remaining time; the gateway-unreachable loop honours the same deadline.
 
 
 def _retry_budget_default(env) -> float:
@@ -160,12 +160,12 @@ def _retry_budget_default(env) -> float:
 
 
 _GW_RETRY_BUDGET_S = _retry_budget_default(os.environ)
-# The relay's ~120 s idle timer also runs BEFORE the first token, and the proxy only sends the
-# response headers once the upstream answers — so the deadline spans create() AND the first chunk.
-# Waiting the relay out costs 120 s per attempt (365 s after the proxy's two retries) for nothing;
-# give up earlier so a retry starts while the relay may already be less busy. Applies to BOTH
-# paths through _create_completion (direct KeyPool too); 0 disables it.
-_FIRST_CHUNK_S = float(os.getenv("KS_LLM_FIRST_CHUNK_S", "100"))
+# Optional pre-first-chunk cutoff spanning create() AND the first chunk (applies to BOTH paths
+# through _create_completion). Default 0 (disabled): reasoning-heavy models behind the gateway
+# routinely buffer internal reasoning tokens for >100 s before emitting the first stream chunk,
+# while outer deadlines (KS_SYNTH_TIMEOUT_S, KS_LLM_TIMEOUT, _CLIENT_TIMEOUT) govern. Set a
+# positive KS_LLM_FIRST_CHUNK_S only behind a relay with a short silent-TCP idle drop.
+_FIRST_CHUNK_S = float(os.getenv("KS_LLM_FIRST_CHUNK_S", "0"))
 _TRANSIENT_STATUSES = frozenset({408, 429})
 
 

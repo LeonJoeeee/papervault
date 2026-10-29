@@ -1096,7 +1096,9 @@ def local_authority_fusion():
 
 
 def fuse_local(searcher, plan, retrieved):
-    return searcher.fusion(plan, retrieved, SimpleNamespace(record=lambda *args, **kwargs: None))
+    from papervault.library.services.registration import ServingTrace
+
+    return searcher.fusion(plan, retrieved, ServingTrace(SimpleNamespace(log=lambda event: None)))
 
 
 def test_local_authority_prior_lifts_landmark_before_bm25_pool_cut(local_authority_fusion):
@@ -1356,3 +1358,127 @@ def test_lookup_caches_are_isolated_in_preview_views(tmp_path, monkeypatch):
     assert lib.find(title="Preview title") is None
     assert paper.title == "Original title"
     assert "Original title" not in calls
+
+
+@pytest.mark.parametrize("catalog_size", [200, 600])
+def test_fusion_traces_only_active_contenders_and_relevant_local_diagnostics(tmp_path, catalog_size):
+    from papervault.library.services.registration import ServingTrace
+    from papervault.library.services.search_pipeline import PlannedSearch, RetrievedSearch, SearchPipeline
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    lib = Library(tmp_path)
+    papers = []
+    for i in range(catalog_size):
+        papers.extend([
+            Paper(key=f"Other{i:03d}", title=f"Stellar spectra {i}", doi=f"10.1234/other{i}"),
+            Paper(key=f"Excluded{i:03d}", title=f"Stellar spectra {i}", doi=f"10.1234/excluded{i}",
+                  terminal_state=TerminalState(quarantine=True)),
+            Paper(key=f"ZZDuplicate{i:03d}", title=f"Stellar spectra {i}", doi=f"10.1234/other{i}"),
+            Paper(key=f"Unresolved{i:03d}", title=f"Stellar spectra {i}", terminal_state=TerminalState(
+                merge=Merge.ALIAS, alias_key="Missing")),
+        ])
+    papers.extend([
+        Paper(key="MatchingExcluded", title="Detector measurements", doi="10.1234/blocked",
+              terminal_state=TerminalState(quarantine=True)),
+        Paper(key="MatchingUnresolved", title="Detector measurements", terminal_state=TerminalState(
+            merge=Merge.ALIAS, alias_key="Missing")),
+        Paper(key="ZZMatchingDuplicate", title="Detector measurements", doi="10.1234/other0"),
+        Paper(key="KGExcluded", title="Stellar spectra", doi="10.1234/kgblocked", terminal_state=TerminalState(quarantine=True)),
+        Paper(key="KGUnresolved", title="Stellar spectra", terminal_state=TerminalState(
+            merge=Merge.ALIAS, alias_key="Missing")),
+        Paper(key="ZZKGDuplicate", title="Stellar spectra", doi="10.1234/other1"),
+        Paper(key="ZZIdentityCanonicalOverlap", title="Stellar spectra", doi="10.1234/relevant1"),
+        Paper(key="ZZCanonicalOverlap", title="Stellar spectra", terminal_state=TerminalState(
+            merge=Merge.ALIAS, alias_key="Relevant000")),
+    ])
+    papers.extend(Paper(key=f"Relevant{i:03d}", title=f"Detector measurements {i}",
+                        doi=f"10.1234/relevant{i}") for i in range(120))
+    for paper in papers:
+        lib._papers[paper.key] = paper
+        lib._reindex(paper)
+    before = [p.model_dump() for p in papers]
+    incoming = [node("Vouch", "Stellar spectra", doi="10.1234/other2"),
+                dict(node("Blocked", "No lexical overlap", doi="10.1234/excluded0"), abstract="Stellar spectra."),
+                node("External", "Detector measurements", rank=1)]
+    trace = ServingTrace(lib)
+    searcher = SearchPipeline(lib, None, None, None, None, None, None, None, None, None,
+                              authority_enabled=False)
+    fused = searcher.fusion(PlannedSearch({}, ["detector measurements"], {}, 10, "by_relevance"),
+                            RetrievedSearch(incoming, papers, {},
+                                            ["KGExcluded", "KGUnresolved", "ZZKGDuplicate"]), trace)
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    pool = [event for event in events if event.get("reason") == "pool_selection"]
+    assert len(pool) == 93  # 90 BM25 contenders, one KG contender, one vouch and one external
+    assert len([event for event in pool if event["decision"] == "pooled"]) == 47
+    assert not any(event.get("key", "").startswith("Other") and event.get("key") not in {"Other001", "Other002"}
+                   for event in pool)
+    diagnostics = {reason: {event["key"] for event in events
+                            if event.get("reason") == reason and event.get("arm") != "external"}
+                   for reason in ("serving_excluded", "unresolved_alias", "local_duplicate")}
+    assert diagnostics == {
+        "serving_excluded": {"MatchingExcluded", "KGExcluded"},
+        "unresolved_alias": {"MatchingUnresolved", "KGUnresolved"},
+        "local_duplicate": {"ZZMatchingDuplicate", "ZZKGDuplicate", "ZZCanonicalOverlap",
+                            "ZZIdentityCanonicalOverlap"},
+    }
+    assert any(event.get("arm") == "external" and event.get("key") == "Excluded000"
+               and event.get("reason") == "serving_excluded" for event in events)
+    assert fused.canonical_keys["ZZDuplicate000"] == "Other000"
+    assert fused.canonical_keys["ZZMatchingDuplicate"] == "Other000"
+    assert fused.canonical_keys["ZZCanonicalOverlap"] == "Relevant000"
+    assert [p.model_dump() for p in papers] == before
+    assert len(fused.local) == 46
+    assert [n["key"] for n in fused.external] == ["External"]
+
+
+def test_fusion_caps_each_local_diagnostic_without_capping_external_exclusions(tmp_path):
+    from collections import Counter
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    lib = Library(tmp_path)
+    for i in range(150):
+        for key, fields in (
+            (f"Excluded{i:03d}", {"terminal_state": TerminalState(quarantine=True),
+                                      "doi": f"10.1234/excluded{i}"}),
+            (f"Unresolved{i:03d}", {"terminal_state": TerminalState(merge=Merge.ALIAS, alias_key="Missing")}),
+            (f"Original{i:03d}", {"doi": f"10.1234/dup{i}"}),
+            (f"ZZDuplicate{i:03d}", {"doi": f"10.1234/dup{i}"}),
+        ):
+            add_record(lib, key, title="Detector measurements", **fields)
+    incoming = [dict(node("Blocked", "Stellar spectra", doi="10.1234/excluded149", rank=0),
+                     abstract="Stellar spectra.")]
+    # Suppression beyond the trace cap must still populate the exclusion identities.
+    fused = fuse_library(lib, incoming)
+    events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
+    counts = Counter(event.get("reason") for event in events if event.get("arm") != "external")
+    assert counts["serving_excluded"] == 90
+    assert counts["local_duplicate"] == 90
+    assert counts["unresolved_alias"] == 90
+    assert any(event.get("arm") == "external" and event.get("reason") == "serving_excluded"
+               for event in events)
+    assert fused.external == []
+    assert len(fused.canonical_keys) == 300
+
+
+def test_fusion_flushes_all_trace_loops_as_one_stage(tmp_path, monkeypatch):
+    from papervault.library.state_v2 import TerminalState
+
+    lib = Library(tmp_path)
+    add_record(lib, "Blocked", title="Detector measurements", doi="10.1234/blocked",
+               terminal_state=TerminalState(quarantine=True))
+    add_record(lib, "Local", title="Detector measurements", doi="10.1234/local")
+    for i in range(5):
+        add_record(lib, f"Other{i}", title=f"Stellar spectra {i}", doi=f"10.1234/other{i}")
+    batches, original = [], lib.log_many
+
+    def logged(events):
+        batches.append(list(events))
+        original(events)
+
+    monkeypatch.setattr(lib, "log_many", logged)
+    fused = fuse_library(lib, [node("BlockedHit", "Stellar spectra", doi="10.1234/blocked"),
+                               node("External", "Detector measurements")])
+    assert [n["key"] for n in fused.external] == ["External"]
+    assert len(batches) == 1
+    assert {event.get("reason") for event in batches[0]} >= {"serving_excluded", "pool_selection"}
+    assert batches[0][-1]["local_pool"] == 1

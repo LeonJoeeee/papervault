@@ -10,6 +10,7 @@ import re
 import stat
 import time
 from dataclasses import asdict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Optional
 
@@ -1345,18 +1346,25 @@ class Library:
         for an unmet prerequisite, without a network attempt. Reconcile
         counts paper routes from status/disk facts, not these tier events.
         """
+        self.log_many([event])
+
+    def log_many(self, events: Sequence[dict]) -> None:
+        """Append a batch of manifest events with one lock and file open."""
         self._check_writer()
+        if not events:
+            return
         from papervault.config import stoprules_v2_enabled
         if stoprules_v2_enabled() and hasattr(self, "_telemetry_live"):
             # Preserve staged observations in the live manifest, with an
             # explicit stage marker; they are not live publication evidence.
-            self._telemetry_live.log({**enrich(event, self), "staged": True})
+            self._telemetry_live.log_many([{**enrich(event, self), "staged": True} for event in events])
             return
-        line = json.dumps(enrich(event, self), ensure_ascii=False)
+        lines = [json.dumps(enrich(event, self), ensure_ascii=False) + "\n" for event in events]
         with manifest_lock, self.manifest_path.open("a") as f:
-            f.write(line + "\n")
+            f.writelines(lines)
         from .telemetry_v2 import observe_publication
-        observe_publication(event, self)
+        for event in events:
+            observe_publication(event, self)
 
     # ----- file paths -----
 

@@ -1273,3 +1273,167 @@ async def test_exact_doi_owner_precedes_identifier_poor_alias_title(tmp_path, mo
         [incoming], actor="test", reason="doi-before-alias-title"))[0]
     assert outcome["status"] == "duplicate"
     assert outcome["key"] == "Exact"
+
+
+@pytest.mark.parametrize("stoprules", [False, True])
+def test_serving_trace_batch_opens_manifest_once(tmp_path, monkeypatch, stoprules):
+    from contextlib import contextmanager
+    from papervault.library import store
+    from papervault.library.services.registration import ServingTrace
+
+    monkeypatch.setenv("PAPERVAULT_STOPRULES_V2", str(int(stoprules)))
+    lib = Library(tmp_path)
+    path, opens, locks = lib.manifest_path, [], []
+    original_lock = store.manifest_lock
+
+    def opened(mode):
+        opens.append(mode)
+        return path.open(mode)
+
+    @contextmanager
+    def locked():
+        locks.append(True)
+        with original_lock:
+            yield
+
+    monkeypatch.setattr(lib, "manifest_path", SimpleNamespace(open=opened))
+    monkeypatch.setattr(store, "manifest_lock", locked())
+    trace = ServingTrace(lib, "batch-test")
+    with trace.batch():
+        trace.record("fusion", key="First", reason="é" * 300, private={"body": "omit"})
+        with trace.batch():
+            trace.record("fusion", candidate=admitted(), key="Second")
+        assert opens == []
+    assert opens == ["a"]
+    assert locks == [True]
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [event["key"] for event in events] == ["First", "Second"]
+    assert all(event["trace_id"] == "batch-test" and event["at"] for event in events)
+    assert events[0]["reason"] == "é" * 256
+    assert "private" not in events[0]
+    assert events[1]["candidate"] == "doi:10.1234/registration"
+    if stoprules:
+        assert all(event["identity_version"] == 2 for event in events)
+    lib.log_many([])
+    with trace.batch():
+        pass
+    assert opens == ["a"]
+
+
+def test_log_many_observes_each_publication_and_preserves_staging(tmp_path, monkeypatch):
+    monkeypatch.setenv("PAPERVAULT_STOPRULES_V2", "1")
+    live = Library(tmp_path / "live")
+    stage = Library(tmp_path / "stage")
+    stage._telemetry_live = live
+    for lib in (live, stage):
+        for key in ("First", "Second"):
+            lib._papers[key] = Paper(key=key, doi="10.1234/" + key)
+    events = [{"event": "downloaded", "key": key, "identity_matches": False}
+              for key in ("First", "Second")]
+    stage.log_many(events)
+    staged = [json.loads(line) for line in live.manifest_path.read_text().splitlines()]
+    assert [event["key"] for event in staged] == ["First", "Second"]
+    assert all(event["staged"] and event["identity_version"] == 2 for event in staged)
+    assert not stage.manifest_path.exists()
+    assert not getattr(stage, "_stoprule_publications", {})
+    assert not getattr(live, "_stoprule_publications", {})
+    live.log_many(events)
+    assert set(live._stoprule_publications) == {"First", "Second"}
+    assert all(not publication.identity_matches for publication in live._stoprule_publications.values())
+    assert all("staged" not in event for event in events)
+
+
+def test_log_many_preserves_writer_fence(tmp_path):
+    from papervault.store.fencing import WriterFenced
+
+    lib = Library(tmp_path)
+    lib.read_only = True
+    with pytest.raises(PermissionError):
+        lib.log_many([{"event": "blocked"}])
+    lib.read_only = False
+    lib.close()
+    with pytest.raises(WriterFenced):
+        lib.log_many([{"event": "blocked"}])
+    assert not lib.manifest_path.exists()
+
+
+@pytest.mark.parametrize("bulk", [False, True])
+def test_trace_batch_flushes_on_exception_and_recovers_after_io_failure(caplog, bulk):
+    from papervault.library.services.registration import ServingTrace
+
+    events = []
+    lib = SimpleNamespace(log=events.append)
+    if bulk:
+        lib.log_many = events.extend
+    trace = ServingTrace(lib)
+    with pytest.raises(ValueError, match="stage failed"):
+        with trace.batch():
+            trace.record("fusion", key="First")
+            trace.record("fusion", key="Second")
+            assert events == []
+            raise ValueError("stage failed")
+    trace.record("serving", key="Immediate")
+    assert [event["key"] for event in events] == ["First", "Second", "Immediate"]
+
+    def unavailable(*args):
+        raise OSError("manifest unavailable")
+
+    if bulk:
+        lib.log_many = unavailable
+    else:
+        lib.log = unavailable
+    with trace.batch():
+        trace.record("serving", key="Lost")
+    assert "serving trace unavailable" in caplog.text
+    lib.log = events.append
+    if bulk:
+        lib.log_many = events.extend
+    with trace.batch():
+        trace.record("serving", key="Recovered")
+    assert events[-1]["key"] == "Recovered"
+
+
+@pytest.mark.parametrize("mode", ["success", "failure", "cancel", "stop", "unavailable"])
+async def test_registration_queue_flushes_each_trace_stage(mode):
+    from papervault.library.services.registration import RegistrationQueue, ServingTrace
+
+    batches = []
+    trace = ServingTrace(SimpleNamespace(log_many=lambda events: batches.append(list(events))))
+    entered = asyncio.Event()
+
+    async def register(candidates, **kwargs):
+        # Acceptance must be visible before the command starts awaiting IO.
+        assert [event["decision"] for event in batches[-1]] == ["accepted", "accepted"]
+        if mode == "failure":
+            raise RuntimeError("command failed")
+        if mode == "cancel":
+            entered.set()
+            await asyncio.Future()
+        return [dict(status="registered", reason="admitted", key=str(i), download="admitted")
+                for i in range(len(candidates))]
+
+    queue = RegistrationQueue(SimpleNamespace(register_candidates=register))
+    if mode != "unavailable":
+        await queue.start()
+    try:
+        queue.submit([admitted(), admitted(doi="10.1234/second")], actor="test", reason="batch", trace=trace)
+        assert len(batches) == 1
+        assert len(batches[0]) == 2
+        if mode == "cancel":
+            await asyncio.wait_for(entered.wait(), 1)
+            await queue.stop()
+        elif mode == "stop":
+            await queue.stop()  # No yield between submission and shutdown: drain the pending request.
+        elif mode != "unavailable":
+            await asyncio.wait_for(queue._queue.join(), 1)
+    finally:
+        await queue.stop()
+    decisions = [[event.get("decision") for event in batch] for batch in batches]
+    if mode == "success":
+        assert decisions == [["submitted"] * 2, ["accepted"] * 2, ["registered"] * 2 + [None]]
+    elif mode in {"failure", "cancel"}:
+        assert decisions == [["submitted"] * 2, ["accepted"] * 2, ["failed"] * 2]
+    elif mode == "stop":
+        assert decisions == [["submitted"] * 2, ["rejected"] * 2]
+    else:
+        assert decisions == [["rejected"] * 2]

@@ -347,3 +347,44 @@ def test_pool_cap_no_truncation_when_pool_small(_stub_reranker, monkeypatch):
     (pairs,) = fake.calls
     assert len(pairs) == 3  # pool <= cap → untouched
     assert len(out) == 2
+
+
+@pytest.mark.parametrize("settings,expected", [
+    ({}, (1, 32, 120, 1)),
+    ({"KS_EMBED_MAX_ASYNC": "8", "KS_EMBED_GPU_MAX_ASYNC": "2"}, (2, 32, 120, 1)),
+    ({"KS_EMBED_OFFLOAD": " True ", "KS_EMBED_GPU_MAX_ASYNC": "3"}, (3, 32, 120, 1)),
+    ({"KS_EMBED_OFFLOAD": "yes", "KS_EMBED_MAX_ASYNC": "2",
+      "KS_EMBED_GPU_MAX_ASYNC": "5"}, (2, 32, 120, 1)),
+    ({"KS_EMBED_OFFLOAD": "0", "KS_EMBED_MAX_ASYNC": "8",
+      "KS_EMBED_GPU_MAX_ASYNC": "1"}, (8, 32, 120, 1)),
+    ({"KS_EMBED_OFFLOAD": "0"}, (16, 32, 120, 1)),
+    ({"KS_EMBED_BATCH_NUM": "64", "KS_EMBED_TIMEOUT": "240",
+      "KS_RERANK_MAX_ASYNC": "4"}, (1, 64, 240, 4)),
+    ({"KS_EMBED_MAX_ASYNC": "0", "KS_EMBED_GPU_MAX_ASYNC": "-2",
+      "KS_EMBED_BATCH_NUM": "0", "KS_RERANK_MAX_ASYNC": "-1"}, (1, 1, 120, 1)),
+])
+def test_construct_graph_aligns_gpu_worker_settings(tmp_path, monkeypatch, settings, expected):
+    from papervault.knowledge.store import graph
+    import lightrag.kg.shared_storage as shared
+
+    for name, value in settings.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setattr(graph, "assert_safe_workspace", lambda: "l0_probe")
+    monkeypatch.setattr(graph, "apply_ks_extraction_prompt", lambda **kw: None)
+
+    class ConfiguredRAG:
+        def __init__(self, **kwargs):
+            self.options = kwargs
+
+        async def initialize_storages(self):
+            pass
+
+    async def initialize_status():
+        pass
+
+    monkeypatch.setattr(graph, "LightRAG", ConfiguredRAG)
+    monkeypatch.setattr(shared, "initialize_pipeline_status", initialize_status)
+    rag = _run(graph._construct_graph(working_dir=str(tmp_path)))
+    assert tuple(rag.options[name] for name in (
+        "embedding_func_max_async", "embedding_batch_num",
+        "default_embedding_timeout", "rerank_model_max_async")) == expected

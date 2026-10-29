@@ -236,6 +236,11 @@ async def _construct_graph(*, namespace=None, working_dir=None, read_only=False)
 
     catalog_options = ({"workspace": namespace, "enable_llm_cache": not read_only}
                        if namespace is not None else {})
+    embed_max_async = max(1, int(os.getenv("KS_EMBED_MAX_ASYNC", "16")))
+    if os.getenv("KS_EMBED_OFFLOAD", "1").strip().lower() in ("1", "true", "yes"):
+        # Keep queued work in LightRAG's priority queue until a GPU worker is
+        # available, rather than starting timers while waiting on its semaphore.
+        embed_max_async = min(embed_max_async, max(1, int(os.getenv("KS_EMBED_GPU_MAX_ASYNC", "1"))))
     rag = LightRAG(
         **catalog_options,
         working_dir=working_dir,
@@ -243,7 +248,9 @@ async def _construct_graph(*, namespace=None, working_dir=None, read_only=False)
         llm_model_name=_execution_model("build"),
         llm_model_max_async=int(os.getenv("KS_LLM_MAX_ASYNC", "32")),        # 硬 LLM 天花板。默认 32(2026-06-04):6-key 时代 conc16 把 2400-chunk 抽取拖过 480s worker(59/100 error)→曾锁 8;补到 24 key 后 conc_probe 实测 conc12/24/36/48 全 0 error、max ≤83s«480s(争抢消失,~1.3 调用/key)。env 可调,应大致随活 key 数走(§7)
         max_parallel_insert=int(os.getenv("KS_MAX_PARALLEL_INSERT", "16")),  # 文档在飞数(默认 2 = 隐藏瓶颈)
-        embedding_func_max_async=int(os.getenv("KS_EMBED_MAX_ASYNC", "16")), # embedding 并发(默认 8 = 隐藏瓶颈);三旋钮缺一不可(§7)
+        embedding_func_max_async=embed_max_async,
+        embedding_batch_num=max(1, int(os.getenv("KS_EMBED_BATCH_NUM", "32"))),
+        default_embedding_timeout=int(os.getenv("KS_EMBED_TIMEOUT", "120")),
         chunk_token_size=CONFIG.lightrag.chunk_token_size,
         chunk_overlap_token_size=CONFIG.lightrag.chunk_overlap_token_size,
         # Boundary-aware chunker (ingest.chunking): same token target as the default
@@ -276,6 +283,7 @@ async def _construct_graph(*, namespace=None, working_dir=None, read_only=False)
         # V1 (SDD §6.9.1): wire the bge-reranker-v2-m3 rerank path. Without rerank_model_func,
         # LightRAG's enable_rerank=True default (base.py:160) silently no-ops (F18). lazy-loaded.
         rerank_model_func=_bge_rerank,
+        rerank_model_max_async=max(1, int(os.getenv("KS_RERANK_MAX_ASYNC", "1"))),
         # LightRAG 1.5.x wraps rerank_model_func in its own worker pool with a per-call
         # timeout (upstream default 30s, worker cap 2x=60s). On a co-rented GPU a facet
         # rerank of a 200-320-chunk pool under 5-way facet concurrency legitimately runs

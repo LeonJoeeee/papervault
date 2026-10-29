@@ -35,10 +35,12 @@ from papervault.llm_usage import log_usage
 logger = logging.getLogger(__name__)
 
 
-# Same transport policy as knowledge.store.llm: first-byte room below the relay's
-# ~120s idle cut, then let an active generation finish. The absolute retry budget
-# admits a retry only when its backoff AND first-chunk allowance still fit.
-_FIRST_CHUNK_S = float(os.getenv("PAPERVAULT_LIB_FIRST_CHUNK_S", "100"))
+# Same transport policy as knowledge.store.llm: pre-first-chunk cutoff is disabled
+# by default (0) so reasoning-heavy gateway calls are governed by _CLIENT_TIMEOUT_S;
+# positive PAPERVAULT_LIB_FIRST_CHUNK_S opts into an early first-chunk deadline for
+# short-idle relays. The absolute retry budget admits a retry only when its backoff
+# and any positive first-chunk allowance still fit.
+_FIRST_CHUNK_S = float(os.getenv("PAPERVAULT_LIB_FIRST_CHUNK_S", "0"))
 _RETRY_BUDGET_S = float(os.getenv("PAPERVAULT_LIB_RETRY_BUDGET_S", "480"))
 _CLIENT_TIMEOUT_S = 900.0
 
@@ -107,12 +109,12 @@ def _close_stream(stream):
 
 
 def _open_stream(kwargs):
-    """Bound completion creation plus first next() by ONE wall-clock deadline.
+    """Open a streamed completion and read its first chunk on a daemon worker.
 
-    A sync SDK call cannot be cancelled in Python. A daemon owns that first read
-    until it hands the stream to this caller; an abandoned read closes its late
-    stream itself. No executor shutdown can block the timeout or the retry.
-    The SDK transport timeout remains a backstop for an abandoned network read.
+    When ``_FIRST_CHUNK_S > 0``, completion creation plus first ``next()`` share one
+    wall-clock deadline; when ``<= 0`` (default), no pre-first-chunk cutoff is applied
+    and ``_CLIENT_TIMEOUT_S`` governs. An abandoned read closes its late stream itself
+    so no executor shutdown can block the timeout or the retry.
     """
     import litellm
 
@@ -143,18 +145,20 @@ def _open_stream(kwargs):
             except InvalidStateError:
                 _close_stream(stream)
 
-    deadline = time.monotonic() + _FIRST_CHUNK_S
+    first_chunk_s = _FIRST_CHUNK_S
+    deadline = time.monotonic() + first_chunk_s if first_chunk_s > 0 else None
     context = contextvars.copy_context()
     threading.Thread(target=context.run, args=(open_first,), daemon=True).start()
     handed_off = False
     try:
-        result = ready.result(timeout=max(0.0, deadline - time.monotonic()))
+        timeout = max(0.0, deadline - time.monotonic()) if deadline is not None else None
+        result = ready.result(timeout=timeout)
         handed_off = True
         return result
     except TimeoutError as exc:
-        if ready.done():  # A timeout raised by the SDK itself keeps its type.
+        if deadline is None or ready.done():  # A timeout raised by the SDK itself keeps its type.
             raise
-        raise StreamTruncated(f"no first chunk within {_FIRST_CHUNK_S:g}s") from exc
+        raise StreamTruncated(f"no first chunk within {first_chunk_s:g}s") from exc
     finally:
         if not handed_off and not ready.cancel() and ready.exception() is None:
             # The worker won the race with cancellation: this caller owns cleanup.
@@ -299,7 +303,7 @@ class LLM:
                 delay = 0.5 + random.random()
                 remaining = deadline - time.monotonic()
                 if (attempt == 1 or not _is_transient(exc)
-                        or remaining - delay <= _FIRST_CHUNK_S):
+                        or remaining - delay <= max(_FIRST_CHUNK_S, 0.0)):
                     raise
                 logger.warning("library transient failure (%s); retrying once in %.1fs "
                                "(%.1fs budget left)", type(exc).__name__, delay, remaining)

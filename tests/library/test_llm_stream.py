@@ -278,3 +278,83 @@ def test_unexpected_request_error_is_not_retried(monkeypatch):
     with pytest.raises(ValueError, match="invalid local input"):
         L.LLM("openai/test").call("ping")
     assert len(calls) == 1
+
+
+def test_default_first_chunk_s_is_zero_when_env_unset(tmp_path):
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if k != "PAPERVAULT_LIB_FIRST_CHUNK_S"}
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "from papervault.library import llm as L; print(L._FIRST_CHUNK_S)"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
+    )
+    assert float(out.stdout.strip().splitlines()[-1]) == 0.0
+
+    opt_in = subprocess.run(
+        [sys.executable, "-c",
+         "from papervault.library import llm as L; print(L._FIRST_CHUNK_S)"],
+        cwd=tmp_path, env={**env, "PAPERVAULT_LIB_FIRST_CHUNK_S": "35"},
+        capture_output=True, text=True, check=True,
+    )
+    assert float(opt_in.stdout.strip().splitlines()[-1]) == 35.0
+
+
+@pytest.mark.parametrize("first_chunk_s", [0.0, -1.0])
+def test_nonpositive_first_chunk_disables_cutoff_in_open_stream(monkeypatch, first_chunk_s):
+    monkeypatch.setattr(L, "_FIRST_CHUNK_S", first_chunk_s)
+
+    def slow_chunks():
+        time.sleep(0.08)
+        yield chunk("answer")
+        yield chunk(finish="stop")
+
+    source = Stream(slow_chunks())
+    calls = []
+
+    def completion(**kwargs):
+        calls.append(kwargs)
+        time.sleep(0.08)
+        return source
+
+    monkeypatch.setattr(litellm, "completion", completion)
+    assert L.LLM("openai/test").call("ping") == "answer"
+    assert len(calls) == 1
+    assert calls[0]["timeout"] == L._CLIENT_TIMEOUT_S == 900.0
+    assert source.closed.is_set()
+
+
+@pytest.mark.parametrize("first_chunk_s", [0.0, -1.0])
+def test_sdk_timeout_keeps_type_when_first_chunk_cutoff_disabled(monkeypatch, first_chunk_s):
+    monkeypatch.setattr(L, "_FIRST_CHUNK_S", first_chunk_s)
+    monkeypatch.setattr(L, "_RETRY_BUDGET_S", 0.0)
+    calls = responses(monkeypatch, TimeoutError("sdk transport timeout"))
+    with pytest.raises(TimeoutError, match="sdk transport timeout") as exc_info:
+        L.LLM("openai/test").call("ping")
+    assert not isinstance(exc_info.value, L.StreamTruncated)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("first_chunk_s", [0.0, -10.0])
+def test_nonpositive_first_chunk_admits_transient_retry_inside_budget_and_guards_negative(
+    monkeypatch, first_chunk_s,
+):
+    monkeypatch.setattr(L, "_FIRST_CHUNK_S", first_chunk_s)
+    monkeypatch.setattr(L, "_RETRY_BUDGET_S", 5.0)
+    calls = responses(
+        monkeypatch,
+        Stream([chunk("partial")]),
+        Stream([chunk("answer"), chunk(finish="stop")]),
+    )
+    assert L.LLM("openai/test").call("ping") == "answer"
+    assert len(calls) == 2
+
+    # With _RETRY_BUDGET_S == 0.5 and delay == 0.5, remaining - delay <= 0.0:
+    # negative _FIRST_CHUNK_S must NOT allow retrying past the budget.
+    monkeypatch.setattr(L, "_RETRY_BUDGET_S", 0.5)
+    exhausted_calls = responses(monkeypatch, Stream([]), Stream([chunk("late"), chunk(finish="stop")]))
+    with pytest.raises(L.StreamTruncated):
+        L.LLM("openai/test").call("ping")
+    assert len(exhausted_calls) == 1

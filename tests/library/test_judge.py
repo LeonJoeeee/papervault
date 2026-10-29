@@ -268,8 +268,10 @@ class _RebasingLLM:
 
     def __init__(self, mode: str):
         self.mode = mode
+        self.calls: int = 0
 
     def call(self, messages):
+        self.calls += 1
         user = messages[1]["content"]
         items = json.loads(user[user.index("[") : user.rindex("]") + 1])
         if self.mode == "return":
@@ -288,26 +290,35 @@ def _many_cands(n: int) -> list[dict]:
 
 
 @pytest.mark.asyncio
-async def test_judge_return_counts_parse_ok_zero_matched_drop(caplog):
+async def test_judge_return_counts_parse_ok_zero_matched_drop(caplog, monkeypatch):
     """§8: a batch that parses OK but matches ZERO expected global indices (index
-    rebasing) is DROPPED, WARN-logged, and counted in judge_batches_dropped. With
-    >BATCH_SIZE cands, batch-0 matches (rebased 0..k-1 == expected) while batch-1
-    (global i>=30) matches nothing → exactly 1 dropped batch."""
+    rebasing) across all retries is DROPPED, WARN-logged (not ERROR-logged), and
+    counted in judge_batches_dropped. With >BATCH_SIZE cands, batch-0 matches
+    (rebased 0..k-1 == expected) while batch-1 (global i>=30) matches nothing →
+    exhausts MAX_RETRIES + 1 attempts and drops 1 batch."""
     import logging
+    monkeypatch.setattr(judge, "_BACKOFF_BASE", 0.0)
     cands = _many_cands(judge.BATCH_SIZE + 5)   # 2 batches
-    with caplog.at_level(logging.WARNING):
-        judged, dropped = await judge_return(cands, "q", llm=_RebasingLLM("return"))
-    # Batch-0 (global 0..29, rebased 0..29) matched; batch-1 dropped.
+    llm = _RebasingLLM("return")
+    with caplog.at_level(logging.WARNING, logger=judge.__name__):
+        judged, dropped = await judge_return(cands, "q", llm=llm)
+    # Batch-0 (1 call) matched; batch-1 retried across MAX_RETRIES + 1 calls then dropped.
+    assert llm.calls == 1 + (judge.MAX_RETRIES + 1)
     assert dropped == 1
     assert set(judged) == set(range(judge.BATCH_SIZE))   # only batch-0 survives
-    assert any("0 items matched expected" in r.message for r in caplog.records)
+    assert any(r.levelno == logging.WARNING and "0 items matched expected" in r.message
+               for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_judge_ingest_counts_parse_ok_zero_matched_drop():
-    """§8: the ingest gate threads the same dropped-batch counter out."""
+async def test_judge_ingest_counts_parse_ok_zero_matched_drop(monkeypatch):
+    """§8: the ingest gate threads the same dropped-batch counter out after retries."""
+    monkeypatch.setattr(judge, "_BACKOFF_BASE", 0.0)
     cands = _many_cands(judge.BATCH_SIZE + 5)
-    judged, dropped = await judge_ingest(cands, llm=_RebasingLLM("ingest"))
+    llm = _RebasingLLM("ingest")
+    judged, dropped = await judge_ingest(cands, llm=llm)
+    assert llm.calls == 1 + (judge.MAX_RETRIES + 1)
     assert dropped == 1
     assert set(judged) == set(range(judge.BATCH_SIZE))
 
@@ -327,22 +338,28 @@ class _UnparseableLLM:
 
     def __init__(self, payload: str):
         self._payload = payload
+        self.calls: int = 0
 
     def call(self, messages):
+        self.calls += 1
         return self._payload
 
 
 @pytest.mark.asyncio
-async def test_judge_drops_unparseable_response_never_crashes():
+async def test_judge_drops_unparseable_response_never_crashes(monkeypatch):
     """R1 regression: a judge LLM reply with no JSON object (a refusal) OR malformed
-    JSON inside braces must be a conservative DROP (fail-CLOSED), not an exception
-    out of judge_ingest/judge_return. (Before the fix, parse_items ran outside the
-    try and a non-JSON reply crashed the whole search.)"""
+    JSON inside braces must exhaust MAX_RETRIES + 1 attempts and then be a conservative
+    DROP (fail-CLOSED), not an exception out of judge_ingest/judge_return."""
+    monkeypatch.setattr(judge, "_BACKOFF_BASE", 0.0)
     for bad in ("I cannot comply with this request.", "{this is not: valid json}"):
-        judged_i, dropped_i = await judge_ingest(_CANDS, llm=_UnparseableLLM(bad))
+        llm_i = _UnparseableLLM(bad)
+        judged_i, dropped_i = await judge_ingest(_CANDS, llm=llm_i)
         assert judged_i == {} and dropped_i == 1
-        judged_r, dropped_r = await judge_return(_CANDS, "q", llm=_UnparseableLLM(bad))
+        assert llm_i.calls == judge.MAX_RETRIES + 1
+        llm_r = _UnparseableLLM(bad)
+        judged_r, dropped_r = await judge_return(_CANDS, "q", llm=llm_r)
         assert judged_r == {} and dropped_r == 1
+        assert llm_r.calls == judge.MAX_RETRIES + 1
 
 
 # ── per-item JSON salvage (one bad item must not void the whole 30-batch) ──────────
@@ -377,3 +394,154 @@ def test_extract_json_obj_nothing_salvageable_raises():
     """Malformed AND no recoverable item (no ``"i"``) -> raises -> caller DROPs."""
     with pytest.raises(Exception):
         judge._extract_json_obj("{this is not: valid json}")
+
+
+# ── retry of transient malformed or zero-matched judge replies (#348) ──────────
+
+
+@pytest.mark.parametrize("gate", ["ingest", "return"])
+@pytest.mark.parametrize("bad_attempts", [1, 2])
+async def test_judge_recovers_from_transient_malformed_json(monkeypatch, gate, bad_attempts):
+    monkeypatch.setattr(judge, "_BACKOFF_BASE", 0.0)
+    calls = 0
+
+    def call(messages):
+        nonlocal calls
+        calls += 1
+        if calls <= bad_attempts:
+            return '{items: [{i: 0, reason: "unquoted property name", score: 0.9}]}'
+        return _CaptureLLM(gate).call(messages)
+
+    llm = SimpleNamespace(call=call)
+    if gate == "ingest":
+        judged, dropped = await judge_ingest(_CANDS, llm=llm)
+    else:
+        judged, dropped = await judge_return(_CANDS, "q", llm=llm)
+    assert dropped == 0
+    assert set(judged) == {0, 1}
+    assert calls == bad_attempts + 1
+
+
+@pytest.mark.parametrize("gate", ["ingest", "return"])
+@pytest.mark.parametrize("bad_attempts", [1, 2])
+async def test_judge_recovers_from_transient_zero_matched_reply(monkeypatch, gate, bad_attempts):
+    monkeypatch.setattr(judge, "_BACKOFF_BASE", 0.0)
+    cands = _many_cands(judge.BATCH_SIZE + 2)
+    batch1_calls = 0
+
+    def call(messages):
+        nonlocal batch1_calls
+        user = messages[1]["content"]
+        items = json.loads(user[user.index("[") : user.rindex("]") + 1])
+        if items[0]["i"] >= judge.BATCH_SIZE:
+            batch1_calls += 1
+            if batch1_calls <= bad_attempts:
+                return _RebasingLLM(gate).call(messages)
+        return _CaptureLLM(gate).call(messages)
+
+    llm = SimpleNamespace(call=call)
+    if gate == "ingest":
+        judged, dropped = await judge_ingest(cands, llm=llm)
+    else:
+        judged, dropped = await judge_return(cands, "q", llm=llm)
+    assert dropped == 0
+    assert set(judged) == set(range(judge.BATCH_SIZE + 2))
+    assert batch1_calls == bad_attempts + 1
+
+
+async def test_judge_retry_backoff_semaphore_and_3arg_compat(monkeypatch):
+    sem = asyncio.Semaphore(1)
+    monkeypatch.setattr(judge.concurrency, "llm_sem", sem)
+    # Positional 3-argument _call_with_retry remains backward-compatible.
+    raw = await judge._call_with_retry("sys", "usr", SimpleNamespace(call=lambda msgs: "plain-raw"))
+    assert raw == "plain-raw"
+
+    sleeps: list[tuple[float, bool]] = []
+    sem_locked_in_worker: list[bool] = []
+
+    async def fake_sleep(delay: float):
+        # Permit must be released BEFORE sleeping between retry attempts.
+        sleeps.append((delay, sem.locked()))
+
+    monkeypatch.setattr(judge.asyncio, "sleep", fake_sleep)
+    seq = iter([
+        "{malformed: json}",
+        json.dumps({"items": [{"i": 999, "reason": "wrong index", "score": 0.9}]}),
+        json.dumps({"items": [{"i": 0, "reason": "ok", "score": 0.9},
+                              {"i": 1, "reason": "ok", "score": 0.7}]}),
+    ])
+
+    def call(messages):
+        sem_locked_in_worker.append(sem.locked())
+        return next(seq)
+
+    judged, dropped = await judge_return(_CANDS, "q", llm=SimpleNamespace(call=call))
+    assert dropped == 0
+    assert set(judged) == {0, 1}
+    assert sem_locked_in_worker == [True, True, True]
+    assert sleeps == [(2.0, False), (4.0, False)]
+
+
+async def test_judge_final_attempt_determines_warning_vs_error_log(monkeypatch, caplog):
+    import logging
+    monkeypatch.setattr(judge, "_BACKOFF_BASE", 0.0)
+
+    # Ends on parse-OK zero-matched -> WARNING, never ERROR.
+    seq_warn = iter([
+        "{malformed: json}",
+        RuntimeError("transient transport error"),
+        json.dumps({"items": [{"i": 999, "reason": "rebased", "score": 0.8}]}),
+    ])
+
+    def call_warn(messages):
+        item = next(seq_warn)
+        if isinstance(item, Exception):
+            raise item
+        return item
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=judge.__name__):
+        judged, dropped = await judge_return(_CANDS, "q", llm=SimpleNamespace(call=call_warn))
+    assert judged == {} and dropped == 1
+    assert any(r.levelno == logging.WARNING and "0 items matched expected idx" in r.message
+               for r in caplog.records)
+    assert not any(r.levelno >= logging.ERROR for r in caplog.records)
+
+    # Ends on malformed JSON after earlier zero-matched replies -> ERROR, not zero-matched WARNING.
+    seq_err = iter([
+        json.dumps({"items": [{"i": 999, "reason": "rebased", "score": 0.8}]}),
+        json.dumps({"items": [{"i": 999, "reason": "rebased", "score": 0.8}]}),
+        "{malformed: json}",
+    ])
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=judge.__name__):
+        judged, dropped = await judge_return(
+            _CANDS, "q", llm=SimpleNamespace(call=lambda msgs: next(seq_err)),
+        )
+    assert judged == {} and dropped == 1
+    assert any(r.levelno == logging.ERROR and "dropping batch" in r.message
+               for r in caplog.records)
+    assert not any("0 items matched expected idx" in r.message for r in caplog.records)
+
+
+async def test_cancelled_judge_during_parse_retry_backoff_does_not_continue(monkeypatch):
+    in_sleep = asyncio.Event()
+    calls = 0
+
+    async def slow_sleep(_delay: float):
+        in_sleep.set()
+        await asyncio.Future()
+
+    monkeypatch.setattr(judge.asyncio, "sleep", slow_sleep)
+
+    def call(messages):
+        nonlocal calls
+        calls += 1
+        return "{malformed: json}"
+
+    task = asyncio.create_task(judge_return(_CANDS, "q", llm=SimpleNamespace(call=call)))
+    await asyncio.wait_for(in_sleep.wait(), 2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls == 1

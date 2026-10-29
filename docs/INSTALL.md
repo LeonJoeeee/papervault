@@ -153,7 +153,7 @@ are useful for diagnosis or capacity tuning; defaults come from the current runt
 | `KS_LLM_BACKOFF_JITTER` | `0.75` | Jitter added to direct key-pool retry backoff in seconds. |
 | `KS_GATEWAY_CONN_RETRIES` / `KS_GATEWAY_CONN_BACKOFF_CAP` | `6` / `15` | Unreachable-gateway connection retries and backoff cap in seconds, still bounded by the configured retry budget. |
 | `KS_SLOW_CALL_LOG_S` | `60` | Log successful knowledge LLM calls exceeding this duration in seconds. |
-| `PAPERVAULT_LIB_FIRST_CHUNK_S` / `PAPERVAULT_LIB_RETRY_BUDGET_S` | `100` / `480` | Library-side first-chunk deadline and total retry-admission budget in seconds; separate from the `KS_*` knowledge settings. |
+| `PAPERVAULT_LIB_FIRST_CHUNK_S` / `PAPERVAULT_LIB_RETRY_BUDGET_S` | `0` / `480` | Library-side pre-first-chunk cutoff (`0` disables; positive seconds opt in) and total retry-admission budget in seconds; separate from the `KS_*` knowledge settings. |
 | `PAPERVAULT_SAVE_MIN_INTERVAL_S` / `PAPERVAULT_BIB_MIN_INTERVAL_S` | `0` / `60` | Non-forced library save debounce and BibTeX refresh cadence in seconds. Forced durable lifecycle saves bypass debounce. |
 | `PAPERVAULT_EXTRACT_DEFER_CANARY` | `8` | Maximum deferred extraction recovery canaries promoted per reconcile sweep; `0` disables canaries. |
 | `PAPERVAULT_LOOP_LAG_MONITOR_MS` | `0` | Event-loop stall warning threshold in milliseconds; `0` disables monitoring. |

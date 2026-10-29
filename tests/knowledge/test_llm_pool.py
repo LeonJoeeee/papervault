@@ -880,3 +880,67 @@ async def test_request_preserves_level_without_caller_effort(tmp_path, monkeypat
     wire = f"{'papervault-' if gateway else ''}{level}"
     assert created == [{"model": wire, "max_tokens": llm_mod._DEFAULT_MAX_TOKENS,
                         "stream": True, "stream_options": {"include_usage": True}}]
+
+
+def test_default_first_chunk_s_is_zero_when_env_unset(tmp_path):
+    """Reasoning-heavy gateway models buffer tokens for >100 s before the first chunk;
+    KS_LLM_FIRST_CHUNK_S must default to 0.0 (disabled) while preserving positive opt-in."""
+    import subprocess
+    import sys
+
+    assert llm_mod._FIRST_CHUNK_S == 0.0
+    assert llm_mod.effective_execution_settings()["first_chunk_seconds"] == 0.0
+
+    env = {k: v for k, v in os.environ.items() if k != "KS_LLM_FIRST_CHUNK_S"}
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import papervault.knowledge.store.llm as m; print(m._FIRST_CHUNK_S)"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
+    )
+    assert float(out.stdout.strip().splitlines()[-1]) == 0.0
+
+    opt_in = subprocess.run(
+        [sys.executable, "-c",
+         "import papervault.knowledge.store.llm as m; print(m._FIRST_CHUNK_S)"],
+        cwd=tmp_path, env={**env, "KS_LLM_FIRST_CHUNK_S": "42"},
+        capture_output=True, text=True, check=True,
+    )
+    assert float(opt_in.stdout.strip().splitlines()[-1]) == 42.0
+
+
+@pytest.mark.parametrize("gateway", [False, True])
+@pytest.mark.parametrize("override", [None, -1.0])
+async def test_slow_first_chunk_succeeds_when_first_chunk_cutoff_disabled(
+    tmp_path, monkeypatch, gateway, override,
+):
+    """With the default _FIRST_CHUNK_S == 0.0 (or negative), pre-first-chunk reasoning delays
+    in both create() and the first chunk read succeed without StreamTruncated."""
+    if override is None:
+        assert llm_mod._FIRST_CHUNK_S == 0.0
+    else:
+        monkeypatch.setattr(llm_mod, "_FIRST_CHUNK_S", override)
+    if gateway:
+        _gateway_mode(monkeypatch)
+    else:
+        monkeypatch.setattr(config, "USE_GATEWAY", False)
+    f = tmp_path / "keys.json"
+    _write(f, [_group("k-slow")])
+
+    class _Completions:
+        async def create(self, *, model, messages, **kw):
+            await asyncio.sleep(0.05)
+
+            async def _gen():
+                await asyncio.sleep(0.05)
+                for c in _HELLO_STREAM:
+                    yield c
+
+            return _gen()
+
+    class _Fake:
+        def __init__(self, *, api_key, base_url, timeout=None, max_retries=None):
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
+    assert await KeyPool(f).complete("ping") == "Hello"

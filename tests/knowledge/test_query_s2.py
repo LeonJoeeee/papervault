@@ -239,6 +239,6 @@ async def test_live_receipt_records_rerank_degradation_and_synthesis_timing(monk
             return {"status": "success", "data": evidence(), "metadata": META}
     out = await aq.query("question", rag=Rag())
     assert out["query_receipt"]["rerank_degraded"] is True
-    assert out["query_receipt"]["synthesis_model"] == "max"
+    assert out["query_receipt"]["synthesis_model"] == "ultra"
     assert out["query_receipt"]["synthesis_latency_s"] >= 0
     assert out["cited_papers"] == ["Alpha"]

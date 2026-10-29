@@ -130,10 +130,10 @@ its own handle; the ingest and return gates share the judge handle.
 | S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `standard` |
 | S1 downloaded PDF identity verification | `verify` | `flash` |
 | S1 extracted-chunk clarity review and whole-document completeness | `gate` | `flash` |
-| S2 build entity/relation extraction and merge summaries | `build` | `standard` |
+| S2 build entity/relation extraction and merge summaries | `build` | `max` |
 | S2 query high/low-level keyword extraction when needed | `keyword` | `flash` |
 | S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `pro` |
-| S2 evidence-grounded synthesis (production/eval) | `synth` | `max` |
+| S2 evidence-grounded synthesis (production/eval) | `synth` | `ultra` |
 | Evaluation answer/refusal scoring | `eval_judge` | `standard` |
 
 Planner, gate, verification and decomposition prompts include concrete calibration

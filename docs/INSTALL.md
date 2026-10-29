@@ -101,9 +101,9 @@ The endpoint resolves its model and effort per key. Defaults are:
 
 | Role | Level | Override |
 | --- | --- | --- |
-| Graph extraction/merge | standard | `PAPERVAULT_LLM_BUILD` |
+| Graph extraction/merge | max | `PAPERVAULT_LLM_BUILD` |
 | Query keyword extraction | flash | `PAPERVAULT_LLM_KEYWORD` |
-| Answer synthesis | max | `PAPERVAULT_LLM_SYNTH` |
+| Answer synthesis | ultra | `PAPERVAULT_LLM_SYNTH` |
 | Extract clarity/completeness gates | flash | `PAPERVAULT_LLM_GATE` |
 | PDF metadata verification | flash | `PAPERVAULT_LLM_VERIFY` |
 | Library search intent | pro | `PAPERVAULT_LLM_INTENT` |

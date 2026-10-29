@@ -93,10 +93,10 @@ A supplied test/client handle bypasses role selection for that call.
 | S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `standard` |
 | S1 downloaded PDF identity verification | `verify` | `flash` |
 | S1 extracted-text chunk clarity review and document completeness gate | `gate` | `flash` |
-| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `standard` |
+| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `max` |
 | S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `flash` |
 | S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `pro` |
-| S2 evidence-grounded answer synthesis, including eval | `synth` | `max` |
+| S2 evidence-grounded answer synthesis, including eval | `synth` | `ultra` |
 | Evaluation answer and refusal judgments | `eval_judge` | `standard` |
 
 Embedding (BGE-M3), reranking and OCR use their existing local/service paths and

@@ -139,3 +139,59 @@ async def test_midstream_transport_error_reaches_synth_as_transient(monkeypatch)
     out = await synth_answer(_DATA, _INTENT)
     assert out == "answer after the reset [X2023]"
     assert len(calls) == 2
+
+
+# ---- #352: omit synth max_tokens unless KS_SYNTH_MAX_TOKENS is explicitly set ----
+
+def test_synth_max_tokens_env_default_is_none_and_parses_explicit(tmp_path):
+    import json
+    import os
+    import subprocess
+    import sys
+
+    assert synth_mod._SYNTH_MAX_TOKENS is None
+    env = {k: v for k, v in os.environ.items() if k != "KS_SYNTH_MAX_TOKENS"}
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    for unset_val in (None, "", "   "):
+        run_env = dict(env)
+        if unset_val is not None:
+            run_env["KS_SYNTH_MAX_TOKENS"] = unset_val
+        out = subprocess.run(
+            [sys.executable, "-c", "import json, papervault.knowledge.query.synth as s; print(json.dumps(s._SYNTH_MAX_TOKENS))"],
+            cwd=tmp_path,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(out.stdout.strip().splitlines()[-1]) is None
+
+    explicit = subprocess.run(
+        [sys.executable, "-c", "import json, papervault.knowledge.query.synth as s; print(json.dumps(s._SYNTH_MAX_TOKENS))"],
+        cwd=tmp_path,
+        env={**env, "KS_SYNTH_MAX_TOKENS": "12000"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(explicit.stdout.strip().splitlines()[-1]) == 12000
+
+
+async def test_synth_answer_omits_max_tokens_by_default_and_forwards_when_set(monkeypatch):
+    seen_kwargs: list[dict] = []
+
+    async def _capture(*args, **kwargs):
+        seen_kwargs.append(dict(kwargs))
+        return "synthesized answer [X2023]"
+
+    monkeypatch.setattr(synth_mod, "mimo_complete", _capture)
+    monkeypatch.delenv("PAPERVAULT_LLM_SYNTH", raising=False)
+
+    monkeypatch.setattr(synth_mod, "_SYNTH_MAX_TOKENS", None)
+    assert await synth_answer(_DATA, _INTENT) == "synthesized answer [X2023]"
+    assert "max_tokens" not in seen_kwargs[-1]
+    assert seen_kwargs[-1]["model"] == "gpt-6-astra@xhigh"
+
+    monkeypatch.setattr(synth_mod, "_SYNTH_MAX_TOKENS", 12000)
+    assert await synth_answer(_DATA, _INTENT) == "synthesized answer [X2023]"
+    assert seen_kwargs[-1]["max_tokens"] == 12000

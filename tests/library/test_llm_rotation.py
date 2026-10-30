@@ -170,25 +170,59 @@ def test_gateway_on_returns_proxy_llm(monkeypatch):
     monkeypatch.setattr(config, "GATEWAY_URL", "http://proxy:4000/v1")
     monkeypatch.setattr(config, "GATEWAY_KEY", "sk-test")
     monkeypatch.delenv("PAPERVAULT_LLM_JUDGE", raising=False)
+    monkeypatch.setattr(L, "_DEFAULT_MAX_TOKENS", None)
     monkeypatch.setattr(L, "_gw_llms", {})
-    got = L.get_llm()                       # default library role → judge (gpt-6.1-terra@high)
+    got = L.get_llm()                       # default library role → judge (gpt-6.1-terra@medium)
     assert isinstance(got, FakeLLM)         # L.LLM is monkeypatched to FakeLLM by _reset
     assert got.kw == {
         "model": "openai/gpt-6.1-terra",
         "base_url": "http://proxy:4000/v1",
         "api_key": "sk-test",
-        "max_tokens": L._DEFAULT_MAX_TOKENS,
+        "max_tokens": None,
         "num_retries": 0,
-        "targets": parse_targets("gpt-6.1-terra@high"),
+        "targets": parse_targets("gpt-6.1-terra@medium"),
     }
     # An explicit multi-target gate route preserves its output ceiling and parsed target chain.
-    gate_spec = "glm-5.3-flash,gpt-6.1-terra@high"
+    gate_spec = "glm-5.3-flash@high,gpt-6.1-terra@medium"
     cheap = L.get_llm(model=gate_spec, max_tokens=4096)
     assert cheap.kw["model"] == "openai/glm-5.3-flash"
     assert cheap.kw["max_tokens"] == 4096
     assert cheap.kw["targets"] == parse_targets(gate_spec)
     # cached: same (max_tokens, spec) → same object
     assert L.get_llm() is got
+
+
+def test_library_default_max_tokens_is_none_when_unset_and_parses_explicit(tmp_path):
+    import os
+    import subprocess
+    import sys
+
+    assert L._DEFAULT_MAX_TOKENS is None
+    env = {k: v for k, v in os.environ.items() if k != "PAPERVAULT_LIB_MAX_TOKENS"}
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    for unset_val in (None, "", "   "):
+        run_env = dict(env)
+        if unset_val is not None:
+            run_env["PAPERVAULT_LIB_MAX_TOKENS"] = unset_val
+        out = subprocess.run(
+            [sys.executable, "-c", "import json, papervault.library.llm as m; print(json.dumps(m._DEFAULT_MAX_TOKENS))"],
+            cwd=tmp_path,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(out.stdout.strip().splitlines()[-1]) is None
+
+    explicit = subprocess.run(
+        [sys.executable, "-c", "import json, papervault.library.llm as m; print(json.dumps(m._DEFAULT_MAX_TOKENS))"],
+        cwd=tmp_path,
+        env={**env, "PAPERVAULT_LIB_MAX_TOKENS": "16384"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(explicit.stdout.strip().splitlines()[-1]) == 16384
 
 
 def test_gateway_on_default_url_and_raises_on_failure(monkeypatch):

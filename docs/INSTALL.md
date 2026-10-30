@@ -101,25 +101,39 @@ from its role (`<model>[@<modifier>][,<fallback>...]`). Defaults are:
 
 | Role | Default route | Override |
 | --- | --- | --- |
-| Graph extraction/merge | `glm-5.3,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
-| Query keyword extraction | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_KEYWORD` |
+| Graph extraction/merge | `glm-5.3@max,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
+| Query keyword extraction | `gpt-6.1-terra@low` | `PAPERVAULT_LLM_KEYWORD` |
 | Answer synthesis | `gpt-6-astra@xhigh` | `PAPERVAULT_LLM_SYNTH` |
-| Extract clarity/completeness gates | `glm-5.3-flash,gpt-6.1-terra@high` | `PAPERVAULT_LLM_GATE` |
-| PDF metadata verification | `glm-5.3-flash,gpt-6.1-terra@high` | `PAPERVAULT_LLM_VERIFY` |
+| Extract clarity/completeness gates | `glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_GATE` |
+| PDF metadata verification | `glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_VERIFY` |
 | Library search intent | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_INTENT` |
-| Library judges/resolver/re-rank | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_JUDGE` |
+| Library judges/resolver/re-rank | `gpt-6.1-terra@medium` | `PAPERVAULT_LLM_JUDGE` |
 | Decomposition (production multiquery and eval) | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_DECOMPOSE` |
-| Eval judges | `glm-5.3,gpt-6.1-terra@high` | `PAPERVAULT_LLM_EVAL_JUDGE` |
+| Eval judges | `glm-5.3@max` | `PAPERVAULT_LLM_EVAL_JUDGE` |
 
-For `glm-*` models, adaptive thinking is enabled by default (`@nothinking` or
-`@none` disables it; effort tiers on `glm-*` raise `ValueError`). Non-`glm-*`
-models accept `@none`, `@low`, `@medium`, `@high`, `@xhigh`, `@max`, `@thinking`,
-or `@nothinking`, or omit the modifier for plain OpenAI-compatible models (e.g.
-`PAPERVAULT_LLM_JUDGE=gpt-4.1-mini`). Multi-target routes fail over immediately
-from a throttled or timed-out primary (`429`, `408`, `5xx`, timeout,
-`StreamTruncated`) to the next target and cool down the primary for
-`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` seconds (default `120`, `<= 0` disables)
-before probing it again; single-target GPT roles never cross-model fallback.
+Modifiers are validated per family against the transparent LLM Gateway `v0.7.3`
+catalog (after stripping an optional `openai/` prefix):
+- `glm-*`, `relay-glm-*` (always-on thinking): bare or `@low`, `@high`, `@max`
+  (`@none`, `@nothinking`, `@thinking`, `@medium`, and `@xhigh` raise `ValueError`).
+- `gpt-6-astra*`, `gpt-6.1-sol*` (always-on Codex): bare or `@low`, `@medium`,
+  `@high`, `@xhigh`, `@max` (`@none`, `@thinking`, and `@nothinking` raise `ValueError`).
+- `gpt-6.1-terra*`, `gpt-6-luna*` (disable-capable Codex): bare or `@none`,
+  `@low`, `@medium`, `@high`, `@xhigh`, `@max` (`@thinking` and `@nothinking` raise `ValueError`).
+- `deepseek-v4*`, `deepseek-flash*`, `relay-deepseek-*`: bare, `@low`, `@high`,
+  `@max`, or `@nothinking` (`@none`); `@medium`, `@xhigh`, and `@thinking` raise `ValueError`.
+- `mimo-v2.6-*`, `relay-mimo-v2.6-*` (binary thinking only): bare, `@thinking`,
+  or `@nothinking` (`@none`); effort tiers (`@low..@max`) raise `ValueError`.
+- Other OpenAI-compatible model IDs (e.g. `PAPERVAULT_LLM_JUDGE=gpt-4.1-mini`):
+  bare, `@none..@max`, `@thinking`, or `@nothinking`.
+
+Multi-target routes fail over immediately from a throttled or timed-out primary
+(`429`, `408`, `5xx`, timeout, `StreamTruncated`) to the next target and cool
+down the primary for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` seconds (default
+`120`, `<= 0` disables) before probing it again; single-target roles never
+cross-model fallback. `eval_judge` defaults to single-target `glm-5.3@max` to
+preserve a single-family benchmark ruler invariant, while still honoring an
+explicit multi-target override such as
+`PAPERVAULT_LLM_EVAL_JUDGE=glm-5.3@max,relay-glm-5.3@max`.
 
 The retired symbolic level names (`flash`, `standard`, `pro`, `max`, `ultra` and
 `papervault-*`) are rejected with `ValueError` naming `PAPERVAULT_LLM_<ROLE>`.
@@ -133,7 +147,9 @@ from `.env` to use the defaults).
 
 The optional gateway transport (`PAPERVAULT_LLM_GATEWAY=1`) sends concrete model
 IDs and thinking/effort parameters directly to `PAPERVAULT_LLM_GATEWAY_URL` using
-`PAPERVAULT_LLM_GATEWAY_KEY` (matching the transparent LLM Gateway `v0.7.0`).
+`PAPERVAULT_LLM_GATEWAY_KEY` (matching the transparent LLM Gateway `v0.7.3`),
+omitting `max_tokens` on the wire unless explicitly configured so the gateway
+injects each model's official output ceiling.
 Without that flag, the single endpoint/key or key pool (`PAPERVAULT_LLM_KEYS`)
 sends the same concrete routes; when no role override is forced, key-pool entries
 rotate across their configured `base_url`/`api_key`/`model` groups and auto-disable
@@ -159,7 +175,7 @@ are useful for diagnosis or capacity tuning; defaults come from the current runt
 | `KS_SKIP_EMBED_SELFCHECK` | `0` | `1`, `true` or `yes` bypasses the embedding boot probe; use only for diagnosis or a separately verified stack. |
 | `KS_EMBED_MAX_ASYNC` / `KS_EMBED_GPU_MAX_ASYNC` | `16` / `1` | LightRAG embedding-call queue concurrency versus actual GPU forward-pass concurrency. |
 | `KS_EMBED_OFFLOAD` | `1` | Offload embedding to a worker thread; `0` restores blocking inference on the server loop. |
-| `KS_LLM_MAX_TOKENS` | `131000` | Knowledge LLM output ceiling unless the caller sets its own limit. |
+| `KS_LLM_MAX_TOKENS` / `KS_SYNTH_MAX_TOKENS` / `PAPERVAULT_LIB_MAX_TOKENS` | unset | Optional explicit LLM output ceilings for Knowledge, synthesis, and Library calls; omitted on the wire when unset unless a caller passes an explicit limit. |
 | `KS_LLM_BACKOFF_JITTER` | `0.75` | Jitter added to direct key-pool retry backoff in seconds. |
 | `KS_GATEWAY_CONN_RETRIES` / `KS_GATEWAY_CONN_BACKOFF_CAP` | `6` / `15` | Unreachable-gateway connection retries and backoff cap in seconds, still bounded by the configured retry budget. |
 | `KS_SLOW_CALL_LOG_S` | `60` | Log successful knowledge LLM calls exceeding this duration in seconds. |

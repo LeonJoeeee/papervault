@@ -176,6 +176,8 @@ def _open_stream(kwargs):
 
 def _create_completion(**kwargs):
     """Join answer deltas and usage, rejecting an EOF without a provider finish."""
+    if kwargs.get("max_tokens") is None:
+        kwargs.pop("max_tokens", None)
     stream, iterator, chunk = _open_stream({
         **kwargs, "stream": True, "stream_options": {"include_usage": True},
         "num_retries": 0, "timeout": _CLIENT_TIMEOUT_S,
@@ -318,12 +320,13 @@ class LLM:
             messages = [{"role": "user", "content": messages}]
         t0 = time.monotonic()
         deadline = t0 + _RETRY_BUDGET_S
+        mt_kw = {"max_tokens": self.max_tokens} if self.max_tokens is not None else {}
         if self.targets is None:
             for attempt in range(2):
                 try:
                     resp = _create_completion(
                         model=self.model, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, max_tokens=self.max_tokens,
+                        api_key=self.api_key, **mt_kw,
                     )
                     break
                 except Exception as exc:  # noqa: BLE001 — retain pool status handling
@@ -349,7 +352,7 @@ class LLM:
                 try:
                     resp = _create_completion(
                         **wire, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, max_tokens=self.max_tokens,
+                        api_key=self.api_key, **mt_kw,
                     )
                     log_usage(logger, "pl", target.model, time.monotonic() - t0, resp)
                     return resp, target_idx > 0
@@ -379,7 +382,7 @@ class LLM:
                 try:
                     resp = _create_completion(
                         **wire, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, max_tokens=self.max_tokens,
+                        api_key=self.api_key, **mt_kw,
                     )
                     log_usage(logger, "pl", target.model, time.monotonic() - t0, resp)
                     return resp, (target_idx > 0 or attempt > 0)
@@ -394,8 +397,14 @@ class LLM:
                     time.sleep(delay)
         raise AssertionError("unreachable: self.targets is non-empty")
 
-# Default well above litellm's small default so a long generation isn't truncated.
-_DEFAULT_MAX_TOKENS = int(os.environ.get("PAPERVAULT_LIB_MAX_TOKENS", "32000"))
+
+def _optional_int_env(name: str) -> int | None:
+    raw = os.environ.get(name, "").strip()
+    return int(raw) if raw else None
+
+
+# Omit max_tokens by default (None) unless PAPERVAULT_LIB_MAX_TOKENS is explicitly set.
+_DEFAULT_MAX_TOKENS: int | None = _optional_int_env("PAPERVAULT_LIB_MAX_TOKENS")
 _DEFAULT_MODEL = litellm_wire_kwargs(parse_targets(route("judge"))[0])["model"]
 _DEFAULT_BASE = config.LLM_BASE_URL
 _KEYS_FILE = config.LLM_KEYS_FILE
@@ -437,7 +446,7 @@ class KeyPool:
     def __init__(
         self,
         path,
-        max_tokens: int,
+        max_tokens: int | None = None,
         model_override: str | None = None,
         *,
         targets: tuple[ModelTarget, ...] | None = None,
@@ -455,6 +464,10 @@ class KeyPool:
         self._groups: list[dict] = []
         self._clients: dict[tuple, LLM] = {}
         self._reload_if_changed()
+
+    @property
+    def max_tokens(self) -> int | None:
+        return self._max_tokens
 
     # ---- hot-read (mtime-cached) ----
     def _reload_if_changed(self) -> None:
@@ -576,7 +589,7 @@ _gw_llms: dict[tuple, "LLM"] = {}
 _gw_lock = threading.Lock()
 
 
-def _get_llm_via_gateway(mt: int, spec: str, targets: tuple[ModelTarget, ...]):
+def _get_llm_via_gateway(mt: int | None, spec: str, targets: tuple[ModelTarget, ...]):
     """PAPERVAULT_LLM_GATEWAY=1 path: an :class:`LLM` pointed at the transparent LLM Gateway.
     Same :class:`LLM` interface + max_tokens passthrough as the direct path, cached per
     ``(max_tokens, spec, base_url)``. ``num_retries=0`` avoids hidden SDK retry stacking."""
@@ -608,7 +621,7 @@ def get_llm(*, max_tokens: int | None = None, model: str | None = None):
     and caller-owned primary cooldown failover. Direct :class:`KeyPool` retains its hot
     reload, key failover, and 401/403 credential auto-disable behavior.
     """
-    mt = max_tokens or _DEFAULT_MAX_TOKENS
+    mt = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
     targets = parse_targets(model or route("judge"))
     spec = format_targets(targets)
     if config.USE_GATEWAY:

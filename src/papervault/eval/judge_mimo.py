@@ -49,9 +49,14 @@ GOLD = EVAL / os.getenv("JUDGE_GOLD", "gold_v2.jsonl")  # env-override for new g
 ALL_TAGS = ["fullcorpus_baseline", "fullcorpus_r2", "fullcorpus_r3",
             "vmq_r1", "vmq_r2", "vmq_r3", "vsr_r1", "vsr_r2", "vsr_r3"]
 
+def _optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw else None
+
+
 GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
 VKEY = os.getenv("KS_VIRTUAL_KEY", "")
-MAX_TOKENS = int(os.getenv("JUDGE_MAX_TOKENS", "32000"))
+MAX_TOKENS: int | None = _optional_int_env("JUDGE_MAX_TOKENS")
 MAX_ATTEMPTS = int(os.getenv("JUDGE_MAX_ATTEMPTS", "2"))  # was 4; lowered so a stuck hard-Q judge fails fast → idempotent resume catches it (overnight robustness)
 
 _SYSTEM = (
@@ -192,13 +197,19 @@ async def _judge_one(client, sem, tag, qid, gold_entry, force, counters):
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             async with sem:
+                req_kwargs = {
+                    "messages": [
+                        {"role": "system", "content": _SYSTEM},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                }
+                if MAX_TOKENS is not None:
+                    req_kwargs["max_tokens"] = MAX_TOKENS
                 resp = await create_openai_chat_completion_with_fallback(
                     client,
                     targets,
-                    messages=[{"role": "system", "content": _SYSTEM},
-                              {"role": "user", "content": prompt}],
-                    temperature=0.1,
-                    max_tokens=MAX_TOKENS,
+                    **req_kwargs,
                 )
             raw = resp.choices[0].message.content or ""
             d = _extract_json(raw)

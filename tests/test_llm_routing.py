@@ -22,14 +22,14 @@ from papervault.llm_routing import (
 
 ROLE_DEFAULTS = [
     ("intent", "gpt-6.1-terra@high"),
-    ("build", "glm-5.3,gpt-6.1-terra@high"),
-    ("keyword", "gpt-6.1-terra@high"),
+    ("build", "glm-5.3@max,gpt-6.1-terra@high"),
+    ("keyword", "gpt-6.1-terra@low"),
     ("synth", "gpt-6-astra@xhigh"),
-    ("gate", "glm-5.3-flash,gpt-6.1-terra@high"),
-    ("verify", "glm-5.3-flash,gpt-6.1-terra@high"),
-    ("judge", "gpt-6.1-terra@high"),
+    ("gate", "glm-5.3-flash@high,gpt-6.1-terra@medium"),
+    ("verify", "glm-5.3-flash@low,gpt-6.1-terra@low"),
+    ("judge", "gpt-6.1-terra@medium"),
     ("decompose", "gpt-6.1-terra@high"),
-    ("eval_judge", "glm-5.3,gpt-6.1-terra@high"),
+    ("eval_judge", "glm-5.3@max"),
 ]
 
 
@@ -74,20 +74,31 @@ def test_role_default_target_objects():
     assert parse_targets(route("synth")) == (
         ModelTarget("gpt-6-astra", reasoning_effort="xhigh"),
     )
-    for role in ("keyword", "intent", "decompose", "judge"):
+    for role in ("intent", "decompose"):
         assert parse_targets(route(role)) == (
             ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
         )
-    for role in ("build", "eval_judge"):
-        assert parse_targets(route(role)) == (
-            ModelTarget("glm-5.3", thinking=True),
-            ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
-        )
-    for role in ("gate", "verify"):
-        assert parse_targets(route(role)) == (
-            ModelTarget("glm-5.3-flash", thinking=True),
-            ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
-        )
+    assert parse_targets(route("keyword")) == (
+        ModelTarget("gpt-6.1-terra", reasoning_effort="low"),
+    )
+    assert parse_targets(route("judge")) == (
+        ModelTarget("gpt-6.1-terra", reasoning_effort="medium"),
+    )
+    assert parse_targets(route("verify")) == (
+        ModelTarget("glm-5.3-flash", reasoning_effort="low"),
+        ModelTarget("gpt-6.1-terra", reasoning_effort="low"),
+    )
+    assert parse_targets(route("gate")) == (
+        ModelTarget("glm-5.3-flash", reasoning_effort="high"),
+        ModelTarget("gpt-6.1-terra", reasoning_effort="medium"),
+    )
+    assert parse_targets(route("build")) == (
+        ModelTarget("glm-5.3", reasoning_effort="max"),
+        ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
+    )
+    assert parse_targets(route("eval_judge")) == (
+        ModelTarget("glm-5.3", reasoning_effort="max"),
+    )
 
 
 @pytest.mark.parametrize("blank", ["", "   "])
@@ -100,61 +111,171 @@ def test_blank_override_uses_role_default(monkeypatch, role, want, blank):
 def test_whitespace_and_openai_prefix_normalized(monkeypatch):
     monkeypatch.setenv(
         "PAPERVAULT_LLM_BUILD",
-        "  openai/glm-5.3@thinking , openai/gpt-6.1-terra@high  ",
+        "  openai/glm-5.3@MAX , openai/gpt-6.1-terra@HIGH  ",
     )
-    assert route(" BUILD ") == "glm-5.3,gpt-6.1-terra@high"
+    assert route(" BUILD ") == "glm-5.3@max,gpt-6.1-terra@high"
     assert parse_targets(route("build")) == (
-        ModelTarget("glm-5.3", thinking=True),
+        ModelTarget("glm-5.3", reasoning_effort="max"),
         ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
     )
 
 
-def test_glm_modifier_rules_and_canonical_formatting():
-    # Omitted modifier on glm-* defaults to thinking=True and formats bare.
-    t_default = parse_targets("glm-5.3")
-    assert t_default == (ModelTarget("glm-5.3", thinking=True),)
-    assert format_target(t_default[0]) == "glm-5.3"
+def test_glm_and_relay_glm_modifier_rules_and_wire_kwargs():
+    for raw_model, want_model in (
+        ("glm-5.3", "glm-5.3"),
+        ("GLM-5.3-Flash", "GLM-5.3-Flash"),
+        ("relay-glm-5.3", "relay-glm-5.3"),
+        ("openai/relay-glm-5.3-flash", "relay-glm-5.3-flash"),
+    ):
+        bare = parse_targets(raw_model)
+        assert bare == (ModelTarget(want_model, reasoning_effort=None, thinking=None),)
+        assert format_target(bare[0]) == want_model
+        assert openai_wire_kwargs(bare[0]) == {"model": want_model}
+        assert litellm_wire_kwargs(bare[0]) == {"model": f"openai/{want_model}"}
 
-    # Case-insensitive glm-* detection.
-    t_upper = parse_targets("GLM-5.3-Flash")
-    assert t_upper == (ModelTarget("GLM-5.3-Flash", thinking=True),)
-
-    # @thinking explicitly sets thinking=True and canonicalizes to bare glm model.
-    t_on = parse_targets("glm-5.3-flash@thinking")
-    assert t_on == (ModelTarget("glm-5.3-flash", thinking=True),)
-    assert format_target(t_on[0]) == "glm-5.3-flash"
-
-    # @nothinking and @none both disable thinking on glm-* and format as @nothinking.
-    for spec in ("glm-5.3@nothinking", "glm-5.3@none"):
-        t_off = parse_targets(spec)
-        assert t_off == (ModelTarget("glm-5.3", thinking=False),)
-        assert format_target(t_off[0]) == "glm-5.3@nothinking"
-        assert parse_targets(format_target(t_off[0])) == t_off
+        for effort in ("low", "high", "max"):
+            tiered = parse_targets(f"{raw_model}@{effort.upper()}")
+            assert tiered == (ModelTarget(want_model, reasoning_effort=effort, thinking=None),)
+            assert format_target(tiered[0]) == f"{want_model}@{effort}"
+            assert parse_targets(format_target(tiered[0])) == tiered
+            assert openai_wire_kwargs(tiered[0]) == {
+                "model": want_model,
+                "reasoning_effort": effort,
+            }
+            assert litellm_wire_kwargs(tiered[0]) == {
+                "model": f"openai/{want_model}",
+                "extra_body": {"reasoning_effort": effort},
+            }
 
 
-def test_non_glm_modifier_rules_and_canonical_formatting():
-    # Plain non-glm model leaves reasoning_effort=None and thinking=None.
-    for plain in ("gpt-4.1-mini", "provider-model"):
+def test_codex_family_modifier_rules_and_wire_kwargs():
+    # Always-on Codex models (gpt-6-astra*, gpt-6.1-sol*): bare or @low..@max.
+    for raw_model, want_model in (
+        ("gpt-6-astra", "gpt-6-astra"),
+        ("gpt-6.1-sol", "gpt-6.1-sol"),
+        ("openai/GPT-6-Astra-Preview", "GPT-6-Astra-Preview"),
+    ):
+        bare = parse_targets(raw_model)
+        assert bare == (ModelTarget(want_model, reasoning_effort=None, thinking=None),)
+        assert format_target(bare[0]) == want_model
+        for effort in ("low", "medium", "high", "xhigh", "max"):
+            tiered = parse_targets(f"{raw_model}@{effort}")
+            assert tiered == (ModelTarget(want_model, reasoning_effort=effort, thinking=None),)
+            assert format_target(tiered[0]) == f"{want_model}@{effort}"
+
+    # Disable-capable Codex models (gpt-6.1-terra*, gpt-6-luna*): bare or @none..@max.
+    for raw_model, want_model in (
+        ("gpt-6.1-terra", "gpt-6.1-terra"),
+        ("gpt-6-luna", "gpt-6-luna"),
+        ("openai/GPT-6.1-Terra", "GPT-6.1-Terra"),
+    ):
+        bare = parse_targets(raw_model)
+        assert bare == (ModelTarget(want_model, reasoning_effort=None, thinking=None),)
+        assert format_target(bare[0]) == want_model
+        for effort in EFFORTS:
+            tiered = parse_targets(f"{raw_model}@{effort}")
+            assert tiered == (ModelTarget(want_model, reasoning_effort=effort, thinking=None),)
+            assert format_target(tiered[0]) == f"{want_model}@{effort}"
+            assert openai_wire_kwargs(tiered[0]) == {
+                "model": want_model,
+                "reasoning_effort": effort,
+            }
+
+
+def test_deepseek_gateway_family_modifier_rules_and_wire_kwargs():
+    for raw_model, want_model in (
+        ("deepseek-v4", "deepseek-v4"),
+        ("deepseek-flash", "deepseek-flash"),
+        ("relay-deepseek-v4", "relay-deepseek-v4"),
+        ("openai/DeepSeek-V4", "DeepSeek-V4"),
+    ):
+        bare = parse_targets(raw_model)
+        assert bare == (ModelTarget(want_model, reasoning_effort=None, thinking=None),)
+        assert format_target(bare[0]) == want_model
+
+        for effort in ("low", "high", "max"):
+            tiered = parse_targets(f"{raw_model}@{effort}")
+            assert tiered == (ModelTarget(want_model, reasoning_effort=effort, thinking=None),)
+            assert format_target(tiered[0]) == f"{want_model}@{effort}"
+            assert openai_wire_kwargs(tiered[0]) == {
+                "model": want_model,
+                "reasoning_effort": effort,
+            }
+            assert litellm_wire_kwargs(tiered[0]) == {
+                "model": f"openai/{want_model}",
+                "extra_body": {"reasoning_effort": effort},
+            }
+
+        for mod in ("nothinking", "none"):
+            disabled = parse_targets(f"{raw_model}@{mod}")
+            assert disabled == (ModelTarget(want_model, reasoning_effort=None, thinking=False),)
+            assert format_target(disabled[0]) == f"{want_model}@nothinking"
+            assert parse_targets(format_target(disabled[0])) == disabled
+            assert openai_wire_kwargs(disabled[0]) == {
+                "model": want_model,
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
+            assert litellm_wire_kwargs(disabled[0]) == {
+                "model": f"openai/{want_model}",
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
+
+
+def test_mimo_gateway_family_modifier_rules_and_wire_kwargs():
+    for raw_model, want_model in (
+        ("mimo-v2.6-pro", "mimo-v2.6-pro"),
+        ("mimo-v2.6-flash", "mimo-v2.6-flash"),
+        ("relay-mimo-v2.6-pro", "relay-mimo-v2.6-pro"),
+        ("openai/MiMo-v2.6-Pro", "MiMo-v2.6-Pro"),
+    ):
+        bare = parse_targets(raw_model)
+        assert bare == (ModelTarget(want_model, reasoning_effort=None, thinking=None),)
+        assert format_target(bare[0]) == want_model
+
+        enabled = parse_targets(f"{raw_model}@thinking")
+        assert enabled == (ModelTarget(want_model, reasoning_effort=None, thinking=True),)
+        assert format_target(enabled[0]) == f"{want_model}@thinking"
+        assert parse_targets(format_target(enabled[0])) == enabled
+        assert openai_wire_kwargs(enabled[0]) == {
+            "model": want_model,
+            "extra_body": {"thinking": {"type": "enabled"}},
+        }
+        assert litellm_wire_kwargs(enabled[0]) == {
+            "model": f"openai/{want_model}",
+            "extra_body": {"thinking": {"type": "enabled"}},
+        }
+
+        for mod in ("nothinking", "none"):
+            disabled = parse_targets(f"{raw_model}@{mod}")
+            assert disabled == (ModelTarget(want_model, reasoning_effort=None, thinking=False),)
+            assert format_target(disabled[0]) == f"{want_model}@nothinking"
+            assert parse_targets(format_target(disabled[0])) == disabled
+            assert openai_wire_kwargs(disabled[0]) == {
+                "model": want_model,
+                "extra_body": {"thinking": {"type": "disabled"}},
+            }
+
+
+def test_arbitrary_openai_compatible_modifier_rules_and_canonical_formatting():
+    for plain in ("gpt-4.1-mini", "deepseek-r1", "provider-model"):
         targets = parse_targets(plain)
         assert targets == (ModelTarget(plain, reasoning_effort=None, thinking=None),)
         assert format_target(targets[0]) == plain
 
-    # Effort modifiers on non-glm models.
-    for effort in EFFORTS:
-        targets = parse_targets(f"gpt-6.1-terra@{effort}")
-        assert targets == (ModelTarget("gpt-6.1-terra", reasoning_effort=effort, thinking=None),)
-        assert format_target(targets[0]) == f"gpt-6.1-terra@{effort}"
+        for effort in EFFORTS:
+            tiered = parse_targets(f"{plain}@{effort}")
+            assert tiered == (ModelTarget(plain, reasoning_effort=effort, thinking=None),)
+            assert format_target(tiered[0]) == f"{plain}@{effort}"
 
-    # @thinking / @nothinking on non-glm models round-trip cleanly.
-    t_think = parse_targets("deepseek-r1@thinking")
-    assert t_think == (ModelTarget("deepseek-r1", reasoning_effort=None, thinking=True),)
-    assert format_target(t_think[0]) == "deepseek-r1@thinking"
-    assert parse_targets(format_target(t_think[0])) == t_think
+        t_think = parse_targets(f"{plain}@thinking")
+        assert t_think == (ModelTarget(plain, reasoning_effort=None, thinking=True),)
+        assert format_target(t_think[0]) == f"{plain}@thinking"
+        assert parse_targets(format_target(t_think[0])) == t_think
 
-    t_nothink = parse_targets("deepseek-r1@nothinking")
-    assert t_nothink == (ModelTarget("deepseek-r1", reasoning_effort=None, thinking=False),)
-    assert format_target(t_nothink[0]) == "deepseek-r1@nothinking"
-    assert parse_targets(format_target(t_nothink[0])) == t_nothink
+        t_nothink = parse_targets(f"{plain}@nothinking")
+        assert t_nothink == (ModelTarget(plain, reasoning_effort=None, thinking=False),)
+        assert format_target(t_nothink[0]) == f"{plain}@nothinking"
+        assert parse_targets(format_target(t_nothink[0])) == t_nothink
 
 
 @pytest.mark.parametrize(
@@ -180,7 +301,7 @@ def test_non_glm_modifier_rules_and_canonical_formatting():
         # Syntax errors: empty comma segments, internal whitespace, malformed @
         "gpt-6.1-terra,",
         ",gpt-6.1-terra",
-        "glm-5.3, ,gpt-6.1-terra@high",
+        "glm-5.3@max, ,gpt-6.1-terra@high",
         "gpt 6.1",
         "gpt-6.1-terra @high",
         "gpt-6.1-terra@ high",
@@ -189,20 +310,63 @@ def test_non_glm_modifier_rules_and_canonical_formatting():
         "gpt-6.1-terra@",
         "openai/",
         "openai/@high",
-        # GLM effort tiers & unknown modifiers rejected
-        "glm-5.3@low",
+        # GLM / relay-glm rejections: @none, @nothinking, @thinking, @medium, @xhigh, unknown
+        "glm-5.3@none",
+        "glm-5.3@nothinking",
+        "glm-5.3@thinking",
         "glm-5.3@medium",
-        "glm-5.3@high",
         "glm-5.3@xhigh",
-        "glm-5.3@max",
         "glm-5.3@bogus",
+        "relay-glm-5.3@none",
+        "relay-glm-5.3@nothinking",
+        "relay-glm-5.3@thinking",
+        "relay-glm-5.3@medium",
+        "relay-glm-5.3@xhigh",
+        "openai/GLM-5.3-Flash@medium",
+        # Codex always-on rejections: @none, @thinking, @nothinking, unknown
+        "gpt-6-astra@none",
+        "gpt-6-astra@thinking",
+        "gpt-6-astra@nothinking",
+        "gpt-6-astra@bogus",
+        "gpt-6.1-sol@none",
+        "gpt-6.1-sol@thinking",
+        "gpt-6.1-sol@nothinking",
+        # Codex disable-capable rejections: @thinking, @nothinking, unknown
+        "gpt-6.1-terra@thinking",
+        "gpt-6.1-terra@nothinking",
         "gpt-6.1-terra@bogus",
+        "gpt-6-luna@thinking",
+        "gpt-6-luna@nothinking",
+        # DeepSeek gateway rejections: @medium, @xhigh, @thinking, unknown
+        "deepseek-v4@medium",
+        "deepseek-v4@xhigh",
+        "deepseek-v4@thinking",
+        "deepseek-v4@bogus",
+        "deepseek-flash@medium",
+        "deepseek-flash@thinking",
+        "relay-deepseek-v4@xhigh",
+        "relay-deepseek-v4@thinking",
+        # MiMo chat gateway rejections: effort tiers + unknown
+        "mimo-v2.6-pro@low",
+        "mimo-v2.6-pro@medium",
+        "mimo-v2.6-pro@high",
+        "mimo-v2.6-pro@xhigh",
+        "mimo-v2.6-pro@max",
+        "mimo-v2.6-pro@bogus",
+        "mimo-v2.6-flash@high",
+        "relay-mimo-v2.6-pro@low",
+        "relay-mimo-v2.6-pro@max",
+        # Arbitrary OpenAI-compatible unknown modifier
+        "gpt-4.1-mini@bogus",
+        "deepseek-r1@bogus",
     ],
 )
 def test_invalid_override_names_the_variable(monkeypatch, bad):
     monkeypatch.setenv("PAPERVAULT_LLM_SYNTH", bad)
     with pytest.raises(ValueError, match="PAPERVAULT_LLM_SYNTH"):
         route("synth")
+    with pytest.raises(ValueError):
+        parse_targets(bad)
 
 
 def test_parse_targets_rejects_empty_spec():
@@ -226,10 +390,10 @@ def test_retired_legacy_env_vars_ignored(monkeypatch):
         "MIMO_MODEL",
     ):
         monkeypatch.setenv(var, "legacy-ignored-model")
-    assert route("build") == "glm-5.3,gpt-6.1-terra@high"
-    assert route("keyword") == "gpt-6.1-terra@high"
-    assert route("verify") == "glm-5.3-flash,gpt-6.1-terra@high"
-    assert route("eval_judge") == "glm-5.3,gpt-6.1-terra@high"
+    assert route("build") == "glm-5.3@max,gpt-6.1-terra@high"
+    assert route("keyword") == "gpt-6.1-terra@low"
+    assert route("verify") == "glm-5.3-flash@low,gpt-6.1-terra@low"
+    assert route("eval_judge") == "glm-5.3@max"
 
 
 def test_wire_kwargs_builders():
@@ -245,23 +409,33 @@ def test_wire_kwargs_builders():
     }
     assert "reasoning_effort" not in litellm_gpt
 
-    glm_on = ModelTarget("glm-5.3", thinking=True)
-    assert openai_wire_kwargs(glm_on) == {
+    glm_max = ModelTarget("glm-5.3", reasoning_effort="max")
+    assert openai_wire_kwargs(glm_max) == {
         "model": "glm-5.3",
+        "reasoning_effort": "max",
+    }
+    assert litellm_wire_kwargs(glm_max) == {
+        "model": "openai/glm-5.3",
+        "extra_body": {"reasoning_effort": "max"},
+    }
+
+    mimo_on = ModelTarget("mimo-v2.6-pro", thinking=True)
+    assert openai_wire_kwargs(mimo_on) == {
+        "model": "mimo-v2.6-pro",
         "extra_body": {"thinking": {"type": "enabled"}},
     }
-    assert litellm_wire_kwargs(glm_on) == {
-        "model": "openai/glm-5.3",
+    assert litellm_wire_kwargs(mimo_on) == {
+        "model": "openai/mimo-v2.6-pro",
         "extra_body": {"thinking": {"type": "enabled"}},
     }
 
-    glm_off = ModelTarget("glm-5.3-flash", thinking=False)
-    assert openai_wire_kwargs(glm_off) == {
-        "model": "glm-5.3-flash",
+    ds_off = ModelTarget("deepseek-v4", thinking=False)
+    assert openai_wire_kwargs(ds_off) == {
+        "model": "deepseek-v4",
         "extra_body": {"thinking": {"type": "disabled"}},
     }
-    assert litellm_wire_kwargs(glm_off) == {
-        "model": "openai/glm-5.3-flash",
+    assert litellm_wire_kwargs(ds_off) == {
+        "model": "openai/deepseek-v4",
         "extra_body": {"thinking": {"type": "disabled"}},
     }
 
@@ -300,8 +474,8 @@ def test_fallback_cooldown_lifecycle(monkeypatch):
 @pytest.mark.parametrize(
     "spec,want_model,want_extra_body",
     [
-        ("gpt-6.1-terra@high", "openai/gpt-6.1-terra", {"reasoning_effort": "high"}),
-        ("glm-5.3-flash,gpt-6.1-terra@high", "openai/glm-5.3-flash", {"thinking": {"type": "enabled"}}),
+        ("gpt-6.1-terra@medium", "openai/gpt-6.1-terra", {"reasoning_effort": "medium"}),
+        ("glm-5.3-flash@high,gpt-6.1-terra@medium", "openai/glm-5.3-flash", {"reasoning_effort": "high"}),
         ("gpt-4.1-mini", "openai/gpt-4.1-mini", None),
     ],
 )
@@ -326,6 +500,7 @@ def test_library_get_llm_sends_litellm_wire_kwargs(
         requests.append(kwargs)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
 
+    monkeypatch.setattr(llm, "_DEFAULT_MAX_TOKENS", None)
     monkeypatch.setattr(llm, "_create_completion", complete)
     assert llm.get_llm().call("judge") == "ok"
     expected = {
@@ -333,11 +508,14 @@ def test_library_get_llm_sends_litellm_wire_kwargs(
         "messages": [{"role": "user", "content": "judge"}],
         "base_url": "https://gateway.example/v1" if gateway else "https://direct.example/v1",
         "api_key": "test-key",
-        "max_tokens": llm._DEFAULT_MAX_TOKENS,
     }
     if want_extra_body is not None:
         expected["extra_body"] = want_extra_body
     assert requests == [expected]
+    assert "max_tokens" not in requests[0]
+
+    assert llm.get_llm(max_tokens=4096).call("judge") == "ok"
+    assert requests[1] == {**expected, "max_tokens": 4096}
 
 
 def test_doctor_accepts_concrete_route_defaults(tmp_path, monkeypatch, capsys):
@@ -349,9 +527,13 @@ def test_doctor_accepts_concrete_route_defaults(tmp_path, monkeypatch, capsys):
     cli._check_config(report)
     assert report.failures == 0
     output = capsys.readouterr().out
-    assert "build=glm-5.3,gpt-6.1-terra@high" in output
+    assert "build=glm-5.3@max,gpt-6.1-terra@high" in output
     assert "synth=gpt-6-astra@xhigh" in output
-    assert "decompose=gpt-6.1-terra@high" in output
+    assert "keyword=gpt-6.1-terra@low" in output
+    assert "judge=gpt-6.1-terra@medium" in output
+    assert "gate=glm-5.3-flash@high,gpt-6.1-terra@medium" in output
+    assert "verify=glm-5.3-flash@low,gpt-6.1-terra@low" in output
+    assert "eval_judge=glm-5.3@max" in output
 
 
 def test_doctor_reports_retired_or_invalid_role_override(tmp_path, monkeypatch, capsys):
@@ -367,7 +549,7 @@ def test_doctor_reports_retired_or_invalid_role_override(tmp_path, monkeypatch, 
 
 
 @pytest.mark.asyncio
-async def test_eval_and_baseline_callers_fail_over_glm_to_gpt_and_honor_cooldown(
+async def test_eval_and_baseline_callers_default_single_target_and_multi_target_override(
     tmp_path, monkeypatch, caplog,
 ):
     import asyncio
@@ -385,6 +567,10 @@ async def test_eval_and_baseline_callers_fail_over_glm_to_gpt_and_honor_cooldown
     assert spec_srb and spec_srb.loader
     srb = importlib.util.module_from_spec(spec_srb)
     spec_srb.loader.exec_module(srb)
+    async def _no_sleep(_):
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 
     class FakeHTTPError(Exception):
         def __init__(self, status_code: int):
@@ -409,7 +595,75 @@ async def test_eval_and_baseline_callers_fail_over_glm_to_gpt_and_honor_cooldown
         )
         return client, calls
 
-    # 1. search_relevance_baseline._judge: 429 on glm-5.3 fails over immediately to gpt-6.1-terra@high
+    valid_judge_reply = json.dumps(
+        {
+            "qid": "q1",
+            "relevance": 90,
+            "faithfulness": 1.0,
+            "n_substantive_claims": 1,
+            "n_claims_with_citation": 1,
+            "citation_recall": 1.0,
+            "citation_support_precision": 1.0,
+            "citation_checks": [{"claim": "c", "cited_key": "K1", "verdict": "entail", "note": "ok"}],
+            "nugget_recall": 1.0,
+            "nugget_judgements": [{"nugget_id": 0, "coverage": "covered", "score": 1.0, "note": "ok"}],
+            "trap_correct_refusal": None,
+            "overall_note": "ok",
+        }
+    )
+    judge_dir = tmp_path / "judge" / "vmq_r1"
+    judge_dir.mkdir(parents=True)
+    (judge_dir / "q1.prompt.txt").write_text("judge prompt")
+    monkeypatch.setattr(
+        judge_mimo, "eval_path", lambda *parts: tmp_path.joinpath(*parts)
+    )
+    monkeypatch.setattr(judge_mimo.JA, "validate_judge_json", lambda d, n_gold_nuggets=None: None)
+
+    # --- A. Default eval_judge='glm-5.3@max': single-target ruler invariant (no cross-family failover) ---
+    clear_fallback_cooldowns()
+    srb_single, srb_single_calls = make_client([FakeHTTPError(429), FakeHTTPError(429)])
+    with pytest.raises(FakeHTTPError):
+        await srb._judge(
+            srb_single, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
+        )
+    assert [c["model"] for c in srb_single_calls] == ["glm-5.3", "glm-5.3"]
+    assert all(
+        c["reasoning_effort"] == "max" and "extra_body" not in c
+        for c in srb_single_calls
+    )
+    assert not is_model_cooled_down("glm-5.3")
+
+    u1_single, u1_single_calls = make_client(
+        [TimeoutError("t1"), json.dumps({"faithful": True, "reason": "ok"})]
+    )
+    assert (
+        await _ab_u1_judge._judge(
+            u1_single,
+            asyncio.Semaphore(1),
+            {"head": "A", "tail": "B", "description": "rel", "source_chunks": ["A causes B"]},
+        )
+        is True
+    )
+    assert [c["model"] for c in u1_single_calls] == ["glm-5.3", "glm-5.3"]
+    assert all(c["reasoning_effort"] == "max" for c in u1_single_calls)
+
+    jm_single, jm_single_calls = make_client([FakeHTTPError(429), valid_judge_reply])
+    counters_single = {"ok": 0, "skip": 0, "fail": 0}
+    res_single = await judge_mimo._judge_one(
+        jm_single,
+        asyncio.Semaphore(1),
+        "vmq_r1",
+        "q1",
+        {"qid": "q1", "gold_keys": ["K1"], "nuggets": ["n1"]},
+        True,
+        counters_single,
+    )
+    assert res_single == ("vmq_r1", "q1", "ok", "attempt=2")
+    assert [c["model"] for c in jm_single_calls] == ["glm-5.3", "glm-5.3"]
+    assert all(c["reasoning_effort"] == "max" for c in jm_single_calls)
+
+    # --- B. Explicit multi-target PAPERVAULT_LLM_EVAL_JUDGE override fails over & honors cooldown ---
+    monkeypatch.setenv("PAPERVAULT_LLM_EVAL_JUDGE", "glm-5.3@max,relay-glm-5.3@max")
     clear_fallback_cooldowns()
     srb_client, srb_calls = make_client(
         [
@@ -427,12 +681,11 @@ async def test_eval_and_baseline_callers_fail_over_glm_to_gpt_and_honor_cooldown
             srb_client, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
         )
     assert scores_1 == [0.9] and scores_2 == [0.8]
-    assert [c["model"] for c in srb_calls] == ["glm-5.3", "gpt-6.1-terra", "gpt-6.1-terra"]
-    assert srb_calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
-    assert srb_calls[1]["reasoning_effort"] == "high" and "extra_body" not in srb_calls[1]
-    assert any("glm-5.3 -> gpt-6.1-terra" in r.getMessage() for r in caplog.records)
+    assert [c["model"] for c in srb_calls] == ["glm-5.3", "relay-glm-5.3", "relay-glm-5.3"]
+    assert all(c["reasoning_effort"] == "max" and "extra_body" not in c for c in srb_calls)
+    assert any("glm-5.3 -> relay-glm-5.3" in r.getMessage() for r in caplog.records)
 
-    # Deterministic 401 does NOT fail over to gpt-6.1-terra:
+    # Deterministic 401 does NOT fail over:
     clear_fallback_cooldowns()
     auth_client, auth_calls = make_client(
         [FakeHTTPError(401), json.dumps({"items": [{"idx": 0, "score": 1.0}]})]
@@ -447,7 +700,7 @@ async def test_eval_and_baseline_callers_fail_over_glm_to_gpt_and_honor_cooldown
         await srb._judge(cancel_client, "solar wind", [{"title": "Paper A", "year": 2024}])
     assert [c["model"] for c in cancel_calls] == ["glm-5.3"]
 
-    # 2. _ab_u1_judge._judge: timeout on glm-5.3 fails over immediately to gpt-6.1-terra@high
+    # _ab_u1_judge._judge: timeout on glm-5.3 fails over immediately to relay-glm-5.3@max
     clear_fallback_cooldowns()
     u1_client, u1_calls = make_client(
         [TimeoutError("upstream timeout"), json.dumps({"faithful": True, "reason": "direct"})]
@@ -458,33 +711,10 @@ async def test_eval_and_baseline_callers_fail_over_glm_to_gpt_and_honor_cooldown
         {"head": "A", "tail": "B", "description": "rel", "source_chunks": ["A causes B"]},
     )
     assert verdict is True
-    assert [c["model"] for c in u1_calls] == ["glm-5.3", "gpt-6.1-terra"]
+    assert [c["model"] for c in u1_calls] == ["glm-5.3", "relay-glm-5.3"]
 
-    # 3. judge_mimo._judge_one: 429 on glm-5.3 fails over in attempt 1 without sleeping/burning attempt
+    # judge_mimo._judge_one: 429 on glm-5.3 fails over in attempt 1 without burning attempt
     clear_fallback_cooldowns()
-    judge_dir = tmp_path / "judge" / "vmq_r1"
-    judge_dir.mkdir(parents=True)
-    (judge_dir / "q1.prompt.txt").write_text("judge prompt")
-    monkeypatch.setattr(
-        judge_mimo, "eval_path", lambda *parts: tmp_path.joinpath(*parts)
-    )
-    valid_judge_reply = json.dumps(
-        {
-            "qid": "q1",
-            "relevance": 90,
-            "faithfulness": 1.0,
-            "n_substantive_claims": 1,
-            "n_claims_with_citation": 1,
-            "citation_recall": 1.0,
-            "citation_support_precision": 1.0,
-            "citation_checks": [{"claim": "c", "cited_key": "K1", "verdict": "entail", "note": "ok"}],
-            "nugget_recall": 1.0,
-            "nugget_judgements": [{"nugget_id": 0, "coverage": "covered", "score": 1.0, "note": "ok"}],
-            "trap_correct_refusal": None,
-            "overall_note": "ok",
-        }
-    )
-    monkeypatch.setattr(judge_mimo.JA, "validate_judge_json", lambda d, n_gold_nuggets=None: None)
     jm_client, jm_calls = make_client([FakeHTTPError(429), valid_judge_reply])
     counters = {"ok": 0, "skip": 0, "fail": 0}
     res = await judge_mimo._judge_one(
@@ -497,4 +727,178 @@ async def test_eval_and_baseline_callers_fail_over_glm_to_gpt_and_honor_cooldown
         counters,
     )
     assert res == ("vmq_r1", "q1", "ok", "attempt=1")
-    assert [c["model"] for c in jm_calls] == ["glm-5.3", "gpt-6.1-terra"]
+    assert [c["model"] for c in jm_calls] == ["glm-5.3", "relay-glm-5.3"]
+
+
+def test_extraction_registration_effective_recipe_records_max_tokens_and_digest(tmp_path, monkeypatch):
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from papervault.library import llm as lib_llm
+    from papervault.library.services.extraction_registration import effective_recipe
+    from papervault.store.knowledge import canonical_recipe
+
+    monkeypatch.setattr(lib_llm, "_DEFAULT_MAX_TOKENS", None)
+    default_recipe = effective_recipe("mineru2.5-pro")
+    assert default_recipe["gate"]["configured_model"] == "glm-5.3-flash@high,gpt-6.1-terra@medium"
+    assert default_recipe["gate"]["max_tokens"] is None
+    canon_default, digest_default = canonical_recipe(default_recipe)
+    assert canon_default["gate"]["max_tokens"] is None
+
+    # KeyPool with no active groups still reports its configured max_tokens cleanly (None or int).
+    monkeypatch.setattr(config, "LLM_API_KEY", "")
+    empty_pool = lib_llm.KeyPool(tmp_path / "absent.json", None, model_override="glm-5.3-flash@high")
+    assert effective_recipe("mineru2.5-pro", llm=empty_pool)["gate"]["max_tokens"] is None
+    capped_pool = lib_llm.KeyPool(tmp_path / "absent.json", 8192, model_override="glm-5.3-flash@high")
+    capped_recipe = effective_recipe("mineru2.5-pro", llm=capped_pool)
+    assert capped_recipe["gate"]["max_tokens"] == 8192
+    assert canonical_recipe(capped_recipe)[1] != digest_default
+
+    # Process startup check for PAPERVAULT_LIB_MAX_TOKENS unset vs explicit integer:
+    program = """
+import json
+from papervault.library.services.extraction_registration import effective_recipe
+from papervault.store.knowledge import canonical_recipe
+r, d = canonical_recipe(effective_recipe('mineru2.5-pro'))
+print(json.dumps({'digest': d, 'max_tokens': r['gate']['max_tokens']}))
+"""
+    base_env = {k: v for k, v in os.environ.items() if k != "PAPERVAULT_LIB_MAX_TOKENS"}
+    base_env["PYTHON_DOTENV_DISABLED"] = "1"
+    unset_proc = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=tmp_path,
+        env=base_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    set_proc = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=tmp_path,
+        env={**base_env, "PAPERVAULT_LIB_MAX_TOKENS": "16384"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    unset_out = json.loads(unset_proc.stdout.strip().splitlines()[-1])
+    set_out = json.loads(set_proc.stdout.strip().splitlines()[-1])
+    assert unset_out["max_tokens"] is None
+    assert set_out["max_tokens"] == 16384
+    assert unset_out["digest"] != set_out["digest"]
+
+
+@pytest.mark.asyncio
+async def test_eval_judges_omit_default_max_tokens_and_honor_judge_max_tokens(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    import os
+    import subprocess
+    import sys
+    from types import SimpleNamespace
+
+    from papervault.eval import _ab_u1_judge, judge_mimo
+
+    # Subprocess check: JUDGE_MAX_TOKENS defaults to None when unset/blank and parses explicit int.
+    env = {k: v for k, v in os.environ.items() if k != "JUDGE_MAX_TOKENS"}
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    for unset_val in (None, "", "   "):
+        run_env = dict(env)
+        if unset_val is not None:
+            run_env["JUDGE_MAX_TOKENS"] = unset_val
+        proc = subprocess.run(
+            [sys.executable, "-c", "import json, papervault.eval.judge_mimo as m; print(json.dumps(m.MAX_TOKENS))"],
+            cwd=tmp_path,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(proc.stdout.strip().splitlines()[-1]) is None
+
+    proc_set = subprocess.run(
+        [sys.executable, "-c", "import json, papervault.eval.judge_mimo as m; print(json.dumps(m.MAX_TOKENS))"],
+        cwd=tmp_path,
+        env={**env, "JUDGE_MAX_TOKENS": "16000"},
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert json.loads(proc_set.stdout.strip().splitlines()[-1]) == 16000
+
+    # Wire check for _ab_u1_judge and judge_mimo:
+    calls: list[dict] = []
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content=json.dumps(
+                            {
+                                "faithful": True,
+                                "reason": "ok",
+                                "qid": "q1",
+                                "relevance": 90,
+                                "faithfulness": 1.0,
+                                "n_substantive_claims": 0,
+                                "n_claims_with_citation": 0,
+                                "citation_recall": 1.0,
+                                "citation_support_precision": 1.0,
+                                "citation_checks": [],
+                                "nugget_recall": 1.0,
+                                "nugget_judgements": [],
+                                "trap_correct_refusal": True,
+                                "overall_note": "ok",
+                            }
+                        )
+                    )
+                )
+            ]
+        )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+    # 1. _ab_u1_judge omits max_tokens on wire (no hardcoded 4000):
+    assert (
+        await _ab_u1_judge._judge(
+            client,
+            asyncio.Semaphore(1),
+            {"head": "A", "tail": "B", "description": "rel", "source_chunks": ["A causes B"]},
+        )
+        is True
+    )
+    assert "max_tokens" not in calls[-1]
+
+    # 2. judge_mimo omits max_tokens when MAX_TOKENS is None and forwards when set:
+    judge_dir = tmp_path / "judge" / "vmq_r1"
+    judge_dir.mkdir(parents=True)
+    (judge_dir / "q1.prompt.txt").write_text("judge prompt")
+    monkeypatch.setattr(judge_mimo, "eval_path", lambda *parts: tmp_path.joinpath(*parts))
+    monkeypatch.setattr(judge_mimo.JA, "validate_judge_json", lambda d, n_gold_nuggets=None: None)
+
+    monkeypatch.setattr(judge_mimo, "MAX_TOKENS", None)
+    await judge_mimo._judge_one(
+        client,
+        asyncio.Semaphore(1),
+        "vmq_r1",
+        "q1",
+        {"qid": "q1", "gold_keys": [], "nuggets": []},
+        True,
+        {"ok": 0, "skip": 0, "fail": 0},
+    )
+    assert "max_tokens" not in calls[-1]
+
+    monkeypatch.setattr(judge_mimo, "MAX_TOKENS", 16000)
+    await judge_mimo._judge_one(
+        client,
+        asyncio.Semaphore(1),
+        "vmq_r1",
+        "q1",
+        {"qid": "q1", "gold_keys": [], "nuggets": []},
+        True,
+        {"ok": 0, "skip": 0, "fail": 0},
+    )
+    assert calls[-1]["max_tokens"] == 16000

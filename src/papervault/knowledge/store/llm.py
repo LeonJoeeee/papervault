@@ -105,19 +105,16 @@ _SLOW_CALL_S = float(os.getenv("KS_SLOW_CALL_LOG_S", "60"))
 # the caller — passed as `timeout=` (already whitelisted → forwarded to .create()) or enforced
 # by an outer asyncio.wait_for (LightRAG worker for extraction, synth_answer's timeout_s). env-tunable.
 _CLIENT_TIMEOUT = float(os.getenv("KS_LLM_CLIENT_TIMEOUT", "900"))
-# Explicit output ceiling just under MiMo's max. 131000, not 128K = 131072: since 2026-09-25 the
-# gateway's primary is MiMo v2.6 flash, which the relay caps at max_tokens <= 131069 (pro: 131071);
-# 131072 drew a 400 "Param Incorrect" on every call and fell through to the GLM backup (#141).
-# Owner's call: the largest value MiMo accepts, not a smaller budget. max_tokens is a CEILING,
-# not a target → FREE for normal calls (a dense extraction finishes in ~hundreds of tokens, finish=
-# stop). This is a DETERMINISTIC SAFETY VALUE, not a fix for an observed bug: we did NOT observe any
-# production output-truncation — the build log has 0 `finish_reason` entries, and MiMo's unset default
-# is already far above any extraction's reasoning+answer (model max is 128K; a sane default ≫ 20K). The
-# reasoning-eats-budget failure mode is real ONLY at a tiny cap (probed: max_tokens=30 → 29 reasoning,
-# 0 answer, finish=length) and does NOT occur at the default. We pin the cap explicitly so it can never
-# silently bite regardless of MiMo's default; a genuine runaway would be caught by the gateway per-
-# attempt timeout (loud 408 → retry). setdefault in complete() → explicit callers (e.g. synth) win.
-_DEFAULT_MAX_TOKENS = int(os.getenv("KS_LLM_MAX_TOKENS", "131000"))
+def _optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw else None
+
+
+# Omit max_tokens on the wire by default (None) so the transparent LLM Gateway v0.7.3 injects each
+# model's official output ceiling (131072 on glm-5.3* / mimo-v2.6-*, 393216 on deepseek-*) while
+# codex-subscription ignores max_tokens. Setting KS_LLM_MAX_TOKENS=<int> opts into an explicit
+# output ceiling; caller-supplied max_tokens=<int> still takes precedence over _DEFAULT_MAX_TOKENS.
+_DEFAULT_MAX_TOKENS: int | None = _optional_int_env("KS_LLM_MAX_TOKENS")
 # Jitter added to the inter-round backoff so concurrent workers don't retry in lockstep against
 # the same endpoints (thundering-herd / retry-storm guard — the #1 naive-retry mistake).
 _BACKOFF_JITTER = float(os.getenv("KS_LLM_BACKOFF_JITTER", "0.75"))
@@ -297,7 +294,11 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
     transient fail-over, attempt-fail logging) is untouched; an error while ITERATING, or a
     stream that ends with no finish_reason, is normalised to ``StreamTruncated`` — except after
     the finish chunk, where the complete answer is kept and only the usage is lost."""
-    kwargs = {k: v for k, v in openai_kwargs.items() if k not in _RESERVED_TRANSPORT_KEYS}
+    kwargs = {
+        k: v
+        for k, v in openai_kwargs.items()
+        if k not in _RESERVED_TRANSPORT_KEYS and not (k == "max_tokens" and v is None)
+    }
     if not _STREAM:
         return await client.chat.completions.create(model=model, messages=messages, **kwargs)
     # One ABSOLUTE deadline for "the first chunk exists": it spans create() (the proxy sends the
@@ -507,11 +508,15 @@ class KeyPool:
         history_messages: list[dict] | None = None,
         **kwargs: Any,
     ) -> str:
-        # Pin an explicit output ceiling at MiMo's max (deterministic safety value, NOT a fix for an
-        # observed bug — see _DEFAULT_MAX_TOKENS). Single chokepoint for BOTH gateway + direct paths;
-        # an explicit caller max_tokens (e.g. synth) wins via setdefault. Applies to extraction too,
-        # which uses the RAW mimo_complete (LightRAG's llm_model_kwargs only reaches the query path).
-        kwargs.setdefault("max_tokens", _DEFAULT_MAX_TOKENS)
+        # Omit max_tokens on the wire when both caller max_tokens and _DEFAULT_MAX_TOKENS are None
+        # (stripping max_tokens=None if passed); forward explicit caller or KS_LLM_MAX_TOKENS ints.
+        effective_max_tokens = kwargs.get("max_tokens")
+        if effective_max_tokens is None:
+            effective_max_tokens = _DEFAULT_MAX_TOKENS
+        if effective_max_tokens is None:
+            kwargs.pop("max_tokens", None)
+        else:
+            kwargs["max_tokens"] = effective_max_tokens
         # Phase 1B (KS_USE_GATEWAY=1, default OFF — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md §9b): route to
         # the LiteLLM proxy instead of the in-process KeyPool. The proxy owns key failover/
         # cooldown/401-disable, so gateway mode has no shuffle and no _MAX_ROUNDS — one endpoint,

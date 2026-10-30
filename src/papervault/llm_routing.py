@@ -22,16 +22,26 @@ EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 _RETIRED_LEVELS = frozenset({"flash", "standard", "pro", "max", "ultra"})
 _RETIRED_GATEWAY_ALIASES = frozenset(f"papervault-{lvl}" for lvl in _RETIRED_LEVELS)
 
+_GLM_PREFIXES = ("glm-", "relay-glm-")
+_GLM_EFFORTS = frozenset({"low", "high", "max"})
+_CODEX_ALWAYS_ON_PREFIXES = ("gpt-6-astra", "gpt-6.1-sol")
+_CODEX_ALWAYS_ON_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
+_CODEX_DISABLE_CAPABLE_PREFIXES = ("gpt-6.1-terra", "gpt-6-luna")
+_CODEX_DISABLE_CAPABLE_EFFORTS = frozenset(EFFORTS)
+_DEEPSEEK_GATEWAY_PREFIXES = ("deepseek-v4", "deepseek-flash", "relay-deepseek-")
+_DEEPSEEK_EFFORTS = frozenset({"low", "high", "max"})
+_MIMO_GATEWAY_PREFIXES = ("mimo-v2.6-", "relay-mimo-v2.6-")
+
 _DEFAULT_ROUTES: dict[str, str] = {
     "intent": "gpt-6.1-terra@high",
-    "build": "glm-5.3,gpt-6.1-terra@high",
-    "keyword": "gpt-6.1-terra@high",
+    "build": "glm-5.3@max,gpt-6.1-terra@high",
+    "keyword": "gpt-6.1-terra@low",
     "synth": "gpt-6-astra@xhigh",
-    "gate": "glm-5.3-flash,gpt-6.1-terra@high",
-    "verify": "glm-5.3-flash,gpt-6.1-terra@high",
-    "judge": "gpt-6.1-terra@high",
+    "gate": "glm-5.3-flash@high,gpt-6.1-terra@medium",
+    "verify": "glm-5.3-flash@low,gpt-6.1-terra@low",
+    "judge": "gpt-6.1-terra@medium",
     "decompose": "gpt-6.1-terra@high",
-    "eval_judge": "glm-5.3,gpt-6.1-terra@high",
+    "eval_judge": "glm-5.3@max",
 }
 ROLES = tuple(_DEFAULT_ROUTES)
 
@@ -47,11 +57,6 @@ class ModelTarget:
     model: str
     reasoning_effort: str | None = None
     thinking: bool | None = None
-
-
-def _is_glm_model(model: str) -> bool:
-    bare = model[7:] if model.lower().startswith("openai/") else model
-    return bare.lower().startswith("glm-")
 
 
 def _spec_error(spec: str, detail: str, *, var_name: str | None) -> ValueError:
@@ -96,27 +101,71 @@ def _parse_single_target(token: str, *, spec: str, var_name: str | None) -> Mode
         raise _spec_error(
             spec,
             f"{raw_model!r} is a retired level alias; specify a concrete model "
-            "(e.g. 'gpt-6.1-terra@high' or 'glm-5.3,gpt-6.1-terra@high')",
+            "(e.g. 'gpt-6.1-terra@high' or 'glm-5.3@max,gpt-6.1-terra@high')",
             var_name=var_name,
         )
 
-    if _is_glm_model(model):
-        if mod is None or mod == "thinking":
+    if low_model.startswith(_GLM_PREFIXES):
+        if mod is None:
+            return ModelTarget(model=model, reasoning_effort=None, thinking=None)
+        if mod in _GLM_EFFORTS:
+            return ModelTarget(model=model, reasoning_effort=mod, thinking=None)
+        raise _spec_error(
+            spec,
+            f"invalid modifier @{raw_mod} for GLM model {model!r}; expected bare model "
+            "or one of @low, @high, @max",
+            var_name=var_name,
+        )
+
+    if low_model.startswith(_CODEX_ALWAYS_ON_PREFIXES):
+        if mod is None:
+            return ModelTarget(model=model, reasoning_effort=None, thinking=None)
+        if mod in _CODEX_ALWAYS_ON_EFFORTS:
+            return ModelTarget(model=model, reasoning_effort=mod, thinking=None)
+        raise _spec_error(
+            spec,
+            f"invalid modifier @{raw_mod} for always-on Codex model {model!r}; expected "
+            "bare model or one of @low, @medium, @high, @xhigh, @max",
+            var_name=var_name,
+        )
+
+    if low_model.startswith(_CODEX_DISABLE_CAPABLE_PREFIXES):
+        if mod is None:
+            return ModelTarget(model=model, reasoning_effort=None, thinking=None)
+        if mod in _CODEX_DISABLE_CAPABLE_EFFORTS:
+            return ModelTarget(model=model, reasoning_effort=mod, thinking=None)
+        raise _spec_error(
+            spec,
+            f"invalid modifier @{raw_mod} for Codex model {model!r}; expected bare model "
+            f"or one of {', '.join(f'@{e}' for e in EFFORTS)}",
+            var_name=var_name,
+        )
+
+    if low_model.startswith(_DEEPSEEK_GATEWAY_PREFIXES):
+        if mod is None:
+            return ModelTarget(model=model, reasoning_effort=None, thinking=None)
+        if mod in _DEEPSEEK_EFFORTS:
+            return ModelTarget(model=model, reasoning_effort=mod, thinking=None)
+        if mod in {"nothinking", "none"}:
+            return ModelTarget(model=model, reasoning_effort=None, thinking=False)
+        raise _spec_error(
+            spec,
+            f"invalid modifier @{raw_mod} for DeepSeek model {model!r}; expected bare model "
+            "or one of @low, @high, @max, @nothinking, @none",
+            var_name=var_name,
+        )
+
+    if low_model.startswith(_MIMO_GATEWAY_PREFIXES):
+        if mod is None:
+            return ModelTarget(model=model, reasoning_effort=None, thinking=None)
+        if mod == "thinking":
             return ModelTarget(model=model, reasoning_effort=None, thinking=True)
         if mod in {"nothinking", "none"}:
             return ModelTarget(model=model, reasoning_effort=None, thinking=False)
-        if mod in EFFORTS:
-            raise _spec_error(
-                spec,
-                f"glm-* model {model!r} uses adaptive thinking "
-                "('@thinking'/'@nothinking'/'@none'), not effort tier "
-                f"@{raw_mod}",
-                var_name=var_name,
-            )
         raise _spec_error(
             spec,
-            f"unknown modifier @{raw_mod} for {model!r}; expected "
-            "@thinking, @nothinking, or @none",
+            f"invalid modifier @{raw_mod} for MiMo model {model!r}; expected bare model "
+            "or one of @thinking, @nothinking, @none",
             var_name=var_name,
         )
 
@@ -150,10 +199,6 @@ def parse_targets(spec: str, *, var_name: str | None = None) -> tuple[ModelTarge
 
 def format_target(target: ModelTarget) -> str:
     """Serialize a ``ModelTarget`` into canonical ``route(role)`` syntax."""
-    if _is_glm_model(target.model):
-        if target.thinking is False:
-            return f"{target.model}@nothinking"
-        return target.model
     if target.reasoning_effort is not None:
         return f"{target.model}@{target.reasoning_effort}"
     if target.thinking is not None:

@@ -51,7 +51,6 @@ async def _judge(client, sem, e):
                     client,
                     targets,
                     messages=[{"role": "system", "content": SYS}, {"role": "user", "content": user}],
-                    max_tokens=4000,
                     temperature=0,
                 )
                 obj = _extract_json(r.choices[0].message.content or "")

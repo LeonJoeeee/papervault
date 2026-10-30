@@ -96,39 +96,49 @@ includes commented examples. Changes affecting retrieval quality require arbitra
 
 ## LLM routing and migration
 
-Every text LLM request sends a gateway level: `flash`, `standard`, `pro`, `max`, or `ultra`.
-The endpoint resolves its model and effort per key. Defaults are:
+Every text LLM request resolves a concrete `primary[,fallback...]` target chain
+from its role (`<model>[@<modifier>][,<fallback>...]`). Defaults are:
 
-| Role | Level | Override |
+| Role | Default route | Override |
 | --- | --- | --- |
-| Graph extraction/merge | max | `PAPERVAULT_LLM_BUILD` |
-| Query keyword extraction | flash | `PAPERVAULT_LLM_KEYWORD` |
-| Answer synthesis | ultra | `PAPERVAULT_LLM_SYNTH` |
-| Extract clarity/completeness gates | flash | `PAPERVAULT_LLM_GATE` |
-| PDF metadata verification | flash | `PAPERVAULT_LLM_VERIFY` |
-| Library search intent | pro | `PAPERVAULT_LLM_INTENT` |
-| Library judges/resolver/re-rank | standard | `PAPERVAULT_LLM_JUDGE` |
-| Decomposition (production multiquery and eval) | pro | `PAPERVAULT_LLM_DECOMPOSE` |
-| Eval judges | standard | `PAPERVAULT_LLM_EVAL_JUDGE` |
+| Graph extraction/merge | `glm-5.3,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
+| Query keyword extraction | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_KEYWORD` |
+| Answer synthesis | `gpt-6-astra@xhigh` | `PAPERVAULT_LLM_SYNTH` |
+| Extract clarity/completeness gates | `glm-5.3-flash,gpt-6.1-terra@high` | `PAPERVAULT_LLM_GATE` |
+| PDF metadata verification | `glm-5.3-flash,gpt-6.1-terra@high` | `PAPERVAULT_LLM_VERIFY` |
+| Library search intent | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_INTENT` |
+| Library judges/resolver/re-rank | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_JUDGE` |
+| Decomposition (production multiquery and eval) | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_DECOMPOSE` |
+| Eval judges | `glm-5.3,gpt-6.1-terra@high` | `PAPERVAULT_LLM_EVAL_JUDGE` |
 
-For example, `PAPERVAULT_LLM_SYNTH=standard` overrides synthesis. Values must be
-bare levels; unset/blank uses the table. Provider model names and suffixes are
-rejected with the variable name in the error. `doctor` validates and reports these
-routes. Speech (`mimo-v2.5-asr`) and local BGE embedding/rerank are unchanged.
+For `glm-*` models, adaptive thinking is enabled by default (`@nothinking` or
+`@none` disables it; effort tiers on `glm-*` raise `ValueError`). Non-`glm-*`
+models accept `@none`, `@low`, `@medium`, `@high`, `@xhigh`, `@max`, `@thinking`,
+or `@nothinking`, or omit the modifier for plain OpenAI-compatible models (e.g.
+`PAPERVAULT_LLM_JUDGE=gpt-4.1-mini`). Multi-target routes fail over immediately
+from a throttled or timed-out primary (`429`, `408`, `5xx`, timeout,
+`StreamTruncated`) to the next target and cool down the primary for
+`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` seconds (default `120`, `<= 0` disables)
+before probing it again; single-target GPT roles never cross-model fallback.
+
+The retired symbolic level names (`flash`, `standard`, `pro`, `max`, `ultra` and
+`papervault-*`) are rejected with `ValueError` naming `PAPERVAULT_LLM_<ROLE>`.
+`papervault doctor` validates and reports all nine routes. Speech (`mimo-v2.5-asr`)
+and local BGE embedding/rerank are unchanged.
 
 `PAPERVAULT_MODEL`, `PAPERVAULT_BUILD_MODEL`, `KS_BUILD_MODEL`,
 `PAPER_PIPELINE_VERIFY_MODEL`, and the eval scripts' `MIMO_MODEL` are retired.
-Replace old model/mode settings with the role variables above. Caller effort
-settings have been removed; configure effort on the endpoint instead.
+Replace old model/level settings with concrete role routes above (or remove them
+from `.env` to use the defaults).
 
-The optional gateway transport (`PAPERVAULT_LLM_GATEWAY=1`) forwards each level
-unchanged to `PAPERVAULT_LLM_GATEWAY_URL` using `PAPERVAULT_LLM_GATEWAY_KEY`.
-Without that flag, the single endpoint/key or key pool also receives the same
-bare levels: the direct endpoint must serve these aliases and own their model
-and effort. Pool entries supply credentials/endpoints; their model field does
-not override a call site's role level. There is no caller-side provider-model
-mapping. Bare `OPENAI_API_KEY`/`ANTHROPIC_API_KEY` model fallbacks are retired;
-use the documented `PAPERVAULT_LLM_*` endpoint/key configuration.
+The optional gateway transport (`PAPERVAULT_LLM_GATEWAY=1`) sends concrete model
+IDs and thinking/effort parameters directly to `PAPERVAULT_LLM_GATEWAY_URL` using
+`PAPERVAULT_LLM_GATEWAY_KEY` (matching the transparent LLM Gateway `v0.7.0`).
+Without that flag, the single endpoint/key or key pool (`PAPERVAULT_LLM_KEYS`)
+sends the same concrete routes; when no role override is forced, key-pool entries
+rotate across their configured `base_url`/`api_key`/`model` groups and auto-disable
+permanent `401`/`403` credentials. Bare `OPENAI_API_KEY`/`ANTHROPIC_API_KEY`
+model fallbacks remain retired; use the documented `PAPERVAULT_LLM_*` settings.
 
 `doctor` accepts a configured gateway key without a direct endpoint key or key-pool
 file when gateway mode is on; a missing gateway key fails even if direct credentials
@@ -153,6 +163,7 @@ are useful for diagnosis or capacity tuning; defaults come from the current runt
 | `KS_LLM_BACKOFF_JITTER` | `0.75` | Jitter added to direct key-pool retry backoff in seconds. |
 | `KS_GATEWAY_CONN_RETRIES` / `KS_GATEWAY_CONN_BACKOFF_CAP` | `6` / `15` | Unreachable-gateway connection retries and backoff cap in seconds, still bounded by the configured retry budget. |
 | `KS_SLOW_CALL_LOG_S` | `60` | Log successful knowledge LLM calls exceeding this duration in seconds. |
+| `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` | `120` | Process-local primary-model cooldown in seconds after multi-target failover (`<= 0` disables). |
 | `PAPERVAULT_LIB_FIRST_CHUNK_S` / `PAPERVAULT_LIB_RETRY_BUDGET_S` | `0` / `480` | Library-side pre-first-chunk cutoff (`0` disables; positive seconds opt in) and total retry-admission budget in seconds; separate from the `KS_*` knowledge settings. |
 | `PAPERVAULT_SAVE_MIN_INTERVAL_S` / `PAPERVAULT_BIB_MIN_INTERVAL_S` | `0` / `60` | Non-forced library save debounce and BibTeX refresh cadence in seconds. Forced durable lifecycle saves bypass debounce. |
 | `PAPERVAULT_EXTRACT_DEFER_CANARY` | `8` | Maximum deferred extraction recovery canaries promoted per reconcile sweep; `0` disables canaries. |

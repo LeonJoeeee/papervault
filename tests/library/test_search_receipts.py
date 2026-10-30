@@ -163,3 +163,39 @@ async def test_intent_observers_stay_request_local_across_to_thread(monkeypatch)
     first, second = await asyncio.gather(request("first"), request("second"))
     assert [event.model for event in first] == ["first-served"]
     assert [event.model for event in second] == ["second-served"]
+
+
+def test_intent_receipt_marks_multi_target_route_fallback_degraded(monkeypatch):
+    from papervault.llm_routing import parse_targets
+
+    transport.clear_fallback_cooldowns()
+    response = SimpleNamespace(
+        model="gpt-6.1-terra-served", provider="openai-gateway", usage=None,
+        choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+            "search_terms": ["cosmic ray transport"], "filters": {},
+        })))],
+    )
+    attempts = iter([transport.StreamTruncated("primary cut"), response])
+
+    def completion(**kwargs):
+        result = next(attempts)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr(transport, "_create_completion", completion)
+    client = transport.LLM(
+        "openai/glm-5.3-flash",
+        targets=parse_targets("glm-5.3-flash,gpt-6.1-terra@high"),
+    )
+    observations = []
+    try:
+        with intent_parser.observe_intent(observations.append):
+            intent_parser.parse_intent("cosmic ray transport", client)
+        assert len(observations) == 1
+        assert observations[0].model == "gpt-6.1-terra-served"
+        assert observations[0].provider == "openai-gateway"
+        assert observations[0].degraded is True
+        assert observations[0].code is None
+    finally:
+        transport.clear_fallback_cooldowns()

@@ -14,6 +14,7 @@ import pytest
 
 from papervault import config
 from papervault.library import llm as L
+from papervault.llm_routing import parse_targets
 
 # api_key -> None (ok) or int HTTP code (raise). Tests set this before calling.
 BEHAVIOR: dict[str, int | None] = {}
@@ -41,10 +42,12 @@ class FakeLLM:
 
 @pytest.fixture(autouse=True)
 def _reset(monkeypatch):
+    L.clear_fallback_cooldowns()
     monkeypatch.setattr(L, "LLM", FakeLLM)
     BEHAVIOR.clear()
     yield
     BEHAVIOR.clear()
+    L.clear_fallback_cooldowns()
 
 
 @pytest.fixture
@@ -161,21 +164,30 @@ def test_gateway_off_is_default_keypool(tmp_path, monkeypatch):
 
 
 def test_gateway_on_returns_proxy_llm(monkeypatch):
-    """config.USE_GATEWAY=True → an LLM pointed at the proxy: group model, config base_url/key,
-    max_tokens passthrough, num_retries=0 (no double-retry), cached per (max_tokens, group)."""
+    """config.USE_GATEWAY=True → an LLM pointed at the proxy: concrete route targets, config base_url/key,
+    max_tokens passthrough, num_retries=0 (no double-retry), cached per (max_tokens, spec)."""
     monkeypatch.setattr(config, "USE_GATEWAY", True)
     monkeypatch.setattr(config, "GATEWAY_URL", "http://proxy:4000/v1")
     monkeypatch.setattr(config, "GATEWAY_KEY", "sk-test")
     monkeypatch.delenv("PAPERVAULT_LLM_JUDGE", raising=False)
     monkeypatch.setattr(L, "_gw_llms", {})
-    got = L.get_llm()                       # default library role → standard
+    got = L.get_llm()                       # default library role → judge (gpt-6.1-terra@high)
     assert isinstance(got, FakeLLM)         # L.LLM is monkeypatched to FakeLLM by _reset
-    assert got.kw == {"model": "openai/papervault-standard", "base_url": "http://proxy:4000/v1",
-                      "api_key": "sk-test", "max_tokens": L._DEFAULT_MAX_TOKENS, "num_retries": 0}
-    # An explicit flash level preserves its output ceiling.
-    cheap = L.get_llm(model="flash", max_tokens=4096)
-    assert cheap.kw["model"] == "openai/papervault-flash" and cheap.kw["max_tokens"] == 4096
-    # cached: same (max_tokens, group) → same object
+    assert got.kw == {
+        "model": "openai/gpt-6.1-terra",
+        "base_url": "http://proxy:4000/v1",
+        "api_key": "sk-test",
+        "max_tokens": L._DEFAULT_MAX_TOKENS,
+        "num_retries": 0,
+        "targets": parse_targets("gpt-6.1-terra@high"),
+    }
+    # An explicit multi-target gate route preserves its output ceiling and parsed target chain.
+    gate_spec = "glm-5.3-flash,gpt-6.1-terra@high"
+    cheap = L.get_llm(model=gate_spec, max_tokens=4096)
+    assert cheap.kw["model"] == "openai/glm-5.3-flash"
+    assert cheap.kw["max_tokens"] == 4096
+    assert cheap.kw["targets"] == parse_targets(gate_spec)
+    # cached: same (max_tokens, spec) → same object
     assert L.get_llm() is got
 
 

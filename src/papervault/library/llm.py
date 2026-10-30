@@ -29,7 +29,16 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from papervault import config
-from papervault.llm_routing import LEVELS, gateway_model, route
+from papervault.llm_routing import (
+    ModelTarget,
+    clear_fallback_cooldowns as clear_fallback_cooldowns,
+    format_targets,
+    is_model_cooled_down,
+    litellm_wire_kwargs,
+    parse_targets,
+    record_model_cooldown,
+    route,
+)
 from papervault.llm_usage import log_usage
 
 logger = logging.getLogger(__name__)
@@ -232,6 +241,20 @@ def _is_transient(exc):
                             litellm.APIConnectionError, httpx.TransportError))
 
 
+def _is_failover_eligible(exc: Exception) -> bool:
+    import httpx
+    import litellm
+    from openai import APITimeoutError
+
+    code = _error_code(exc)
+    if code is not None:
+        return code in {408, 429} or 500 <= code <= 599
+    return isinstance(
+        exc,
+        (StreamTruncated, TimeoutError, APITimeoutError, litellm.Timeout, httpx.TimeoutException),
+    )
+
+
 def _litellm_model(model: str) -> str:
     """litellm needs a provider prefix to route a custom OpenAI-compatible endpoint.
     Bare model names get an ``openai/`` prefix; anything already prefixed is left as-is."""
@@ -253,17 +276,20 @@ class LLM:
     litellm raises typed exceptions that carry ``.status_code`` (e.g.
     ``AuthenticationError`` → 401), so the pool's 401/403 auto-disable + transient
     (429/5xx/timeout) failover in :meth:`KeyPool.call` are byte-unchanged.
-    Calls stream internally and retry transient failures once within a retry
-    admission budget; the legacy num_retries argument cannot multiply SDK retries.
+    Calls stream internally; multi-target routes fail over immediately on transient
+    primary errors with process-local cooldown, and single/final targets retry
+    transient failures once within a retry admission budget.
     """
 
     def __init__(self, model, *, base_url=None, api_key=None, max_tokens=None,
-                 num_retries=0, **_ignored):
+                 num_retries=0, targets: tuple[ModelTarget, ...] | None = None,
+                 **_ignored):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.max_tokens = max_tokens
         self.num_retries = num_retries
+        self.targets = tuple(targets) if targets is not None else None
 
     def call(self, messages, **_ignored):
         started = time.monotonic()
@@ -292,30 +318,85 @@ class LLM:
             messages = [{"role": "user", "content": messages}]
         t0 = time.monotonic()
         deadline = t0 + _RETRY_BUDGET_S
-        for attempt in range(2):
-            try:
-                resp = _create_completion(
-                    model=self.model, messages=messages, base_url=self.base_url,
-                    api_key=self.api_key, max_tokens=self.max_tokens,
-                )
-                break
-            except Exception as exc:  # noqa: BLE001 — retain pool status handling
-                delay = 0.5 + random.random()
-                remaining = deadline - time.monotonic()
-                if (attempt == 1 or not _is_transient(exc)
-                        or remaining - delay <= max(_FIRST_CHUNK_S, 0.0)):
-                    raise
-                logger.warning("library transient failure (%s); retrying once in %.1fs "
-                               "(%.1fs budget left)", type(exc).__name__, delay, remaining)
-                time.sleep(delay)
-        # Bare model name (strip the litellm provider prefix) so pl and ks lines
-        # aggregate under one label in per-model roll-ups.
-        log_usage(logger, "pl", self.model.rsplit("/", 1)[-1], time.monotonic() - t0, resp)
-        return resp, attempt > 0
+        if self.targets is None:
+            for attempt in range(2):
+                try:
+                    resp = _create_completion(
+                        model=self.model, messages=messages, base_url=self.base_url,
+                        api_key=self.api_key, max_tokens=self.max_tokens,
+                    )
+                    break
+                except Exception as exc:  # noqa: BLE001 — retain pool status handling
+                    delay = 0.5 + random.random()
+                    remaining = deadline - time.monotonic()
+                    if (attempt == 1 or not _is_transient(exc)
+                            or remaining - delay <= max(_FIRST_CHUNK_S, 0.0)):
+                        raise
+                    logger.warning("library transient failure (%s); retrying once in %.1fs "
+                                   "(%.1fs budget left)", type(exc).__name__, delay, remaining)
+                    time.sleep(delay)
+            # Bare model name (strip the litellm provider prefix) so pl and ks lines
+            # aggregate under one label in per-model roll-ups.
+            log_usage(logger, "pl", self.model.rsplit("/", 1)[-1], time.monotonic() - t0, resp)
+            return resp, attempt > 0
+
+        for target_idx, target in enumerate(self.targets):
+            is_final = target_idx == len(self.targets) - 1
+            if not is_final and is_model_cooled_down(target.model, now=time.monotonic()):
+                continue
+            wire = litellm_wire_kwargs(target)
+            if not is_final:
+                try:
+                    resp = _create_completion(
+                        **wire, messages=messages, base_url=self.base_url,
+                        api_key=self.api_key, max_tokens=self.max_tokens,
+                    )
+                    log_usage(logger, "pl", target.model, time.monotonic() - t0, resp)
+                    return resp, target_idx > 0
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_failover_eligible(exc):
+                        raise
+                    now = time.monotonic()
+                    ttl = record_model_cooldown(target.model, now=now)
+                    remaining = deadline - now
+                    fallback_model = self.targets[target_idx + 1].model
+                    code = _error_code(exc)
+                    if remaining <= max(_FIRST_CHUNK_S, 0.0):
+                        logger.warning(
+                            "library primary failover skipped (budget exhausted: %.1fs left) "
+                            "%s -> %s code=%s err=%s",
+                            max(0.0, remaining), target.model, fallback_model,
+                            code, type(exc).__name__,
+                        )
+                        raise
+                    logger.warning(
+                        "library primary failover %s -> %s code=%s err=%s cooldown=%.0fs",
+                        target.model, fallback_model, code, type(exc).__name__, ttl,
+                    )
+                    continue
+
+            for attempt in range(2):
+                try:
+                    resp = _create_completion(
+                        **wire, messages=messages, base_url=self.base_url,
+                        api_key=self.api_key, max_tokens=self.max_tokens,
+                    )
+                    log_usage(logger, "pl", target.model, time.monotonic() - t0, resp)
+                    return resp, (target_idx > 0 or attempt > 0)
+                except Exception as exc:  # noqa: BLE001
+                    delay = 0.5 + random.random()
+                    remaining = deadline - time.monotonic()
+                    if (attempt == 1 or not _is_transient(exc)
+                            or remaining - delay <= max(_FIRST_CHUNK_S, 0.0)):
+                        raise
+                    logger.warning("library transient failure (%s); retrying once in %.1fs "
+                                   "(%.1fs budget left)", type(exc).__name__, delay, remaining)
+                    time.sleep(delay)
+        raise AssertionError("unreachable: self.targets is non-empty")
 
 # Default well above litellm's small default so a long generation isn't truncated.
 _DEFAULT_MAX_TOKENS = int(os.environ.get("PAPERVAULT_LIB_MAX_TOKENS", "32000"))
-_DEFAULT_MODEL = _litellm_model(route("judge"))
+_DEFAULT_MODEL = litellm_wire_kwargs(parse_targets(route("judge"))[0])["model"]
 _DEFAULT_BASE = config.LLM_BASE_URL
 _KEYS_FILE = config.LLM_KEYS_FILE
 
@@ -353,10 +434,22 @@ class KeyPool:
     :class:`LLM`.call (parse_intent / judge_* go through ``llm.call``); other attribute
     access delegates to a representative client."""
 
-    def __init__(self, path, max_tokens: int, model_override: str | None = None):
+    def __init__(
+        self,
+        path,
+        max_tokens: int,
+        model_override: str | None = None,
+        *,
+        targets: tuple[ModelTarget, ...] | None = None,
+    ):
         self._path = Path(path)
         self._max_tokens = max_tokens
-        self._model_override = model_override   # force a specific model (else per-group/default)
+        self._model_override = model_override   # force a specific route/model (else per-group/default)
+        self._targets = (
+            tuple(targets)
+            if targets is not None
+            else (parse_targets(model_override) if model_override is not None else None)
+        )
         self._lock = threading.Lock()
         self._mtime = -1.0            # sentinel: force the first load
         self._groups: list[dict] = []
@@ -397,8 +490,21 @@ class KeyPool:
         return active
 
     def _client(self, g: dict) -> LLM:
-        key = (self._model_override or g.get("model") or _DEFAULT_MODEL,
-               g["base_url"], g["api_key"])
+        if self._targets is not None:
+            wire_model = litellm_wire_kwargs(self._targets[0])["model"]
+            key = (wire_model, g["base_url"], g["api_key"], self._targets)
+            c = self._clients.get(key)
+            if c is None:
+                c = LLM(
+                    model=wire_model,
+                    base_url=g["base_url"],
+                    api_key=g["api_key"],
+                    max_tokens=self._max_tokens,
+                    targets=self._targets,
+                )
+                self._clients[key] = c
+            return c
+        key = (g.get("model") or _DEFAULT_MODEL, g["base_url"], g["api_key"])
         c = self._clients.get(key)
         if c is None:
             c = LLM(model=key[0], base_url=key[1], api_key=key[2], max_tokens=self._max_tokens)
@@ -470,47 +576,49 @@ _gw_llms: dict[tuple, "LLM"] = {}
 _gw_lock = threading.Lock()
 
 
-def _get_llm_via_gateway(mt: int, model: str | None):
-    """PAPERVAULT_LLM_GATEWAY=1 path: an :class:`LLM` (litellm under the hood) pointed at the running LiteLLM
-    proxy. The proxy holds the real MiMo keys + does failover/retry/cooldown/401-disable, so pl just
-    talks to it with a virtual key. Same :class:`LLM` interface + max_tokens passthrough as the direct
-    path, so callers (and their fail-open/closed exception handling) are byte-unchanged. Cached per
-    (max_tokens, group), mirroring the direct pool cache. num_retries=0 so litellm does NOT stack its
-    own retry on top of the proxy's failover (avoid double-retry)."""
+def _get_llm_via_gateway(mt: int, spec: str, targets: tuple[ModelTarget, ...]):
+    """PAPERVAULT_LLM_GATEWAY=1 path: an :class:`LLM` pointed at the transparent LLM Gateway.
+    Same :class:`LLM` interface + max_tokens passthrough as the direct path, cached per
+    ``(max_tokens, spec, base_url)``. ``num_retries=0`` avoids hidden SDK retry stacking."""
     base = config.GATEWAY_URL
     key = config.GATEWAY_KEY
-    bare = (model or route("judge"))
-    bare = bare.split("/", 1)[-1]  # accept "openai/<level>" transport spelling too
-    if bare in LEVELS:
-        bare = gateway_model(bare)
-    group = _litellm_model(bare)
-    cache_key = (mt, group, base)
+    wire_model = litellm_wire_kwargs(targets[0])["model"]
+    cache_key = (mt, spec, base)
     with _gw_lock:
         c = _gw_llms.get(cache_key)
         if c is None:
-            c = LLM(model=group, base_url=base, api_key=key, max_tokens=mt, num_retries=0)
+            c = LLM(
+                model=wire_model,
+                base_url=base,
+                api_key=key,
+                max_tokens=mt,
+                num_retries=0,
+                targets=targets,
+            )
             _gw_llms[cache_key] = c
         return c
 
 
 def get_llm(*, max_tokens: int | None = None, model: str | None = None):
-    """Shared LLM handle, defaulting to judge (standard); intent selects its own pro role.
+    """Shared LLM handle, defaulting to the ``judge`` route; ``intent``, ``gate``, and ``verify``
+    pass their own resolved ``route(role)`` target chains.
 
-    ``model`` is the requested level. LiteLLM's openai/ prefix is transport syntax;
-    both the gateway and direct endpoint receive the bare level unchanged. Direct
-    endpoints must serve flash/standard/pro/max/ultra aliases and own their model and effort.
-    The key pool retains its hot reload, failover and credential-disable behavior.
+    ``model`` is parsed via :func:`papervault.llm_routing.parse_targets` into one or more
+    concrete :class:`ModelTarget` entries with per-target thinking/effort wire parameters
+    and caller-owned primary cooldown failover. Direct :class:`KeyPool` retains its hot
+    reload, key failover, and 401/403 credential auto-disable behavior.
     """
     mt = max_tokens or _DEFAULT_MAX_TOKENS
-    model = _litellm_model(model or route("judge"))
+    targets = parse_targets(model or route("judge"))
+    spec = format_targets(targets)
     if config.USE_GATEWAY:
-        return _get_llm_via_gateway(mt, model)
+        return _get_llm_via_gateway(mt, spec, targets)
     if _KEYS_FILE.exists() or config.LLM_API_KEY:
         with _pools_lock:
-            pkey = (mt, model)
+            pkey = (mt, spec)
             pool = _pools.get(pkey)
             if pool is None:
-                pool = KeyPool(_KEYS_FILE, mt, model_override=model)
+                pool = KeyPool(_KEYS_FILE, mt, model_override=spec, targets=targets)
                 _pools[pkey] = pool
             return pool
     raise RuntimeError(

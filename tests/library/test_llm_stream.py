@@ -75,10 +75,14 @@ def responses(monkeypatch, *items):
 
 @pytest.fixture(autouse=True)
 def timing(monkeypatch):
+    L.clear_fallback_cooldowns()
+    monkeypatch.delenv("PAPERVAULT_LLM_FALLBACK_COOLDOWN_S", raising=False)
     monkeypatch.setattr(L, "_FIRST_CHUNK_S", 0.1, raising=False)
     monkeypatch.setattr(L, "_RETRY_BUDGET_S", 5.0, raising=False)
     monkeypatch.setattr(L.random, "random", lambda: 0.0)
     monkeypatch.setattr(litellm, "disable_streaming_logging", True)
+    yield
+    L.clear_fallback_cooldowns()
 
 
 def test_real_wrapper_joins_content_and_retains_usage(monkeypatch, caplog):
@@ -358,3 +362,103 @@ def test_nonpositive_first_chunk_admits_transient_retry_inside_budget_and_guards
     with pytest.raises(L.StreamTruncated):
         L.LLM("openai/test").call("ping")
     assert len(exhausted_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "primary_failure",
+    [
+        lambda: litellm.RateLimitError("quota", model="glm-5.3-flash", llm_provider="openai"),
+        lambda: litellm.Timeout("timeout", model="glm-5.3-flash", llm_provider="openai"),
+        lambda: TimeoutError("sdk transport timeout"),
+        lambda: litellm.ServiceUnavailableError("503", model="glm-5.3-flash", llm_provider="openai"),
+        lambda: Stream([chunk("partial")]),
+    ],
+)
+def test_multi_target_glm_fails_over_immediately_to_gpt_with_litellm_wire_kwargs(
+    monkeypatch, caplog, primary_failure,
+):
+    from papervault.llm_routing import parse_targets
+
+    targets = parse_targets("glm-5.3-flash,gpt-6.1-terra@high")
+    slept = []
+    monkeypatch.setattr(L.time, "sleep", slept.append)
+    calls = responses(
+        monkeypatch,
+        primary_failure(),
+        Stream([chunk("fallback-ok"), chunk(finish="stop")]),
+    )
+    observations = []
+    with caplog.at_level(logging.INFO, logger=L.__name__), L.observe_llm_calls(observations.append):
+        client = L.LLM("openai/glm-5.3-flash", targets=targets, max_tokens=512)
+        assert client.call("ping") == "fallback-ok"
+
+    assert slept == []
+    assert len(calls) == 2
+    assert calls[0]["model"] == "openai/glm-5.3-flash"
+    assert calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "reasoning_effort" not in calls[0]
+    assert calls[1]["model"] == "openai/gpt-6.1-terra"
+    assert calls[1]["extra_body"] == {"reasoning_effort": "high"}
+    assert "reasoning_effort" not in calls[1]
+    assert any("glm-5.3-flash -> gpt-6.1-terra" in r.getMessage() for r in caplog.records)
+    tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
+    assert len(tok) == 1 and "plane=pl model=gpt-6.1-terra" in tok[0]
+    assert len(observations) == 1 and observations[0].degraded is True
+
+
+def test_multi_target_cooldown_skips_primary_and_marks_degraded_until_expiry(monkeypatch):
+    from types import SimpleNamespace
+    from papervault.llm_routing import parse_targets
+
+    monkeypatch.setattr(L, "_FIRST_CHUNK_S", 0.0)
+    clock = [500.0]
+    monkeypatch.setattr(L, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
+    targets = parse_targets("glm-5.3-flash,gpt-6.1-terra@high")
+    calls = responses(
+        monkeypatch,
+        litellm.RateLimitError("quota", model="glm-5.3-flash", llm_provider="openai"),
+        Stream([chunk("c1"), chunk(finish="stop")]),
+        Stream([chunk("c2"), chunk(finish="stop")]),
+        Stream([chunk("c3"), chunk(finish="stop")]),
+    )
+    client = L.LLM("openai/glm-5.3-flash", targets=targets)
+    obs = []
+    with L.observe_llm_calls(obs.append):
+        assert client.call("p1") == "c1"
+        clock[0] = 560.0  # inside 120s cooldown
+        assert client.call("p2") == "c2"
+        clock[0] = 621.0  # past 120s cooldown -> probe primary again
+        assert client.call("p3") == "c3"
+
+    assert [c["model"] for c in calls] == [
+        "openai/glm-5.3-flash",
+        "openai/gpt-6.1-terra",
+        "openai/gpt-6.1-terra",
+        "openai/glm-5.3-flash",
+    ]
+    assert [o.degraded for o in obs] == [True, True, False]
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 422])
+def test_multi_target_does_not_fail_over_on_deterministic_4xx(monkeypatch, code):
+    from papervault.llm_routing import parse_targets
+
+    err = litellm.BadRequestError("bad", model="glm-5.3-flash", llm_provider="openai")
+    err.status_code = code
+    calls = responses(monkeypatch, err, Stream([chunk("never"), chunk(finish="stop")]))
+    client = L.LLM("openai/glm-5.3-flash", targets=parse_targets("glm-5.3-flash,gpt-6.1-terra@high"))
+    with pytest.raises(type(err)):
+        client.call("ping")
+    assert [c["model"] for c in calls] == ["openai/glm-5.3-flash"]
+
+
+def test_single_target_gpt_role_never_cross_model_falls_back(monkeypatch):
+    from papervault.llm_routing import parse_targets
+
+    monkeypatch.setattr(L.time, "sleep", lambda _: None)
+    err = litellm.RateLimitError("429", model="gpt-6.1-terra", llm_provider="openai")
+    calls = responses(monkeypatch, err, err, Stream([chunk("never"), chunk(finish="stop")]))
+    client = L.LLM("openai/gpt-6.1-terra", targets=parse_targets("gpt-6.1-terra@high"))
+    with pytest.raises(litellm.RateLimitError):
+        client.call("ping")
+    assert [c["model"] for c in calls] == ["openai/gpt-6.1-terra", "openai/gpt-6.1-terra"]

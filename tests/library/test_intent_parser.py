@@ -378,13 +378,16 @@ def test_intent_preserves_explicit_recency_and_closed_year_windows(query, year_m
     assert plan["ranking_hint"] == "by_recency"
 
 
-@pytest.mark.parametrize("level", [None, "flash", "standard", "pro", "max", "ultra"])
-def test_intent_default_client_uses_its_dedicated_route(monkeypatch, level):
+@pytest.mark.parametrize(
+    "override",
+    [None, "gpt-6.1-terra@high", "gpt-6-astra@xhigh", "glm-5.3,gpt-6.1-terra@high"],
+)
+def test_intent_default_client_uses_its_dedicated_route(monkeypatch, override):
     from papervault.library import llm
 
     monkeypatch.delenv("PAPERVAULT_LLM_INTENT", raising=False)
-    if level:
-        monkeypatch.setenv("PAPERVAULT_LLM_INTENT", level)
+    if override:
+        monkeypatch.setenv("PAPERVAULT_LLM_INTENT", override)
     requested = []
 
     def get_client(*, model=None):
@@ -393,11 +396,11 @@ def test_intent_default_client_uses_its_dedicated_route(monkeypatch, level):
 
     monkeypatch.setattr(llm, "get_llm", get_client)
     assert parse_intent("solar modulation")["search_terms"] == ["solar modulation"]
-    assert requested == [level or "pro"]
+    assert requested == [override or "gpt-6.1-terra@high"]
 
 
 def test_injected_intent_client_bypasses_route_resolution(monkeypatch):
-    monkeypatch.setenv("PAPERVAULT_LLM_INTENT", "invalid")
+    monkeypatch.setenv("PAPERVAULT_LLM_INTENT", "flash")
     assert parse_intent("solar modulation", FakeLLM(["solar modulation"]))["search_terms"] == ["solar modulation"]
 
 

@@ -425,14 +425,17 @@ async def test_main_loop_defers_operator_doc_pickup_while_open(breaker, fake_led
     assert seen == {"rounds": 2, "drains": 1}
 
 
-@pytest.mark.parametrize("keyword,want", [(False, "max"), (True, "flash")])
-async def test_graph_uses_role_level_over_inherited_model(breaker, monkeypatch, keyword, want):
+@pytest.mark.parametrize(
+    "keyword,want",
+    [(False, "glm-5.3,gpt-6.1-terra@high"), (True, "gpt-6.1-terra@high")],
+)
+async def test_graph_uses_role_route_over_inherited_model(breaker, monkeypatch, keyword, want):
     for role in ("BUILD", "KEYWORD"):
         monkeypatch.delenv(f"PAPERVAULT_LLM_{role}", raising=False)
     fake = FakeComplete()
     monkeypatch.setattr(graph, "mimo_complete", fake)
     kwargs = {"response_format": {"type": "json_object"}} if keyword else {}
-    assert await graph.build_llm("prompt", model="pro", **kwargs) == "ok"
+    assert await graph.build_llm("prompt", model="gpt-6-astra@xhigh", **kwargs) == "ok"
     assert fake.calls == [{"model": want, **kwargs}]
 
 

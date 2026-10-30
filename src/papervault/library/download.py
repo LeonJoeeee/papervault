@@ -216,7 +216,7 @@ def _llm_verify_identity(head: str, paper: Paper, *, llm=None,
         try:
             from .llm import get_llm
 
-            # PDF metadata verification uses flash (PAPERVAULT_LLM_VERIFY overrides).
+            # PDF metadata verification uses the 'verify' route (PAPERVAULT_LLM_VERIFY overrides).
             llm = get_llm(model=route("verify"))
         except Exception as exc:
             return True, f"verify_llm_unavailable: {repr(exc)[:60]}"

@@ -55,6 +55,12 @@ def effective_recipe(engine: str, *, request=None, llm=None) -> dict:
     root = Path(__file__).parents[1]
     sources = (("extract.py", "mineru_client.py") if engine == "mineru2.5-pro" else (
         "download_sources/firecrawl.py", "download_sources/_shared.py", "extract.py")) + ("llm.py",)
+    gate_model = getattr(llm, "model", "unknown") if llm is not None else route("gate")
+    gate_max_tokens = (
+        getattr(llm, "max_tokens", "unknown")
+        if llm is not None
+        else llm_module._DEFAULT_MAX_TOKENS
+    )
     return {"schema_version": 1, "name": "papervault-extraction", "engine": engine,
             "transport": "mineru-api-tasks" if engine == "mineru2.5-pro" else "firecrawl",
             "remote_engine_version": "unknown",
@@ -72,8 +78,8 @@ def effective_recipe(engine: str, *, request=None, llm=None) -> dict:
                          "backoff_base": mineru_client._BACKOFF_BASE,
                          "backoff_cap": mineru_client._BACKOFF_CAP,
                          "client_limits": list(mineru_client.client_limits())},
-            "gate": {"configured_model": getattr(llm, "model", "unknown") if llm else route("gate"),
-                     "max_tokens": getattr(llm, "max_tokens", "unknown") if llm else llm_module._DEFAULT_MAX_TOKENS,
+            "gate": {"configured_model": gate_model,
+                     "max_tokens": gate_max_tokens,
                      "first_chunk_seconds": llm_module._FIRST_CHUNK_S,
                      "retry_budget_seconds": llm_module._RETRY_BUDGET_S,
                      "client_timeout_seconds": llm_module._CLIENT_TIMEOUT_S,

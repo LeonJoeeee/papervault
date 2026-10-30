@@ -151,12 +151,13 @@ held constant between arms:
 | `PAPERVAULT_EVAL_DIR` | `/data/paper-vault/eval-results` | Root for raw runs and judge artifacts; never a source directory. |
 | `KS_EVAL_ALLOW_COTENANCY` | unset | Exact `1` bypasses the stopped-service guard; workspace checks still apply. |
 | `PAPERVAULT_LLM_SYNTH` | `gpt-6-astra@xhigh` | Evidence-grounded synthesis route, shared by production and eval. |
-| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `gpt-6.1-terra@high` / `glm-5.3,gpt-6.1-terra@high` | Decomposition and eval-judge routes (`eval_judge` fails over from `glm-5.3` to `gpt-6.1-terra@high` on transient upstream errors with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S=120`). |
+| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `gpt-6.1-terra@high` / `glm-5.3@max` | Decomposition and eval-judge routes (`eval_judge` defaults to single-target `glm-5.3@max` so benchmarks preserve the ruler invariant; explicit multi-target overrides such as `glm-5.3@max,relay-glm-5.3@max` fail over on transient upstream errors with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S=120`). |
 
 The retained standalone `judge_mimo` utility uses `KS_GATEWAY_URL` (default
 `http://127.0.0.1:4000/v1`) and requires `KS_VIRTUAL_KEY`; these utility names are
 separate from the production `PAPERVAULT_LLM_GATEWAY_*` transport settings. It also
-reads `JUDGE_GOLD` (`gold_v2.jsonl`), `JUDGE_MAX_TOKENS` (`32000`),
+reads `JUDGE_GOLD` (`gold_v2.jsonl`), optional `JUDGE_MAX_TOKENS` (unset by
+default, omitting `max_tokens` on the wire unless set),
 `JUDGE_MAX_ATTEMPTS` (`2`) and `JUDGE_CALL_TIMEOUT` (`300` seconds). Its
 `--concurrency` CLI option controls concurrency. `_ab_u1_judge` shares those gateway
 settings and reads `AB_JUDGE_CONC` (`20`). `recall_curve` accepts

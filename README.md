@@ -84,26 +84,36 @@ or lifecycle logic.
 
 Every text LLM call selects one of nine roles via `PAPERVAULT_LLM_<ROLE>`
 (`<model>[@<modifier>][,<fallback>...]`; unset or blank uses the defaults below).
-`glm-*` targets enable adaptive thinking by default (`@nothinking` / `@none`
-disables); non-`glm-*` targets accept `@none|@low|@medium|@high|@xhigh|@max` or
-plain model IDs (e.g. `gpt-4.1-mini`). Multi-target routes fail over immediately
-on transient upstream errors (`429`, `408`, `5xx`, timeout, `StreamTruncated`)
-and cool down the failed primary for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`
-(default `120`s) before re-probing. Retired `flash`..`ultra` and `papervault-*`
-aliases raise `ValueError`. A supplied test/client handle bypasses role
-selection for that call.
+Modifiers are validated per model family against the transparent LLM Gateway
+`v0.7.3` catalog: `glm-*`/`relay-glm-*` accept bare or `@low|@high|@max`
+(always-on thinking); `gpt-6-astra*`/`gpt-6.1-sol*` accept bare or `@low..@max`;
+`gpt-6.1-terra*`/`gpt-6-luna*` accept bare or `@none..@max`; `deepseek-v4*`/
+`deepseek-flash*`/`relay-deepseek-*` accept bare, `@low|@high|@max`, or
+`@nothinking` (`@none`); `mimo-v2.6-*`/`relay-mimo-v2.6-*` accept bare,
+`@thinking`, or `@nothinking` (`@none`); and other OpenAI-compatible model IDs
+(e.g. `gpt-4.1-mini`) accept bare, `@none..@max`, or `@thinking|@nothinking`.
+`max_tokens` is omitted on the wire by default unless an explicit ceiling env
+(`KS_LLM_MAX_TOKENS`, `PAPERVAULT_LIB_MAX_TOKENS`, `KS_SYNTH_MAX_TOKENS`,
+`JUDGE_MAX_TOKENS`) or caller cap is set. Multi-target routes fail over
+immediately on transient upstream errors (`429`, `408`, `5xx`, timeout,
+`StreamTruncated`) and cool down the failed primary for
+`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` (default `120`s) before re-probing;
+`eval_judge` defaults to single-target `glm-5.3@max` so benchmarks preserve the
+ruler invariant unless an explicit multi-target chain is set. Retired
+`flash`..`ultra` and `papervault-*` aliases raise `ValueError`. A supplied
+test/client handle bypasses role selection for that call.
 
 | Plane and stage | Role | Default |
 | --- | --- | --- |
 | S1 search intent: API terms and local KG concepts in one call | `intent` | `gpt-6.1-terra@high` |
-| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `gpt-6.1-terra@high` |
-| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash,gpt-6.1-terra@high` |
-| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `glm-5.3-flash,gpt-6.1-terra@high` |
-| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.3,gpt-6.1-terra@high` |
-| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `gpt-6.1-terra@high` |
+| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `gpt-6.1-terra@medium` |
+| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.3@max,gpt-6.1-terra@high` |
+| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `gpt-6.1-terra@low` |
 | S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `gpt-6.1-terra@high` |
 | S2 evidence-grounded answer synthesis, including eval | `synth` | `gpt-6-astra@xhigh` |
-| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.3,gpt-6.1-terra@high` |
+| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.3@max` |
 
 Embedding (BGE-M3), reranking and OCR use their existing local/service paths and
 do not select text LLM roles. The prompt examples calibrate the planner, both
@@ -172,8 +182,8 @@ path within those boundaries; they are not six separate services.
    against the domain-pack tiers and paper classification. Source publication types
    take precedence when conclusive; an LLM paper/non-paper judgment fills missing
    metadata. Production search passes a shared judge handle to its gates, defaulting
-   to `PAPERVAULT_LLM_JUDGE=gpt-6.1-terra@high`; the separate extraction `gate` role
-   defaults to `glm-5.3-flash,gpt-6.1-terra@high`. The stage name does not select a model.
+   to `PAPERVAULT_LLM_JUDGE=gpt-6.1-terra@medium`; the separate extraction `gate` role
+   defaults to `glm-5.3-flash@high,gpt-6.1-terra@medium`. The stage name does not select a model.
 4. **Stage 4 — relevance and quality gates.** `registration_rejection` screens the
    external pool for conference/meeting abstracts, non-papers, contentless stubs and
    invalid new-record metadata before preview. Newly allocated records need named

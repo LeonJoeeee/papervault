@@ -851,22 +851,85 @@ async def test_gateway_retries_a_transport_timeout_that_consumed_its_interval(tm
     assert len(created) == 2
 
 
-# ---- #141: the default output ceiling must stay under MiMo v2.6's relay cap ------------------------
+# ---- #352: omit default max_tokens on the wire unless explicitly configured ----------------------
 
-def test_default_max_tokens_is_131000_when_env_unset(tmp_path):
-    """MiMo v2.6 flash (the gateway primary since 2026-09-25) rejects max_tokens > 131069, so the
-    old 131072 default sent every call to the GLM backup. A fresh interpreter with no
-    KS_LLM_MAX_TOKENS (and no .env in its cwd) must fall back to 131000."""
+def test_default_max_tokens_is_none_when_env_unset_and_parses_explicit_int(tmp_path):
+    """When KS_LLM_MAX_TOKENS is unset or blank, _DEFAULT_MAX_TOKENS is None so Gateway v0.7.3
+    injects each model's official output ceiling; explicit integer overrides remain honored."""
     import subprocess
     import sys
 
+    assert llm_mod._DEFAULT_MAX_TOKENS is None
+    assert llm_mod.effective_execution_settings()["max_tokens"] is None
+
     env = {k: v for k, v in os.environ.items() if k != "KS_LLM_MAX_TOKENS"}
-    out = subprocess.run(
-        [sys.executable, "-c",
-         "import papervault.knowledge.store.llm as m; print(m._DEFAULT_MAX_TOKENS)"],
-        cwd=tmp_path, env=env, capture_output=True, text=True, check=True,
+    env["PYTHON_DOTENV_DISABLED"] = "1"
+    for unset_val in (None, "", "   "):
+        run_env = dict(env)
+        if unset_val is not None:
+            run_env["KS_LLM_MAX_TOKENS"] = unset_val
+        out = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import json, papervault.knowledge.store.llm as m; "
+                "print(json.dumps([m._DEFAULT_MAX_TOKENS, m.effective_execution_settings()['max_tokens']]))",
+            ],
+            cwd=tmp_path,
+            env=run_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        assert json.loads(out.stdout.strip().splitlines()[-1]) == [None, None]
+
+    explicit = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import json, papervault.knowledge.store.llm as m; "
+            "print(json.dumps([m._DEFAULT_MAX_TOKENS, m.effective_execution_settings()['max_tokens']]))",
+        ],
+        cwd=tmp_path,
+        env={**env, "KS_LLM_MAX_TOKENS": "65536"},
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    assert int(out.stdout.strip().splitlines()[-1]) == 131000
+    assert json.loads(explicit.stdout.strip().splitlines()[-1]) == [65536, 65536]
+
+
+@pytest.mark.parametrize("gateway", [False, True])
+async def test_max_tokens_omitted_by_default_and_forwarded_when_explicit(
+    tmp_path, monkeypatch, gateway,
+):
+    monkeypatch.setattr(config, "USE_GATEWAY", gateway)
+    monkeypatch.setattr(config, "GATEWAY_URL", "http://gw.example/v1")
+    monkeypatch.setattr(config, "GATEWAY_KEY", "test-key")
+    f = tmp_path / "keys.json"
+    _write(f, [_group("test-key", model="gpt-6.1-terra@high")])
+    created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
+    pool = KeyPool(f)
+
+    # 1. Default (_DEFAULT_MAX_TOKENS is None) + omitted caller max_tokens -> omitted on wire
+    monkeypatch.setattr(llm_mod, "_DEFAULT_MAX_TOKENS", None)
+    assert await pool.complete("ping", model="gpt-6.1-terra@high") == "Hello"
+    assert "max_tokens" not in created[-1]
+
+    # 2. Explicit max_tokens=None passed by caller -> stripped, omitted on wire
+    assert await pool.complete("ping", model="gpt-6.1-terra@high", max_tokens=None) == "Hello"
+    assert "max_tokens" not in created[-1]
+
+    # 3. KS_LLM_MAX_TOKENS configured (_DEFAULT_MAX_TOKENS=65536) -> forwarded on wire
+    monkeypatch.setattr(llm_mod, "_DEFAULT_MAX_TOKENS", 65536)
+    assert await pool.complete("ping", model="gpt-6.1-terra@high") == "Hello"
+    assert created[-1]["max_tokens"] == 65536
+    assert await pool.complete("ping", model="gpt-6.1-terra@high", max_tokens=None) == "Hello"
+    assert created[-1]["max_tokens"] == 65536
+
+    # 4. Caller max_tokens=<int> wins over _DEFAULT_MAX_TOKENS (whether None or int)
+    assert await pool.complete("ping", model="gpt-6.1-terra@high", max_tokens=4096) == "Hello"
+    assert created[-1]["max_tokens"] == 4096
 
 
 @pytest.mark.parametrize("gateway", [False, True])
@@ -875,10 +938,15 @@ def test_default_max_tokens_is_131000_when_env_unset(tmp_path):
     [
         ("gpt-6-astra@xhigh", {"model": "gpt-6-astra", "reasoning_effort": "xhigh"}),
         ("gpt-6.1-terra@high", {"model": "gpt-6.1-terra", "reasoning_effort": "high"}),
-        ("glm-5.3", {"model": "glm-5.3", "extra_body": {"thinking": {"type": "enabled"}}}),
+        ("glm-5.3@max", {"model": "glm-5.3", "reasoning_effort": "max"}),
+        ("glm-5.3", {"model": "glm-5.3"}),
         (
-            "glm-5.3-flash@nothinking",
-            {"model": "glm-5.3-flash", "extra_body": {"thinking": {"type": "disabled"}}},
+            "deepseek-v4@nothinking",
+            {"model": "deepseek-v4", "extra_body": {"thinking": {"type": "disabled"}}},
+        ),
+        (
+            "mimo-v2.6-pro@thinking",
+            {"model": "mimo-v2.6-pro", "extra_body": {"thinking": {"type": "enabled"}}},
         ),
         ("gpt-4.1-mini", {"model": "gpt-4.1-mini"}),
     ],
@@ -889,6 +957,7 @@ async def test_request_applies_target_wire_kwargs_and_strips_caller_overrides(
     monkeypatch.setattr(config, "USE_GATEWAY", gateway)
     monkeypatch.setattr(config, "GATEWAY_URL", "http://gw.example/v1")
     monkeypatch.setattr(config, "GATEWAY_KEY", "test-key")
+    monkeypatch.setattr(llm_mod, "_DEFAULT_MAX_TOKENS", None)
     f = tmp_path / "keys.json"
     _write(f, [_group("test-key", model="provider-model")])
     created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
@@ -901,14 +970,13 @@ async def test_request_applies_target_wire_kwargs_and_strips_caller_overrides(
     assert created == [
         {
             **expected_wire,
-            "max_tokens": llm_mod._DEFAULT_MAX_TOKENS,
             "stream": True,
             "stream_options": {"include_usage": True},
         }
     ]
 
 
-# ---- issue #350: caller-owned GLM -> GPT quota failover & cooldown ------------------------------
+# ---- issue #350/#352: caller-owned GLM -> GPT quota failover & cooldown --------------------------
 
 @pytest.mark.parametrize(
     "primary_failure",
@@ -924,18 +992,21 @@ async def test_glm_primary_fails_over_immediately_to_gpt_without_same_target_ret
     tmp_path, monkeypatch, caplog, _instant_gateway_backoff, primary_failure,
 ):
     _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_DEFAULT_MAX_TOKENS", None)
     created = _install_sequenced_stream_client(monkeypatch, [primary_failure, list(_HELLO_STREAM)])
     pool = KeyPool(tmp_path / "unused.json")
     with caplog.at_level("INFO", logger="papervault.knowledge.store.llm"):
-        out = await pool.complete("ping", model="glm-5.3,gpt-6.1-terra@high")
+        out = await pool.complete("ping", model="glm-5.3@max,gpt-6.1-terra@high")
     assert out == "Hello"
     assert len(created) == 2
     assert created[0]["model"] == "glm-5.3"
-    assert created[0]["extra_body"] == {"thinking": {"type": "enabled"}}
-    assert "reasoning_effort" not in created[0]
+    assert created[0]["reasoning_effort"] == "max"
+    assert "extra_body" not in created[0]
+    assert "max_tokens" not in created[0]
     assert created[1]["model"] == "gpt-6.1-terra"
     assert created[1]["reasoning_effort"] == "high"
     assert "extra_body" not in created[1]
+    assert "max_tokens" not in created[1]
     assert any("glm-5.3 -> gpt-6.1-terra" in r.getMessage() for r in caplog.records)
     tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
     assert len(tok) == 1 and "model=gpt-6.1-terra" in tok[0]
@@ -957,7 +1028,7 @@ async def test_active_cooldown_skips_primary_then_reprobes_after_expiry(
         ],
     )
     pool = KeyPool(tmp_path / "unused.json")
-    route_spec = "glm-5.3,gpt-6.1-terra@high"
+    route_spec = "glm-5.3@max,gpt-6.1-terra@high"
 
     assert await pool.complete("c1", model=route_spec) == "Hello"
     assert [c["model"] for c in created] == ["glm-5.3", "gpt-6.1-terra"]
@@ -988,7 +1059,7 @@ async def test_cooldown_zero_disables_skipping(tmp_path, monkeypatch, _instant_g
         ],
     )
     pool = KeyPool(tmp_path / "unused.json")
-    route_spec = "glm-5.3,gpt-6.1-terra@high"
+    route_spec = "glm-5.3@max,gpt-6.1-terra@high"
     assert await pool.complete("c1", model=route_spec) == "Hello"
     assert await pool.complete("c2", model=route_spec) == "Hello"
     assert [c["model"] for c in created] == ["glm-5.3", "gpt-6.1-terra", "glm-5.3"]
@@ -1002,7 +1073,7 @@ async def test_multi_target_does_not_fail_over_on_deterministic_4xx(
     created = _install_sequenced_stream_client(monkeypatch, [_FakeError(code), list(_HELLO_STREAM)])
     pool = KeyPool(tmp_path / "unused.json")
     with pytest.raises(_FakeError):
-        await pool.complete("ping", model="glm-5.3,gpt-6.1-terra@high")
+        await pool.complete("ping", model="glm-5.3@max,gpt-6.1-terra@high")
     assert [c["model"] for c in created] == ["glm-5.3"]
 
 
@@ -1024,7 +1095,7 @@ async def test_multi_target_does_not_fail_over_on_cancelled_error(
     monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
     pool = KeyPool(tmp_path / "unused.json")
     with pytest.raises(asyncio.CancelledError):
-        await pool.complete("ping", model="glm-5.3,gpt-6.1-terra@high")
+        await pool.complete("ping", model="glm-5.3@max,gpt-6.1-terra@high")
     assert calls == ["glm-5.3"]
 
 
@@ -1038,7 +1109,7 @@ async def test_gateway_plain_connection_error_uses_unreachable_loop_without_cool
     )
     created = _install_sequenced_stream_client(monkeypatch, [conn_err, list(_HELLO_STREAM)])
     pool = KeyPool(tmp_path / "unused.json")
-    assert await pool.complete("ping", model="glm-5.3,gpt-6.1-terra@high") == "Hello"
+    assert await pool.complete("ping", model="glm-5.3@max,gpt-6.1-terra@high") == "Hello"
     assert [c["model"] for c in created] == ["glm-5.3", "glm-5.3"]
 
 
@@ -1069,7 +1140,7 @@ async def test_direct_pool_multi_target_route_fails_over_and_cools_down(tmp_path
         ],
     )
     pool = KeyPool(f)
-    route_spec = "glm-5.3-flash,gpt-6.1-terra@high"
+    route_spec = "glm-5.3-flash@high,gpt-6.1-terra@medium"
     assert await pool.complete("c1", model=route_spec) == "Hello"
     assert await pool.complete("c2", model=route_spec) == "Hello"
     assert [c["model"] for c in created] == [

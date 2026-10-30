@@ -1,6 +1,6 @@
 # 0012 — Direct role model routing and caller-owned GLM quota fallback
 
-Status: Accepted (2026-10-30)
+Status: Accepted (2026-10-30), Amended by 0013 (2026-10-30)
 
 ## Context
 
@@ -28,3 +28,5 @@ Rejected alternatives:
 - PaperVault works directly against the transparent LLM Gateway (`v0.7.0`) and any standard OpenAI-compatible endpoint without proxy-owned `papervault-*` aliases.
 - Sustained GLM `429` or timeout windows fail over to `gpt-6.1-terra@high` on the first failed attempt and bypass the throttled primary for 120 seconds before automatic recovery probing; library serving observations mark fallback calls `degraded=True` and usage logs record the actual served `target.model`.
 - Operators upgrading an existing `.env` that pinned `PAPERVAULT_LLM_<ROLE>=flash|standard|pro|max|ultra` must remove those lines (to adopt the new defaults) or replace them with concrete `<model>[@<modifier>][,<fallback>...]` specs; `papervault doctor` surfaces any unmigrated variable immediately.
+
+**Amendment (2026-10-30, see 0013):** [ADR-0013](0013-effort-tiered-role-routing-and-omitted-max-tokens.md) aligns the nine role defaults, per-family modifier validation, `eval_judge` single-target ruler-invariant default (`glm-5.3@max`), and omitted default `max_tokens` behavior with the transparent LLM Gateway `v0.7.3` catalog and owner-confirmed first-principles routing design. Direct concrete `PAPERVAULT_LLM_<ROLE>` chains, centralized OpenAI/LiteLLM wire builders, retired alias rejection, and caller-owned cooldown failover from Decision items 1, 3, and 4 remain in force.

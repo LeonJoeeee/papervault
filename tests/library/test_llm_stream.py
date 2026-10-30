@@ -379,7 +379,7 @@ def test_multi_target_glm_fails_over_immediately_to_gpt_with_litellm_wire_kwargs
 ):
     from papervault.llm_routing import parse_targets
 
-    targets = parse_targets("glm-5.3-flash,gpt-6.1-terra@high")
+    targets = parse_targets("glm-5.3-flash@high,gpt-6.1-terra@medium")
     slept = []
     monkeypatch.setattr(L.time, "sleep", slept.append)
     calls = responses(
@@ -395,15 +395,45 @@ def test_multi_target_glm_fails_over_immediately_to_gpt_with_litellm_wire_kwargs
     assert slept == []
     assert len(calls) == 2
     assert calls[0]["model"] == "openai/glm-5.3-flash"
-    assert calls[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert calls[0]["extra_body"] == {"reasoning_effort": "high"}
+    assert calls[0]["max_tokens"] == 512
     assert "reasoning_effort" not in calls[0]
     assert calls[1]["model"] == "openai/gpt-6.1-terra"
-    assert calls[1]["extra_body"] == {"reasoning_effort": "high"}
+    assert calls[1]["extra_body"] == {"reasoning_effort": "medium"}
+    assert calls[1]["max_tokens"] == 512
     assert "reasoning_effort" not in calls[1]
     assert any("glm-5.3-flash -> gpt-6.1-terra" in r.getMessage() for r in caplog.records)
     tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
     assert len(tok) == 1 and "plane=pl model=gpt-6.1-terra" in tok[0]
     assert len(observations) == 1 and observations[0].degraded is True
+
+
+def test_library_llm_omits_max_tokens_on_wire_when_none_and_forwards_when_set(monkeypatch):
+    from papervault.llm_routing import parse_targets
+
+    calls = responses(
+        monkeypatch,
+        Stream([chunk("plain-ok"), chunk(finish="stop")]),
+        Stream([chunk("target-ok"), chunk(finish="stop")]),
+        Stream([chunk("direct-ok"), chunk(finish="stop")]),
+        Stream([chunk("capped-ok"), chunk(finish="stop")]),
+    )
+    assert L.LLM("openai/gpt-6.1-terra").call("p1") == "plain-ok"
+    assert "max_tokens" not in calls[0]
+
+    assert L.LLM("openai/gpt-6.1-terra", targets=parse_targets("gpt-6.1-terra@medium")).call("p2") == "target-ok"
+    assert "max_tokens" not in calls[1]
+
+    res = L._create_completion(
+        model="openai/gpt-6.1-terra",
+        messages=[{"role": "user", "content": "p3"}],
+        max_tokens=None,
+    )
+    assert res.choices[0].message.content == "direct-ok"
+    assert "max_tokens" not in calls[2]
+
+    assert L.LLM("openai/gpt-6.1-terra", max_tokens=2048).call("p4") == "capped-ok"
+    assert calls[3]["max_tokens"] == 2048
 
 
 def test_multi_target_cooldown_skips_primary_and_marks_degraded_until_expiry(monkeypatch):
@@ -413,7 +443,7 @@ def test_multi_target_cooldown_skips_primary_and_marks_degraded_until_expiry(mon
     monkeypatch.setattr(L, "_FIRST_CHUNK_S", 0.0)
     clock = [500.0]
     monkeypatch.setattr(L, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
-    targets = parse_targets("glm-5.3-flash,gpt-6.1-terra@high")
+    targets = parse_targets("glm-5.3-flash@high,gpt-6.1-terra@medium")
     calls = responses(
         monkeypatch,
         litellm.RateLimitError("quota", model="glm-5.3-flash", llm_provider="openai"),
@@ -436,6 +466,7 @@ def test_multi_target_cooldown_skips_primary_and_marks_degraded_until_expiry(mon
         "openai/gpt-6.1-terra",
         "openai/glm-5.3-flash",
     ]
+    assert all("max_tokens" not in c for c in calls)
     assert [o.degraded for o in obs] == [True, True, False]
 
 
@@ -446,7 +477,10 @@ def test_multi_target_does_not_fail_over_on_deterministic_4xx(monkeypatch, code)
     err = litellm.BadRequestError("bad", model="glm-5.3-flash", llm_provider="openai")
     err.status_code = code
     calls = responses(monkeypatch, err, Stream([chunk("never"), chunk(finish="stop")]))
-    client = L.LLM("openai/glm-5.3-flash", targets=parse_targets("glm-5.3-flash,gpt-6.1-terra@high"))
+    client = L.LLM(
+        "openai/glm-5.3-flash",
+        targets=parse_targets("glm-5.3-flash@high,gpt-6.1-terra@medium"),
+    )
     with pytest.raises(type(err)):
         client.call("ping")
     assert [c["model"] for c in calls] == ["openai/glm-5.3-flash"]

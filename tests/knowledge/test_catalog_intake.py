@@ -116,9 +116,10 @@ def test_recipe_declares_every_tier_and_no_credentials(monkeypatch):
     assert "secret-must-never-enter-recipe" not in canonical_json(actual)
 
 
-def test_recipe_changes_when_boot_time_llm_token_limit_changes():
+def test_recipe_changes_when_boot_time_llm_token_limit_changes(tmp_path):
     # The wrapper reads this at import time. Test real process startup so the
-    # recipe cannot claim a fresh environment value the running wrapper ignores.
+    # recipe cannot claim a fresh environment value the running wrapper ignores,
+    # and verify unset KS_LLM_MAX_TOKENS serializes max_tokens=None cleanly.
     program = """
 import json
 from papervault.knowledge.scheduler.catalog_intake import effective_distill_recipe
@@ -127,14 +128,18 @@ from papervault.store.knowledge import canonical_recipe
 recipe, digest = canonical_recipe(effective_distill_recipe())
 print(json.dumps({'digest': digest, 'recipe': recipe, 'actual': _DEFAULT_MAX_TOKENS}))
 """
+    base_env = {k: v for k, v in os.environ.items() if k != "KS_LLM_MAX_TOKENS"}
+    base_env["PYTHON_DOTENV_DISABLED"] = "1"
     results = []
-    for limit in (4096, 8192):
-        result = subprocess.run([sys.executable, "-c", program], check=True,
-                                capture_output=True, text=True,
-                                env={**os.environ, "KS_LLM_MAX_TOKENS": str(limit)})
+    for limit in (None, 4096, 8192):
+        run_env = dict(base_env)
+        if limit is not None:
+            run_env["KS_LLM_MAX_TOKENS"] = str(limit)
+        result = subprocess.run([sys.executable, "-c", program], cwd=tmp_path, check=True,
+                                capture_output=True, text=True, env=run_env)
         results.append(json.loads(result.stdout.splitlines()[-1]))
-    assert results[0]["digest"] != results[1]["digest"]
-    for result, expected in zip(results, (4096, 8192), strict=True):
+    assert len({r["digest"] for r in results}) == 3
+    for result, expected in zip(results, (None, 4096, 8192), strict=True):
         assert result["actual"] == expected
         assert result["recipe"]["execution_settings"]["llm_wrapper"]["max_tokens"] == expected
 

@@ -44,13 +44,15 @@ _SYNTH_FAILED_MSG = (
     "see retrieved_papers and pull them via get_paper.)"
 )
 
-# MiMo is a REASONING model: it spends a large chain-of-thought budget BEFORE the visible
-# answer, billed from the SAME max_tokens budget. The synth task (deep multi-paper cited answer)
-# is far larger than the sibling decompose JSON-array task that already needed 8000 just to fit
-# its tiny output after the CoT burn — so synth needs MORE headroom or a deep answer is cut
-# mid-sentence, dropping trailing [key] cites and corrupting both the prose and citation metrics.
-# Raising the ceiling is purely protective: a short answer still stops early on its own.
-_SYNTH_MAX_TOKENS = 16000
+def _optional_int_env(name: str) -> int | None:
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw else None
+
+
+# Omit max_tokens on the wire by default (None) so reasoning+output headroom uses each model's
+# official output ceiling behind Gateway v0.7.3 (and avoids artificial truncation on deep answers).
+# Optional KS_SYNTH_MAX_TOKENS=<int> sets an explicit synthesis output ceiling when desired.
+_SYNTH_MAX_TOKENS: int | None = _optional_int_env("KS_SYNTH_MAX_TOKENS")
 
 # Synth's OWN business deadline (Phase 0, 2026-06-04 — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md). A deep
 # 16k-token cited synthesis legitimately takes ~600s under contention (~20-45 tok/s), so the old
@@ -390,14 +392,15 @@ async def synth_answer(
         # — only the generic >=60s slow-call log in store/llm.py ever recorded it.
         t0 = time.monotonic()
         try:
+            synth_kwargs: dict[str, Any] = {
+                "system_prompt": _SYNTH_SYSTEM,
+                "temperature": 0.2,
+                "model": level,
+            }
+            if _SYNTH_MAX_TOKENS is not None:
+                synth_kwargs["max_tokens"] = _SYNTH_MAX_TOKENS
             raw = await asyncio.wait_for(
-                mimo_complete(
-                    prompt,
-                    system_prompt=_SYNTH_SYSTEM,
-                    temperature=0.2,
-                    max_tokens=_SYNTH_MAX_TOKENS,
-                    model=level,
-                ),
+                mimo_complete(prompt, **synth_kwargs),
                 timeout=timeout_s,
             )
         except Exception as e:  # noqa: BLE001 — CancelledError is BaseException, never caught here

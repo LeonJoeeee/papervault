@@ -100,13 +100,13 @@ def _execution_model(role):
     recipe = current_execution_recipe()
     return recipe["configured_models"][role] if recipe is not None else route(role)
 
-# Graph extraction/merge default to max; query keywords to flash. The endpoint owns effort.
+# Graph extraction/merge use the 'build' route; query keyword extraction uses 'keyword'.
 async def build_llm(prompt, system_prompt=None, history_messages=None, **kwargs):
     """LightRAG's ``llm_model_func``: route by role, and gate the BUILD role on the build-path
     breaker (#143) — while it is open a build call fails fast with ``BuildPausedError`` without
     contacting the gateway. The query-path keyword call never touches the breaker."""
     # In the pinned LightRAG text-mode config, only query keyword extraction
-    # carries response_format. Override any inherited model with this role's level.
+    # carries response_format. Override any inherited model with this role's route.
     role = "keyword" if kwargs.get("response_format") else "build"
     kwargs["model"] = _execution_model(role)
     if role != "build":

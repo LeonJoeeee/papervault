@@ -55,7 +55,15 @@ from typing import Any
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from papervault import config
-from papervault.llm_routing import LEVELS, gateway_model, route
+from papervault.llm_routing import (
+    ModelTarget,
+    clear_fallback_cooldowns as clear_fallback_cooldowns,
+    is_model_cooled_down,
+    openai_wire_kwargs,
+    parse_targets,
+    record_model_cooldown,
+    route,
+)
 from papervault.llm_usage import log_usage
 
 logger = logging.getLogger(__name__)
@@ -204,8 +212,8 @@ def _endpoint_label(g: dict) -> str:
     return f"…{k[-4:]}@{host}"
 
 # OpenAI SDK ChatCompletions.create() accepted kwargs (whitelist).
-# LightRAG's internal kwargs are discarded. Provider extensions are not forwarded:
-# the endpoint owns model and effort for the requested level.
+# LightRAG's internal kwargs are discarded. Caller-supplied reasoning_effort and
+# extra_body are excluded so only route-derived openai_wire_kwargs(target) govern them.
 _OPENAI_STANDARD_KWARGS = {
     "model",
     "messages",
@@ -246,9 +254,12 @@ def _env_fallback_groups() -> list[dict]:
 
 
 def _sdk_model(model: str | None) -> str:
-    """Map a shared-file ``model`` (litellm form ``openai/standard``) to the bare name
-    the raw OpenAI SDK / gateway expects (``standard``)."""
-    m = model or _DEFAULT_MODEL
+    """Map a shared-file or route ``model`` to its primary bare model ID."""
+    m = (model or _DEFAULT_MODEL).strip()
+    if "," in m:
+        m = m.split(",", 1)[0].strip()
+    if "@" in m:
+        m = m.split("@", 1)[0].strip()
     if "/" in m:
         m = m.split("/", 1)[1]
     return m
@@ -388,6 +399,14 @@ def _error_code(exc: Exception) -> int | None:
         return None
 
 
+def _is_failover_eligible(exc: Exception) -> bool:
+    """True iff ``exc`` is a transient upstream error eligible for immediate cross-model failover."""
+    code = _error_code(exc)
+    if code is not None:
+        return code in _TRANSIENT_STATUSES or 500 <= code <= 599
+    return isinstance(exc, (StreamTruncated, APITimeoutError, TimeoutError))
+
+
 class KeyPool:
     """Central hot-reloaded MiMo key pool (see module docstring). Mirrors paper-library's
     ``KeyPool``: mtime-cached hot-read, active-only selection, 401/403 auto-disable written
@@ -517,27 +536,42 @@ class KeyPool:
             messages.extend(history_messages)
         messages.append({"role": "user", "content": prompt})
 
-        # Standard request parameters only: provider extensions could override
-        # the role's level or effort. Drop LightRAG's internal parameters too.
-        openai_kwargs = {k: v for k, v in kwargs.items() if k in _OPENAI_STANDARD_KWARGS}
-        model_override = openai_kwargs.pop("model", None)
+        # Standard request parameters only: caller-supplied reasoning_effort / extra_body
+        # are excluded so only route-derived openai_wire_kwargs(target) govern them.
+        base_kwargs = {k: v for k, v in kwargs.items() if k in _OPENAI_STANDARD_KWARGS}
+        model_override = base_kwargs.pop("model", None)
+        if model_override is not None:
+            override_targets: tuple[ModelTarget, ...] | None = parse_targets(model_override)
+            if len(override_targets) > 1:
+                return await self._complete_direct_multi_target(
+                    base_groups, messages, base_kwargs, override_targets,
+                )
+        else:
+            override_targets = None
 
         last_error: Exception | None = None
         for round_idx in range(_MAX_ROUNDS):
             groups = list(base_groups)
             random.shuffle(groups)   # per-request random order; NO cross-request state
             for g in groups:
-                model = _sdk_model(model_override or g.get("model"))
+                target = (
+                    override_targets[0]
+                    if override_targets is not None
+                    else parse_targets(g.get("model") or _DEFAULT_MODEL)[0]
+                )
+                wire = openai_wire_kwargs(target)
+                model = wire.pop("model")
+                attempt_kwargs = {**base_kwargs, **wire}
                 ep = _endpoint_label(g)
                 t0 = time.monotonic()
                 try:
                     client = self._client(g)
-                    resp = await _create_completion(client, model, messages, openai_kwargs)
+                    resp = await _create_completion(client, model, messages, attempt_kwargs)
                     dt = time.monotonic() - t0
                     if dt >= _SLOW_CALL_S:
                         # Slow but OK — the call we want to see before an outer worker timeout kills it.
                         logger.info("mimo slow-ok %.0fs endpoint=%s round=%d", dt, ep, round_idx)
-                    log_usage(logger, "ks", model, dt, resp)
+                    log_usage(logger, "ks", target.model, dt, resp)
                     return resp.choices[0].message.content or ""
                 except asyncio.CancelledError:
                     # Killed from OUTSIDE (e.g. LightRAG's worker timeout cancels this still-running
@@ -574,6 +608,117 @@ class KeyPool:
             f"Last error: {type(last_error).__name__}: {last_error}"
         ) from last_error
 
+    async def _complete_direct_multi_target(
+        self,
+        base_groups: list[dict],
+        messages: list[dict[str, str]],
+        base_kwargs: dict[str, Any],
+        targets: tuple[ModelTarget, ...],
+    ) -> str:
+        """Multi-target route execution over direct KeyPool endpoints (PAPERVAULT_LLM_GATEWAY=0)."""
+        deadline = time.monotonic() + _GW_RETRY_BUDGET_S
+        for target_idx, target in enumerate(targets):
+            is_final = target_idx == len(targets) - 1
+            if not is_final and is_model_cooled_down(target.model, now=time.monotonic()):
+                continue
+            wire = openai_wire_kwargs(target)
+            model = wire.pop("model")
+            attempt_kwargs = {**base_kwargs, **wire}
+
+            if not is_final:
+                groups = list(base_groups)
+                random.shuffle(groups)
+                primary_failed_transient: Exception | None = None
+                primary_t0 = time.monotonic()
+                for g in groups:
+                    ep = _endpoint_label(g)
+                    t0 = time.monotonic()
+                    try:
+                        client = self._client(g)
+                        resp = await _create_completion(client, model, messages, attempt_kwargs)
+                        dt = time.monotonic() - t0
+                        if dt >= _SLOW_CALL_S:
+                            logger.info("mimo slow-ok %.0fs endpoint=%s round=0", dt, ep)
+                        log_usage(logger, "ks", target.model, dt, resp)
+                        return resp.choices[0].message.content or ""
+                    except asyncio.CancelledError:
+                        logger.warning("mimo CANCELLED after %.0fs endpoint=%s round=0 "
+                                       "(outer timeout / shutdown — call did not finish)",
+                                       time.monotonic() - t0, ep)
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        dt = time.monotonic() - t0
+                        code = _error_code(e)
+                        logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s round=0",
+                                       dt, ep, code, type(e).__name__)
+                        if code in _PERMANENT_CODES:
+                            await self._disable_key(g["api_key"], code, type(e).__name__)
+                            base_groups = [x for x in base_groups
+                                           if x.get("api_key") != g["api_key"]]
+                            if base_groups:
+                                continue
+                            raise
+                        if _is_failover_eligible(e):
+                            primary_failed_transient = e
+                            primary_t0 = t0
+                            break
+                        raise
+                if primary_failed_transient is not None:
+                    if self._failover_from_primary(
+                        primary_failed_transient,
+                        ep=f"direct:{target.model}",
+                        primary=target.model,
+                        fallback=targets[target_idx + 1].model,
+                        t0=primary_t0,
+                        deadline=deadline,
+                        log_attempt=False,
+                    ):
+                        continue
+                    raise primary_failed_transient
+                continue
+
+            last_error: Exception | None = None
+            for round_idx in range(_MAX_ROUNDS):
+                groups = list(base_groups)
+                random.shuffle(groups)
+                for g in groups:
+                    ep = _endpoint_label(g)
+                    t0 = time.monotonic()
+                    try:
+                        client = self._client(g)
+                        resp = await _create_completion(client, model, messages, attempt_kwargs)
+                        dt = time.monotonic() - t0
+                        if dt >= _SLOW_CALL_S:
+                            logger.info("mimo slow-ok %.0fs endpoint=%s round=%d", dt, ep, round_idx)
+                        log_usage(logger, "ks", target.model, dt, resp)
+                        return resp.choices[0].message.content or ""
+                    except asyncio.CancelledError:
+                        logger.warning("mimo CANCELLED after %.0fs endpoint=%s round=%d "
+                                       "(outer timeout / shutdown — call did not finish)",
+                                       time.monotonic() - t0, ep, round_idx)
+                        raise
+                    except Exception as e:  # noqa: BLE001
+                        dt = time.monotonic() - t0
+                        last_error = e
+                        code = _error_code(e)
+                        logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s round=%d",
+                                       dt, ep, code, type(e).__name__, round_idx)
+                        if code in _PERMANENT_CODES:
+                            await self._disable_key(g["api_key"], code, type(e).__name__)
+                            base_groups = [x for x in base_groups
+                                           if x.get("api_key") != g["api_key"]]
+                        continue
+                if not base_groups:
+                    break
+                if round_idx < _MAX_ROUNDS - 1:
+                    await asyncio.sleep(
+                        _BASE_BACKOFF * (2 ** round_idx) + random.uniform(0, _BACKOFF_JITTER)
+                    )
+            raise RuntimeError(
+                f"All configured LLM keys failed after {_MAX_ROUNDS} rounds. "
+                f"Last error: {type(last_error).__name__}: {last_error}"
+            ) from last_error
+
     # ---- gateway mode (KS_USE_GATEWAY=1): one proxy endpoint, no shuffle/rounds; bounded transient retry ----
     async def _complete_via_gateway(
         self,
@@ -583,13 +728,10 @@ class KeyPool:
         **kwargs: Any,
     ) -> str:
         """Thin path: build the same messages and whitelist standard request parameters
-        as ``complete()``, then ``chat.completions.create`` against the
-        proxy. The PROXY does key failover/cooldown, so there is NO shuffle and NO ``_MAX_ROUNDS``
-        here; what KS adds (issue #102) is a bounded, wall-clock-budgeted retry of TRANSIENT
-        failures — a stream cut before or while answering, 408/429, 5xx — because the proxy's
-        own retries only cover a connection that never opens. The caller's outer deadline
-        (LightRAG worker / synth ``wait_for``) still governs. Preserves the contract:
-        ``CancelledError`` re-raised, str return (None→"")."""
+        as ``complete()``, then ``chat.completions.create`` against the transparent gateway.
+        Multi-target routes fail over immediately from a throttled/timed-out non-final primary
+        to the next target with process-local cooldown; the final target uses bounded,
+        wall-clock-budgeted transient retries (issue #102)."""
         messages: list[dict[str, str]] = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
@@ -597,74 +739,126 @@ class KeyPool:
             messages.extend(history_messages)
         messages.append({"role": "user", "content": prompt})
 
-        # Pass the requested level unchanged; the gateway resolves model and effort.
-        openai_kwargs = {k: v for k, v in kwargs.items() if k in _OPENAI_STANDARD_KWARGS}
-        model = _sdk_model(openai_kwargs.pop("model", None))
-        if model in LEVELS:  # namespaced wire name: papervault-<level>, no global aliases
-            model = gateway_model(model)
+        base_kwargs = {k: v for k, v in kwargs.items() if k in _OPENAI_STANDARD_KWARGS}
+        raw_model = base_kwargs.pop("model", None)
+        targets = parse_targets(raw_model or _DEFAULT_MODEL)
 
-        # Gateway owns retry + timeout (config.yaml request_timeout/num_retries/retry_policy), so
-        # send NO per-request retry/timeout to the proxy. synth.py / multiquery.py pass timeout=…
-        # for the DIRECT KeyPool path; drop it (and any header kwarg) on the gateway path. The outer
-        # asyncio.wait_for at those call sites still enforces the caller deadline locally.
-        openai_kwargs.pop("timeout", None)
-        openai_kwargs.pop("extra_headers", None)
+        # Drop per-request timeout / extra_headers intended for the direct KeyPool path;
+        # outer asyncio.wait_for at call sites enforces caller deadlines locally.
+        base_kwargs.pop("timeout", None)
+        base_kwargs.pop("extra_headers", None)
 
-        ep = f"gateway:{model}"
-        conn_try = 0
-        retry_state = {"tries": 0, "sleep": 0.0}   # the bounded transient retries (issue #102)
         t_call = time.monotonic()
         deadline = t_call + _GW_RETRY_BUDGET_S   # ABSOLUTE: spans every attempt and every backoff
-        while True:
-            t0 = time.monotonic()
-            try:
-                client = self._gateway_client()
-                resp = await _create_completion(client, model, messages, openai_kwargs)
-                dt = time.monotonic() - t0
-                if dt >= _SLOW_CALL_S:
-                    # Slow but OK — the call we want to see before an outer worker timeout kills it.
-                    logger.info("mimo slow-ok %.0fs endpoint=%s", dt, ep)
-                log_usage(logger, "ks", model, dt, resp)
-                return resp.choices[0].message.content or ""
-            except asyncio.CancelledError:
-                # Killed from OUTSIDE (LightRAG worker timeout / synth wait_for / shutdown). Log
-                # WHERE + how long, then RE-RAISE (never swallow cancellation).
-                logger.warning("mimo CANCELLED after %.0fs endpoint=%s "
-                               "(outer timeout / shutdown — call did not finish)",
-                               time.monotonic() - t0, ep)
-                raise
-            except APIConnectionError as e:
-                # APITimeoutError SUBCLASSES APIConnectionError (openai/_exceptions.py): a transport
-                # timeout is "nothing arrived in time" — a transient like a cut stream, and synth
-                # already treats it so; it takes the bounded transient retry below (issue #102),
-                # not the unreachable loop. A plain APIConnectionError = the GATEWAY ITSELF is
-                # unreachable (down/restarting): back off and WAIT for it instead of fast-failing —
-                # without this a brief gateway restart is a thundering herd (every worker
-                # instant-fails, churning hundreds of docs). Jittered exp backoff so the workers
-                # don't all reconnect in lockstep the instant the gateway is back; the same
-                # absolute deadline + first-chunk room rule as the transient retry bounds it.
-                if isinstance(e, APITimeoutError):
+        for target_idx, target in enumerate(targets):
+            is_final = target_idx == len(targets) - 1
+            if not is_final and is_model_cooled_down(target.model, now=time.monotonic()):
+                continue
+            wire = openai_wire_kwargs(target)
+            model = wire.pop("model")
+            attempt_kwargs = {**base_kwargs, **wire}
+            ep = f"gateway:{model}"
+            conn_try = 0
+            retry_state = {"tries": 0, "sleep": 0.0}   # bounded transient retries (issue #102)
+            while True:
+                t0 = time.monotonic()
+                try:
+                    client = self._gateway_client()
+                    resp = await _create_completion(client, model, messages, attempt_kwargs)
+                    dt = time.monotonic() - t0
+                    if dt >= _SLOW_CALL_S:
+                        # Slow but OK — the call we want to see before an outer worker timeout kills it.
+                        logger.info("mimo slow-ok %.0fs endpoint=%s", dt, ep)
+                    log_usage(logger, "ks", target.model, dt, resp)
+                    return resp.choices[0].message.content or ""
+                except asyncio.CancelledError:
+                    # Killed from OUTSIDE (LightRAG worker timeout / synth wait_for / shutdown). Log
+                    # WHERE + how long, then RE-RAISE (never swallow cancellation).
+                    logger.warning("mimo CANCELLED after %.0fs endpoint=%s "
+                                   "(outer timeout / shutdown — call did not finish)",
+                                   time.monotonic() - t0, ep)
+                    raise
+                except APIConnectionError as e:
+                    # APITimeoutError SUBCLASSES APIConnectionError: transport timeout is an upstream
+                    # transient (fails over immediately on non-final primary; bounded retry on final).
+                    # Plain APIConnectionError = local gateway itself is unreachable: back off and wait
+                    # without marking the primary model cooled down.
+                    if isinstance(e, APITimeoutError):
+                        if not is_final:
+                            if self._failover_from_primary(
+                                e,
+                                ep=ep,
+                                primary=target.model,
+                                fallback=targets[target_idx + 1].model,
+                                t0=t0,
+                                deadline=deadline,
+                            ):
+                                break
+                            raise
+                        if not self._gateway_retry(e, ep, t0, deadline, retry_state):
+                            raise
+                        await asyncio.sleep(retry_state["sleep"])
+                        continue
+                    conn_try += 1
+                    remaining = deadline - time.monotonic()
+                    delay = _retry_delay(conn_try, _GW_CONN_BACKOFF_CAP)
+                    if conn_try > _GW_CONN_MAX_RETRIES or remaining - delay <= max(_FIRST_CHUNK_S, 0.0):
+                        logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s "
+                                       "(%.0fs of %.0fs budget left) — giving up",
+                                       conn_try - 1, ep, max(0.0, remaining), _GW_RETRY_BUDGET_S)
+                        raise
+                    logger.warning("mimo gateway unreachable (conn err) endpoint=%s — backoff %.1fs (try %d/%d)",
+                                   ep, delay, conn_try, _GW_CONN_MAX_RETRIES)
+                    await asyncio.sleep(delay)
+                    continue
+                except Exception as e:  # noqa: BLE001
+                    if not is_final:
+                        if self._failover_from_primary(
+                            e,
+                            ep=ep,
+                            primary=target.model,
+                            fallback=targets[target_idx + 1].model,
+                            t0=t0,
+                            deadline=deadline,
+                        ):
+                            break
+                        raise
                     if not self._gateway_retry(e, ep, t0, deadline, retry_state):
                         raise
                     await asyncio.sleep(retry_state["sleep"])
                     continue
-                conn_try += 1
-                remaining = deadline - time.monotonic()
-                delay = _retry_delay(conn_try, _GW_CONN_BACKOFF_CAP)
-                if conn_try > _GW_CONN_MAX_RETRIES or remaining - delay <= max(_FIRST_CHUNK_S, 0.0):
-                    logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s "
-                                   "(%.0fs of %.0fs budget left) — giving up",
-                                   conn_try - 1, ep, max(0.0, remaining), _GW_RETRY_BUDGET_S)
-                    raise
-                logger.warning("mimo gateway unreachable (conn err) endpoint=%s — backoff %.1fs (try %d/%d)",
-                               ep, delay, conn_try, _GW_CONN_MAX_RETRIES)
-                await asyncio.sleep(delay)
-                continue
-            except Exception as e:  # noqa: BLE001 — proxy owns failover; surface its final error
-                if not self._gateway_retry(e, ep, t0, deadline, retry_state):
-                    raise
-                await asyncio.sleep(retry_state["sleep"])
-                continue
+        raise AssertionError("unreachable: targets is non-empty")
+
+    def _failover_from_primary(
+        self,
+        e: Exception,
+        *,
+        ep: str,
+        primary: str,
+        fallback: str,
+        t0: float,
+        deadline: float,
+        log_attempt: bool = True,
+    ) -> bool:
+        """Record primary cooldown and decide whether to immediately advance to ``fallback``."""
+        dt = time.monotonic() - t0
+        code = _error_code(e)
+        if log_attempt:
+            logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s",
+                           dt, ep, code, type(e).__name__)
+        if not _is_failover_eligible(e):
+            return False
+        now = time.monotonic()
+        ttl = record_model_cooldown(primary, now=now)
+        remaining = deadline - now
+        if remaining <= max(_FIRST_CHUNK_S, 0.0):
+            logger.warning("mimo primary failover skipped (budget exhausted: %.1fs left) "
+                           "%s -> %s code=%s err=%s",
+                           max(0.0, remaining), primary, fallback, code, type(e).__name__)
+            return False
+        logger.warning("mimo primary failover %.0fs %s -> %s code=%s err=%s cooldown=%.0fs",
+                       dt, primary, fallback, code, type(e).__name__, ttl)
+        return True
 
     def _gateway_retry(self, e: Exception, ep: str, t0: float, deadline: float, state: dict) -> bool:
         """Log the failed attempt; decide whether it gets one of the bounded TRANSIENT retries

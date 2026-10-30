@@ -113,7 +113,7 @@ MCP_ALLOWED_HOSTS: list[str] = [
 # Single-endpoint fallback when no key-pool file is present:
 LLM_API_KEY = os.environ.get("PAPERVAULT_LLM_API_KEY", "")
 LLM_BASE_URL = os.environ.get("PAPERVAULT_LLM_BASE_URL", "")
-# Role levels and their operator overrides are resolved by llm_routing.route.
+# Role model routes and operator overrides are resolved by llm_routing.route.
 
 # --- optional LiteLLM gateway (advanced: many keys behind a local proxy) ---
 USE_GATEWAY = os.environ.get("PAPERVAULT_LLM_GATEWAY", "0") == "1"

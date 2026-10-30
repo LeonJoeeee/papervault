@@ -68,10 +68,10 @@ def _check_config(r: _Report) -> None:
     else:
         r.fail("LLM credentials", "set PAPERVAULT_LLM_API_KEY or PAPERVAULT_LLM_KEYS")
     try:
-        levels = " ".join(f"{role}={route(role)}" for role in ROLES)
-        r.ok("LLM levels", levels)
+        routes = " ".join(f"{role}={route(role)}" for role in ROLES)
+        r.ok("LLM routes", routes)
     except ValueError as exc:
-        r.fail("LLM levels", str(exc))
+        r.fail("LLM routes", str(exc))
     if not config.USE_GATEWAY and not config.LLM_BASE_URL and not has_pool:
         r.warn("LLM base URL", "PAPERVAULT_LLM_BASE_URL empty (ok if the key-pool file sets base_url)")
 

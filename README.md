@@ -82,22 +82,28 @@ or lifecycle logic.
 
 ### LLM stages and routing
 
-Every text LLM call selects one of nine roles. Set `PAPERVAULT_LLM_<ROLE>` to
-`flash`, `standard`, `pro`, `max` or `ultra`; unset or blank uses the defaults below.
-Both direct endpoints and the optional gateway must serve these level aliases.
-A supplied test/client handle bypasses role selection for that call.
+Every text LLM call selects one of nine roles via `PAPERVAULT_LLM_<ROLE>`
+(`<model>[@<modifier>][,<fallback>...]`; unset or blank uses the defaults below).
+`glm-*` targets enable adaptive thinking by default (`@nothinking` / `@none`
+disables); non-`glm-*` targets accept `@none|@low|@medium|@high|@xhigh|@max` or
+plain model IDs (e.g. `gpt-4.1-mini`). Multi-target routes fail over immediately
+on transient upstream errors (`429`, `408`, `5xx`, timeout, `StreamTruncated`)
+and cool down the failed primary for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`
+(default `120`s) before re-probing. Retired `flash`..`ultra` and `papervault-*`
+aliases raise `ValueError`. A supplied test/client handle bypasses role
+selection for that call.
 
 | Plane and stage | Role | Default |
 | --- | --- | --- |
-| S1 search intent: API terms and local KG concepts in one call | `intent` | `pro` |
-| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `standard` |
-| S1 downloaded PDF identity verification | `verify` | `flash` |
-| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `flash` |
-| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `max` |
-| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `flash` |
-| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `pro` |
-| S2 evidence-grounded answer synthesis, including eval | `synth` | `ultra` |
-| Evaluation answer and refusal judgments | `eval_judge` | `standard` |
+| S1 search intent: API terms and local KG concepts in one call | `intent` | `gpt-6.1-terra@high` |
+| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `gpt-6.1-terra@high` |
+| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash,gpt-6.1-terra@high` |
+| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `glm-5.3-flash,gpt-6.1-terra@high` |
+| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.3,gpt-6.1-terra@high` |
+| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `gpt-6.1-terra@high` |
+| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `gpt-6.1-terra@high` |
+| S2 evidence-grounded answer synthesis, including eval | `synth` | `gpt-6-astra@xhigh` |
+| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.3,gpt-6.1-terra@high` |
 
 Embedding (BGE-M3), reranking and OCR use their existing local/service paths and
 do not select text LLM roles. The prompt examples calibrate the planner, both
@@ -166,8 +172,8 @@ path within those boundaries; they are not six separate services.
    against the domain-pack tiers and paper classification. Source publication types
    take precedence when conclusive; an LLM paper/non-paper judgment fills missing
    metadata. Production search passes a shared judge handle to its gates, defaulting
-   to `PAPERVAULT_LLM_JUDGE=standard`; the separate extraction `gate` role defaults
-   to `flash`. The stage name does not select a model.
+   to `PAPERVAULT_LLM_JUDGE=gpt-6.1-terra@high`; the separate extraction `gate` role
+   defaults to `glm-5.3-flash,gpt-6.1-terra@high`. The stage name does not select a model.
 4. **Stage 4 — relevance and quality gates.** `registration_rejection` screens the
    external pool for conference/meeting abstracts, non-papers, contentless stubs and
    invalid new-record metadata before preview. Newly allocated records need named

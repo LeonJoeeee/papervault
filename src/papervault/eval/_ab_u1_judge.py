@@ -10,7 +10,12 @@ Usage:  set -a; . ./.env; set +a
 """
 import asyncio, json, os, sys
 
-from papervault.llm_routing import gateway_model, route
+from papervault.llm_routing import (
+    create_openai_chat_completion_with_fallback,
+    http_status_code,
+    parse_targets,
+    route,
+)
 
 GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
 VKEY = os.getenv("KS_VIRTUAL_KEY", "")
@@ -38,16 +43,23 @@ async def _judge(client, sem, e):
     user = (f"head: {e['head']}\ntail: {e['tail']}\nrelationship_description: {e.get('description')}\n"
             f"keywords: {e.get('keywords')}\n\nSOURCE TEXT (the only evidence):\n" +
             "\n---\n".join(e.get("source_chunks", [])))
+    targets = parse_targets(route("eval_judge"))
     async with sem:
         for _ in range(3):
             try:
-                r = await client.chat.completions.create(
-                    model=gateway_model(route("eval_judge")), messages=[{"role": "system", "content": SYS}, {"role": "user", "content": user}],
-                    max_tokens=4000, temperature=0)
+                r = await create_openai_chat_completion_with_fallback(
+                    client,
+                    targets,
+                    messages=[{"role": "system", "content": SYS}, {"role": "user", "content": user}],
+                    max_tokens=4000,
+                    temperature=0,
+                )
                 obj = _extract_json(r.choices[0].message.content or "")
                 if obj is not None and "faithful" in obj:
                     return bool(obj["faithful"])
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                if http_status_code(exc) in {400, 401, 403, 422}:
+                    raise
                 await asyncio.sleep(2)
     return None  # unparseable → excluded
 

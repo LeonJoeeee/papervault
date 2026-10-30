@@ -33,7 +33,12 @@ from openai import AsyncOpenAI
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from papervault import config  # noqa: E402
-from papervault.llm_routing import gateway_model, route  # noqa: E402
+from papervault.llm_routing import (  # noqa: E402
+    create_openai_chat_completion_with_fallback,
+    http_status_code,
+    parse_targets,
+    route,
+)
 
 RELEVANT_BAR = 0.7
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
@@ -61,10 +66,12 @@ def _judge_prompt(intent: str, papers: list[dict]) -> str:
 
 
 async def _judge(client: AsyncOpenAI, intent: str, papers: list[dict]) -> list[float]:
+    targets = parse_targets(route("eval_judge"))
     for attempt in (1, 2):
         try:
-            resp = await client.chat.completions.create(
-                model=gateway_model(route("eval_judge")),
+            resp = await create_openai_chat_completion_with_fallback(
+                client,
+                targets,
                 temperature=0.0,
                 messages=[
                     {"role": "system", "content": _JUDGE_SYSTEM},
@@ -80,7 +87,7 @@ async def _judge(client: AsyncOpenAI, intent: str, papers: list[dict]) -> list[f
                     scores[idx] = max(0.0, min(1.0, float(it["score"])))
             return scores
         except Exception as e:  # noqa: BLE001
-            if attempt == 2:
+            if attempt == 2 or http_status_code(e) in {400, 401, 403, 422}:
                 raise
             print(f"    judge retry after: {type(e).__name__}: {e}", flush=True)
             await asyncio.sleep(5)
@@ -114,7 +121,9 @@ async def main() -> None:
     out_path = Path(__file__).resolve().parent.parent / "src/papervault/eval/results" / f"{args.tag}.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    judge_client = AsyncOpenAI(base_url=config.GATEWAY_URL, api_key=config.GATEWAY_KEY or "sk-")
+    judge_client = AsyncOpenAI(
+        base_url=config.GATEWAY_URL, api_key=config.GATEWAY_KEY or "sk-", max_retries=0
+    )
     cards = []
     with out_path.open("w") as fh:
         for row in intents:

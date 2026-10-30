@@ -308,7 +308,7 @@ def review_extract(extract_text: str, *, llm=None) -> dict:
         if llm is None:
             from .llm import get_llm
 
-            # Both extraction gates use the flash level (PAPERVAULT_LLM_GATE overrides).
+            # Both extraction gates use the 'gate' route (PAPERVAULT_LLM_GATE overrides).
             llm = get_llm(model=route("gate"))
         raw = llm.call([
             {"role": "system", "content": _REVIEW_PROMPT},
@@ -462,7 +462,7 @@ def completeness_gate(full_text: str, *, llm=None) -> dict:
         if llm is None:
             from .llm import get_llm
 
-            # Both extraction gates use the flash level (PAPERVAULT_LLM_GATE overrides).
+            # Both extraction gates use the 'gate' route (PAPERVAULT_LLM_GATE overrides).
             llm = get_llm(model=route("gate"))
         raw = llm.call([
             {"role": "system", "content": _GATE_PROMPT},

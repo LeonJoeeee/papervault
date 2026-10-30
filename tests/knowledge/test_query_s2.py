@@ -31,7 +31,7 @@ def test_outfeed_counts_only_verified_inline_citations_by_frequency_then_retriev
     original = deepcopy(data)
     out = aq.build_outfeed(data, META,
         "[Alpha] [Beta] [Zeta] [Beta] [Invented] [textbook:Book] [1]",
-        generation_id="g1", variant="multiquery", synthesis_model="pro", synthesis_latency_s=2.5)
+        generation_id="g1", variant="multiquery", synthesis_model="gpt-6.1-terra@high", synthesis_latency_s=2.5)
     assert out["cited_papers"] == ["Beta", "Zeta", "Alpha"]
     assert out["retrieved_papers"] == ["Zeta", "Alpha", "Beta"]
     assert out["cited_sources"] == ["textbook:Book"]
@@ -42,7 +42,7 @@ def test_outfeed_counts_only_verified_inline_citations_by_frequency_then_retriev
     assert receipt["kb_coverage"] == "strong"
     assert (receipt["retrieved_chunk_count"], receipt["retrieved_paper_count"], receipt["cited_paper_count"]) == (4, 3, 3)
     assert receipt["rerank_degraded"] is False
-    assert receipt["synthesis_model"] == "pro" and receipt["synthesis_latency_s"] == 2.5
+    assert receipt["synthesis_model"] == "gpt-6.1-terra@high" and receipt["synthesis_latency_s"] == 2.5
     assert data == original
 
 
@@ -239,6 +239,6 @@ async def test_live_receipt_records_rerank_degradation_and_synthesis_timing(monk
             return {"status": "success", "data": evidence(), "metadata": META}
     out = await aq.query("question", rag=Rag())
     assert out["query_receipt"]["rerank_degraded"] is True
-    assert out["query_receipt"]["synthesis_model"] == "ultra"
+    assert out["query_receipt"]["synthesis_model"] == "gpt-6-astra@xhigh"
     assert out["query_receipt"]["synthesis_latency_s"] >= 0
     assert out["cited_papers"] == ["Alpha"]

@@ -38,7 +38,12 @@ EVAL = Path(__file__).resolve().parent
 sys.path.insert(0, str(EVAL.parent.parent))  # repo root, for `papervault.eval`
 from papervault.eval._paths import eval_path
 from papervault.eval import judge_aggregate as JA  # noqa: E402
-from papervault.llm_routing import gateway_model, route  # noqa: E402
+from papervault.llm_routing import (  # noqa: E402
+    create_openai_chat_completion_with_fallback,
+    http_status_code,
+    parse_targets,
+    route,
+)
 
 GOLD = EVAL / os.getenv("JUDGE_GOLD", "gold_v2.jsonl")  # env-override for new gold frames (gold_v4 / gold_newq)
 ALL_TAGS = ["fullcorpus_baseline", "fullcorpus_r2", "fullcorpus_r3",
@@ -182,12 +187,14 @@ async def _judge_one(client, sem, tag, qid, gold_entry, force, counters):
         except Exception:
             pass  # invalid existing seed -> rejudge
     prompt = eval_path("judge", tag, f"{qid}.prompt.txt").read_text()
+    targets = parse_targets(route("eval_judge"))
     last_err = ""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
             async with sem:
-                resp = await client.chat.completions.create(
-                    model=gateway_model(route("eval_judge")),
+                resp = await create_openai_chat_completion_with_fallback(
+                    client,
+                    targets,
                     messages=[{"role": "system", "content": _SYSTEM},
                               {"role": "user", "content": prompt}],
                     temperature=0.1,
@@ -203,6 +210,8 @@ async def _judge_one(client, sem, tag, qid, gold_entry, force, counters):
             return (tag, qid, "ok", f"attempt={attempt}")
         except Exception as e:  # noqa: BLE001
             last_err = f"{type(e).__name__}: {str(e)[:120]}"
+            if http_status_code(e) in {400, 401, 403, 422}:
+                break
             await asyncio.sleep(min(2.0 * attempt, 8.0))
     counters["fail"] += 1
     return (tag, qid, "fail", last_err)
@@ -219,7 +228,7 @@ async def _run(tags, concurrency, force):
     sem = asyncio.Semaphore(concurrency)
     counters = {"ok": 0, "skip": 0, "fail": 0}
     print(f"judging {len(jobs)} (tag,qid) over {len(tags)} tags @ concurrency {concurrency} "
-          f"via {GATEWAY} level={route('eval_judge')} force={force}", flush=True)
+          f"via {GATEWAY} route={route('eval_judge')} force={force}", flush=True)
     tasks = [asyncio.create_task(_judge_one(client, sem, t, q, gold[q], force, counters))
              for (t, q) in jobs]
     done = 0

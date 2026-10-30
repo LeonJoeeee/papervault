@@ -61,8 +61,12 @@ def _stream_on(monkeypatch):
     .env, so the streaming tests exercise the streaming branch; the kill-switch test overrides.
     Also zero the gateway-path retry backoff so no test sleeps (retry COUNTS stay at their
     defaults; the #102 tests pin what they assert)."""
+    llm_mod.clear_fallback_cooldowns()
+    monkeypatch.delenv("PAPERVAULT_LLM_FALLBACK_COOLDOWN_S", raising=False)
     monkeypatch.setattr(llm_mod, "_STREAM", True)
     monkeypatch.setattr(llm_mod, "_GW_TRANSIENT_BACKOFF_CAP", 0.0)
+    yield
+    llm_mod.clear_fallback_cooldowns()
 
 
 def _pin_order(monkeypatch):
@@ -766,10 +770,11 @@ async def test_mimo_complete_merge_stage_call_survives_one_cut(tmp_path, monkeyp
     monkeypatch.setattr(llm_mod, "_pool", None)
     created = _install_sequenced_stream_client(monkeypatch, [
         [_chunk(content="par"), httpx.RemoteProtocolError("peer closed")], list(_HELLO_STREAM)])
-    out = await mimo_complete("Summarize entity `Energy`", system_prompt="merge", model="flash",
-                              max_tokens=131072)
+    out = await mimo_complete("Summarize entity `Energy`", system_prompt="merge",
+                              model="gpt-6.1-terra@high", max_tokens=131072)
     assert out == "Hello"
     assert len(created) == 2
+    assert created[1]["reasoning_effort"] == "high"
     assert "extra_body" not in created[1] and created[1]["max_tokens"] == 131072
 
 
@@ -865,8 +870,22 @@ def test_default_max_tokens_is_131000_when_env_unset(tmp_path):
 
 
 @pytest.mark.parametrize("gateway", [False, True])
-@pytest.mark.parametrize("level", ["flash", "standard", "pro", "max", "ultra"])
-async def test_request_preserves_level_without_caller_effort(tmp_path, monkeypatch, gateway, level):
+@pytest.mark.parametrize(
+    "spec,expected_wire",
+    [
+        ("gpt-6-astra@xhigh", {"model": "gpt-6-astra", "reasoning_effort": "xhigh"}),
+        ("gpt-6.1-terra@high", {"model": "gpt-6.1-terra", "reasoning_effort": "high"}),
+        ("glm-5.3", {"model": "glm-5.3", "extra_body": {"thinking": {"type": "enabled"}}}),
+        (
+            "glm-5.3-flash@nothinking",
+            {"model": "glm-5.3-flash", "extra_body": {"thinking": {"type": "disabled"}}},
+        ),
+        ("gpt-4.1-mini", {"model": "gpt-4.1-mini"}),
+    ],
+)
+async def test_request_applies_target_wire_kwargs_and_strips_caller_overrides(
+    tmp_path, monkeypatch, gateway, spec, expected_wire,
+):
     monkeypatch.setattr(config, "USE_GATEWAY", gateway)
     monkeypatch.setattr(config, "GATEWAY_URL", "http://gw.example/v1")
     monkeypatch.setattr(config, "GATEWAY_KEY", "test-key")
@@ -874,12 +893,190 @@ async def test_request_preserves_level_without_caller_effort(tmp_path, monkeypat
     _write(f, [_group("test-key", model="provider-model")])
     created = _install_fake_stream_client(monkeypatch, lambda key: list(_HELLO_STREAM))
     assert await KeyPool(f).complete(
-        "ping", model=level, reasoning_effort="max",
-        extra_body={"model": "provider-model", "thinking": True},
+        "ping",
+        model=spec,
+        reasoning_effort="low",
+        extra_body={"model": "hijack", "thinking": {"type": "disabled"}, "stream": False},
     ) == "Hello"
-    wire = f"{'papervault-' if gateway else ''}{level}"
-    assert created == [{"model": wire, "max_tokens": llm_mod._DEFAULT_MAX_TOKENS,
-                        "stream": True, "stream_options": {"include_usage": True}}]
+    assert created == [
+        {
+            **expected_wire,
+            "max_tokens": llm_mod._DEFAULT_MAX_TOKENS,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+    ]
+
+
+# ---- issue #350: caller-owned GLM -> GPT quota failover & cooldown ------------------------------
+
+@pytest.mark.parametrize(
+    "primary_failure",
+    [
+        _FakeError(429),
+        _FakeError(408),
+        _FakeError(503),
+        openai.APITimeoutError(request=httpx.Request("POST", "http://gw.example/v1/chat/completions")),
+        [_chunk(content="par"), httpx.RemoteProtocolError("cut midstream")],
+    ],
+)
+async def test_glm_primary_fails_over_immediately_to_gpt_without_same_target_retries(
+    tmp_path, monkeypatch, caplog, _instant_gateway_backoff, primary_failure,
+):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(monkeypatch, [primary_failure, list(_HELLO_STREAM)])
+    pool = KeyPool(tmp_path / "unused.json")
+    with caplog.at_level("INFO", logger="papervault.knowledge.store.llm"):
+        out = await pool.complete("ping", model="glm-5.3,gpt-6.1-terra@high")
+    assert out == "Hello"
+    assert len(created) == 2
+    assert created[0]["model"] == "glm-5.3"
+    assert created[0]["extra_body"] == {"thinking": {"type": "enabled"}}
+    assert "reasoning_effort" not in created[0]
+    assert created[1]["model"] == "gpt-6.1-terra"
+    assert created[1]["reasoning_effort"] == "high"
+    assert "extra_body" not in created[1]
+    assert any("glm-5.3 -> gpt-6.1-terra" in r.getMessage() for r in caplog.records)
+    tok = [r.getMessage() for r in caplog.records if r.getMessage().startswith("LLMTOK ")]
+    assert len(tok) == 1 and "model=gpt-6.1-terra" in tok[0]
+
+
+async def test_active_cooldown_skips_primary_then_reprobes_after_expiry(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    _gateway_mode(monkeypatch)
+    clock = [1000.0]
+    monkeypatch.setattr(llm_mod.time, "monotonic", lambda: clock[0])
+    created = _install_sequenced_stream_client(
+        monkeypatch,
+        [
+            _FakeError(429),       # call 1 primary (glm-5.3) -> 429, enters 120s cooldown
+            list(_HELLO_STREAM),   # call 1 fallback (gpt-6.1-terra) -> ok
+            list(_HELLO_STREAM),   # call 2 during cooldown -> skips glm-5.3, calls gpt-6.1-terra directly
+            list(_HELLO_STREAM),   # call 3 after expiry -> probes glm-5.3 again -> ok
+        ],
+    )
+    pool = KeyPool(tmp_path / "unused.json")
+    route_spec = "glm-5.3,gpt-6.1-terra@high"
+
+    assert await pool.complete("c1", model=route_spec) == "Hello"
+    assert [c["model"] for c in created] == ["glm-5.3", "gpt-6.1-terra"]
+
+    clock[0] = 1050.0  # still inside 120s cooldown
+    assert await pool.complete("c2", model=route_spec) == "Hello"
+    assert [c["model"] for c in created] == ["glm-5.3", "gpt-6.1-terra", "gpt-6.1-terra"]
+
+    clock[0] = 1121.0  # past 120s cooldown -> probes primary again
+    assert await pool.complete("c3", model=route_spec) == "Hello"
+    assert [c["model"] for c in created] == [
+        "glm-5.3",
+        "gpt-6.1-terra",
+        "gpt-6.1-terra",
+        "glm-5.3",
+    ]
+
+
+async def test_cooldown_zero_disables_skipping(tmp_path, monkeypatch, _instant_gateway_backoff):
+    _gateway_mode(monkeypatch)
+    monkeypatch.setenv("PAPERVAULT_LLM_FALLBACK_COOLDOWN_S", "0")
+    created = _install_sequenced_stream_client(
+        monkeypatch,
+        [
+            _FakeError(429),
+            list(_HELLO_STREAM),
+            list(_HELLO_STREAM),
+        ],
+    )
+    pool = KeyPool(tmp_path / "unused.json")
+    route_spec = "glm-5.3,gpt-6.1-terra@high"
+    assert await pool.complete("c1", model=route_spec) == "Hello"
+    assert await pool.complete("c2", model=route_spec) == "Hello"
+    assert [c["model"] for c in created] == ["glm-5.3", "gpt-6.1-terra", "glm-5.3"]
+
+
+@pytest.mark.parametrize("code", [400, 401, 403, 422])
+async def test_multi_target_does_not_fail_over_on_deterministic_4xx(
+    tmp_path, monkeypatch, _instant_gateway_backoff, code,
+):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(monkeypatch, [_FakeError(code), list(_HELLO_STREAM)])
+    pool = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(_FakeError):
+        await pool.complete("ping", model="glm-5.3,gpt-6.1-terra@high")
+    assert [c["model"] for c in created] == ["glm-5.3"]
+
+
+async def test_multi_target_does_not_fail_over_on_cancelled_error(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    _gateway_mode(monkeypatch)
+    calls: list[str] = []
+
+    class _Completions:
+        async def create(self, *, model, messages, **kw):
+            calls.append(model)
+            raise asyncio.CancelledError
+
+    class _Fake:
+        def __init__(self, *, api_key, base_url, timeout=None, max_retries=None):
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
+    pool = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(asyncio.CancelledError):
+        await pool.complete("ping", model="glm-5.3,gpt-6.1-terra@high")
+    assert calls == ["glm-5.3"]
+
+
+async def test_gateway_plain_connection_error_uses_unreachable_loop_without_cooling_down_primary(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_GW_CONN_BACKOFF_CAP", 0.0)
+    conn_err = openai.APIConnectionError(
+        request=httpx.Request("POST", "http://gw.example/v1/chat/completions")
+    )
+    created = _install_sequenced_stream_client(monkeypatch, [conn_err, list(_HELLO_STREAM)])
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("ping", model="glm-5.3,gpt-6.1-terra@high") == "Hello"
+    assert [c["model"] for c in created] == ["glm-5.3", "glm-5.3"]
+
+
+async def test_single_target_gpt_role_never_cross_model_falls_back(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(
+        monkeypatch, [_FakeError(429), _FakeError(429), _FakeError(429), list(_HELLO_STREAM)]
+    )
+    pool = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(_FakeError):
+        await pool.complete("ping", model="gpt-6-astra@xhigh")
+    assert [c["model"] for c in created] == ["gpt-6-astra", "gpt-6-astra", "gpt-6-astra"]
+
+
+async def test_direct_pool_multi_target_route_fails_over_and_cools_down(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "USE_GATEWAY", False)
+    monkeypatch.setattr(llm_mod, "_BASE_BACKOFF", 0.0)
+    f = tmp_path / "keys.json"
+    _write(f, [_group("k1")])
+    created = _install_sequenced_stream_client(
+        monkeypatch,
+        [
+            _FakeError(429),       # call 1 primary (glm-5.3-flash) -> 429, cools down
+            list(_HELLO_STREAM),   # call 1 fallback (gpt-6.1-terra) -> ok
+            list(_HELLO_STREAM),   # call 2 skips cooled-down primary -> gpt-6.1-terra directly
+        ],
+    )
+    pool = KeyPool(f)
+    route_spec = "glm-5.3-flash,gpt-6.1-terra@high"
+    assert await pool.complete("c1", model=route_spec) == "Hello"
+    assert await pool.complete("c2", model=route_spec) == "Hello"
+    assert [c["model"] for c in created] == [
+        "glm-5.3-flash",
+        "gpt-6.1-terra",
+        "gpt-6.1-terra",
+    ]
 
 
 def test_default_first_chunk_s_is_zero_when_env_unset(tmp_path):

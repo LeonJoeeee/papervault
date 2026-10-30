@@ -120,21 +120,28 @@ retrieved-paper citation fallback, not a synthesis-quality measurement.
 
 ### LLM stage routing
 
-All text LLM stages use these nine roles. `PAPERVAULT_LLM_<ROLE>` overrides the
-default level with `flash`, `standard`, `pro`, `max` or `ultra`. Search intent selects
-its own handle; the ingest and return gates share the judge handle.
+All text LLM stages resolve through these nine roles via `PAPERVAULT_LLM_<ROLE>`
+as ordered `primary[,fallback...]` chains of concrete `ModelTarget` specs
+(`<model>[@<effort>|@thinking|@nothinking]`); see
+[ADR-0012](adr/0012-direct-role-model-routing-and-glm-fallback.md). `glm-*`
+targets enable adaptive thinking by default; multi-target GLM-primary routes
+fail over immediately on transient upstream errors (`429`, `408`, `5xx`,
+timeout, `StreamTruncated`) with a process-local primary cooldown
+(`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`, default `120`s), while single-target GPT
+roles use bounded same-model retries without cross-model fallback. Search intent
+selects its own handle; the ingest and return gates share the judge handle.
 
 | Plane / LLM stage | Role | Default |
 | --- | --- | --- |
-| S1 intent parsing (API terms, local KG concepts, filters and ranking hints) | `intent` | `pro` |
-| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `standard` |
-| S1 downloaded PDF identity verification | `verify` | `flash` |
-| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `flash` |
-| S2 build entity/relation extraction and merge summaries | `build` | `max` |
-| S2 query high/low-level keyword extraction when needed | `keyword` | `flash` |
-| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `pro` |
-| S2 evidence-grounded synthesis (production/eval) | `synth` | `ultra` |
-| Evaluation answer/refusal scoring | `eval_judge` | `standard` |
+| S1 intent parsing (API terms, local KG concepts, filters and ranking hints) | `intent` | `gpt-6.1-terra@high` |
+| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `gpt-6.1-terra@high` |
+| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash,gpt-6.1-terra@high` |
+| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `glm-5.3-flash,gpt-6.1-terra@high` |
+| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.3,gpt-6.1-terra@high` |
+| S2 query high/low-level keyword extraction when needed | `keyword` | `gpt-6.1-terra@high` |
+| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `gpt-6.1-terra@high` |
+| S2 evidence-grounded synthesis (production/eval) | `synth` | `gpt-6-astra@xhigh` |
+| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.3,gpt-6.1-terra@high` |
 
 Planner, gate, verification and decomposition prompts include concrete calibration
 examples. Local embedding/reranking and the MinerU OCR service remain outside text

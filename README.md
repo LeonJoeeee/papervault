@@ -207,6 +207,16 @@ path within those boundaries; they are not six separate services.
    precedes the asynchronous Stage 5 command execution; the stage numbers describe
    responsibilities, not a registration-before-return dependency.
 
+Both heavy MCP tools (`search_papers` and `query`) run in bounded-wait resumable
+task registries (`PAPERVAULT_MCP_SEARCH_WAIT_S=90`, `PAPERVAULT_MCP_SEARCH_RETENTION_S=900`,
+`PAPERVAULT_SEARCH_HEARTBEAT_S=45`; `KS_MCP_QUERY_WAIT_S=90`, `KS_MCP_QUERY_RETENTION_S=900`,
+`KS_PROGRESS_HEARTBEAT_S=45`) so MCP client wall-clock timeouts never cancel an
+in-flight run. Calls still running at the wait bound return `status="running"` with
+`search_id` (`s-<12hex>`) or `query_id` (`q-<12hex>`) and retain their admission
+permit until background completion; polling with the same input or ID attaches
+before admission without consuming another slot. Library shutdown drains active
+detached searches before stopping `RegistrationQueue`.
+
 ### Authority at both ranking boundaries
 
 `PAPERVAULT_SEARCH_AUTHORITY_PRIOR=1` enables both the local fusion prior and final

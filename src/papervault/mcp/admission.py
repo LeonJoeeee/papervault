@@ -27,10 +27,13 @@ its own session frees a slot, so the session never holds more than its cap of
 executing calls. (The cap is shared by both heavy tools while the depth is
 per-tool, so a slot a ``search_papers`` call frees may start a queued ``query``.)
 
-Resumable knowledge queries transfer their session permit, executing depth and
-service timer to the underlying task. A soft return or client disconnect does
-not release capacity. Resumes attach to the existing task before either layer,
-and only actual task completion releases the permit and records one duration.
+Resumable ``query`` and ``search_papers`` calls transfer their session permit,
+executing depth and service timer to the underlying background task. A soft
+return or client disconnect does not release capacity. Pre-admission control
+calls (shutdown, resume/collect, unknown/expired IDs, and empty ``search_papers``
+queries) resolve before either layer without consuming a permit or polluting
+service-time estimates, and only actual task completion releases the permit and
+records one duration.
 
 An LLM caller reschedules itself well on such an answer; an opaque 20-minute
 stall it handles badly. The rolling average is fed by real completions (last
@@ -47,9 +50,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import time
 from collections import deque
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -127,15 +133,82 @@ def _busy_answer(tool: str, depth: int, expected_wait_s: float) -> dict[str, Any
     }
 
 
-def _wrap(name: str, fn):
-    # Only the knowledge tool implements task retention; ordinary heavy tools
-    # keep their existing caller-lifetime cancellation and queueing behavior.
-    from papervault.knowledge.mcp import server as knowledge
-    resumable = name == "query" and fn is knowledge.query
+_QUERY_ID_RE = re.compile(r"q-[0-9a-f]{12}")
+_SEARCH_ID_RE = re.compile(r"s-[0-9a-f]{12}")
+
+
+@dataclass(frozen=True)
+class _ResumableAdapter:
+    arg_name: str
+    is_stopping: Callable[[], bool]
+    stopping_reply: Callable[[], dict[str, Any]]
+    find: Callable[[str], Any]
+    wait: Callable[[Any, Context | None], Awaitable[dict[str, Any]]]
+    id_re: re.Pattern[str]
+    not_found_reply: Callable[[str], dict[str, Any]]
+    empty_reply: Callable[[], dict[str, Any]] | None = None
+
+
+def _resumable_adapter(name: str, fn: Any, mcp: FastMCP | None) -> _ResumableAdapter | None:
+    if name == "query":
+        from papervault.knowledge.mcp import server as knowledge
+
+        if fn is knowledge.query:
+            return _ResumableAdapter(
+                arg_name="intent",
+                is_stopping=lambda: bool(knowledge._query_stopping),
+                stopping_reply=lambda: {
+                    "status": "busy",
+                    "busy": True,
+                    "retry_after_s": 5,
+                    "reason": "Knowledge server is shutting down; retry after restart.",
+                },
+                find=knowledge._find_query,
+                wait=knowledge._wait_query,
+                id_re=_QUERY_ID_RE,
+                not_found_reply=lambda qid: {
+                    "status": "not_found",
+                    "query_id": qid,
+                    "reason": "Query expired or server restarted; resubmit the original intent.",
+                },
+                empty_reply=None,
+            )
+    elif name == "search_papers" and mcp is not None:
+        registry = getattr(mcp, "_paper_search_registry", None)
+        if registry is not None and fn is registry.tool_fn:
+            return _ResumableAdapter(
+                arg_name="query",
+                is_stopping=lambda: bool(registry.stopping),
+                stopping_reply=registry.stopping_reply,
+                find=registry.find,
+                wait=registry.wait,
+                id_re=_SEARCH_ID_RE,
+                not_found_reply=registry.not_found_reply,
+                empty_reply=registry.empty_reply,
+            )
+    return None
+
+
+def _wrap(name: str, fn, mcp: FastMCP | None = None):
+    # Only the real knowledge.query and library.search_papers functions implement
+    # task retention; toy tools in tests keep caller-lifetime queueing behavior.
+    adapter = _resumable_adapter(name, fn, mcp)
+    resumable = adapter is not None
 
     async def admitted(**kwargs):
-        if resumable and (entry := knowledge._find_query(kwargs["intent"])) is not None:
-            return await knowledge._wait_query(entry, kwargs.get("ctx"))
+        raw = ""
+        if adapter is not None:
+            raw = kwargs.get(adapter.arg_name) or ""
+            if adapter.is_stopping():
+                return adapter.stopping_reply()
+            if (entry := adapter.find(raw)) is not None:
+                return await adapter.wait(entry, kwargs.get("ctx"))
+            stripped = raw.strip()
+            if adapter.id_re.fullmatch(stripped):
+                return adapter.not_found_reply(stripped)
+            if not stripped and adapter.empty_reply is not None:
+                return adapter.empty_reply()
+
         skey = _session_key(kwargs)
         # A session already at its cap queues this call behind ITSELF (layer 1): it
         # adds nothing to the executing depth, so layer 2 does not judge it (#137).
@@ -171,12 +244,17 @@ def _wrap(name: str, fn):
         try:
             await sem.acquire()
             acquired = True
-            # An identical query may have started while this call queued behind
-            # its session. Attach without counting another execution or permit.
-            if resumable and (entry := knowledge._find_query(kwargs["intent"])) is not None:
-                release()
-                transferred = True  # Already released; the finally owns nothing.
-                return await knowledge._wait_query(entry, kwargs.get("ctx"))
+            # An identical call may have started (or shutdown begun) while this
+            # call queued behind its session. Handle without counting another permit.
+            if adapter is not None:
+                if adapter.is_stopping():
+                    release()
+                    transferred = True
+                    return adapter.stopping_reply()
+                if (entry := adapter.find(raw)) is not None:
+                    release()
+                    transferred = True  # Already released; the finally owns nothing.
+                    return await adapter.wait(entry, kwargs.get("ctx"))
             waited = time.monotonic() - t_enter
             if waited > 1.0:
                 log.info("ADMISSION wait tool=%s waited=%.0fs (session cap)", name, waited)
@@ -210,7 +288,7 @@ def install_admission(mcp: FastMCP) -> None:
         tool = tools.get(name)
         if tool is None or not getattr(tool, "is_async", True):
             continue
-        tool.fn = _wrap(name, tool.fn)
+        tool.fn = _wrap(name, tool.fn, mcp=mcp)
         wrapped.append(name)
     log.info("admission installed on %s (session cap %d, lanes %d, max wait %.0fs%s)",
              ", ".join(wrapped) or "NOTHING", _SESSION_INFLIGHT, _LANES, _MAX_WAIT_S,

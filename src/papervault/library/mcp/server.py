@@ -30,7 +30,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Optional, Union
+import math
+import os
+import re
+import time
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional, Union
+from uuid import uuid4
 
 from mcp.server.fastmcp import Context, FastMCP
 
@@ -278,6 +284,276 @@ def _make_threadsafe_progress_cb(ctx: Optional[Context],
             pass
 
     return cb
+
+
+# ---------------- bounded-wait resumable search registry (#354) -------------
+
+_SEARCH_CAPACITY = 128
+_SEARCH_ID_RE = re.compile(r"s-[0-9a-f]{12}")
+_EMPTY_QUERY_MESSAGE = (
+    "empty query — pass a natural-language description of what you're working on "
+    "and what literature you want to find"
+)
+
+
+def _search_setting(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)))
+        if not math.isfinite(value):
+            raise ValueError("search setting must be finite")
+        return value
+    except ValueError:
+        logger.warning("Invalid %s; using default %ss", name, default)
+        return default
+
+
+@dataclass
+class _SearchEntry:
+    search_id: str
+    query: str
+    started_at: float
+    task: asyncio.Task = field(init=False)
+    completed_at: float | None = None
+    collected: bool = False
+    stage_message: str = ""
+
+
+async def _progress_heartbeat(ctx: Context, stop: asyncio.Event, entry: _SearchEntry) -> None:
+    """Send waiter-scoped MCP progress notifications until ``stop`` is set."""
+    interval = _search_setting("PAPERVAULT_SEARCH_HEARTBEAT_S", 45.0)
+    if interval <= 0:
+        return
+    meta = getattr(getattr(ctx, "request_context", None), "meta", None)
+    token = getattr(meta, "progressToken", None)
+    if token is None:
+        return
+    tick = 0
+    while True:
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            return
+        except asyncio.TimeoutError:
+            pass
+        tick += 1
+        elapsed = int(time.monotonic() - entry.started_at)
+        stage = entry.stage_message
+        message = (
+            f"search_papers running ({stage}) — {elapsed}s elapsed"
+            if stage
+            else f"search_papers running — {elapsed}s elapsed"
+        )
+        try:
+            await ctx.session.send_progress_notification(
+                progress_token=token,
+                progress=float(tick),
+                total=None,
+                message=message,
+                related_request_id=ctx.request_id,
+            )
+        except Exception:  # noqa: BLE001 — heartbeat must never kill the waiter or search
+            logger.debug("search progress heartbeat send failed (tick=%d)", tick, exc_info=True)
+
+
+class _PaperSearchRegistry:
+    """Per-FastMCP-instance task registry for bounded-wait resumable search_papers."""
+
+    def __init__(self, mcp: FastMCP, library: Library, capacity: int = _SEARCH_CAPACITY) -> None:
+        self.mcp = mcp
+        self.library = library
+        self.capacity = capacity
+        self.by_id: dict[str, _SearchEntry] = {}
+        self.by_query: dict[str, _SearchEntry] = {}
+        self.stopping: bool = False
+        self.tool_fn: Callable[..., Any] | None = None
+
+    @staticmethod
+    def stopping_reply() -> dict[str, Any]:
+        return {
+            "status": "busy",
+            "busy": True,
+            "retry_after_s": 5,
+            "reason": "Library server is shutting down; retry after restart.",
+        }
+
+    @staticmethod
+    def capacity_busy_reply() -> dict[str, Any]:
+        return {
+            "status": "busy",
+            "busy": True,
+            "retry_after_s": 5,
+            "reason": "Search registry is at capacity; retry after running work finishes.",
+        }
+
+    @staticmethod
+    def not_found_reply(search_id: str) -> dict[str, Any]:
+        return {
+            "status": "not_found",
+            "search_id": search_id,
+            "reason": "Search expired or server restarted; resubmit the original query.",
+        }
+
+    @staticmethod
+    def empty_reply() -> dict[str, Any]:
+        return {"status": "error", "results": [], "message": _EMPTY_QUERY_MESSAGE}
+
+    def forget(self, entry: _SearchEntry) -> None:
+        if self.by_id.get(entry.search_id) is entry:
+            self.by_id.pop(entry.search_id, None)
+        if self.by_query.get(entry.query) is entry:
+            self.by_query.pop(entry.query, None)
+
+    def _forget_search(self, entry: _SearchEntry) -> None:
+        self.forget(entry)
+
+    def find(self, raw_query: str) -> _SearchEntry | None:
+        """Shared with admission: resume/collect calls need no new executing permit."""
+        now = time.monotonic()
+        retention = max(0.0, _search_setting("PAPERVAULT_MCP_SEARCH_RETENTION_S", 900.0))
+        for entry in list(self.by_id.values()):
+            if entry.completed_at is not None and now - entry.completed_at >= retention:
+                self.forget(entry)
+        key = (raw_query or "").strip()
+        if not key:
+            return None
+        return self.by_id.get(key) or self.by_query.get(key)
+
+    @staticmethod
+    def _search_finished(entry: _SearchEntry) -> None:
+        entry.completed_at = time.monotonic()
+        if not entry.task.cancelled():
+            entry.task.exception()  # Detached failures are delivered on collection.
+
+    async def _execute_search(self, entry: _SearchEntry) -> dict[str, Any]:
+        async def progress(_step: float, message: str) -> None:
+            entry.stage_message = str(message)
+
+        pipeline = SearchPipeline(
+            library=getattr(self.mcp, "_paper_library", self.library),
+            registration_queue=self.mcp._paper_registration_queue,  # type: ignore[attr-defined]
+            llm_factory=get_llm,
+            parse=parse_intent,
+            retrieve=search_external_async,
+            judge_ingest=judge_ingest,
+            judge_return=judge_return,
+            project=_paper_dict,
+            reframe_hint=_reframe_hint,
+            progress=progress,
+            authority_enabled=SEARCH_AUTHORITY_PRIOR,
+            authority_weight=SEARCH_AUTHORITY_LAMBDA,
+        )
+        response = await pipeline.run(entry.query)
+        if isinstance(response, dict) and response.get("status") == "ok":
+            degraded = _degraded_fields(self.mcp)
+            if degraded:
+                response = {**response, **degraded}
+        return response
+
+    def start_new(self, query: str) -> _SearchEntry | None:
+        from papervault.mcp.admission import _retain_query_task
+
+        if len(self.by_id) >= self.capacity:
+            completed = [entry for entry in self.by_id.values() if entry.task.done()]
+            if not completed:
+                return None
+            victim = min(
+                completed,
+                key=lambda entry: (not entry.collected, entry.completed_at or entry.started_at),
+            )
+            self.forget(victim)
+        search_id = f"s-{uuid4().hex[:12]}"
+        entry = _SearchEntry(search_id=search_id, query=query, started_at=time.monotonic())
+        task = asyncio.create_task(self._execute_search(entry), name=f"paper-search-{search_id}")
+        entry.task = task
+        # Register synchronously before any await so concurrent identical queries
+        # attach to the same execution rather than dispatching duplicate searches.
+        self.by_id[search_id] = self.by_query[query] = entry
+        task.add_done_callback(lambda _: self._search_finished(entry))
+        _retain_query_task(task)
+        return entry
+
+    async def wait(self, entry: _SearchEntry, ctx: Optional[Context] = None) -> dict[str, Any]:
+        return await _wait_search(self, entry, ctx)
+
+    async def shutdown(self) -> None:
+        """Idempotently stop accepting new searches and cancel/drain all active tasks."""
+        self.stopping = True
+        tasks = [entry.task for entry in list(self.by_id.values()) if not entry.task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.by_id.clear()
+        self.by_query.clear()
+
+
+async def _wait_search(
+    registry: _PaperSearchRegistry,
+    entry: _SearchEntry,
+    ctx: Optional[Context] = None,
+) -> dict[str, Any]:
+    """Wait on an already selected search entry, including admission's atomic resumes."""
+    # Heartbeats belong to this waiter, never to the detached execution: a lost
+    # request must not keep trying to notify a dead session in the background.
+    stop = asyncio.Event()
+    heartbeat = asyncio.create_task(_progress_heartbeat(ctx, stop, entry)) if ctx else None
+    collected = False
+    result: Any = None
+    try:
+        if ctx:
+            try:
+                await ctx.info(f"search_papers query={entry.query!r}")
+            except Exception:  # noqa: BLE001
+                logger.debug("search log notification failed; execution remains collectable", exc_info=True)
+        wait = _search_setting("PAPERVAULT_MCP_SEARCH_WAIT_S", 90.0)
+        if wait <= 0:
+            result = await asyncio.shield(entry.task)
+        else:
+            try:
+                result = await asyncio.wait_for(asyncio.shield(entry.task), timeout=wait)
+            except asyncio.TimeoutError:
+                if entry.task.done():
+                    result = entry.task.result()  # Includes an underlying TimeoutError.
+                else:
+                    return {
+                        "status": "running",
+                        "running": True,
+                        "search_id": entry.search_id,
+                        "elapsed_s": int(time.monotonic() - entry.started_at),
+                        "retry_after_s": 5,
+                        "reason": (
+                            f"Search continues in the background. Call search_papers with the same "
+                            f'query or query="{entry.search_id}" to collect the results.'
+                        ),
+                    }
+        collected = True
+        return result
+    except asyncio.CancelledError:
+        # Shutdown owns cancellation/drain; a disconnected caller only stops its
+        # own wait unless the underlying search task itself was cancelled.
+        if entry.task.cancelled():
+            collected = True
+        raise
+    except Exception:
+        collected = entry.task.done()
+        raise
+    finally:
+        if heartbeat is not None:
+            stop.set()
+            heartbeat.cancel()
+            await asyncio.gather(heartbeat, return_exceptions=True)
+        # No await may follow consumption: cancellation during notification
+        # teardown must leave even a completed result available for resume.
+        if collected:
+            if (
+                entry.task.cancelled()
+                or entry.task.exception() is not None
+                or (isinstance(result, dict) and result.get("status") == "error")
+            ):
+                registry._forget_search(entry)
+            else:
+                entry.collected = True
+                if registry.by_query.get(entry.query) is entry:
+                    registry.by_query.pop(entry.query, None)
 
 
 # ----------------------------- resolution hints -----------------------------
@@ -647,7 +923,9 @@ Tools (full params + good/bad examples are in each tool's own schema):
     description of what you're doing + what you want to find (NOT keywords); a backend LLM
     parses intent, searches multiple sources, drops off-domain + non-paper records, and returns
     papers ranked by relevance (each a minimal record: title / authors / year / venue / abstract
-    / doi / arxiv_id / citation_count + a text reference).
+    / doi / arxiv_id / citation_count + a text reference). A long search returns
+    status="running" and a search_id after a bounded wait; retry with the same query or
+    query="<search_id>" to collect its results without restarting work.
 - get_paper(identifiers): look up ONE paper — or a LIST in a single call — by citation key /
     DOI / arXiv id / fuzzy text. Returns the same minimal record per identifier (plus its
     resolution status). READ-ONLY: a DOI/arxiv not already in the library returns not_found
@@ -670,10 +948,12 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
 """.strip())
 
     # Stash references on the server so __main__ / tests can manage lifecycle
+    search_registry = _PaperSearchRegistry(mcp, library)
     mcp._paper_library = library  # type: ignore[attr-defined]
     mcp._paper_download_queue = download_queue  # type: ignore[attr-defined]
     mcp._paper_extract_queue = extract_queue  # type: ignore[attr-defined]
     mcp._paper_registration_queue = registration_queue  # type: ignore[attr-defined]
+    mcp._paper_search_registry = search_registry  # type: ignore[attr-defined]
 
     # ---------------- get_paper ----------------
 
@@ -886,24 +1166,36 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         ``text_path``. Once registration commits, ``get_paper`` can resolve its
         DOI/arXiv identity or internal citation key; admission may still be pending.
 
-        Latency: minutes, not seconds — plan other work around the call. When the
-        service is saturated the call returns a normal result
+        Latency: minutes, not seconds — plan other work around the call. After
+        PAPERVAULT_MCP_SEARCH_WAIT_S (default 90 seconds), unfinished work returns
+        {"status": "running", "running": true, "search_id": "s-...", "retry_after_s": 5, ...}.
+        Call search_papers again with the SAME query or query="<search_id>" to collect
+        the results without restarting work. Completed results can be replayed by ID;
+        after collection, the same query starts fresh work (error responses are delivered
+        once and then evicted). Results are retained for PAPERVAULT_MCP_SEARCH_RETENTION_S
+        (default 900 seconds) after completion, subject to bounded capacity.
+        PAPERVAULT_MCP_SEARCH_WAIT_S <= 0 waits until completion.
+        When the service is saturated the call returns a normal result
         {"status": "busy", "busy": true, "retry_after_s": N, ...} instead of
         ``results``: nothing is wrong — wait retry_after_s seconds, then retry,
         rather than treating papervault as down or retrying at once.
         """
+        if search_registry.stopping:
+            return search_registry.stopping_reply()
+        entry = search_registry.find(query)
+        if entry is None:
+            stripped = (query or "").strip()
+            if _SEARCH_ID_RE.fullmatch(stripped):
+                return search_registry.not_found_reply(stripped)
+            if not stripped:
+                return search_registry.empty_reply()
+            entry = search_registry.start_new(stripped)
+            if entry is None:
+                return search_registry.capacity_busy_reply()
 
-        async def progress(step, message):
-            await _maybe_progress(ctx, step, 5, message)
+        return await search_registry.wait(entry, ctx)
 
-        pipeline = SearchPipeline(
-            library=library, registration_queue=mcp._paper_registration_queue,
-            llm_factory=get_llm, parse=parse_intent, retrieve=search_external_async,
-            judge_ingest=judge_ingest, judge_return=judge_return, project=_paper_dict,
-            reframe_hint=_reframe_hint, progress=progress,
-            authority_enabled=SEARCH_AUTHORITY_PRIOR, authority_weight=SEARCH_AUTHORITY_LAMBDA,
-        )
-        return await pipeline.run(query, service_fields=_degraded_fields(mcp))
+    search_registry.tool_fn = search_papers
 
     # ---------------- Distillation-tracking endpoints (curator queue) -------
     #

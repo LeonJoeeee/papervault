@@ -94,19 +94,56 @@ async def _judge(client: AsyncOpenAI, intent: str, papers: list[dict]) -> list[f
     raise AssertionError("unreachable")
 
 
-async def _search(intent: str) -> tuple[list[dict], float]:
+async def _search(intent: str, *, timeout_s: float = 900.0) -> tuple[list[dict], float]:
     t0 = time.monotonic()
+    deadline = t0 + timeout_s
+    current_query = intent
     async with streamablehttp_client(
-        "http://127.0.0.1:8080/mcp", sse_read_timeout=timedelta(seconds=120)
+        "http://127.0.0.1:8080/mcp",
+        sse_read_timeout=timedelta(seconds=max(630.0, timeout_s + 30.0)),
     ) as (r, w, _):
         async with ClientSession(r, w) as s:
             await s.initialize()
-            res = await s.call_tool(
-                "search_papers", {"query": intent},
-                read_timeout_seconds=timedelta(seconds=600),
-            )
-            data = json.loads(res.content[0].text)
-    return data.get("results") or [], time.monotonic() - t0
+            while True:
+                remaining = deadline - time.monotonic()
+                try:
+                    res = await s.call_tool(
+                        "search_papers",
+                        {"query": current_query},
+                        read_timeout_seconds=timedelta(seconds=min(600.0, max(5.0, remaining))),
+                    )
+                except Exception as exc:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"search_papers timed out after {timeout_s:.0f}s waiting for {current_query}"
+                        ) from exc
+                    raise
+                if getattr(res, "isError", False):
+                    detail = res.content[0].text if getattr(res, "content", None) else "MCP tool error"
+                    raise RuntimeError(f"search_papers MCP error: {detail}")
+                if not getattr(res, "content", None):
+                    raise RuntimeError("search_papers returned empty MCP content")
+                data = json.loads(res.content[0].text)
+                status = data.get("status")
+                if status == "ok":
+                    return data.get("results") or [], time.monotonic() - t0
+                if status == "running":
+                    search_id = data.get("search_id")
+                    if not isinstance(search_id, str) or not search_id:
+                        raise RuntimeError(
+                            f"search_papers returned status='running' without search_id: {data}"
+                        )
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(
+                            f"search_papers timed out after {timeout_s:.0f}s waiting for {search_id}"
+                        )
+                    retry_after = float(data.get("retry_after_s") or 5.0)
+                    await asyncio.sleep(min(max(0.1, retry_after), remaining))
+                    current_query = search_id
+                    continue
+                detail = data.get("reason") or data.get("message") or data
+                raise RuntimeError(f"search_papers failed with status={status!r}: {detail}")
 
 
 async def main() -> None:

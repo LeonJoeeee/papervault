@@ -2179,3 +2179,399 @@ async def test_raw_extract_resources_honor_current_exclusion(populated_lib, serv
                                              quarantine=marker == "quarantine")
     assert await _read(server, "library://extract/Wei2024.md") == ""
     assert await _read(server, "library://extract/Wei2024.txt") == ""
+
+
+# ============== bounded-wait resumable search_papers (#354) =================
+
+
+@pytest.mark.asyncio
+async def test_search_papers_schema_and_per_instance_registry_isolation(populated_lib, monkeypatch):
+    """#354 (1, 2): search_papers keeps its exact public input schema and attaches
+    isolated registry state to each FastMCP instance."""
+    import re
+    from papervault.library.mcp import server as srv
+
+    gate = asyncio.Event()
+    calls = []
+
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "0.01")
+    monkeypatch.setattr(srv, "get_llm", lambda: SimpleNamespace())
+    monkeypatch.setattr(srv, "parse_intent", lambda q, llm=None: _fake_plan(search_terms=[q]))
+
+    async def blocked_ext(terms, **kw):
+        calls.append(terms[0])
+        await gate.wait()
+        return [], {}
+
+    async def noop_ingest(cands, *, llm=None):
+        return {}, 0
+
+    async def noop_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {}, 0
+
+    monkeypatch.setattr(srv, "search_external_async", blocked_ext)
+    monkeypatch.setattr(srv, "judge_ingest", noop_ingest)
+    monkeypatch.setattr(srv, "judge_return", noop_return)
+
+    s1 = srv.build_server(library=populated_lib)
+    s2 = srv.build_server(library=populated_lib)
+    assert s1._paper_search_registry is not s2._paper_search_registry
+    assert s1._paper_search_registry.capacity == 128
+
+    tools = await s1.list_tools()
+    sp_tool = next(t for t in tools if t.name == "search_papers")
+    assert sp_tool.inputSchema["required"] == ["query"]
+    assert sp_tool.inputSchema["properties"] == {"query": {"title": "Query", "type": "string"}}
+
+    out1 = await _call(s1, "search_papers", {"query": "heliospheric modulation"})
+    assert out1["status"] == "running"
+    assert out1["running"] is True
+    assert re.fullmatch(r"s-[0-9a-f]{12}", out1["search_id"])
+    assert out1["retry_after_s"] == 5
+    assert out1["elapsed_s"] >= 0
+    assert out1["search_id"] in out1["reason"]
+
+    # s2 does NOT know about s1's running search_id or in-flight query.
+    miss_on_s2 = await _call(s2, "search_papers", {"query": out1["search_id"]})
+    assert miss_on_s2["status"] == "not_found"
+    assert s2._paper_search_registry.by_id == {}
+
+    gate.set()
+    res1 = await _call(s1, "search_papers", {"query": out1["search_id"]})
+    assert res1["status"] == "ok"
+    await s1._paper_search_registry.shutdown()
+    await s2._paper_search_registry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_search_papers_dedup_replay_retention_and_capacity(populated_lib, monkeypatch):
+    """#354 (2): concurrent identical queries share one task; collected ok results
+    pop by_query while retaining by_id until retention expiry; capacity evicts
+    collected before uncollected and never evicts active tasks."""
+    from papervault.library.mcp import server as srv
+
+    gate = asyncio.Event()
+    calls = []
+
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "0.01")
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_RETENTION_S", "900")
+    monkeypatch.setattr(srv, "get_llm", lambda: SimpleNamespace())
+    monkeypatch.setattr(srv, "parse_intent", lambda q, llm=None: _fake_plan(search_terms=[q]))
+
+    async def gated_ext(terms, **kw):
+        calls.append(terms[0])
+        await gate.wait()
+        return [], {}
+
+    async def noop_ingest(cands, *, llm=None):
+        return {}, 0
+
+    async def noop_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {}, 0
+
+    monkeypatch.setattr(srv, "search_external_async", gated_ext)
+    monkeypatch.setattr(srv, "judge_ingest", noop_ingest)
+    monkeypatch.setattr(srv, "judge_return", noop_return)
+
+    s = srv.build_server(library=populated_lib)
+    reg = s._paper_search_registry
+
+    # Concurrent identical stripped queries attach to the SAME execution.
+    a, b = await asyncio.gather(
+        _call(s, "search_papers", {"query": "  solar energetic particles "}),
+        _call(s, "search_papers", {"query": "solar energetic particles"}),
+    )
+    assert a["status"] == "running" and b["status"] == "running"
+    assert a["search_id"] == b["search_id"]
+    assert calls == ["solar energetic particles"]
+
+    gate.set()
+    first_collect = await _call(s, "search_papers", {"query": "solar energetic particles"})
+    assert first_collect["status"] == "ok"
+    assert reg.by_query == {}  # popped after collection so same query starts fresh work
+    assert a["search_id"] in reg.by_id and reg.by_id[a["search_id"]].collected is True
+
+    # Replay by search_id returns cached result without re-running pipeline.
+    replay = await _call(s, "search_papers", {"query": a["search_id"]})
+    assert replay["status"] == "ok"
+    assert calls == ["solar energetic particles"]
+
+    # Retention expiry removes completed entry lazily and returns not_found on ID poll.
+    reg.by_id[a["search_id"]].completed_at -= 901.0
+    expired = await _call(s, "search_papers", {"query": a["search_id"]})
+    assert expired["status"] == "not_found" and expired["search_id"] == a["search_id"]
+
+    # Capacity: prefers evicting collected=True over uncollected completed, and never evicts active.
+    reg.capacity = 2
+    gate.clear()
+    uncollected_run = await _call(s, "search_papers", {"query": "uncollected query"})
+    assert uncollected_run["status"] == "running"
+    # All slots active check when capacity == 1:
+    gate.set()
+    await reg.by_id[uncollected_run["search_id"]].task  # completed, uncollected
+
+    collected_ok = await _call(s, "search_papers", {"query": "collected query"})
+    assert collected_ok["status"] == "ok"
+    collected_id = next(k for k in reg.by_id if k != uncollected_run["search_id"])
+
+    third_ok = await _call(s, "search_papers", {"query": "third query"})
+    assert third_ok["status"] == "ok"
+    assert uncollected_run["search_id"] in reg.by_id  # uncollected preserved
+    assert collected_id not in reg.by_id              # collected evicted first
+
+    # Active tasks are never evicted -> busy when all slots active.
+    reg.by_id.clear()
+    reg.by_query.clear()
+    reg.capacity = 1
+    gate.clear()
+    active_one = await _call(s, "search_papers", {"query": "active slot"})
+    assert active_one["status"] == "running"
+    busy = await _call(s, "search_papers", {"query": "overflow slot"})
+    assert busy["status"] == "busy" and busy["busy"] is True and busy["retry_after_s"] == 5
+
+    gate.set()
+    await reg.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_search_papers_error_retained_until_collected_and_heartbeat_cancel_safe(
+    populated_lib, monkeypatch
+):
+    """#354 (3): status=='error' result dicts stay in registry until first collection,
+    are evicted on collection, and survive cancellation during heartbeat teardown;
+    waiter-scoped heartbeats reflect stage_message + elapsed_s with progressToken=0."""
+    from mcp.server.fastmcp import Context
+    from mcp.shared.context import RequestContext
+    from mcp.types import RequestParams
+    from papervault.library.mcp import server as srv
+
+    parse_gate = asyncio.Event()
+    calls = 0
+
+    def slow_bad_parse(q, llm=None):
+        nonlocal calls
+        calls += 1
+        raise ValueError("unparseable")
+
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "0.01")
+    monkeypatch.setattr(srv, "get_llm", lambda: SimpleNamespace())
+
+    async def slow_intent_wrapper(self, query, llm, trace):
+        await self.progress(1, "parsing intent")
+        await parse_gate.wait()
+        return self.parse(query, llm)
+
+    monkeypatch.setattr(srv.SearchPipeline, "intent", slow_intent_wrapper)
+    monkeypatch.setattr(srv, "parse_intent", slow_bad_parse)
+
+    s = srv.build_server(library=populated_lib)
+    reg = s._paper_search_registry
+    tool = s._tool_manager._tools["search_papers"]
+
+    running = await _call(s, "search_papers", {"query": "abstract method terms"})
+    assert running["status"] == "running"
+    entry = reg.by_id[running["search_id"]]
+    assert entry.stage_message == "parsing intent"
+
+    # Waiter-scoped heartbeat test with progressToken=0 and cancellation during cleanup!
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "0")
+    monkeypatch.setenv("PAPERVAULT_SEARCH_HEARTBEAT_S", "0.005")
+    notifications = []
+    sending = asyncio.Event()
+    cleaning = asyncio.Event()
+
+    async def send_progress_notification(**kwargs):
+        notifications.append(kwargs)
+        sending.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleaning.set()
+            await asyncio.Event().wait()
+
+    req = RequestContext(
+        request_id="req-hb-0",
+        meta=RequestParams.Meta(progressToken=0),
+        session=SimpleNamespace(send_progress_notification=send_progress_notification),
+        lifespan_context=None,
+    )
+    ctx = Context(request_context=req, fastmcp=s)
+
+    waiter = asyncio.create_task(tool.fn(query=running["search_id"], ctx=ctx))
+    await asyncio.wait_for(sending.wait(), 1.0)
+    assert len(notifications) == 1
+    assert notifications[0]["progress_token"] == 0
+    assert notifications[0]["progress"] == 1.0
+    assert notifications[0]["total"] is None
+    assert notifications[0]["related_request_id"] == "req-hb-0"
+    assert "parsing intent" in notifications[0]["message"]
+
+    # Complete with status=="error" while heartbeat is in cleanup, then cancel waiter!
+    parse_gate.set()
+    await asyncio.wait_for(cleaning.wait(), 1.0)
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    # Uncollected error MUST still be in the registry because waiter cancelled in heartbeat cleanup!
+    assert running["search_id"] in reg.by_id
+
+    # First completed collection delivers the error + reframe_hint, THEN evicts it!
+    err = await _call(s, "search_papers", {"query": running["search_id"]})
+    assert err["status"] == "error"
+    assert "reframe_hint" in err
+    assert calls == 1
+    assert running["search_id"] not in reg.by_id
+    assert reg.by_query == {}
+
+    # Subsequent poll by search_id sees not_found.
+    after = await _call(s, "search_papers", {"query": running["search_id"]})
+    assert after["status"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_search_papers_splices_live_degraded_fields_on_completion(populated_lib, monkeypatch):
+    """#354 (3): _degraded_fields(mcp) is spliced when SearchPipeline.run finishes,
+    capturing a _paper_boot_failed set while search_papers is already in flight."""
+    from papervault.library.mcp import server as srv
+
+    gate = asyncio.Event()
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "0.01")
+    monkeypatch.setattr(srv, "get_llm", lambda: SimpleNamespace())
+    monkeypatch.setattr(srv, "parse_intent", lambda q, llm=None: _fake_plan(search_terms=[q]))
+
+    async def ext(terms, **kw):
+        await gate.wait()
+        return [], {}
+
+    async def noop_ingest(cands, *, llm=None):
+        return {}, 0
+
+    async def noop_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {}, 0
+
+    monkeypatch.setattr(srv, "search_external_async", ext)
+    monkeypatch.setattr(srv, "judge_ingest", noop_ingest)
+    monkeypatch.setattr(srv, "judge_return", noop_return)
+
+    s = srv.build_server(library=populated_lib)
+    running = await _call(s, "search_papers", {"query": "in-flight boot failure test"})
+    assert running["status"] == "running"
+
+    # Boot fails AFTER search started!
+    s._paper_boot_failed = "library background boot failed: RuntimeError: boom"
+    gate.set()
+    done = await _call(s, "search_papers", {"query": running["search_id"]})
+    assert done["status"] == "ok"
+    assert done["service_degraded"] == "library background boot failed: RuntimeError: boom"
+    await s._paper_search_registry.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_search_papers_waiter_isolation_unbounded_wait_and_exception_eviction(
+    populated_lib, monkeypatch
+):
+    """#354 (2, 3): <=0 wait waits until completion, invalid env falls back to default,
+    a cancelled waiter's ctx stops receiving heartbeats while a resuming waiter's ctx
+    receives them, and an unhandled task exception is evicted on first collection."""
+    from mcp.server.fastmcp import Context
+    from mcp.shared.context import RequestContext
+    from mcp.types import RequestParams
+    from papervault.library.mcp import server as srv
+
+    for bad in ("not-a-float", "nan", "inf", "-inf"):
+        monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", bad)
+        assert srv._search_setting("PAPERVAULT_MCP_SEARCH_WAIT_S", 90.0) == 90.0
+
+    started = asyncio.Event()
+    gate = asyncio.Event()
+    should_fail = False
+
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "-1")
+    monkeypatch.setenv("PAPERVAULT_SEARCH_HEARTBEAT_S", "0.01")
+    monkeypatch.setattr(srv, "get_llm", lambda: SimpleNamespace())
+    monkeypatch.setattr(srv, "parse_intent", lambda q, llm=None: _fake_plan(search_terms=[q]))
+
+    async def ext(terms, **kw):
+        started.set()
+        await gate.wait()
+        if should_fail:
+            raise RuntimeError("upstream crash")
+        return [], {}
+
+    async def noop_ingest(cands, *, llm=None):
+        return {}, 0
+
+    async def noop_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {}, 0
+
+    monkeypatch.setattr(srv, "search_external_async", ext)
+    monkeypatch.setattr(srv, "judge_ingest", noop_ingest)
+    monkeypatch.setattr(srv, "judge_return", noop_return)
+
+    s = srv.build_server(library=populated_lib)
+    tool = s._tool_manager._tools["search_papers"]
+
+    first_notes, second_notes = [], []
+    second_tick = asyncio.Event()
+
+    async def send1(**kw):
+        first_notes.append(kw)
+
+    async def send2(**kw):
+        second_notes.append(kw)
+        second_tick.set()
+
+    ctx1 = Context(
+        request_context=RequestContext(
+            request_id="r1",
+            meta=RequestParams.Meta(progressToken="t1"),
+            session=SimpleNamespace(send_progress_notification=send1),
+            lifespan_context=None,
+        ),
+        fastmcp=s,
+    )
+    ctx2 = Context(
+        request_context=RequestContext(
+            request_id="r2",
+            meta=RequestParams.Meta(progressToken="t2"),
+            session=SimpleNamespace(send_progress_notification=send2),
+            lifespan_context=None,
+        ),
+        fastmcp=s,
+    )
+
+    w1 = asyncio.create_task(tool.fn(query="resumable across cancel", ctx=ctx1))
+    await started.wait()
+    w1.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await w1
+    count_after_cancel = len(first_notes)
+
+    # Second waiter attaches to the SAME running search, receives heartbeats on ctx2,
+    # and waits past 10ms until gate opens because PAPERVAULT_MCP_SEARCH_WAIT_S == -1.
+    w2 = asyncio.create_task(tool.fn(query="resumable across cancel", ctx=ctx2))
+    await asyncio.wait_for(second_tick.wait(), 1.0)
+    assert len(first_notes) == count_after_cancel
+    assert second_notes and second_notes[0]["related_request_id"] == "r2"
+    assert "searching external sources" in second_notes[0]["message"]
+
+    gate.set()
+    done = await asyncio.wait_for(w2, 1.0)
+    assert done["status"] == "ok"
+
+    # Unhandled task exception: retained until collected, raised on collection, then evicted.
+    started.clear()
+    gate.clear()
+    should_fail = True
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "0.005")
+    failing = await _call(s, "search_papers", {"query": "boom query"})
+    assert failing["status"] == "running"
+    gate.set()
+    await asyncio.gather(s._paper_search_registry.by_id[failing["search_id"]].task, return_exceptions=True)
+    with pytest.raises(Exception, match="upstream crash"):
+        await _call(s, "search_papers", {"query": failing["search_id"]})
+    assert failing["search_id"] not in s._paper_search_registry.by_id
+    assert s._paper_search_registry.by_query == {}
+    await s._paper_search_registry.shutdown()
+

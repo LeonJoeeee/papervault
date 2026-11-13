@@ -194,6 +194,8 @@ the PAPERS themselves and DIGESTED knowledge distilled from them. Three tools:
     working on and what you want to find; a backend LLM parses the intent, searches multiple
     sources, and returns papers ranked by relevance. Relevant finds are auto-ingested
     (downloaded + OCR'd) in the background so they become readable and, later, queryable.
+    A long search returns status="running" and a search_id after a bounded wait. Retry with
+    the same query or query="<search_id>" to collect its results without restarting work.
 - get_paper(identifiers): look up ONE paper — or a LIST in one call — by citation key / DOI /
     arXiv id / fuzzy text. Returns a minimal record per identifier plus EXACTLY ONE of
     ``text_path`` (Read it for verbatim full text) or ``text_status`` (pending / metadata_only /

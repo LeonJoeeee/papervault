@@ -254,3 +254,86 @@ def test_registration_starts_independently_of_stalled_acquisition_boot(tmp_path)
         assert not server._paper_registration_queue._started
         assert server._paper_registration_queue._workers == []
     asyncio.run(scenario())
+
+
+def test_shutdown_stops_detached_searches_before_registration_queue(tmp_path, monkeypatch):
+    """Shutdown marks registry.stopping immediately (before awaiting boot_task) and
+    cancels + drains active detached searches BEFORE registration_queue.stop()."""
+    from papervault.library.mcp import server as library_server
+
+    async def scenario():
+        monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "0.01")
+        monkeypatch.setattr(library_server, "get_llm", lambda: object())
+        monkeypatch.setattr(
+            library_server,
+            "parse_intent",
+            lambda q, llm=None: {
+                "search_terms": [q],
+                "filters": {},
+                "limit_suggested": 5,
+                "ranking_hint": "by_relevance",
+                "reasoning": "test",
+            },
+        )
+        search_started = asyncio.Event()
+        search_cancelled = asyncio.Event()
+
+        async def hanging_external(terms, **kw):
+            search_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                search_cancelled.set()
+                raise
+
+        monkeypatch.setattr(library_server, "search_external_async", hanging_external)
+
+        server = build_server(library_path=str(tmp_path))
+        boot_release = asyncio.Event()
+        boot_cancelling = asyncio.Event()
+        orig_extract_start = server._paper_extract_queue.start
+
+        async def slow_extract_start():
+            try:
+                await boot_release.wait()
+            except asyncio.CancelledError:
+                boot_cancelling.set()
+                # Yield during boot_task cancellation so we can verify stopping=True already set.
+                await asyncio.sleep(0)
+                raise
+            await orig_extract_start()
+
+        server._paper_extract_queue.start = slow_extract_start  # type: ignore[method-assign]
+        shutdown = await start_background(server, log)
+
+        tool = server._tool_manager._tools["search_papers"]
+        running = await tool.run({"query": "detached search during shutdown"})
+        assert running["status"] == "running"
+        await search_started.wait()
+
+        events: list[str] = []
+        orig_reg_stop = server._paper_registration_queue.stop
+
+        async def spy_reg_stop():
+            assert server._paper_search_registry.stopping is True
+            assert search_cancelled.is_set(), "detached search must finish cancelling before registration_queue.stop()"
+            assert server._paper_search_registry.by_id == {}
+            events.append("reg_stop")
+            await orig_reg_stop()
+
+        server._paper_registration_queue.stop = spy_reg_stop  # type: ignore[method-assign]
+
+        shutting_down = asyncio.create_task(shutdown())
+        await boot_cancelling.wait()
+        # Even before boot_task finishes awaiting, stopping is already True!
+        assert server._paper_search_registry.stopping is True
+        late_call = await tool.run({"query": "racing shutdown"})
+        assert late_call["status"] == "busy"
+
+        await shutting_down
+        assert events == ["reg_stop"]
+        # Idempotent second shutdown call on registry:
+        await server._paper_search_registry.shutdown()
+
+    asyncio.run(scenario())
+

@@ -61,6 +61,9 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
     download_queue = server._paper_download_queue   # type: ignore[attr-defined]
     extract_queue = server._paper_extract_queue     # type: ignore[attr-defined]
     registration_queue = server._paper_registration_queue  # type: ignore[attr-defined]
+    search_registry = getattr(server, "_paper_search_registry", None)
+    if search_registry is not None:
+        search_registry.stopping = False
     # Metadata registration has its own bounded worker and does not wait for
     # acquisition/OCR recovery or availability.
     await registration_queue.start()
@@ -147,6 +150,8 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
     server._paper_boot_task = boot_task  # type: ignore[attr-defined]
 
     async def shutdown() -> None:
+        if search_registry is not None:
+            search_registry.stopping = True
         # If the background boot is still running, stop it; if it finished, this
         # is a no-op and the await returns its (already-logged) result.
         boot_task.cancel()
@@ -166,7 +171,11 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
                 await _t
             except (asyncio.CancelledError, Exception):
                 pass
-        # Stop both queues UNCONDITIONALLY. Each ``stop()`` is idempotent-safe
+        # Drain detached searches BEFORE stopping registration_queue so no
+        # completing search submits registration work after queue teardown.
+        if search_registry is not None:
+            await search_registry.shutdown()
+        # Stop queues UNCONDITIONALLY. Each ``stop()`` is idempotent-safe
         # when the queue was never started (the boot raised before start(), or
         # a shutdown races an in-flight boot): with no workers spawned the
         # cancel/gather over an empty ``_workers`` list is a no-op, ``_pending``

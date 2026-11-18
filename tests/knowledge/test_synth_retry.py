@@ -190,7 +190,7 @@ async def test_synth_answer_omits_max_tokens_by_default_and_forwards_when_set(mo
     monkeypatch.setattr(synth_mod, "_SYNTH_MAX_TOKENS", None)
     assert await synth_answer(_DATA, _INTENT) == "synthesized answer [X2023]"
     assert "max_tokens" not in seen_kwargs[-1]
-    assert seen_kwargs[-1]["model"] == "gpt-6-astra@xhigh"
+    assert seen_kwargs[-1]["model"] == "gpt-6.2-astra@xhigh"
 
     monkeypatch.setattr(synth_mod, "_SYNTH_MAX_TOKENS", 12000)
     assert await synth_answer(_DATA, _INTENT) == "synthesized answer [X2023]"

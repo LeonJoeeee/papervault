@@ -936,6 +936,7 @@ async def test_max_tokens_omitted_by_default_and_forwarded_when_explicit(
 @pytest.mark.parametrize(
     "spec,expected_wire",
     [
+        ("gpt-6.2-astra@xhigh", {"model": "gpt-6.2-astra", "reasoning_effort": "xhigh"}),
         ("gpt-6-astra@xhigh", {"model": "gpt-6-astra", "reasoning_effort": "xhigh"}),
         ("gpt-6.1-terra@high", {"model": "gpt-6.1-terra", "reasoning_effort": "high"}),
         ("glm-5.3@max", {"model": "glm-5.3", "reasoning_effort": "max"}),
@@ -1148,6 +1149,76 @@ async def test_direct_pool_multi_target_route_fails_over_and_cools_down(tmp_path
         "gpt-6.1-terra",
         "gpt-6.1-terra",
     ]
+
+
+@pytest.mark.parametrize("gateway", [True, False])
+@pytest.mark.parametrize(
+    "relay_quota_error",
+    [
+        ("402", "HTTP 402 Payment Required", None),
+        ("403_quota", "预扣费额度失败, 用户剩余额度不足 (insufficient_user_quota)", None),
+        ("400_zhipu", "Zhipu error", {"error": {"code": "1308", "message": "limit"}}),
+    ],
+)
+async def test_three_tier_glm_to_relay_quota_to_codex_failover_and_cooldown(
+    tmp_path, monkeypatch, caplog, _instant_gateway_backoff, gateway, relay_quota_error,
+):
+    from papervault.llm_routing import is_model_cooled_down
+
+    _, msg, body = relay_quota_error
+
+    class _QuotaErr(Exception):
+        def __init__(self, status_code: int, message: str, *, err_body=None):
+            super().__init__(message)
+            self.status_code = status_code
+            self.body = err_body
+
+    code = 402 if relay_quota_error[0] == "402" else (403 if relay_quota_error[0] == "403_quota" else 400)
+    relay_err = _QuotaErr(code, msg, err_body=body)
+    tier1_err = _QuotaErr(429, "weekly limit reached")
+
+    f = tmp_path / "keys.json"
+    if gateway:
+        _gateway_mode(monkeypatch)
+    else:
+        monkeypatch.setattr(config, "USE_GATEWAY", False)
+        monkeypatch.setattr(llm_mod, "_BASE_BACKOFF", 0.0)
+        _write(f, [_group("shared-key")])
+
+    clock = [2000.0]
+    monkeypatch.setattr(llm_mod.time, "monotonic", lambda: clock[0])
+    created = _install_sequenced_stream_client(
+        monkeypatch,
+        [
+            tier1_err,             # Tier 1 glm-5.3 -> cools down
+            relay_err,             # Tier 2 relay-glm-5.3 (402 / 403 quota / 1308) -> cools down
+            list(_HELLO_STREAM),   # Tier 3 gpt-6.1-terra -> succeeds
+            list(_HELLO_STREAM),   # Call 2 inside 120s cooldown -> skips Tier 1 & Tier 2 directly to Tier 3
+        ],
+    )
+    pool = KeyPool(f)
+    route_spec = "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high"
+    with caplog.at_level("WARNING", logger="papervault.knowledge.store.llm"):
+        assert await pool.complete("c1", model=route_spec) == "Hello"
+        assert is_model_cooled_down("glm-5.3", now=clock[0])
+        assert is_model_cooled_down("relay-glm-5.3", now=clock[0])
+        clock[0] = 2040.0
+        assert await pool.complete("c2", model=route_spec) == "Hello"
+
+    assert [c["model"] for c in created] == [
+        "glm-5.3",
+        "relay-glm-5.3",
+        "gpt-6.1-terra",
+        "gpt-6.1-terra",
+    ]
+    assert [c["reasoning_effort"] for c in created] == ["max", "max", "high", "high"]
+    warnings = [r.getMessage() for r in caplog.records]
+    assert any("glm-5.3 -> relay-glm-5.3" in w for w in warnings)
+    assert any("relay-glm-5.3 -> gpt-6.1-terra" in w for w in warnings)
+    if not gateway:
+        # Quota-indicated 403 must NOT permanently disable the shared endpoint key in llm_keys.json:
+        saved = json.loads(f.read_text())
+        assert not saved[0].get("disabled")
 
 
 def test_default_first_chunk_s_is_zero_when_env_unset(tmp_path):

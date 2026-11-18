@@ -33,7 +33,9 @@ from papervault.llm_routing import (
     ModelTarget,
     clear_fallback_cooldowns as clear_fallback_cooldowns,
     format_targets,
+    http_status_code,
     is_model_cooled_down,
+    is_quota_exhaustion_error,
     litellm_wire_kwargs,
     parse_targets,
     record_model_cooldown,
@@ -249,6 +251,8 @@ def _is_failover_eligible(exc: Exception) -> bool:
     from openai import APITimeoutError
 
     code = _error_code(exc)
+    if is_quota_exhaustion_error(exc, code):
+        return True
     if code is not None:
         return code in {408, 429} or 500 <= code <= 599
     return isinstance(
@@ -428,14 +432,8 @@ def _env_fallback_groups() -> list[dict]:
 
 def _error_code(exc: Exception):
     """Best-effort HTTP status from an LLM/litellm exception; None if unknown.
-    Falls back to the type name (``*AuthenticationError*`` → 401)."""
-    code = getattr(exc, "status_code", None)
-    if code is None and "authentication" in type(exc).__name__.lower():
-        return 401
-    try:
-        return int(code) if code is not None else None
-    except (ValueError, TypeError):
-        return None
+    Falls back to ``response.status_code`` and type name (``*AuthenticationError*`` → 401)."""
+    return http_status_code(exc)
 
 
 class KeyPool:
@@ -535,10 +533,10 @@ class KeyPool:
         for g in groups:
             try:
                 return self._client(g).call(*args, **kwargs)
-            except Exception as e:  # noqa: BLE001 — fail over; auto-disable only on 401/403
+            except Exception as e:  # noqa: BLE001 — fail over; auto-disable only on non-quota 401/403
                 last_exc = e
                 code = _error_code(e)
-                if code in _PERMANENT_CODES:
+                if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
                     self._disable_key(g["api_key"], code, type(e).__name__)
         raise last_exc                               # every active key failed this call
 

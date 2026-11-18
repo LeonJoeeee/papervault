@@ -59,6 +59,7 @@ from papervault.llm_routing import (
     ModelTarget,
     clear_fallback_cooldowns as clear_fallback_cooldowns,
     is_model_cooled_down,
+    is_quota_exhaustion_error,
     openai_wire_kwargs,
     parse_targets,
     record_model_cooldown,
@@ -401,8 +402,10 @@ def _error_code(exc: Exception) -> int | None:
 
 
 def _is_failover_eligible(exc: Exception) -> bool:
-    """True iff ``exc`` is a transient upstream error eligible for immediate cross-model failover."""
+    """True iff ``exc`` is a transient or quota-exhaustion upstream error eligible for immediate cross-model failover."""
     code = _error_code(exc)
+    if is_quota_exhaustion_error(exc, code):
+        return True
     if code is not None:
         return code in _TRANSIENT_STATUSES or 500 <= code <= 599
     return isinstance(exc, (StreamTruncated, APITimeoutError, TimeoutError))
@@ -595,12 +598,12 @@ class KeyPool:
                     # vs slow generation, and on which endpoint). Additive only — flow unchanged.
                     logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s round=%d",
                                    dt, ep, code, type(e).__name__, round_idx)
-                    if code in _PERMANENT_CODES:
+                    if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
                         # PERMANENT: disable on first occurrence + drop from this call's pool.
                         await self._disable_key(g["api_key"], code, type(e).__name__)
                         base_groups = [x for x in base_groups
                                        if x.get("api_key") != g["api_key"]]
-                    # else TRANSIENT (429 / timeout / 5xx): just fail over, nothing remembered.
+                    # else TRANSIENT (429 / timeout / 5xx / quota): just fail over, nothing remembered.
                     continue
             if not base_groups:
                 break
@@ -656,7 +659,7 @@ class KeyPool:
                         code = _error_code(e)
                         logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s round=0",
                                        dt, ep, code, type(e).__name__)
-                        if code in _PERMANENT_CODES:
+                        if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
                             await self._disable_key(g["api_key"], code, type(e).__name__)
                             base_groups = [x for x in base_groups
                                            if x.get("api_key") != g["api_key"]]
@@ -708,7 +711,7 @@ class KeyPool:
                         code = _error_code(e)
                         logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s round=%d",
                                        dt, ep, code, type(e).__name__, round_idx)
-                        if code in _PERMANENT_CODES:
+                        if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
                             await self._disable_key(g["api_key"], code, type(e).__name__)
                             base_groups = [x for x in base_groups
                                            if x.get("api_key") != g["api_key"]]

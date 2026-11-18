@@ -106,8 +106,15 @@ def test_recipe_declares_every_tier_and_no_credentials(monkeypatch):
     from papervault.knowledge.scheduler.catalog_intake import effective_distill_recipe
     from papervault.store.repository import canonical_json
 
+    monkeypatch.delenv("PAPERVAULT_LLM_BUILD", raising=False)
+    monkeypatch.delenv("PAPERVAULT_LLM_KEYWORD", raising=False)
     monkeypatch.setenv("PAPERVAULT_LLM_API_KEY", "secret-must-never-enter-recipe")
     actual = effective_distill_recipe()
+    assert actual["configured_models"]["build"] == "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high"
+    assert (
+        actual["configured_models"]["keyword"]
+        == "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"
+    )
     for tier in ("fulltext", "abstract", "metadata"):
         contract = actual["output_contract"][tier]
         assert contract["required"]

@@ -123,31 +123,35 @@ retrieved-paper citation fallback, not a synthesis-quality measurement.
 All text LLM stages resolve through these nine roles via `PAPERVAULT_LLM_<ROLE>`
 as ordered `primary[,fallback...]` chains of concrete `ModelTarget` specs
 (`<model>[@<effort>|@thinking|@nothinking]`), validated per model family against
-the transparent LLM Gateway `v0.7.3` catalog and omitting `max_tokens` on the
-wire unless explicitly configured; see
-[ADR-0012](adr/0012-direct-role-model-routing-and-glm-fallback.md) and
-[ADR-0013](adr/0013-effort-tiered-role-routing-and-omitted-max-tokens.md).
-Multi-target GLM-primary production routes (`verify`, `gate`, `build`) fail over
-immediately on transient upstream errors (`429`, `408`, `5xx`, timeout,
-`StreamTruncated`) with a process-local primary cooldown
-(`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`, default `120`s), while single-target GPT
-roles use bounded same-model retries without cross-model fallback. `eval_judge`
-defaults to single-target `glm-5.3@max` so evaluation runs preserve a
-single-family ruler invariant unless an explicit multi-target
-`PAPERVAULT_LLM_EVAL_JUDGE` chain is configured. Search intent selects its own
-handle; the ingest and return gates share the judge handle.
+the transparent LLM Gateway catalog and omitting `max_tokens` on the wire unless
+explicitly configured; see
+[ADR-0012](adr/0012-direct-role-model-routing-and-glm-fallback.md),
+[ADR-0013](adr/0013-effort-tiered-role-routing-and-omitted-max-tokens.md), and
+[ADR-0014](adr/0014-three-tier-glm-relay-codex-routing-and-gpt62.md).
+Three-tier production routes (`build`, `gate`, `verify`, `keyword`, `judge`,
+`decompose`) drain official GLM subscription quota first, step to `relay-glm-*`
+balance, and fall back to Codex `gpt-6.1-terra` — failing over immediately on
+transient upstream errors (`429`, `408`, `5xx`, timeout, `StreamTruncated`) and
+quota/balance exhaustion (`402`, or quota-indicated `400/403/429`) with a
+process-local per-model cooldown (`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`, default
+`120`s), while single-target Codex roles (`intent`, `synth`) use bounded
+same-model retries without cross-model fallback. `eval_judge` defaults to
+two-tier same-family `glm-5.3@max,relay-glm-5.3@max` (without Tier 3 GPT
+fallback) so evaluation runs preserve a single-family ruler invariant. Search
+intent selects its own handle; the ingest and return gates share the judge
+handle.
 
 | Plane / LLM stage | Role | Default |
 | --- | --- | --- |
 | S1 intent parsing (API terms, local KG concepts, filters and ranking hints) | `intent` | `gpt-6.1-terra@high` |
-| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `gpt-6.1-terra@medium` |
-| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,gpt-6.1-terra@low` |
-| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.3@max,gpt-6.1-terra@high` |
-| S2 query high/low-level keyword extraction when needed | `keyword` | `gpt-6.1-terra@low` |
-| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `gpt-6.1-terra@high` |
-| S2 evidence-grounded synthesis (production/eval) | `synth` | `gpt-6-astra@xhigh` |
-| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.3@max` |
+| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
+| S2 query high/low-level keyword extraction when needed | `keyword` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` |
+| S2 evidence-grounded synthesis (production/eval) | `synth` | `gpt-6.2-astra@xhigh` |
+| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.3@max,relay-glm-5.3@max` |
 
 Planner, gate, verification and decomposition prompts include concrete calibration
 examples. Local embedding/reranking and the MinerU OCR service remain outside text

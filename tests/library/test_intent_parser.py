@@ -102,35 +102,34 @@ class FakeLLM:
 
 @pytest.mark.parametrize("term,expected", [
     ("PAMELA AMS-02 positron spectrum",
-     ["PAMELA positron spectrum", "PAMELA positron abundance",
-      "AMS-02 positron spectrum", "AMS-02 positron abundance"]),
+     ["PAMELA positron spectrum", "AMS-02 positron spectrum",
+      "PAMELA positron abundance", "AMS-02 positron abundance"]),
     ("AMS-02 PAMELA positron spectrum",
-     ["AMS-02 positron spectrum", "AMS-02 positron abundance",
-      "PAMELA positron spectrum", "PAMELA positron abundance"]),
+     ["AMS-02 positron spectrum", "PAMELA positron spectrum",
+      "AMS-02 positron abundance", "PAMELA positron abundance"]),
     ("PAMELA and AMS-02 electron and positron spectra",
      ["PAMELA electron and positron spectra", "AMS-02 electron and positron spectra"]),
     ("PAMELA/AMS-02 positron fraction",
-     ["PAMELA positron fraction", "PAMELA positron flux",
-      "AMS-02 positron fraction", "AMS-02 positron flux"]),
+     ["PAMELA positron fraction", "AMS-02 positron fraction",
+      "PAMELA positron flux", "AMS-02 positron flux"]),
     ("PAMELA vs. AMS-02 positron spectrum",
-     ["PAMELA positron spectrum", "PAMELA positron abundance",
-      "AMS-02 positron spectrum", "AMS-02 positron abundance"]),
+     ["PAMELA positron spectrum", "AMS-02 positron spectrum",
+      "PAMELA positron abundance", "AMS-02 positron abundance"]),
     ("pamela ams02 positron spectrum",
-     ["pamela positron spectrum", "pamela positron abundance",
-      "ams02 positron spectrum", "ams02 positron abundance"]),
+     ["pamela positron spectrum", "ams02 positron spectrum",
+      "pamela positron abundance", "ams02 positron abundance"]),
     ("PAMELA Alpha Magnetic Spectrometer positron spectrum",
-     ["PAMELA positron spectrum", "PAMELA positron abundance",
-      "Alpha Magnetic Spectrometer positron spectrum",
-      "Alpha Magnetic Spectrometer positron abundance"]),
+     ["PAMELA positron spectrum", "Alpha Magnetic Spectrometer positron spectrum",
+      "PAMELA positron abundance", "Alpha Magnetic Spectrometer positron abundance"]),
     ("Pierre Auger Observatory and Telescope Array cosmic ray spectrum",
-     ["Pierre Auger Observatory cosmic ray spectrum", "Pierre Auger Observatory cosmic ray abundance",
-      "Telescope Array cosmic ray spectrum", "Telescope Array cosmic ray abundance"]),
+     ["Pierre Auger Observatory cosmic ray spectrum", "Telescope Array cosmic ray spectrum",
+      "Pierre Auger Observatory cosmic ray abundance", "Telescope Array cosmic ray abundance"]),
     ("AMS-02 Alpha Magnetic Spectrometer PAMELA positron spectrum",
-     ["AMS-02 positron spectrum", "AMS-02 positron abundance",
-      "PAMELA positron spectrum", "PAMELA positron abundance"]),
+     ["AMS-02 positron spectrum", "PAMELA positron spectrum",
+      "AMS-02 positron abundance", "PAMELA positron abundance"]),
     ("positron spectrum PAMELA AMS-02",
-     ["PAMELA positron spectrum", "PAMELA positron abundance",
-      "AMS-02 positron spectrum", "AMS-02 positron abundance"]),
+     ["PAMELA positron spectrum", "AMS-02 positron spectrum",
+      "PAMELA positron abundance", "AMS-02 positron abundance"]),
     ("PAMELA AMS-02 (electron and positron) spectra",
      ["PAMELA (electron and positron) spectra", "AMS-02 (electron and positron) spectra"]),
 ])
@@ -226,15 +225,16 @@ def test_parse_intent_splits_before_deduplication_and_cap():
         "geomagnetic cutoff",
         "overflow facet",
     ]))
+    # All primary facets survive ahead of measurement siblings so later facets aren't evicted.
     assert plan["search_terms"] == [
         "cosmic ray positron",
         "AMS-02 positron spectrum",
-        "AMS-02 positron abundance",
         "PAMELA positron spectrum",
-        "PAMELA positron abundance",
         "solar modulation",
         "charge sign dependence",
         "interstellar flux",
+        "cosmic ray diffusion",
+        "geomagnetic cutoff",
     ]
 
 
@@ -245,8 +245,8 @@ def test_parse_intent_drops_alias_parentheses_before_deduplication():
         "AMS-02 positron spectrum",
     ]))
     assert plan["search_terms"] == [
-        "PAMELA positron spectrum", "PAMELA positron abundance",
-        "AMS-02 positron spectrum", "AMS-02 positron abundance",
+        "PAMELA positron spectrum", "AMS-02 positron spectrum",
+        "PAMELA positron abundance", "AMS-02 positron abundance",
     ]
 
 
@@ -261,17 +261,18 @@ def test_parse_intent_deduplicates_siblings_before_cap():
         "interstellar flux",
         "cosmic ray diffusion",
         "geomagnetic cutoff",
-        "overflow facet",
     ]))
+    # Sibling "PAMELA positron abundance" deduplicates against primary #2,
+    # leaving room for sibling "PAMELA positron fraction" in the final slot.
     assert plan["search_terms"] == [
         "PAMELA positron spectrum",
         "PAMELA positron abundance",
-        "PAMELA positron fraction",
         "solar modulation",
         "charge sign dependence",
         "interstellar flux",
         "cosmic ray diffusion",
         "geomagnetic cutoff",
+        "PAMELA positron fraction",
     ]
 
 
@@ -315,8 +316,8 @@ def test_parse_intent_cap_prioritizes_parent_before_sibling(padding, expected_ta
 def test_parse_intent_splits_merged_query_fallback(terms):
     plan = parse_intent("  PAMELA AMS-02 positron spectrum  ", FakeLLM(terms))
     assert plan["search_terms"] == [
-        "PAMELA positron spectrum", "PAMELA positron abundance",
-        "AMS-02 positron spectrum", "AMS-02 positron abundance",
+        "PAMELA positron spectrum", "AMS-02 positron spectrum",
+        "PAMELA positron abundance", "AMS-02 positron abundance",
     ]
 
 
@@ -426,8 +427,8 @@ def test_invalid_or_empty_kg_concepts_fall_back_to_final_search_terms(concepts):
                                "kg_concepts": concepts})
 
     plan = parse_intent("positron measurements", ConceptLLM())
-    assert plan["kg_concepts"] == ["PAMELA positron spectrum", "PAMELA positron abundance",
-                                   "AMS-02 positron spectrum", "AMS-02 positron abundance"]
+    assert plan["kg_concepts"] == ["PAMELA positron spectrum", "AMS-02 positron spectrum",
+                                   "PAMELA positron abundance", "AMS-02 positron abundance"]
 
 
 def test_missing_kg_concepts_fall_back_to_query_when_terms_are_missing():
@@ -443,3 +444,72 @@ def test_kg_concepts_are_bounded_after_deduplication():
     assert parse_intent("solar modulation", ConceptLLM())["kg_concepts"] == [
         "concept 0", "concept 1", "concept 2", "concept 3", "concept 4", "concept 5", "concept 6", "concept 7",
     ]
+
+
+@pytest.mark.parametrize("query", [
+    "宇宙线传输的经典论文",
+    "太阳风磁流体力学的奠基性研究",
+    "行星际激波加速开创性工作",
+    "日球层调制里程碑文献",
+    "Parker 太阳风原始推导",
+    "太阳高能粒子传输综述",
+    "磁重联研究回顾",
+    "空间天气预报研究现状",
+    "辐射带物理概览",
+    "经典扩散理论与最新进展",
+])
+def test_cjk_year_min_guard_clears_false_positive_recency_cut(query):
+    class FalseRecencyLLM:
+        def call(self, messages):
+            return json.dumps({
+                "search_terms": ["cosmic ray transport"],
+                "filters": {"year_min": 2021, "year_max": None},
+                "ranking_hint": "by_recency",
+            })
+
+    plan = parse_intent(query, FalseRecencyLLM())
+    assert plan["filters"]["year_min"] is None
+    assert plan["ranking_hint"] == "by_relevance"
+
+
+@pytest.mark.parametrize("query", [
+    "近三年太阳风湍流综述",
+    "近几年宇宙线调制回顾",
+    "近5年磁重联现状",
+    "最新的太阳高能粒子综述",
+    "近期辐射带研究概览",
+    "最近日球层物理综述",
+    "2024年宇宙线传输综述",
+])
+def test_cjk_year_min_guard_preserves_explicit_recency_cues(query):
+    class RecencyLLM:
+        def call(self, messages):
+            return json.dumps({
+                "search_terms": ["solar wind turbulence"],
+                "filters": {"year_min": 2022, "year_max": None},
+                "ranking_hint": "by_recency",
+            })
+
+    plan = parse_intent(query, RecencyLLM())
+    assert plan["filters"]["year_min"] == 2022
+    assert plan["ranking_hint"] == "by_recency"
+
+
+def test_intent_raw_decode_handles_surrounding_braces_and_retries_once_on_malformed_json():
+    calls = 0
+
+    class FlakyLLM:
+        def call(self, messages):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return "oops {not valid json at all"
+            return (
+                "Note: ignore {this prose brace}\n"
+                '{"search_terms": ["Parker spiral"], "filters": {}}\n'
+                "Trailing commentary {with braces}"
+            )
+
+    plan = parse_intent("Parker spiral solar wind", FlakyLLM())
+    assert calls == 2
+    assert plan["search_terms"] == ["Parker spiral"]

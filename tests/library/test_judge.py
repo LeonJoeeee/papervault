@@ -545,3 +545,106 @@ async def test_cancelled_judge_during_parse_retry_backoff_does_not_continue(monk
     with pytest.raises(asyncio.CancelledError):
         await task
     assert calls == 1
+
+
+def test_extract_json_obj_preserves_latex_braces_in_reason_during_salvage_and_trailing_braces():
+    raw_trailing = (
+        '{"items": [{"i": 0, "reason": "Solves \\\\frac{a}{b} for E_{max}", "score": 0.85}]}\n'
+        "Note: trailing {brace commentary}"
+    )
+    parsed = judge._extract_json_obj(raw_trailing)
+    assert len(parsed["items"]) == 1
+    assert parsed["items"][0]["i"] == 0
+    assert "\\frac{a}{b}" in parsed["items"][0]["reason"]
+
+    raw_salvage = (
+        '{"items": ['
+        '{"i": 0, "reason": "Derives \\\\kappa_{\\\\parallel} via \\\\frac{1}{2}", "score": 0.9}, '
+        '{"i": 1, "score": }, '
+        '{"i": 2, "reason": "Models B_{0} turbulence", "score": 0.7}'
+        "]}"
+    )
+    salvaged = judge._extract_json_obj(raw_salvage)
+    by_i = {it["i"]: it for it in salvaged["items"]}
+    assert sorted(by_i) == [0, 2]
+    assert "\\frac{1}{2}" in by_i[0]["reason"]
+    assert "B_{0}" in by_i[2]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_judge_partial_batch_retries_only_missing_subset_and_warns_when_unrecovered(
+        monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(judge, "_BACKOFF_BASE", 0.0)
+    cands = _many_cands(4)
+    seen_subsets: list[list[int]] = []
+
+    def call_recover(messages):
+        user = messages[1]["content"]
+        items = json.loads(user[user.index("[") : user.rindex("]") + 1])
+        ids = [it["i"] for it in items]
+        seen_subsets.append(ids)
+        if len(seen_subsets) == 1:
+            # First call returns only half the batch.
+            return json.dumps({"items": [
+                {"i": 0, "reason": "ok", "score": 0.8},
+                {"i": 1, "reason": "ok", "score": 0.7},
+            ]})
+        return json.dumps({"items": [
+            {"i": i, "reason": "recovered", "score": 0.6} for i in ids
+        ]})
+
+    judged, dropped = await judge_return(cands, "q", llm=SimpleNamespace(call=call_recover))
+    assert dropped == 0
+    assert seen_subsets == [[0, 1, 2, 3], [2, 3]]
+    assert set(judged) == {0, 1, 2, 3}
+
+    # Unrecovered partial items keep recovered subset, log warning, and increment stats.
+    before = judge.judge_stats()
+    unrecovered_subsets: list[list[int]] = []
+
+    def call_still_missing(messages):
+        user = messages[1]["content"]
+        items = json.loads(user[user.index("[") : user.rindex("]") + 1])
+        unrecovered_subsets.append([it["i"] for it in items])
+        return json.dumps({"items": [{"i": 0, "reason": "only zero", "score": 0.9}]})
+
+    with caplog.at_level(logging.WARNING, logger=judge.__name__):
+        judged2, dropped2 = await judge_return(
+            _many_cands(2), "q", llm=SimpleNamespace(call=call_still_missing)
+        )
+    assert dropped2 == 0
+    assert set(judged2) == {0}
+    assert unrecovered_subsets == [[0, 1], [1], [1]]
+    assert any("unrecovered missing" in rec.message for rec in caplog.records)
+    assert judge.judge_stats()["unrecovered_missing_items"] >= before["unrecovered_missing_items"] + 1
+
+
+@pytest.mark.asyncio
+async def test_judge_batch_timeout_bounds_hung_call(monkeypatch):
+    monkeypatch.setattr(judge, "_BACKOFF_BASE", 0.0)
+    monkeypatch.setenv("PAPERVAULT_JUDGE_BATCH_TIMEOUT_S", "0.05")
+    sem = asyncio.Semaphore(4)
+    monkeypatch.setattr(judge.concurrency, "llm_sem", sem)
+    release = threading.Event()
+    calls = 0
+
+    def hung_call(messages):
+        nonlocal calls
+        calls += 1
+        release.wait(2.0)
+        return json.dumps({"items": [{"i": 0, "reason": "late", "score": 0.8}]})
+
+    before = judge.judge_stats()
+    try:
+        judged, dropped = await asyncio.wait_for(
+            judge_return(_many_cands(1), "q", llm=SimpleNamespace(call=hung_call)),
+            timeout=1.0,
+        )
+        assert judged == {}
+        assert dropped == 1
+        assert calls == judge.MAX_RETRIES + 1
+        assert judge.judge_stats()["batch_timeouts"] >= before["batch_timeouts"] + 1
+    finally:
+        release.set()

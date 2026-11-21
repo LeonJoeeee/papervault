@@ -88,11 +88,15 @@ def diff(
         led = {k: v for k, v in led.items() if k in ks}
     d = Diff()
     for key, rec in idx.items():
-        fp = fp_of(rec)
         existing = led.get(key)
         if existing is None:
+            if getattr(rec, "is_deterministic_garbage", False):
+                continue  # Never distill new deterministic garbage into the graph
+            fp = fp_of(rec)
             d.to_distill.append((key, fp))
-        elif fp != existing.fingerprint:
+            continue
+        fp = fp_of(rec)
+        if fp != existing.fingerprint:
             d.to_redistill.append((key, fp))
         elif existing.status == "error":            # F9: 指纹未变也重投(否则永卡 error,§6.1.e)
             d.to_redistill.append((key, fp))
@@ -216,6 +220,8 @@ async def reconcile_library(rag, idx: Mapping, *, only_keys=None) -> dict:
         if own is not None or r.ingest_source != "paper" or r.source_id not in idx:
             continue
         if r.status not in ("done", "done_meta", "done_abstract", "error_parked") or r.attempts != 0:
+            continue
+        if getattr(idx[r.source_id], "is_deterministic_garbage", False):
             continue
         fp = await asyncio.to_thread(fingerprint, idx[r.source_id])
         if fp != META:

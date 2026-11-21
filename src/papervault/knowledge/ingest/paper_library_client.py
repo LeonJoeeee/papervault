@@ -130,12 +130,20 @@ class PaperRecord:
     merge_intent: Optional[dict[str, Any]] = None
 
     @property
-    def eligible(self) -> bool:
+    def is_deterministic_garbage(self) -> bool:
+        """True when bibliographic metadata matches the two-way deterministic garbage fence.
+
+        Checked on NEW distillation intake (``diff()`` / ``reconcile_library()``) rather than
+        ``eligible`` so pre-fence already-distilled graph documents are not retroactively
+        mass-purged on upgrade.
+        """
         from papervault.library.services.registration import deterministic_garbage_reason
 
+        return bool(deterministic_garbage_reason(self))
+
+    @property
+    def eligible(self) -> bool:
         if self.domain_status is not None or self.merge_intent is not None:
-            return False
-        if deterministic_garbage_reason(self):
             return False
         if self.terminal_state is None:
             return True

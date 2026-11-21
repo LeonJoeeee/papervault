@@ -31,7 +31,9 @@ def test_assert_safe_workspace_logs_info_once_then_debug(monkeypatch, caplog):
     assert len(debug_records) == 2
 
 
-def test_paper_library_client_cache_maxsize_and_garbage_filter(tmp_path):
+def test_paper_library_client_cache_maxsize_and_garbage_intake_fence(tmp_path):
+    from papervault.knowledge.scheduler.reconcile import diff
+
     assert client._load_vault_index.cache_info().maxsize == 1
 
     entries = {
@@ -44,10 +46,28 @@ def test_paper_library_client_cache_maxsize_and_garbage_filter(tmp_path):
         "Dataset": {"key": "Dataset", "title": "Magnetometer data", "authors": ["Smith, J."],
                     "publication_types": ["Dataset"]},
         "Anon": {"key": "Anon", "title": "Anonymous note", "authors": ["Anonymous"]},
+        "Quarantined": {"key": "Quarantined", "title": "Off domain", "authors": ["Smith, J."],
+                        "domain_status": "off_domain"},
     }
     (tmp_path / "index.json").write_text(json.dumps({"version": 1, "papers": entries}))
     clean = client.load_vault_index(tmp_path)
-    assert set(clean) == {"Clean2024"}
+    # Quarantined records remain excluded from clean view; pre-fence garbage records remain in clean
+    # view so already-distilled docs are NOT retroactively mass-purged, while flagged for intake skip.
+    assert "Quarantined" not in clean
+    assert clean["Clean2024"].is_deterministic_garbage is False
+    for junk_key in ("AguAbs", "EguAbs", "Dataset", "Anon"):
+        assert clean[junk_key].is_deterministic_garbage is True
+
+    # New deterministic garbage is skipped by diff().to_distill, while already-distilled legacy
+    # records stay untouched (NOT added to to_remove!).
+    existing_led = {
+        "AguAbs": LedgerRecord("l0_probe", "paper", "AguAbs", "fp_agu", "paper:AguAbs", "done"),
+    }
+    d = diff(clean, existing_led, fp_of=lambda r: "fp_agu" if r.key == "AguAbs" else f"fp_{r.key}")
+    assert [k for k, _ in d.to_distill] == ["Clean2024"]
+    assert d.to_remove == []
+    assert d.to_redistill == []
+
     all_recs = client.load_vault_index(tmp_path, include_quarantined=True)
     assert set(all_recs) == set(entries)
 
@@ -62,7 +82,7 @@ def test_paper_library_client_reads_pg_directly_when_authoritative(tmp_path, mon
     state = {
         "rows": [
             {"key": "P1", "revision": 1, "payload": {"key": "P1", "title": "Real PG paper", "authors": ["A. B."]}},
-            {"key": "Junk", "revision": 1, "payload": {"key": "Junk", "title": "Abstract", "venue": "AGU Fall Meeting"}},
+            {"key": "OffDom", "revision": 1, "payload": {"key": "OffDom", "title": "Off domain", "domain_status": "off_domain"}},
         ],
         "full_scans": 0,
     }

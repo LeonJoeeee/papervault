@@ -361,7 +361,11 @@ def _predict_with_oom_retry(model, pairs):
         try:
             return model.predict(pairs, batch_size=bs)
         except RuntimeError as e:  # torch.cuda.OutOfMemoryError is a RuntimeError subclass
-            if "out of memory" not in str(e).lower():
+            is_oom = (
+                "out of memory" in str(e).lower()
+                or any(cls.__name__ == "OutOfMemoryError" for cls in type(e).__mro__)
+            )
+            if not is_oom:
                 raise
             last = e
             try:

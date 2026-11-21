@@ -309,3 +309,32 @@ async def test_mcp_and_aquery_log_query_receipt_once(monkeypatch, caplog):
     receipt_logs = [r for r in caplog.records if getattr(r, "query_receipt", None) is not None]
     assert result["cited_papers"] == ["Alpha"]
     assert len(receipt_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_trimmed_prompt_chunks_excluded_from_verified_citations(monkeypatch, caplog):
+    """A paper retrieved in data but trimmed out by KS_SYNTH_MAX_PROMPT_TOKENS must NOT pass as
+    a verified cited_paper — citing it must trigger unverified_citations instead."""
+    monkeypatch.setattr(synth, "_SYNTH_MAX_PROMPT_TOKENS", 220)
+
+    async def fake_complete(prompt, **kwargs):
+        assert "KeepPaper2023" in prompt
+        assert "DropPaper2024" not in prompt
+        return "Findings supported by [KeepPaper2023] and hallucinated [DropPaper2024]."
+
+    monkeypatch.setattr(synth, "mimo_complete", fake_complete)
+    data = {
+        "chunks": [
+            {"file_path": "paper/KeepPaper2023", "content": "Concise finding about SEP onset."},
+            {"file_path": "paper/DropPaper2024", "content": " ".join(["overflow"] * 300)},
+        ],
+        "references": [{"file_path": "paper/KeepPaper2023"}, {"file_path": "paper/DropPaper2024"}],
+        "entities": [],
+        "relationships": [],
+    }
+    with caplog.at_level(logging.WARNING, logger="ks.query.aquery"):
+        out = await aq.synthesize_outfeed(data, META, "Summarize SEP onset.")
+    assert out["retrieved_papers"] == ["KeepPaper2023", "DropPaper2024"]
+    assert out["cited_papers"] == ["KeepPaper2023"]
+    assert out["query_receipt"]["unverified_citations"] == ["DropPaper2024"]
+    assert any("unverified inline citations" in r.getMessage() for r in caplog.records)

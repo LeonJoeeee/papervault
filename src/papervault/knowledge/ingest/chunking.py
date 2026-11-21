@@ -238,32 +238,64 @@ def _hard_split_oversized(
 def _split_oversized_table(
     tokenizer: Tokenizer, table: str, chunk_token_size: int, overlap: int
 ) -> list[tuple[int, str]]:
-    """Subdivide an oversized markdown table along row boundaries before falling back to token slicing."""
+    """Subdivide an oversized markdown table along row boundaries, repeating the header +
+    separator rows on every continuation chunk so numeric data rows keep their column labels."""
     rows = [ln.rstrip() for ln in table.splitlines() if ln.strip()]
+    if not rows:
+        return []
+
+    header_lines: list[str] = []
+    data_rows = rows
+    if len(rows) >= 2 and _TABLE_SEP_LINE.match(rows[1]):
+        cand_header = rows[:2]
+        cand_header_tok = len(tokenizer.encode("\n".join(cand_header)))
+        if cand_header_tok < chunk_token_size:
+            header_lines = cand_header
+            data_rows = rows[2:]
+            if not data_rows:
+                joined = "\n".join(header_lines)
+                return [(cand_header_tok, joined)]
+
+    header_tok = len(tokenizer.encode("\n".join(header_lines))) if header_lines else 0
     out: list[tuple[int, str]] = []
-    buf: list[str] = []
-    buf_est = 0
-    for row in rows:
+    buf: list[str] = list(header_lines)
+    buf_est = header_tok
+
+    def _has_body() -> bool:
+        return len(buf) > len(header_lines)
+
+    def _flush_buf() -> None:
+        nonlocal buf, buf_est
+        if _has_body():
+            joined = "\n".join(buf)
+            out.append((len(tokenizer.encode(joined)), joined))
+        buf = list(header_lines)
+        buf_est = header_tok
+
+    for row in data_rows:
         rtok = len(tokenizer.encode(row))
         if rtok > chunk_token_size:
-            if buf:
-                joined = "\n".join(buf)
-                out.append((len(tokenizer.encode(joined)), joined))
-                buf, buf_est = [], 0
+            _flush_buf()
             out.extend(_hard_split_oversized(tokenizer, row, chunk_token_size, overlap))
             continue
-        if buf and buf_est + 1 + rtok > chunk_token_size:
+        if _has_body() and buf_est + 1 + rtok > chunk_token_size:
             cand = "\n".join(buf + [row])
             if len(tokenizer.encode(cand)) > chunk_token_size:
-                joined = "\n".join(buf)
-                out.append((len(tokenizer.encode(joined)), joined))
-                buf, buf_est = [row], rtok
+                _flush_buf()
+        if header_lines and not _has_body():
+            cand_with_hdr = "\n".join(header_lines + [row])
+            cand_tok = len(tokenizer.encode(cand_with_hdr))
+            if cand_tok > chunk_token_size:
+                # Header + single wide row exceeds chunk limit: emit row alone cleanly.
+                out.append((rtok, row))
                 continue
+            buf.append(row)
+            buf_est = cand_tok
+            continue
         buf.append(row)
         buf_est = buf_est + 1 + rtok if len(buf) > 1 else rtok
-    if buf:
-        joined = "\n".join(buf)
-        out.append((len(tokenizer.encode(joined)), joined))
+
+    _flush_buf()
     return out
 
 

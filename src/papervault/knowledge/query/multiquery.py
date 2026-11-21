@@ -542,6 +542,20 @@ def _citation_map() -> dict[str, int]:
     return _citation_cache
 
 
+def _chunk_paper_key(c: dict) -> str:
+    """Resolve a chunk's source bucket using ``file_path``, ``paper_key``, or ``source_key``.
+
+    Distinct chunks carrying only ``paper_key`` (or ``source_key``) get their own paper bucket
+    instead of colliding under ``"unknown"``; genuinely unattributed chunks fall back to
+    ``chunk_id`` / object identity so they are never erroneously merged into one bucket.
+    """
+    raw = c.get("file_path") or c.get("paper_key") or c.get("source_key") or ""
+    label = _source_label(raw)[0]
+    if label != "unknown":
+        return label
+    return f"_unk:{c.get('chunk_id') or id(c)}"
+
+
 def _citation_rerank(ranked_chunks: list[dict]) -> list[dict]:
     """Path-1 authority rerank (two-pass, bias-safe). Re-order the RRF-fused chunk pool by blending
     each chunk's SEMANTIC rank (its position in the fused order) with its paper's CITATION rank
@@ -551,7 +565,9 @@ def _citation_rerank(ranked_chunks: list[dict]) -> list[dict]:
     cmap = _citation_map()
     if not cmap:
         return ranked_chunks
-    keyof = lambda c: (c.get("file_path") or "").split("/", 1)[-1]
+    keyof = lambda c: _source_label(
+        c.get("file_path") or c.get("paper_key") or c.get("source_key") or ""
+    )[0]
     pool_keys = list(dict.fromkeys(keyof(c) for c in ranked_chunks))
     by_cit = sorted(pool_keys, key=lambda k: -cmap.get(k, 0))   # most-cited papers in the pool first
     cit_rank = {k: i for i, k in enumerate(by_cit)}
@@ -676,13 +692,14 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
 
     _scored_chunks = _rrf_scored(
         _annotated_chunk_lists(datas),
-        key_fn=lambda c: (_source_label(c.get("file_path") or "")[0], c.get("chunk_id") or c.get("content")),
+        key_fn=lambda c: (_chunk_paper_key(c), c.get("chunk_id") or c.get("content")),
         # Tier priority must apply before any served-window cut.
         top=None,
     )
-    if _CITATION_PRIOR:
+    if _CITATION_PRIOR and _citation_map():
         # Path 1: authority rerank the full pool BEFORE the served cut / diversity step, so a
         # foundational paper crowded out of the top-60 by its descendants gets lifted into the window.
+        # Guarded on non-empty _citation_map() so an absent/empty map preserves raw RRF fusion scores.
         _reranked = _citation_rerank([c for c, _s in _scored_chunks])
         _scored_chunks = [(c, 1.0 / (_RRF_K + idx)) for idx, c in enumerate(_reranked)]
     _ranked_chunks = _order_chunks_by_tier(_scored_chunks)
@@ -692,7 +709,7 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
         chunks = []
         _per_paper: dict = {}
         for c in _ranked_chunks:
-            fp = _source_label(c.get("file_path") or "")[0]
+            fp = _chunk_paper_key(c)
             if _per_paper.get(fp, 0) >= _MQ_MAX_CHUNKS_PER_PAPER:
                 continue
             chunks.append(c)
@@ -707,7 +724,7 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
     seen: set = set()
     refs: list[dict] = []
     for c in chunks:
-        fp = c.get("file_path")
+        fp = c.get("file_path") or c.get("paper_key") or c.get("source_key")
         if fp and fp not in seen:
             seen.add(fp)
             refs.append({"file_path": fp, "reference_id": c.get("reference_id"), "source_tier": source_tier(c)})

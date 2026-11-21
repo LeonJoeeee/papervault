@@ -806,7 +806,8 @@ def test_build_pause_leaves_operator_input_pending(pending):
 
 
 def test_pdf_already_ingested_skips_mineru_ocr_and_moves_to_processed(tmp_path, monkeypatch):
-    """An already-ingested PDF drop (without .force) must skip MinerU OCR completely."""
+    """An already-ingested valid PDF drop (without .force) must skip MinerU OCR completely
+    and must NOT overwrite an existing healthy PDF already in processed/."""
     from papervault.knowledge.ingest import operator_docs as od
 
     monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
@@ -829,6 +830,48 @@ def test_pdf_already_ingested_skips_mineru_ocr_and_moves_to_processed(tmp_path, 
     assert extract.calls == []
     assert (d / "processed" / "textbook-Foo2020.pdf").exists()
     assert not (d / "textbook-Foo2020.pdf").exists()
+
+    # Dropping a second duplicate when processed/textbook-Foo2020.pdf already exists must NOT clobber it.
+    original_bytes = b"%PDF-ORIGINAL-HEALTHY"
+    (d / "processed" / "textbook-Foo2020.pdf").write_bytes(original_bytes)
+    _drop_pdf(d, "textbook-Foo2020.pdf", body=_VALID_PDF)
+    counts2 = _run(drain_pending(FakeRag(doc_status="processed")))
+    assert counts2["already"] == 1 and counts2["failed"] == 0
+    assert extract.calls == []
+    assert (d / "processed" / "textbook-Foo2020.pdf").read_bytes() == original_bytes
+    assert (d / "processed" / "textbook-Foo2020.dup1.pdf").read_bytes() == _VALID_PDF
+    assert not (d / "textbook-Foo2020.pdf").exists()
+
+
+def test_pdf_corrupt_duplicate_for_already_ingested_key_quarantined_pre_ocr(tmp_path, monkeypatch):
+    """pdf_probe runs BEFORE check_not_already_ingested so a corrupt PDF for an already-ingested
+    key routes to failed/ with .reason and never touches processed/."""
+    from papervault.knowledge.ingest import operator_docs as od
+
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    d = tmp_path / "pending"
+    d.mkdir()
+    (d / "processed").mkdir()
+    healthy = b"%PDF-EXISTING-HEALTHY"
+    (d / "processed" / "textbook-Foo2020.pdf").write_bytes(healthy)
+    monkeypatch.setenv("KS_OPDOC_PENDING_DIR", str(d))
+    op._disabled_logged.clear()
+    op._mineru_down_logged.clear()
+
+    async def _fake_load(ingest_source):
+        return {"Foo2020": object()}
+
+    monkeypatch.setattr(od.ledger, "load", _fake_load)
+    extract = FakeExtract()
+    _patch_extract(monkeypatch, extract)
+    _drop_pdf(d, "textbook-Foo2020.pdf", body=_CORRUPT_PDF)
+
+    counts = _run(drain_pending(FakeRag(doc_status="processed")))
+    assert counts["failed"] == 1 and counts["already"] == 0
+    assert extract.calls == []
+    assert (d / "failed" / "textbook-Foo2020.pdf").exists()
+    assert (d / "failed" / "textbook-Foo2020.pdf.reason").exists()
+    assert (d / "processed" / "textbook-Foo2020.pdf").read_bytes() == healthy
 
 
 def test_pdf_already_ingested_with_force_runs_ocr(tmp_path, monkeypatch):

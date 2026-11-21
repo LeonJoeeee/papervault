@@ -199,21 +199,25 @@ async def _clear_insert_path(rag, key: str) -> tuple[Optional[str], int]:
 
     Returns (blocking_doc_id, purged): blocking_doc_id is the id of a row that is NOT a stale
     marker yet still holds the file_path (LightRAG's filename dedup would reject the insert
-    against it), or None when the path is clear. Only stale markers are ever deleted.
-    Re-queries after each delete via ``find_doc_by_file_basename`` so ``is_duplicate=true``
-    markers under LightRAG 1.5.7 PG are visible and purged cleanly.
+    against it), or None when the path is clear. Only stale markers returned by LightRAG's own
+    ``doc_status.get_doc_by_file_basename`` are ever deleted: under LightRAG 1.5.7 PostgreSQL,
+    ``get_doc_by_file_basename`` already excludes ``is_duplicate=true`` rows from filename
+    conflicts, leaving those ``dup-*`` audit rows intact for ``reconcile_library``.
     """
     knowledge_runtime.assert_knowledge_authority("legacy")
+    ds = getattr(rag, "doc_status", None)
+    if ds is None or not hasattr(ds, "get_doc_by_file_basename"):
+        return None, 0
     basename = normalize_document_file_path(file_path(key))
     purged = 0
     while True:
-        match = await find_doc_by_file_basename(rag, basename)
+        match = await ds.get_doc_by_file_basename(basename)
         if not match:
             return None, purged
         mid, mdoc = match
         if purged >= _MAX_MARKER_PURGE or not await _is_stale_dup_marker(rag, mid, mdoc):
             return mid, purged
-        await rag.doc_status.delete([mid])
+        await ds.delete([mid])
         purged += 1
         log.info("distill_batch: purged stale duplicate marker %s blocking %s (#131)", mid, basename)
 

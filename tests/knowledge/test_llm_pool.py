@@ -1432,3 +1432,31 @@ async def test_direct_multi_target_fails_over_on_connection_error(tmp_path, monk
     out = await KeyPool(f).complete("ping", model="glm-5.3-flash@high,gpt-6.1-terra@medium")
     assert out == "Hello"
     assert [c["model"] for c in created] == ["glm-5.3-flash", "gpt-6.1-terra"]
+
+
+async def test_caller_timeout_does_not_override_tighter_gateway_retry_budget(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    """An explicit caller timeout must NOT expand a tighter KS_GATEWAY_RETRY_BUDGET_S (e.g. 0)."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_GW_RETRY_BUDGET_S", 0.0)
+    created = _install_sequenced_stream_client(monkeypatch, [_FakeError(503), list(_HELLO_STREAM)])
+    with pytest.raises(_FakeError):
+        await KeyPool(tmp_path / "unused.json").complete("ping", timeout=30.0)
+    assert len(created) == 1
+
+
+async def test_retries_zero_limits_gateway_connection_error_retries(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    """Passing retries=0 disables inner gateway connection-error retries too (no 3x7 amplification)."""
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_GW_CONN_BACKOFF_CAP", 0.0)
+    monkeypatch.setattr(llm_mod, "_GW_CONN_MAX_RETRIES", 6)
+    conn_err = openai.APIConnectionError(
+        request=httpx.Request("POST", "http://gw.example/v1/chat/completions")
+    )
+    created = _install_sequenced_stream_client(monkeypatch, [conn_err, list(_HELLO_STREAM)])
+    with pytest.raises(openai.APIConnectionError):
+        await KeyPool(tmp_path / "unused.json").complete("ping", retries=0)
+    assert len(created) == 1

@@ -210,7 +210,7 @@ def test_from_env_defaults_and_overrides():
         response=httpx.Response(400, request=_REQ),
         body={"error": {"code": "1308", "message": "limit"}},
     ),
-    _status_error(402), _status_error(429), _status_error(503),
+    _status_error(402), _status_error(404), _status_error(429), _status_error(503),
     openai.APIConnectionError(request=_REQ), openai.APITimeoutError(request=_REQ),
     StreamTruncated("cut"),
 ])

@@ -426,21 +426,24 @@ def _per_target_timeout(
     n_targets: int,
     caller_timeout: float | None,
     deadline: float,
+    budget_s: float | None = None,
 ) -> float | None:
     """Bounded per-target timeout so a hung non-final tier raises APITimeoutError and fails over."""
     if n_targets <= 1:
         if caller_timeout is not None:
             return min(caller_timeout, _CLIENT_TIMEOUT)
         return None
+    has_budget = budget_s is None or budget_s > 0
     remaining = max(0.05, deadline - time.monotonic())
     if not is_final:
         if caller_timeout is not None:
-            return min(caller_timeout * 0.45, remaining * 0.6, _CLIENT_TIMEOUT)
+            cap = min(caller_timeout * 0.45, _CLIENT_TIMEOUT)
+            return min(cap, remaining * 0.6) if has_budget else cap
         if _GW_RETRY_BUDGET_S > 0:
             return min(_GW_RETRY_BUDGET_S * 0.45, remaining * 0.6, _CLIENT_TIMEOUT)
         return None
     if caller_timeout is not None:
-        return min(remaining, _CLIENT_TIMEOUT)
+        return min(remaining, _CLIENT_TIMEOUT) if has_budget else min(caller_timeout, _CLIENT_TIMEOUT)
     return None
 
 
@@ -709,7 +712,12 @@ class KeyPool:
         raw_timeout = base_kwargs.pop("timeout", None)
         caller_timeout = float(raw_timeout) if raw_timeout is not None and float(raw_timeout) > 0 else None
         t_call = time.monotonic()
-        deadline = t_call + (caller_timeout if caller_timeout is not None else _GW_RETRY_BUDGET_S)
+        budget_s = (
+            min(caller_timeout, _GW_RETRY_BUDGET_S)
+            if caller_timeout is not None
+            else _GW_RETRY_BUDGET_S
+        )
+        deadline = t_call + budget_s
         max_rounds = _MAX_ROUNDS if retries is None else max(1, int(retries) + 1)
         for target_idx, target in enumerate(targets):
             is_final = target_idx == len(targets) - 1
@@ -732,6 +740,7 @@ class KeyPool:
                         n_targets=len(targets),
                         caller_timeout=caller_timeout,
                         deadline=deadline,
+                        budget_s=budget_s,
                     )
                     try:
                         client = self._client(g)
@@ -791,6 +800,7 @@ class KeyPool:
                         n_targets=len(targets),
                         caller_timeout=caller_timeout,
                         deadline=deadline,
+                        budget_s=budget_s,
                     )
                     try:
                         client = self._client(g)
@@ -863,8 +873,17 @@ class KeyPool:
         base_kwargs.pop("extra_headers", None)
 
         max_transient_retries = _GW_TRANSIENT_RETRIES if retries is None else max(0, int(retries))
+        max_conn_retries = (
+            _GW_CONN_MAX_RETRIES
+            if retries is None
+            else min(_GW_CONN_MAX_RETRIES, max(0, int(retries)))
+        )
         t_call = time.monotonic()
-        budget_s = caller_timeout if caller_timeout is not None else _GW_RETRY_BUDGET_S
+        budget_s = (
+            min(caller_timeout, _GW_RETRY_BUDGET_S)
+            if caller_timeout is not None
+            else _GW_RETRY_BUDGET_S
+        )
         deadline = t_call + budget_s   # ABSOLUTE: spans every attempt and every backoff
         for target_idx, target in enumerate(targets):
             is_final = target_idx == len(targets) - 1
@@ -883,6 +902,7 @@ class KeyPool:
                     n_targets=len(targets),
                     caller_timeout=caller_timeout,
                     deadline=deadline,
+                    budget_s=budget_s,
                 )
                 try:
                     client = self._gateway_client()
@@ -920,7 +940,8 @@ class KeyPool:
                                 break
                             raise
                         if not self._gateway_retry(
-                            e, ep, t0, deadline, retry_state, max_retries=max_transient_retries,
+                            e, ep, t0, deadline, retry_state,
+                            max_retries=max_transient_retries, budget_s=budget_s,
                         ):
                             raise
                         await asyncio.sleep(retry_state["sleep"])
@@ -928,13 +949,13 @@ class KeyPool:
                     conn_try += 1
                     remaining = deadline - time.monotonic()
                     delay = _retry_delay(conn_try, _GW_CONN_BACKOFF_CAP)
-                    if conn_try > _GW_CONN_MAX_RETRIES or remaining - delay <= max(_FIRST_CHUNK_S, 0.0):
+                    if conn_try > max_conn_retries or remaining - delay <= max(_FIRST_CHUNK_S, 0.0):
                         logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s "
                                        "(%.0fs of %.0fs budget left) — giving up",
                                        conn_try - 1, ep, max(0.0, remaining), budget_s)
                         raise
                     logger.warning("mimo gateway unreachable (conn err) endpoint=%s — backoff %.1fs (try %d/%d)",
-                                   ep, delay, conn_try, _GW_CONN_MAX_RETRIES)
+                                   ep, delay, conn_try, max_conn_retries)
                     await asyncio.sleep(delay)
                     continue
                 except Exception as e:  # noqa: BLE001
@@ -950,7 +971,8 @@ class KeyPool:
                             break
                         raise
                     if not self._gateway_retry(
-                        e, ep, t0, deadline, retry_state, max_retries=max_transient_retries,
+                        e, ep, t0, deadline, retry_state,
+                        max_retries=max_transient_retries, budget_s=budget_s,
                     ):
                         raise
                     await asyncio.sleep(retry_state["sleep"])
@@ -999,6 +1021,7 @@ class KeyPool:
         state: dict,
         *,
         max_retries: int | None = None,
+        budget_s: float | None = None,
     ) -> bool:
         """Log the failed attempt; decide whether it gets one of the bounded TRANSIENT retries
         (issue #102): a stream cut before/while answering (``StreamTruncated``), a transport
@@ -1023,10 +1046,11 @@ class KeyPool:
             return False
         state["tries"] += 1
         state["sleep"] = delay
+        eff_budget = _GW_RETRY_BUDGET_S if budget_s is None else budget_s
         logger.warning("mimo gateway transient failure (%s) endpoint=%s — retrying in %.1fs "
                        "(try %d/%d, %.0fs of %.0fs budget left)",
                        type(e).__name__, ep, delay, state["tries"], limit,
-                       remaining, _GW_RETRY_BUDGET_S)
+                       remaining, eff_budget)
         return True
 
     # ---- 401/403 auto-disable: the only persistent state, written to the shared file ----

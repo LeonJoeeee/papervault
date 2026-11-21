@@ -162,11 +162,16 @@ def test_get_graph_wires_rerank_and_prompt_before_ctor(monkeypatch, tmp_path):
     Everything heavy (assert_safe_workspace, LightRAG ctor, storage init) is stubbed so this
     runs with no DB / no model. We assert ordering via a shared event log.
     """
+    from dataclasses import replace
     from papervault.knowledge.store import graph as graph_mod
 
     events = []
     monkeypatch.setattr(graph_mod, "_RAG", None)
-    monkeypatch.setattr(graph_mod.CONFIG.lightrag, "working_dir", str(tmp_path))
+    monkeypatch.setattr(
+        graph_mod,
+        "CONFIG",
+        replace(graph_mod.CONFIG, lightrag=replace(graph_mod.CONFIG.lightrag, working_dir=str(tmp_path))),
+    )
     monkeypatch.setattr(graph_mod, "assert_safe_workspace", lambda: "l0_probe")
     monkeypatch.setattr(
         graph_mod, "apply_ks_extraction_prompt", lambda **kw: events.append(("prompt", kw))

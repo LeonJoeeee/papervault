@@ -197,9 +197,10 @@ class BuildSchedule:
 
 def is_upstream_failure(exc: BaseException) -> bool:
     """True when ``exc`` (or an exception in its ``__cause__`` chain) is an upstream/gateway failure:
-    an upstream/quota HTTP status (401/402/403/408/429/5xx, or quota-indicated 400), a transport
-    error, or a stream cut short. Deterministic non-quota 400/422 validation errors, cancellations,
-    and every other error are the caller's, not the upstream's."""
+    an upstream/quota HTTP status (4xx/5xx except deterministic non-quota 400/422 validation
+    errors — keeping 404 missing model/endpoint, 401/402/403/408/429, 5xx, and quota-indicated
+    400), a transport error, or a stream cut short. Deterministic non-quota 400/422 validation
+    errors, cancellations, and every other error are the caller's, not the upstream's."""
     seen: set[int] = set()
     e: Optional[BaseException] = exc
     while e is not None and id(e) not in seen:
@@ -212,7 +213,7 @@ def is_upstream_failure(exc: BaseException) -> bool:
             code = _error_code(e)
             if is_quota_exhaustion_error(e, code):
                 return True
-            if code is not None and (code in {401, 402, 403, 408, 429} or 500 <= code <= 599):
+            if code is not None and 400 <= code < 600 and code not in {400, 422}:
                 return True
         e = e.__cause__
     return False

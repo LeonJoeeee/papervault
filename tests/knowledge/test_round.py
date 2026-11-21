@@ -1037,12 +1037,13 @@ async def test_reconcile_library_skips_basename_lookup_for_plain_done_meta_rows(
     assert not any(kind == "get_doc_by_file_basename" for kind, _ in rag.calls)
 
 
-async def test_find_doc_by_file_basename_sees_pg_duplicate_rows_in_clear_and_reconcile(
+async def test_pg_duplicate_audit_rows_preserved_on_clear_and_read_by_reconcile(
     fake_ledger, monkeypatch,
 ):
-    """LightRAG 1.5.7's PGDocStatusStorage.get_doc_by_file_basename hides is_duplicate=true rows;
-    find_doc_by_file_basename queries LIGHTRAG_DOC_STATUS directly so both _clear_insert_path and
-    reconcile_library see dup-* rows."""
+    """Under LightRAG 1.5.7 PostgreSQL, PGDocStatusStorage.get_doc_by_file_basename excludes
+    is_duplicate=true rows from filename conflicts. Therefore:
+    1) _clear_insert_path leaves PG dup-* audit rows intact instead of deleting audit history.
+    2) reconcile_library still reads those is_duplicate=true rows via find_doc_by_file_basename."""
     from lightrag.utils_pipeline import compute_text_content_hash
     from papervault.knowledge.scheduler.reconcile import reconcile_library
 
@@ -1067,17 +1068,17 @@ async def test_find_doc_by_file_basename_sees_pg_duplicate_rows_in_clear_and_rec
                 )
             return matches[:1] if multi_rows else matches[0]
 
-    # 1. _clear_insert_path purges a stale dup-* marker even though stock get_doc_by_file_basename hides it.
+    # 1. _clear_insert_path leaves PG is_duplicate=true audit row intact (LightRAG 1.5.7 excludes it).
     monkeypatch.setattr(distill, "read_extract_raw", lambda rec: "body of Stale")
     rag1 = FakeRag(markers={"dup-stale": _marker("Stale", "paper:Stale")})
     rag1.doc_status.workspace = "l0_probe"
     rag1.doc_status.db = _PgDb(rag1.rows)
     rag1.doc_status.get_doc_by_file_basename = (
-        lambda bn: asyncio.sleep(0, result=None)  # simulates 1.5.7 hiding is_duplicate=true
+        lambda bn: asyncio.sleep(0, result=None)  # simulates 1.5.7 excluding is_duplicate=true
     )
-    counters = await distill.distill_batch(rag1, [(_rec("Stale"), "fpStale")])
-    assert counters["purged_markers"] == 1 and counters["queued"] == 1
-    assert "dup-stale" not in rag1.rows
+    blocker, purged = await distill._clear_insert_path(rag1, "Stale")
+    assert blocker is None and purged == 0
+    assert "dup-stale" in rag1.rows
 
     # 2. reconcile_library adopts content_hash twin from hidden PG dup-* marker.
     fake_ledger.rows["Dup"] = LedgerRecord("l0_probe", "paper", "Dup", "fpDup", "paper:Dup", "processing")

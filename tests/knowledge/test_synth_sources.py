@@ -80,7 +80,8 @@ def test_build_prompt_trims_tail_chunks_to_token_ceiling(monkeypatch, caplog):
     import logging
     from papervault.knowledge.query import synth
 
-    monkeypatch.setattr(synth, "_SYNTH_MAX_PROMPT_TOKENS", 60)
+    limit = 220
+    monkeypatch.setattr(synth, "_SYNTH_MAX_PROMPT_TOKENS", limit)
     data = {
         "chunks": [
             {"file_path": "paper/Keep1", "content": "Important first finding about solar wind."},
@@ -91,5 +92,25 @@ def test_build_prompt_trims_tail_chunks_to_token_ceiling(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="ks.query.synth"):
         prompt = _build_prompt(data, "Summarize.")
     assert "Keep1" in prompt
-    assert "Drop3" not in prompt
+    assert "Drop2" not in prompt and "Drop3" not in prompt
+    assert synth._count_prompt_tokens(prompt) <= limit
     assert "trimmed" in caplog.text.lower()
+
+
+def test_build_prompt_truncates_single_oversized_chunk_to_token_ceiling(monkeypatch, caplog):
+    import logging
+    from papervault.knowledge.query import synth
+
+    limit = 220
+    monkeypatch.setattr(synth, "_SYNTH_MAX_PROMPT_TOKENS", limit)
+    data = {
+        "chunks": [
+            {"file_path": "paper/Giant2024", "content": " ".join(f"word{i}" for i in range(600))},
+        ],
+    }
+    with caplog.at_level(logging.WARNING, logger="ks.query.synth"):
+        prompt = _build_prompt(data, "Summarize.")
+    assert "Giant2024" in prompt
+    assert "[truncated]" in prompt
+    assert synth._count_prompt_tokens(prompt) <= limit
+    assert "truncated lead chunk" in caplog.text.lower()

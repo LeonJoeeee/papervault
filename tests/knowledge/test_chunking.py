@@ -136,17 +136,25 @@ def test_preserves_paragraphs_headings_and_markdown_tables(tok):
     assert "## Observations\n\n" in content
     assert table in content
 
-    # Oversized markdown table splits on row boundaries without exceeding chunk_token_size.
+    # Oversized markdown table splits on row boundaries and repeats header+separator on every chunk.
     big_rows = ["| ColA | ColB | ColC |", "| --- | --- | --- |"] + [
         f"| Row{i} alpha beta | value_{i} gamma delta | note_{i} epsilon |" for i in range(60)
     ]
     big_table = "\n".join(big_rows)
     table_chunks = chunking_by_sentence_boundary(tok, big_table, None, False, 10, 120)
     assert len(table_chunks) >= 3
+    seen_rows = set()
     for c in table_chunks:
         assert c["tokens"] <= 120
-        for line in c["content"].splitlines():
+        assert c["tokens"] == len(tok.encode(c["content"]))
+        lines = c["content"].splitlines()
+        assert lines[0] == "| ColA | ColB | ColC |"
+        assert lines[1] == "| --- | --- | --- |"
+        assert len(lines) >= 3
+        for line in lines:
             assert line.startswith("|") and line.endswith("|")
+        seen_rows.update(lines[2:])
+    assert len(seen_rows) == 60
 
 
 def test_overlap_carry_trimmed_so_large_next_unit_never_exceeds_limit(tok):

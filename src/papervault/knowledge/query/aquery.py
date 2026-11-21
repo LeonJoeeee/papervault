@@ -149,6 +149,8 @@ def _normalize_citation_token(token: str) -> str:
 def _parse_inline_citations(
     answer: str | None,
     known_keys: set[str],
+    *,
+    unverified_hint_keys: set[str] | None = None,
 ) -> tuple[Counter[str], list[str]]:
     """Parse verified inline citation keys and detect citation-like unverified brackets.
 
@@ -160,6 +162,7 @@ def _parse_inline_citations(
     unverified: list[str] = []
     if not answer:
         return counts, unverified
+    hints = unverified_hint_keys or set()
     for match in re.finditer(r"\[([^\[\]\n]+)\]", answer):
         inner = match.group(1).strip()
         if not inner:
@@ -183,7 +186,7 @@ def _parse_inline_citations(
             if cand in known_keys:
                 counts[cand] += 1
                 continue
-            if cand and _CITATION_LIKE_RE.match(cand) and cand not in unverified:
+            if cand and (_CITATION_LIKE_RE.match(cand) or cand in hints) and cand not in unverified:
                 unverified.append(cand)
     return counts, unverified
 
@@ -233,12 +236,14 @@ def build_outfeed(
     query_mode: str = _QUERY_MODE, variant: str = "single", rerank_degraded: bool = False,
     synthesis_model: str | None = None, synthesis_latency_s: float = 0.0,
     serving_manifest: dict[str, Any] | None = None,
+    presented_data: dict[str, Any] | None = None,
     _annotated: bool = False,
 ) -> dict[str, Any]:
     """Pure production/eval contract over one captured retrieval and its answer.
 
     No-synthesis eval retains retrieval-ranked candidates as cited_papers for recall
-    compatibility. All synthesized outputs admit only verified inline keys in that pool.
+    compatibility. All synthesized outputs admit only verified inline keys actually
+    presented to synthesis (excluding chunks trimmed by the synth token ceiling).
     The model records the requested routing level; the gateway's underlying model is
     undisclosed and is never inferred from configuration.
     """
@@ -247,20 +252,30 @@ def build_outfeed(
     coverage = _assess_coverage(metadata, data, _annotated=True)
     papers = _retrieved_keys(data)
     sources = _retrieved_keys(data, sources=True)
+    if presented_data is not None:
+        citeable_papers = _retrieved_keys(presented_data)
+        citeable_sources = _retrieved_keys(presented_data, sources=True)
+    else:
+        citeable_papers, citeable_sources = papers, sources
     if coverage == "empty" and not no_synth:
         answer = _EMPTY["answer"]
     if no_synth:
         counts: Counter[str] = Counter()
         unverified: list[str] = []
     else:
-        counts, unverified = _parse_inline_citations(answer, set(papers) | set(sources))
+        known = set(citeable_papers) | set(citeable_sources)
+        trimmed = (set(papers) | set(sources)) - known
+        counts, unverified = _parse_inline_citations(
+            answer, known, unverified_hint_keys=trimmed,
+        )
         if unverified:
             logger.warning("unverified inline citations in answer: %s", unverified)
     def cited(keys):
         if no_synth:
             return list(keys)
         return sorted((k for k in keys if counts[k]), key=lambda k: (-counts[k], keys.index(k)))
-    cited_papers, cited_sources = cited(papers), cited(sources)
+    cited_papers = cited(papers if no_synth else citeable_papers)
+    cited_sources = cited(sources if no_synth else citeable_sources)
     abstract = set(_abstract_only_papers(data))
     fulltext = {_source_label(c.get("file_path") or c.get("paper_key") or "")[0] for c in data["chunks"]
                 if source_tier(c) != "abstract_only"}
@@ -308,16 +323,23 @@ async def synthesize_outfeed(
     coverage = _assess_coverage(metadata, data, _annotated=True)
     answer = None
     model, latency = None, 0.0
+    presented_data: dict[str, Any] | None = None
     if not no_synth and coverage != "empty":
         model = route("synth")
         started = time.monotonic()
         if synth_answer is _DEFAULT_SYNTH_ANSWER:
-            answer = await synth_answer(data, intent, kb_coverage=coverage, _annotated=True)
+            presented_chunks: list[dict[str, Any]] = []
+            answer = await synth_answer(
+                data, intent, kb_coverage=coverage,
+                _annotated=True, _presented_chunks_out=presented_chunks,
+            )
+            presented_data = {"chunks": presented_chunks, "references": []}
         else:
             answer = await synth_answer(data, intent, kb_coverage=coverage)
         latency = time.monotonic() - started
     out = build_outfeed(data, metadata, answer, no_synth=no_synth,
                         synthesis_model=model, synthesis_latency_s=latency,
+                        presented_data=presented_data,
                         _annotated=True, **receipt_fields)
     logger.info("query_receipt %s", out["query_receipt"], extra={"query_receipt": out["query_receipt"]})
     if (logged := _receipt_logged_in_scope.get()) is not None:

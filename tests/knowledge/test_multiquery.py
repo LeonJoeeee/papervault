@@ -389,3 +389,45 @@ def test_rrf_chunk_id_undirected_rel_retrieve_standard_tokens_and_domain_prompt(
     monkeypatch.setattr(mq, "_decompose_standard", fake_decompose)
     _run(mq.retrieve_standard("intent", Rag()))
     assert seen_params and seen_params[0].max_total_tokens == mq._MAX_TOTAL_TOKENS
+
+
+def test_per_paper_cap_uses_paper_key_when_file_path_absent(monkeypatch):
+    """Chunks carrying only paper_key (no file_path) must bucket by paper_key, not collapse into 'unknown'."""
+    _patch_decompose(monkeypatch, 1)
+    monkeypatch.setattr(mq.aq, "_CHUNK_TOP_K", 6)
+    monkeypatch.setattr(mq, "_MQ_MAX_CHUNKS_PER_PAPER", 1)
+    base = _strong_base()
+    base["data"]["chunks"] = [
+        {"chunk_id": "a1", "paper_key": "PaperA", "content": "PaperA chunk 1"},
+        {"chunk_id": "a2", "paper_key": "PaperA", "content": "PaperA chunk 2"},
+        {"chunk_id": "b1", "paper_key": "PaperB", "content": "PaperB chunk 1"},
+        {"chunk_id": "c1", "paper_key": "PaperC", "content": "PaperC chunk 1"},
+        {"chunk_id": "d1", "paper_key": "PaperD", "content": "PaperD chunk 1"},
+    ]
+    data, _, fused = _run(mq.retrieve_fused("anchor", _StubRag(base, [_ok_facet("FacetX")])))
+    assert fused is True
+    keys = [c.get("paper_key") or c.get("file_path") for c in data["chunks"]]
+    assert set(keys) >= {"PaperA", "PaperB", "PaperC", "PaperD"}
+    assert keys.count("PaperA") == 1
+
+
+def test_empty_citation_map_preserves_rrf_fusion_scores_against_canon_boost(monkeypatch):
+    """When citation_map is empty, _CITATION_PRIOR must NOT discard multi-facet RRF fusion scores."""
+    _patch_decompose(monkeypatch, 2)
+    monkeypatch.setattr(mq, "_CITATION_PRIOR", True)
+    monkeypatch.setattr(mq, "_citation_map", lambda: {})
+    monkeypatch.setattr(mq.aq, "_CHUNK_TOP_K", 2)
+
+    base = _strong_base()
+    base["data"]["chunks"] = [
+        {"chunk_id": "tb1", "file_path": "textbook:Book2002#s1", "content": "Single-facet textbook"},
+        {"chunk_id": "p1", "file_path": "paper/Consensus2023", "content": "Multi-facet consensus"},
+    ]
+    f1 = _ok_facet("Consensus2023")
+    f1["data"]["chunks"] = [{"chunk_id": "p1", "file_path": "paper/Consensus2023", "content": "Multi-facet consensus"}]
+    f2 = _ok_facet("Consensus2023")
+    f2["data"]["chunks"] = [{"chunk_id": "p1", "file_path": "paper/Consensus2023", "content": "Multi-facet consensus"}]
+    data, _, fused = _run(mq.retrieve_fused("anchor", _StubRag(base, [f1, f2])))
+    assert fused is True
+    # Consensus2023 appeared in 3 lists (RRF ~0.0497) vs Book2002 in 1 list + canon boost (~0.0183)
+    assert data["chunks"][0]["file_path"] == "paper/Consensus2023"

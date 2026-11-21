@@ -208,3 +208,54 @@ async def test_quota_429_is_not_retried_by_synth(monkeypatch):
     out = await synth_answer(_DATA, _INTENT)
     assert out.startswith(SYNTH_FAILED_PREFIX)
     assert len(calls) == 1
+
+
+async def test_direct_mode_single_key_transient_503_retries_and_403_fails_fast(tmp_path, monkeypatch):
+    """In direct mode (USE_GATEWAY=False) with a single key, retries=0 stops KeyPool rounds at 1,
+    so synth_answer's outer retry loop must unwrap KeyPool's RuntimeError.__cause__ and retry
+    transient 503s while still failing fast on deterministic 403s."""
+    import json
+    from papervault import config
+    from papervault.knowledge.store import llm as llm_mod
+
+    monkeypatch.setattr(config, "USE_GATEWAY", False)
+    monkeypatch.setattr(llm_mod, "_BASE_BACKOFF", 0.0)
+    monkeypatch.setattr(llm_mod, "_STREAM", False)
+
+    # 1. Transient 503 on single direct key -> retries cleanly and recovers on attempt 2.
+    f1 = tmp_path / "keys_503.json"
+    f1.write_text(json.dumps([{"model": "openai/test-model", "api_key": "k1", "base_url": "https://x/v1"}]))
+    pool1 = llm_mod.KeyPool(f1)
+    monkeypatch.setattr(llm_mod, "_pool", pool1)
+    monkeypatch.setattr(synth_mod, "mimo_complete", llm_mod.mimo_complete)
+
+    attempts_503 = 0
+
+    async def _create_503(client, model, messages, kw):
+        nonlocal attempts_503
+        attempts_503 += 1
+        if attempts_503 == 1:
+            raise _FakeStatusError(503)
+        return type("R", (), {"choices": [type("C", (), {"message": type("M", (), {"content": "recovered [X2023]"})(), "finish_reason": "stop"})()]})()
+
+    monkeypatch.setattr(llm_mod, "_create_completion", _create_503)
+    out = await synth_answer(_DATA, _INTENT)
+    assert out == "recovered [X2023]"
+    assert attempts_503 == 2
+
+    # 2. Permanent 403 on single direct key -> fails fast in 1 attempt (not retried).
+    f2 = tmp_path / "keys_403.json"
+    f2.write_text(json.dumps([{"model": "openai/test-model", "api_key": "k2", "base_url": "https://x/v1"}]))
+    pool2 = llm_mod.KeyPool(f2)
+    monkeypatch.setattr(llm_mod, "_pool", pool2)
+    attempts_403 = 0
+
+    async def _create_403(client, model, messages, kw):
+        nonlocal attempts_403
+        attempts_403 += 1
+        raise _FakeStatusError(403)
+
+    monkeypatch.setattr(llm_mod, "_create_completion", _create_403)
+    out2 = await synth_answer(_DATA, _INTENT)
+    assert out2.startswith(SYNTH_FAILED_PREFIX)
+    assert attempts_403 == 1

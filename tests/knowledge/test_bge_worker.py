@@ -369,7 +369,7 @@ def test_explicit_unload_and_server_stop_background_shut_down_worker(isolated_wo
     assert isolated_worker.is_running() is False
 
 
-def test_worker_crash_recovers_cleanly_on_next_call(isolated_worker):
+def test_worker_crash_recovers_cleanly_on_next_call(isolated_worker, monkeypatch):
     lightrag_init._bge_encode_sync(["before crash"])
     proc1 = isolated_worker._proc
     pid1 = isolated_worker.pid
@@ -385,27 +385,211 @@ def test_worker_crash_recovers_cleanly_on_next_call(isolated_worker):
     pid2 = isolated_worker.pid
     assert pid2 is not None and pid2 != pid1
 
-    # Also simulate a pre-existing worker dying right after poll() returned None
-    # (BrokenPipeError / EOFError race before work runs) -> retries ONCE cleanly.
+    # Genuine pipe-error recovery branch: keep proc2 alive so _ensure_started_locked()
+    # reuses it, then kill proc2 right as write_frame() fires on attempt 0 so
+    # write_frame/read_frame genuinely hits BrokenPipeError/EOFError and retries ONCE.
     proc2 = isolated_worker._proc
-    assert proc2 is not None
-    real_poll = proc2.poll
-    faked_once = {"done": False}
+    assert proc2 is not None and proc2.poll() is None
 
-    def stale_poll():
-        if not faked_once["done"]:
-            faked_once["done"] = True
-            return None
-        return real_poll()
+    real_write_frame = bge_worker.write_frame
+    real_cleanup = isolated_worker._terminate_and_cleanup_locked
+    write_calls = {"n": 0}
+    cleanup_calls = {"n": 0}
 
-    proc2.kill()
-    proc2.wait(timeout=5)
-    proc2.poll = stale_poll  # type: ignore[method-assign]
+    def kill_on_first_write(stream, header, payload=b"", **kwargs):
+        write_calls["n"] += 1
+        if write_calls["n"] == 1:
+            proc2.kill()
+            proc2.wait(timeout=5)
+        return real_write_frame(stream, header, payload, **kwargs)
 
-    arr2 = lightrag_init._bge_encode_sync(["after race"])
+    def tracked_cleanup():
+        cleanup_calls["n"] += 1
+        return real_cleanup()
+
+    monkeypatch.setattr(bge_worker, "write_frame", kill_on_first_write)
+    monkeypatch.setattr(isolated_worker, "_terminate_and_cleanup_locked", tracked_cleanup)
+
+    arr2 = lightrag_init._bge_encode_sync(["after pipe error"])
     assert arr2.shape == (1, 1024)
+    assert write_calls["n"] == 2
+    assert cleanup_calls["n"] == 1
     pid3 = isolated_worker.pid
     assert pid3 is not None and pid3 != pid2
+
+
+def test_queued_request_aborts_instead_of_respawning_during_shutdown(isolated_worker, monkeypatch):
+    """A request queued behind an active call must abort if shutdown() runs, never respawn."""
+    lightrag_init._bge_encode_sync(["warmup"])
+    assert isolated_worker.is_running()
+
+    real_write_frame = bge_worker.write_frame
+    active_in_worker = threading.Event()
+
+    def spy_write(stream, header, payload=b"", **kwargs):
+        if header.get("op") == "embed" and header.get("texts") == ["__TEST_SLEEP__:5.0"]:
+            active_in_worker.set()
+        return real_write_frame(stream, header, payload, **kwargs)
+
+    monkeypatch.setattr(bge_worker, "write_frame", spy_write)
+
+    errors: dict[str, BaseException] = {}
+
+    def run_active():
+        try:
+            lightrag_init._bge_encode_sync(["__TEST_SLEEP__:5.0"])
+        except BaseException as exc:  # noqa: BLE001
+            errors["active"] = exc
+
+    def run_queued():
+        try:
+            lightrag_init._bge_encode_sync(["queued-after-active"])
+        except BaseException as exc:  # noqa: BLE001
+            errors["queued"] = exc
+
+    t_active = threading.Thread(target=run_active)
+    t_active.start()
+    assert active_in_worker.wait(5.0), "active request did not reach worker"
+
+    t_queued = threading.Thread(target=run_queued)
+    t_queued.start()
+    # Wait until the queued thread has entered _model_activity() and is blocked on _io_lock.
+    deadline = time.monotonic() + 5.0
+    while lightrag_init._IDLE_UNLOAD_ACTIVE < 2 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert lightrag_init._IDLE_UNLOAD_ACTIVE == 2
+    time.sleep(0.03)  # Ensure t_queued has snapshotted _shutdown_epoch and blocked on _io_lock.
+
+    assert lightrag_init.shutdown_bge_worker(timeout=0.05) is True
+
+    t_active.join(timeout=5.0)
+    t_queued.join(timeout=5.0)
+    assert not t_active.is_alive() and not t_queued.is_alive()
+    assert isinstance(errors.get("active"), RuntimeError)
+    assert "shut down" in str(errors["active"]).lower()
+    assert isinstance(errors.get("queued"), RuntimeError)
+    assert "shut down" in str(errors["queued"]).lower()
+    assert isolated_worker.is_running() is False
+    assert isolated_worker._proc is None
+
+
+def test_hung_worker_times_out_gets_reaped_and_next_call_recovers(isolated_worker, monkeypatch):
+    """A hung inference exceeds its deadline, kills+reaps the worker, and next call recovers."""
+    monkeypatch.setenv("KS_BGE_WORKER_EMBED_TIMEOUT_S", "0.15")
+    lightrag_init._bge_encode_sync(["warmup"])
+    proc1 = isolated_worker._proc
+    pid1 = isolated_worker.pid
+    assert proc1 is not None and pid1 is not None
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="timed out"):
+        lightrag_init._bge_encode_sync(["__TEST_SLEEP__:30.0"])
+    elapsed = time.monotonic() - started
+    assert elapsed < 3.0, f"timeout took too long ({elapsed:.2f}s)"
+    assert proc1.poll() is not None, "hung worker was not reaped after timeout"
+    assert isolated_worker.is_running() is False
+    assert isolated_worker._proc is None
+
+    monkeypatch.setenv("KS_BGE_WORKER_EMBED_TIMEOUT_S", "10")
+    arr = lightrag_init._bge_encode_sync(["recovered"])
+    assert arr.shape == (1, 1024)
+    pid2 = isolated_worker.pid
+    assert pid2 is not None and pid2 != pid1
+
+
+def test_parent_death_pipe_kills_worker_blocked_in_native_call():
+    """Closing parent-death pipe kills worker immediately even while blocked in native sleep."""
+    death_r, death_w = os.pipe()
+    env = {
+        **os.environ,
+        "KS_BGE_WORKER_TEST_FAKE": "1",
+        bge_worker._DEATH_FD_ENV: str(death_r),
+    }
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "papervault.knowledge.store.bge_worker"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0,
+        env=env,
+        pass_fds=(death_r,),
+    )
+    os.close(death_r)
+    death_w_closed = False
+    try:
+        assert proc.stdin is not None and proc.stdout is not None
+        bge_worker.write_frame(proc.stdin, {"id": 1, "op": "ping"})
+        frame = bge_worker.read_frame(proc.stdout, timeout_s=5.0)
+        assert frame is not None and frame[0]["ok"] is True
+
+        # Start a 30s blocking native sleep in the worker's main thread without closing stdin.
+        bge_worker.write_frame(
+            proc.stdin,
+            {"id": 2, "op": "embed", "texts": ["__TEST_SLEEP__:30.0"]},
+        )
+        time.sleep(0.1)
+        assert proc.poll() is None
+
+        # Simulate parent SIGKILL by closing ONLY the parent-death pipe write end.
+        started = time.monotonic()
+        os.close(death_w)
+        death_w_closed = True
+        rc = proc.wait(timeout=2.0)
+        elapsed = time.monotonic() - started
+        assert rc == 1
+        assert elapsed < 2.0
+    finally:
+        if not death_w_closed:
+            try:
+                os.close(death_w)
+            except OSError:
+                pass
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+
+def test_unload_bge_models_skips_active_call_even_when_idle_unload_disabled(
+    isolated_worker, monkeypatch
+):
+    """With KS_BGE_IDLE_UNLOAD=0, unload_bge_models(force=False) still sees active work."""
+    monkeypatch.setattr(lightrag_init, "_IDLE_UNLOAD_ENABLED", False)
+    lightrag_init._bge_encode_sync(["warmup"])
+    pid1 = isolated_worker.pid
+    assert pid1 is not None
+
+    results: list[np.ndarray] = []
+    worker_thread = threading.Thread(
+        target=lambda: results.append(lightrag_init._bge_encode_sync(["__TEST_SLEEP__:0.4"]))
+    )
+    worker_thread.start()
+    deadline = time.monotonic() + 5.0
+    while lightrag_init._IDLE_UNLOAD_ACTIVE < 1 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert lightrag_init._IDLE_UNLOAD_ACTIVE == 1
+
+    started = time.monotonic()
+    unloaded = lightrag_init.unload_bge_models(force=False)
+    elapsed = time.monotonic() - started
+    assert unloaded is False
+    assert elapsed < 0.15, f"unload_bge_models(force=False) blocked for {elapsed:.2f}s"
+    assert isolated_worker.is_running() is True
+
+    worker_thread.join(timeout=5.0)
+    assert not worker_thread.is_alive()
+    assert len(results) == 1 and results[0].shape == (1, 1024)
+    assert lightrag_init._IDLE_UNLOAD_ACTIVE == 0
+    assert lightrag_init._IDLE_UNLOAD_TIMER is None
+
+    # Once idle, explicit unload succeeds and reaps the worker cleanly.
+    assert lightrag_init.unload_bge_models(force=False) is True
+    assert isolated_worker.is_running() is False
 
 
 def test_fresh_worker_fatal_crash_does_not_retry_infinitely(monkeypatch):

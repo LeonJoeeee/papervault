@@ -181,6 +181,7 @@ are useful for diagnosis or capacity tuning; defaults come from the current runt
 | `KS_EMBED_BATCH_NUM` / `KS_EMBED_TIMEOUT` | `32` / `120` | LightRAG embedding batch size and per-call embedding timeout in seconds. |
 | `KS_EMBED_OFFLOAD` | `1` | Offload embedding to a worker thread; `0` restores blocking inference on the server loop. |
 | `KS_BGE_WORKER_MODE` | `subprocess` | `subprocess` runs local BGE-M3 embedding and reranking in an on-demand worker subprocess so the MCP server never imports PyTorch or holds a CUDA context; `inprocess` restores legacy in-process loading. |
+| `KS_BGE_WORKER_EMBED_TIMEOUT_S` / `KS_BGE_WORKER_RERANK_TIMEOUT_S` | `180` / `600` | Per-request BGE worker RPC deadlines in seconds (`<= 0` disables); timed-out workers are killed and reaped so subsequent calls recover cleanly. |
 | `KS_BUILD_OFFPEAK_ONLY` | `false` | `true`, `1`, or `yes` pauses background graph builds during configured peak windows; interactive queries are never paused. |
 | `KS_BUILD_PEAK_WINDOWS` / `KS_BUILD_PEAK_DAYS` | `09:00-12:00,14:00-18:00` / `Mon-Fri` | Same-day peak `HH:MM-HH:MM` windows (start inclusive, end exclusive) and weekday names/ranges for off-peak build gating. |
 | `KS_BUILD_PEAK_TZ` / `KS_BUILD_PEAK_HOLIDAYS` | `Asia/Shanghai` / empty | IANA timezone (`zoneinfo`) and comma-separated `YYYY-MM-DD` holiday dates excluded from peak windows. |

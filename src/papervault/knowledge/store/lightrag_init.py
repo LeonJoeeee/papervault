@@ -172,9 +172,9 @@ def shutdown_bge_worker(timeout: float = 5.0) -> bool:
 @contextmanager
 def _model_activity():
     global _IDLE_UNLOAD_ACTIVE, _IDLE_UNLOAD_GENERATION, _IDLE_UNLOAD_TIMER
-    if not _IDLE_UNLOAD_ENABLED:
-        yield
-        return
+    # Always track active inference (even when KS_BGE_IDLE_UNLOAD=0) so explicit
+    # `unload_bge_models(force=False)` sees in-flight work and returns False
+    # immediately instead of blocking on the worker lock.
     with _IDLE_UNLOAD_LOCK:
         _IDLE_UNLOAD_GENERATION += 1
         if _IDLE_UNLOAD_TIMER is not None:
@@ -188,12 +188,13 @@ def _model_activity():
             _IDLE_UNLOAD_ACTIVE -= 1
             if _IDLE_UNLOAD_ACTIVE == 0:
                 _IDLE_UNLOAD_GENERATION += 1
-                _IDLE_UNLOAD_TIMER = threading.Timer(
-                    _IDLE_UNLOAD_TIMEOUT, _unload_idle_models,
-                    args=(_IDLE_UNLOAD_GENERATION,),
-                )
-                _IDLE_UNLOAD_TIMER.daemon = True
-                _IDLE_UNLOAD_TIMER.start()
+                if _IDLE_UNLOAD_ENABLED:
+                    _IDLE_UNLOAD_TIMER = threading.Timer(
+                        _IDLE_UNLOAD_TIMEOUT, _unload_idle_models,
+                        args=(_IDLE_UNLOAD_GENERATION,),
+                    )
+                    _IDLE_UNLOAD_TIMER.daemon = True
+                    _IDLE_UNLOAD_TIMER.start()
 
 # Rerank concurrency gate + integrity counter (2026-06-07, eval-trust drill).
 # Unlike embedding (embedding_func_max_async=16 in graph.py), LightRAG calls rerank_model_func

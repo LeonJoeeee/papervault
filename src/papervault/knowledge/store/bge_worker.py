@@ -24,11 +24,12 @@ and so `main()` can redirect fd 1 -> fd 2 before any ML library is imported.
 from __future__ import annotations
 
 import atexit
-import ctypes
+import io
 import json
 import logging
+import math
 import os
-import signal
+import select
 import struct
 import subprocess
 import sys
@@ -42,19 +43,74 @@ _HEADER_STRUCT = struct.Struct(">I")
 _MAX_HEADER_BYTES = 256 * 1024 * 1024
 _MAX_PAYLOAD_BYTES = 512 * 1024 * 1024
 _EMBED_DIM = 1024
-_PARENT_PID_ENV = "_KS_BGE_WORKER_PARENT_PID"
+_PIPE_WRITE_CHUNK = 4096
+_DEATH_FD_ENV = "_KS_BGE_WORKER_DEATH_FD"
+_DEFAULT_EMBED_TIMEOUT_S = 180.0
+_DEFAULT_RERANK_TIMEOUT_S = 600.0
+_DEFAULT_PING_TIMEOUT_S = 30.0
+_UNSET = object()
+
+
+def _read_timeout_env(name: str, default: float) -> float | None:
+    """Read a positive request timeout from env; <=0 disables; invalid falls back to default."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw)
+        if not math.isfinite(value):
+            raise ValueError("timeout must be finite")
+    except ValueError:
+        log.warning("Invalid %s=%r; using default %.1fs", name, raw, default)
+        return default
+    if value <= 0:
+        return None
+    return value
+
+
+def _stream_fileno(stream: BinaryIO) -> int | None:
+    fileno_fn = getattr(stream, "fileno", None)
+    if not callable(fileno_fn):
+        return None
+    try:
+        return int(fileno_fn())
+    except (OSError, ValueError, io.UnsupportedOperation):
+        return None
 
 
 # ---------------------------------------------------------------------------
 # Binary-framed JSON + raw-bytes RPC helpers (strictly zero-pickle)
 # ---------------------------------------------------------------------------
 
-def _write_all(stream: BinaryIO, data: bytes | memoryview) -> None:
+def _write_all(
+    stream: BinaryIO,
+    data: bytes | memoryview,
+    *,
+    deadline: float | None = None,
+) -> None:
     view = memoryview(data)
     total = view.nbytes
     sent = 0
+    fd = _stream_fileno(stream) if deadline is not None else None
     while sent < total:
-        written = stream.write(view[sent:])
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timed out writing BGE worker frame ({sent}/{total} bytes)"
+                )
+            if fd is not None:
+                _, writable, _ = select.select([], [fd], [], remaining)
+                if not writable:
+                    raise TimeoutError(
+                        f"Timed out writing BGE worker frame ({sent}/{total} bytes)"
+                    )
+                chunk = view[sent : sent + _PIPE_WRITE_CHUNK]
+                written = os.write(fd, chunk)
+            else:
+                written = stream.write(view[sent:])
+        else:
+            written = stream.write(view[sent:])
         if written is None:
             break
         if written <= 0:
@@ -62,12 +118,35 @@ def _write_all(stream: BinaryIO, data: bytes | memoryview) -> None:
         sent += written
 
 
-def _read_exact(stream: BinaryIO, n: int, *, allow_empty_eof: bool = False) -> bytes:
+def _read_exact(
+    stream: BinaryIO,
+    n: int,
+    *,
+    allow_empty_eof: bool = False,
+    deadline: float | None = None,
+) -> bytes:
     if n == 0:
         return b""
     buf = bytearray()
+    fd = _stream_fileno(stream) if deadline is not None else None
     while len(buf) < n:
-        chunk = stream.read(n - len(buf))
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f"Timed out reading BGE worker frame ({len(buf)}/{n} bytes)"
+                )
+            if fd is not None:
+                readable, _, _ = select.select([fd], [], [], remaining)
+                if not readable:
+                    raise TimeoutError(
+                        f"Timed out reading BGE worker frame ({len(buf)}/{n} bytes)"
+                    )
+                chunk = os.read(fd, n - len(buf))
+            else:
+                chunk = stream.read(n - len(buf))
+        else:
+            chunk = stream.read(n - len(buf))
         if not chunk:
             if allow_empty_eof and not buf:
                 return b""
@@ -82,6 +161,8 @@ def write_frame(
     stream: BinaryIO,
     header: dict[str, Any],
     payload: bytes | bytearray | memoryview = b"",
+    *,
+    timeout_s: float | None = None,
 ) -> None:
     """Write one length-prefixed JSON header + optional raw byte payload."""
     payload_view = memoryview(payload) if payload else memoryview(b"")
@@ -103,29 +184,36 @@ def write_frame(
         raise ValueError(
             f"BGE worker frame payload too large: {payload_view.nbytes} bytes"
         )
-    _write_all(stream, _HEADER_STRUCT.pack(len(header_bytes)))
-    _write_all(stream, header_bytes)
+    deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
+    _write_all(stream, _HEADER_STRUCT.pack(len(header_bytes)) + header_bytes, deadline=deadline)
     if payload_view.nbytes:
-        _write_all(stream, payload_view)
+        _write_all(stream, payload_view, deadline=deadline)
     stream.flush()
 
 
-def read_frame(stream: BinaryIO) -> tuple[dict[str, Any], bytes] | None:
+def read_frame(
+    stream: BinaryIO,
+    *,
+    timeout_s: float | None = None,
+) -> tuple[dict[str, Any], bytes] | None:
     """Read one frame. Returns None on clean EOF at a frame boundary."""
-    len_bytes = _read_exact(stream, _HEADER_STRUCT.size, allow_empty_eof=True)
+    deadline = (time.monotonic() + timeout_s) if timeout_s is not None else None
+    len_bytes = _read_exact(
+        stream, _HEADER_STRUCT.size, allow_empty_eof=True, deadline=deadline
+    )
     if not len_bytes:
         return None
     (header_len,) = _HEADER_STRUCT.unpack(len_bytes)
     if header_len <= 0 or header_len > _MAX_HEADER_BYTES:
         raise ValueError(f"Invalid BGE worker frame header_len={header_len}")
-    header_raw = _read_exact(stream, header_len)
+    header_raw = _read_exact(stream, header_len, deadline=deadline)
     header = json.loads(header_raw.decode("utf-8"))
     if not isinstance(header, dict):
         raise ValueError(f"BGE worker frame header must be dict, got {type(header).__name__}")
     payload_bytes = int(header.get("payload_bytes", 0))
     if payload_bytes < 0 or payload_bytes > _MAX_PAYLOAD_BYTES:
         raise ValueError(f"Invalid BGE worker frame payload_bytes={payload_bytes}")
-    payload = _read_exact(stream, payload_bytes) if payload_bytes else b""
+    payload = _read_exact(stream, payload_bytes, deadline=deadline) if payload_bytes else b""
     return header, payload
 
 
@@ -173,9 +261,12 @@ class _BGEWorkerClient:
     def __init__(self, *, module_name: str = "papervault.knowledge.store.bge_worker") -> None:
         self._module_name = module_name
         self._io_lock = threading.Lock()
+        self._state_lock = threading.Lock()
         self._proc: subprocess.Popen[bytes] | None = None
+        self._death_w: int | None = None
         self._next_id = 0
         self._shutdown_epoch = 0
+        self._closing_count = 0
 
     @property
     def pid(self) -> int | None:
@@ -189,32 +280,61 @@ class _BGEWorkerClient:
         proc = self._proc
         return proc is not None and proc.poll() is None
 
-    def _build_env(self) -> dict[str, str]:
+    def _build_env(self, *, death_fd: int) -> dict[str, str]:
         return {
             **os.environ,
             "MALLOC_ARENA_MAX": "2",
             "OMP_NUM_THREADS": "1",
             "OPENBLAS_NUM_THREADS": "1",
             "TOKENIZERS_PARALLELISM": "false",
-            _PARENT_PID_ENV: str(os.getpid()),
+            _DEATH_FD_ENV: str(death_fd),
         }
+
+    def _close_death_pipe(self) -> None:
+        """Close the parent-death pipe write end at most once (thread-safe)."""
+        with self._state_lock:
+            fd = self._death_w
+            self._death_w = None
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
     def _ensure_started_locked(self) -> subprocess.Popen[bytes]:
         if self._proc is not None:
             if self._proc.poll() is None:
                 return self._proc
+            self._close_death_pipe()
             self._close_pipes(self._proc)
             self._proc = None
+        death_r, death_w = os.pipe()
         cmd = [sys.executable, "-m", self._module_name]
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=None,
-            env=self._build_env(),
-            start_new_session=False,
-            close_fds=True,
-        )
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=None,
+                bufsize=0,
+                env=self._build_env(death_fd=death_r),
+                pass_fds=(death_r,),
+                start_new_session=False,
+                close_fds=True,
+            )
+        except Exception:
+            for fd in (death_r, death_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            raise
+        try:
+            os.close(death_r)
+        except OSError:
+            pass
+        with self._state_lock:
+            self._death_w = death_w
         self._proc = proc
         log.info("spawned BGE worker subprocess (pid=%d)", proc.pid)
         return proc
@@ -231,24 +351,51 @@ class _BGEWorkerClient:
     def _terminate_and_cleanup_locked(self) -> int | None:
         proc = self._proc
         if proc is None:
+            self._close_death_pipe()
             return None
-        self._proc = None
-        if proc.poll() is None:
-            try:
-                proc.terminate()
-                proc.wait(timeout=2.0)
-            except (OSError, subprocess.TimeoutExpired):
+        try:
+            self._close_death_pipe()
+            if proc.poll() is None:
                 try:
-                    proc.kill()
+                    proc.terminate()
                     proc.wait(timeout=2.0)
                 except (OSError, subprocess.TimeoutExpired):
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=2.0)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+            self._close_pipes(proc)
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
                     pass
-        self._close_pipes(proc)
-        return proc.returncode
+            return proc.returncode
+        finally:
+            # Only clear self._proc after termination & reaping have completed.
+            self._proc = None
 
-    def _request(self, op: str, **params: Any) -> tuple[dict[str, Any], bytes]:
-        with self._io_lock:
+    def _request(
+        self,
+        op: str,
+        *,
+        timeout_s: float | None = None,
+        **params: Any,
+    ) -> tuple[dict[str, Any], bytes]:
+        # Snapshot shutdown state BEFORE waiting on _io_lock so a request queued
+        # behind an active call aborts instead of spawning a new worker after shutdown.
+        with self._state_lock:
+            if self._closing_count > 0:
+                raise RuntimeError(f"BGE worker is shutting down; refusing {op}")
             epoch = self._shutdown_epoch
+
+        with self._io_lock:
+            with self._state_lock:
+                if self._closing_count > 0 or self._shutdown_epoch != epoch:
+                    raise RuntimeError(
+                        f"BGE worker shut down while {op} request was queued"
+                    )
             reused = self._proc is not None and self._proc.poll() is None
             for attempt in range(2):
                 proc = self._ensure_started_locked()
@@ -257,13 +404,34 @@ class _BGEWorkerClient:
                 header = {"id": req_id, "op": op, **params}
                 assert proc.stdin is not None and proc.stdout is not None
                 try:
-                    write_frame(proc.stdin, header)
-                    frame = read_frame(proc.stdout)
+                    started = time.monotonic()
+                    write_frame(proc.stdin, header, timeout_s=timeout_s)
+                    remaining = (
+                        max(0.0, timeout_s - (time.monotonic() - started))
+                        if timeout_s is not None
+                        else None
+                    )
+                    frame = read_frame(proc.stdout, timeout_s=remaining)
                     if frame is None:
                         raise EOFError("BGE worker closed stdout unexpectedly")
+                except TimeoutError as exc:
+                    rc = self._terminate_and_cleanup_locked()
+                    log.error(
+                        "BGE worker timed out after %.1fs during %s (killed, rc=%s)",
+                        timeout_s or 0.0,
+                        op,
+                        rc,
+                    )
+                    raise TimeoutError(
+                        f"BGE worker subprocess timed out after {timeout_s}s during {op}"
+                    ) from exc
                 except (BrokenPipeError, EOFError, OSError) as exc:
                     rc = self._terminate_and_cleanup_locked()
-                    if self._shutdown_epoch != epoch:
+                    with self._state_lock:
+                        shutting_down = (
+                            self._closing_count > 0 or self._shutdown_epoch != epoch
+                        )
+                    if shutting_down:
                         raise RuntimeError(
                             f"BGE worker shut down during {op} (rc={rc})"
                         ) from exc
@@ -295,8 +463,11 @@ class _BGEWorkerClient:
                 return resp, payload
             raise RuntimeError(f"BGE worker subprocess failed during {op}")
 
-    def ping(self) -> dict[str, Any]:
-        resp, _ = self._request("ping")
+    def ping(self, *, timeout_s: float | None | object = _UNSET) -> dict[str, Any]:
+        resolved_timeout = (
+            _DEFAULT_PING_TIMEOUT_S if timeout_s is _UNSET else timeout_s
+        )
+        resp, _ = self._request("ping", timeout_s=resolved_timeout)
         return resp
 
     def embed(
@@ -305,11 +476,18 @@ class _BGEWorkerClient:
         *,
         batch_size: int = 32,
         max_length: int = 8192,
+        timeout_s: float | None | object = _UNSET,
     ) -> Any:
         import numpy as np
 
+        resolved_timeout = (
+            _read_timeout_env("KS_BGE_WORKER_EMBED_TIMEOUT_S", _DEFAULT_EMBED_TIMEOUT_S)
+            if timeout_s is _UNSET
+            else timeout_s
+        )
         resp, payload = self._request(
             "embed",
+            timeout_s=resolved_timeout,
             texts=list(texts),
             batch_size=int(batch_size),
             max_length=int(max_length),
@@ -334,9 +512,16 @@ class _BGEWorkerClient:
         top_n: int | None = None,
         batch_size: int = 32,
         max_length: int = 4096,
+        timeout_s: float | None | object = _UNSET,
     ) -> list[dict[str, int | float]]:
+        resolved_timeout = (
+            _read_timeout_env("KS_BGE_WORKER_RERANK_TIMEOUT_S", _DEFAULT_RERANK_TIMEOUT_S)
+            if timeout_s is _UNSET
+            else timeout_s
+        )
         resp, _ = self._request(
             "rerank",
+            timeout_s=resolved_timeout,
             query=query,
             documents=list(documents),
             top_n=top_n,
@@ -354,89 +539,106 @@ class _BGEWorkerClient:
     def _shutdown_locked(self, timeout: float = 5.0) -> bool:
         proc = self._proc
         if proc is None:
+            self._close_death_pipe()
             return False
-        self._proc = None
-        was_alive = proc.poll() is None
-        if was_alive:
-            if proc.stdin is not None:
+        try:
+            was_alive = proc.poll() is None
+            if was_alive:
+                if proc.stdin is not None:
+                    try:
+                        self._next_id += 1
+                        write_frame(
+                            proc.stdin,
+                            {"id": self._next_id, "op": "shutdown"},
+                            timeout_s=min(timeout, 2.0),
+                        )
+                    except (BrokenPipeError, OSError, ValueError, TimeoutError):
+                        pass
+                    try:
+                        proc.stdin.close()
+                    except OSError:
+                        pass
                 try:
-                    self._next_id += 1
-                    write_frame(proc.stdin, {"id": self._next_id, "op": "shutdown"})
-                except (BrokenPipeError, OSError, ValueError):
-                    pass
-                try:
-                    proc.stdin.close()
-                except OSError:
-                    pass
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                log.warning(
-                    "BGE worker (pid=%d) did not exit within %.1fs; sending SIGTERM",
-                    proc.pid, timeout,
-                )
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-                try:
-                    proc.wait(timeout=2.0)
+                    proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     log.warning(
-                        "BGE worker (pid=%d) ignored SIGTERM; sending SIGKILL",
-                        proc.pid,
+                        "BGE worker (pid=%d) did not exit within %.1fs; closing death pipe + SIGTERM",
+                        proc.pid, timeout,
                     )
+                    self._close_death_pipe()
                     try:
-                        proc.kill()
-                        proc.wait(timeout=2.0)
-                    except (OSError, subprocess.TimeoutExpired):
+                        proc.terminate()
+                    except OSError:
                         pass
-        self._close_pipes(proc)
-        if proc.poll() is None:
-            try:
-                proc.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
-                pass
-        if was_alive:
-            log.info(
-                "BGE worker subprocess shut down cleanly (pid=%d, rc=%s)",
-                proc.pid, proc.returncode,
-            )
-        return was_alive
+                    try:
+                        proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        log.warning(
+                            "BGE worker (pid=%d) ignored SIGTERM; sending SIGKILL",
+                            proc.pid,
+                        )
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=2.0)
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
+            self._close_death_pipe()
+            self._close_pipes(proc)
+            if proc.poll() is None:
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    pass
+            if was_alive:
+                log.info(
+                    "BGE worker subprocess shut down cleanly (pid=%d, rc=%s)",
+                    proc.pid, proc.returncode,
+                )
+            return was_alive
+        finally:
+            # Only clear self._proc after the child process has been reaped.
+            self._proc = None
 
     def shutdown(self, timeout: float = 5.0, *, force_if_busy: bool = False) -> bool:
         """Cleanly terminate and reap the worker subprocess. Returns True if it was alive."""
-        self._shutdown_epoch += 1
-        acquired = (
-            self._io_lock.acquire(timeout=timeout)
-            if force_if_busy
-            else self._io_lock.acquire()
-        )
-        if not acquired:
-            proc = self._proc
-            if proc is not None and proc.poll() is None:
-                log.warning(
-                    "BGE worker busy during forced shutdown (pid=%d); terminating",
-                    proc.pid,
-                )
-                try:
-                    proc.terminate()
-                except OSError:
-                    pass
-                try:
-                    proc.wait(timeout=2.0)
-                except subprocess.TimeoutExpired:
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=2.0)
-                    except (OSError, subprocess.TimeoutExpired):
-                        pass
-                return True
-            return False
+        with self._state_lock:
+            self._shutdown_epoch += 1
+            self._closing_count += 1
         try:
-            return self._shutdown_locked(timeout=timeout)
+            acquired = (
+                self._io_lock.acquire(timeout=timeout)
+                if force_if_busy
+                else self._io_lock.acquire()
+            )
+            if not acquired:
+                self._close_death_pipe()
+                proc = self._proc
+                if proc is not None and proc.poll() is None:
+                    log.warning(
+                        "BGE worker busy during forced shutdown (pid=%d); terminating",
+                        proc.pid,
+                    )
+                    try:
+                        proc.terminate()
+                    except OSError:
+                        pass
+                    try:
+                        proc.wait(timeout=2.0)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            proc.kill()
+                            proc.wait(timeout=2.0)
+                        except (OSError, subprocess.TimeoutExpired):
+                            pass
+                    return True
+                return False
+            try:
+                return self._shutdown_locked(timeout=timeout)
+            finally:
+                self._io_lock.release()
         finally:
-            self._io_lock.release()
+            with self._state_lock:
+                self._closing_count -= 1
 
 
 _DEFAULT_WORKER = _BGEWorkerClient()
@@ -486,6 +688,8 @@ class _FakeEmbedModel:
                 raise ValueError("simulated worker embed failure")
             if text == "__TEST_OSERROR__":
                 raise FileNotFoundError("simulated missing checkpoint")
+            if text.startswith("__TEST_SLEEP__:"):
+                time.sleep(float(text.split(":", 1)[1]))
             arr[i, 0] = float(len(text))
             arr[i, 1] = float(sum(text.encode("utf-8")) % 1000) / 1000.0
         return {"dense_vecs": arr}
@@ -587,32 +791,35 @@ class _WorkerState:
 def _install_parent_death_guard() -> None:
     """Exit immediately if the parent process dies (including SIGKILL) without polling.
 
-    Uses Linux `PR_SET_PDEATHSIG` with `SIGUSR1` + an `os.getppid()` check so that
-    if a short-lived worker thread inside the parent spawned this subprocess and
-    exits while the parent process stays alive, the worker keeps serving — whereas
-    if the parent process itself terminates, `os.getppid()` changes and the worker
-    exits immediately with zero orphan GPU processes.
+    The parent keeps the write end of an anonymous `os.pipe()` open and passes
+    the read end fd via `pass_fds` + `_KS_BGE_WORKER_DEATH_FD`. A daemon thread
+    blocks in a single `os.read(death_fd, 1)` syscall (0% CPU, releases the GIL).
+    The instant the parent process dies (even via SIGKILL) or closes the pipe,
+    `os.read` returns `b""` and the thread immediately calls `os._exit(1)` — even
+    if the worker's main thread is blocked inside native C++/CUDA code, and with
+    zero false exits when a short-lived spawning thread in the parent terminates.
     """
-    if sys.platform != "linux":
+    raw_fd = os.getenv(_DEATH_FD_ENV, "").strip()
+    if not raw_fd.isdigit():
         return
-    raw_ppid = os.getenv(_PARENT_PID_ENV, "").strip()
-    expected_ppid = int(raw_ppid) if raw_ppid.isdigit() else os.getppid()
+    death_fd = int(raw_fd)
 
-    def _on_pdeath(_signum: int, _frame: Any) -> None:
-        if os.getppid() != expected_ppid:
-            os._exit(0)
+    def _watch_parent_death() -> None:
+        try:
+            while True:
+                data = os.read(death_fd, 1)
+                if not data:
+                    break
+        except OSError:
+            pass
+        os._exit(1)
 
-    try:
-        signal.signal(signal.SIGUSR1, _on_pdeath)
-        libc = ctypes.CDLL("libc.so.6")
-        pr_set_pdeathsig = 1
-        libc.prctl(pr_set_pdeathsig, int(signal.SIGUSR1))
-    except Exception:  # noqa: BLE001 — best-effort orphan guard
-        return
-
-    # Close the fork()-to-prctl() race window.
-    if os.getppid() != expected_ppid:
-        os._exit(0)
+    watcher = threading.Thread(
+        target=_watch_parent_death,
+        name="bge-parent-death-watch",
+        daemon=True,
+    )
+    watcher.start()
 
 
 def _execute_request(

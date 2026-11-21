@@ -9,9 +9,8 @@ server. Claude Code, Codex CLI, Antigravity CLI/IDE and other MCP clients share 
 | `get_paper` | Resolve a citation key, DOI, arXiv ID or fuzzy title and return metadata plus a serve-safe full-text path when available. |
 | `query` | Retrieve evidence from the knowledge graph and synthesize an answer with verified paper citations. |
 
-Version **0.10.15** expands the default research domain and venue authority to include
-space computing alongside space physics and AI4Science.
-The product is pre-release (closed beta). Read the [PRD](docs/PRD.md) for scope,
+The factory domain pack and venue authority cover **space physics, space computing, and
+AI4Science**. Read the [PRD](docs/PRD.md) for scope and design philosophy,
 [architecture](docs/architecture.md) for boundaries, [installation guide](docs/INSTALL.md)
 for deployment, and [baselines](docs/baselines.md#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
 for dated measurements. The [constitution and refactor plan](docs/adr/0007-papervault-constitution.md)
@@ -169,9 +168,11 @@ path within those boundaries; they are not six separate services.
    cut**, helping landmark papers reach judgment. It also weights the vouched
    supplement. Explicit recency/importance ordering bypasses this prior.
 
-   `PAPERVAULT_SEARCH_KG=0` disables this optional arm. If unset, it is enabled
-   only when `PAPERVAULT_STORAGE_BACKEND=postgres`; `PAPERVAULT_SEARCH_KG=1`
-   explicitly enables it. Configure the knowledge database with `POSTGRES_*`
+   `PAPERVAULT_SEARCH_KG=0` disables this optional arm, and `PAPERVAULT_SEARCH_KG=1`
+   explicitly enables it. When unset, the runtime currently checks only the legacy
+   `PAPERVAULT_STORAGE_BACKEND=postgres` flag (not `PAPERVAULT_CATALOG_AUTHORITY=postgres`),
+   so PostgreSQL catalog deployments (`PAPERVAULT_CATALOG_AUTHORITY=postgres`) must set
+   `PAPERVAULT_SEARCH_KG=1` explicitly to enable KG candidate discovery. Configure the knowledge database with `POSTGRES_*`
    (not the catalog DSN), `POSTGRES_WORKSPACE` and `NEO4J_*`; any explicit Neo4j
    workspace must match. Queries use PostgreSQL read-only transactions with
    `hnsw.ef_search=120` and Neo4j read sessions, without schema initialization.
@@ -712,7 +713,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv sync --extra dev
 
 [Evaluation](docs/eval.md) explains gold sets, reference-machine runs and benchmark
 arbitration. Raw eval outputs contain paper text and stay local/untracked under
-`PAPERVAULT_EVAL_DIR`; publish summary evidence on the issue or PR. CI tests scoring
+`PAPERVAULT_EVAL_DIR`; record summary evidence in `docs/baselines.md`. CI tests scoring
 logic without GPU/DB/network and does not replace reference-hardware retrieval gates.
 [Baselines](docs/baselines.md) separates dated legacy rulers, post-refactor measurements
 and isolated recovery/maintenance rehearsals.
@@ -722,17 +723,16 @@ and isolated recovery/maintenance rehearsals.
 papervault is consumed **by pin** ([ADR-0001](docs/adr/0001-public-repo-is-upstream.md)):
 deployments track an annotated git tag (`vX.Y.Z[-stage]`), never `main`.
 
-The repo carries **one version**, and every change PR bumps it per the semver call
-stated in its description. The declared fields move together: `pyproject.toml`
-`[project].version`, the `papervault` entry in `uv.lock` (refresh with `uv lock`),
+The repo carries **one version**, bumped at **release time** rather than on ordinary
+feature or fix slices (preventing parallel worktree collisions). On an authorized release
+bump, all five declared fields move together: `pyproject.toml` `[project].version`, the
+`papervault` entry in `uv.lock` (refresh with `uv lock`),
 `plugin/.claude-plugin/plugin.json`, `plugin/plugin.json`, and the `papervault`
 entry in `.claude-plugin/marketplace.json`. `tests/test_plugin_version_sync.py`
-fails when they drift. This compatible factory-domain/venue expansion uses the issue-requested
-patch version **0.10.15**.
+fails when any of the five drifts.
 
-A release is a tag naming the version already on `main` (`vX.Y.Z`, optionally
-`-stage`); the release commit changes no version field. CI builds wheel/sdist on
-every commit. The historical `v0.1.6-beta` tag predates the one-version rule.
+A release tags that synchronized commit (`vX.Y.Z`, optionally `-stage`). CI builds
+wheel/sdist on every commit. The historical `v0.1.6-beta` tag predates the one-version rule.
 
 ## License
 

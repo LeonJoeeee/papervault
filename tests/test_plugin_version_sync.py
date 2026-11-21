@@ -1,7 +1,7 @@
 """Release discipline guard: the repo carries one version (README "Releases").
 
 The plugin manifests, their marketplace entry, and the Python package version (pyproject.toml
-plus its uv.lock entry) move together in every change PR; this test fails the moment any of
+plus its uv.lock entry) move together on release bumps; this test fails the moment any of
 them drifts.
 """
 import json

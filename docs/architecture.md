@@ -24,7 +24,7 @@ One package, one server process, with these ownership boundaries:
 | `library/` | Search coordination, bibliographic identity, registration, acquisition and extraction. Library owns vault writes; registration is a separately admitted command. |
 | `store/` | Transactional catalog authority, revisions, audit/outbox, publication lineage, recovery and derivative lifecycle/capacity. JSON exports are projections under PostgreSQL authority. |
 | `knowledge/` | Immutable knowledge intake, distillation scheduling, LightRAG backend adapters, evidence retrieval and synthesis. Catalog commands accept verified outputs; backend computation alone grants no publication authority. |
-| `domain/` | Configured search rubric, entity ontology, extraction examples and instructions; space physics/AI4Science is the factory domain. |
+| `domain/` | Configured search rubric, entity ontology, extraction examples and instructions; space physics, space computing, and AI4Science form the factory domain. |
 | `eval/` | Gold workloads, scoring and shared response assembly; reference-machine retrieval evidence complements CI's deterministic scoring tests. |
 
 Persistence has three logical roles: **Source** retains research/input bytes;
@@ -66,8 +66,10 @@ stores or mutate derived data. Neo4j follows LightRAG's `chunk-entity-relation`
 database default and read-only home-database fallback on `DatabaseNotFound`.
 Encoding shares S2's serving-loop GPU semaphore and retains its permit until the
 synchronous worker finishes even after caller cancellation; DB reads hold no GPU
-permit. `PAPERVAULT_SEARCH_KG` defaults on only with
-`PAPERVAULT_STORAGE_BACKEND=postgres`; explicit `0` disables and `1` enables.
+permit. Explicit `PAPERVAULT_SEARCH_KG=0` disables and `1` enables this arm; when unset,
+the runtime checks only legacy `PAPERVAULT_STORAGE_BACKEND=postgres` (not
+`PAPERVAULT_CATALOG_AUTHORITY=postgres`), so PostgreSQL catalog deployments set
+`PAPERVAULT_SEARCH_KG=1` explicitly.
 Missing configuration or PG/Neo4j/BGE failure returns an empty KG list, preserving
 BM25/external serving. This is candidate discovery, not S2 evidence publication.
 

@@ -1,14 +1,19 @@
-"""MiMo U1 faithfulness judge (via the LiteLLM gateway) — for the extraction-prompt A/B.
+"""MiMo U1 faithfulness judge (via the configured LLM endpoint) — for the extraction-prompt A/B.
 
 Reads a u1 edges jsonl (from _ab_upstream.py sample-u1): {head, tail, description, source_chunks[]}.
-For each edge asks MiMo whether the relationship_description is FAITHFUL — i.e. explicitly stated /
-directly supported by the source chunk text, not an inferred or fabricated connection. U1 = fraction
-faithful. Same gateway/model as the downstream judge (judge_mimo); needs KS_VIRTUAL_KEY exported.
+For each edge asks the judge whether the relationship_description is FAITHFUL — i.e. explicitly
+stated / directly supported by the source chunk text, not an inferred or fabricated connection.
+U1 = fraction faithful. Uses explicit ``KS_GATEWAY_URL`` / ``KS_VIRTUAL_KEY`` if set, otherwise
+falls back to ``papervault.config``.
 
-Usage:  set -a; . ./.env; set +a
-        python -m papervault.eval._ab_u1_judge /tmp/u1_new.jsonl
+Usage:  python -m papervault.eval._ab_u1_judge /tmp/u1_new.jsonl
 """
-import asyncio, json, os, sys
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import sys
 
 from papervault.llm_routing import (
     create_openai_chat_completion_with_fallback,
@@ -17,8 +22,29 @@ from papervault.llm_routing import (
     route,
 )
 
-GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
-VKEY = os.getenv("KS_VIRTUAL_KEY", "")
+
+def _resolve_endpoint() -> tuple[str, str]:
+    """Resolve judge endpoint URL and API key.
+
+    If either legacy ``KS_GATEWAY_URL`` or ``KS_VIRTUAL_KEY`` is set, both
+    values resolve strictly within the legacy/gateway domain (never mixing
+    direct-provider credentials with a gateway URL or vice versa). Otherwise
+    fall back to ``papervault.config`` (gateway vs direct transport).
+    """
+    from papervault import config
+
+    legacy_url = os.getenv("KS_GATEWAY_URL", "").strip()
+    legacy_key = os.getenv("KS_VIRTUAL_KEY", "").strip()
+    if legacy_url or legacy_key:
+        url = legacy_url or "http://127.0.0.1:4000/v1"
+        key = legacy_key or (config.GATEWAY_KEY.strip() if config.USE_GATEWAY else "")
+        return url, key
+    if config.USE_GATEWAY:
+        return config.GATEWAY_URL.strip(), config.GATEWAY_KEY.strip()
+    return config.LLM_BASE_URL.strip(), config.LLM_API_KEY.strip()
+
+
+GATEWAY, VKEY = _resolve_endpoint()
 
 SYS = ("You audit one edge of a scientific knowledge graph for FAITHFULNESS. You are given the edge "
        "(head entity, tail entity, and its relationship_description) and the SOURCE TEXT chunks the edge "
@@ -65,11 +91,25 @@ async def _judge(client, sem, e):
 
 async def main():
     path = sys.argv[1]
-    edges = [json.loads(l) for l in open(path)]
-    if not VKEY:
-        raise SystemExit("KS_VIRTUAL_KEY not set — `set -a; . ./.env; set +a` first")
+    edges = [json.loads(line) for line in open(path)]
+    from papervault import config
+
+    gateway, vkey = _resolve_endpoint()
+    if not vkey:
+        raise SystemExit(
+            "No judge API key configured — set KS_VIRTUAL_KEY or configure "
+            "PAPERVAULT_LLM_GATEWAY_KEY / PAPERVAULT_LLM_API_KEY in .env"
+        )
+    if config.USE_GATEWAY and not gateway:
+        raise SystemExit(
+            "PAPERVAULT_LLM_GATEWAY_URL is empty while gateway mode is enabled"
+        )
     from openai import AsyncOpenAI
-    client = AsyncOpenAI(base_url=GATEWAY, api_key=VKEY, timeout=300, max_retries=0)
+
+    client_kwargs: dict[str, object] = {"api_key": vkey, "timeout": 300, "max_retries": 0}
+    if gateway:
+        client_kwargs["base_url"] = gateway
+    client = AsyncOpenAI(**client_kwargs)
     sem = asyncio.Semaphore(int(os.getenv("AB_JUDGE_CONC", "20")))
     verdicts = await asyncio.gather(*[_judge(client, sem, e) for e in edges])
     scored = [v for v in verdicts if v is not None]

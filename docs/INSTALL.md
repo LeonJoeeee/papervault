@@ -178,8 +178,13 @@ are useful for diagnosis or capacity tuning; defaults come from the current runt
 | `KS_STARTUP_AWAIT_SEC` | `3` | Maximum startup wait in seconds; initialization/retries continue in the background after it expires. `0` skips waiting. |
 | `KS_SKIP_EMBED_SELFCHECK` | `0` | `1`, `true` or `yes` bypasses the embedding boot probe; use only for diagnosis or a separately verified stack. |
 | `KS_EMBED_MAX_ASYNC` / `KS_EMBED_GPU_MAX_ASYNC` | `16` / `1` | LightRAG embedding-call queue concurrency versus actual GPU forward-pass concurrency. |
+| `KS_EMBED_BATCH_NUM` / `KS_EMBED_TIMEOUT` | `32` / `120` | LightRAG embedding batch size and per-call embedding timeout in seconds. |
 | `KS_EMBED_OFFLOAD` | `1` | Offload embedding to a worker thread; `0` restores blocking inference on the server loop. |
-| `KS_LLM_MAX_TOKENS` / `KS_SYNTH_MAX_TOKENS` / `PAPERVAULT_LIB_MAX_TOKENS` | unset | Optional explicit LLM output ceilings for Knowledge, synthesis, and Library calls; omitted on the wire when unset unless a caller passes an explicit limit. |
+| `KS_BUILD_OFFPEAK_ONLY` | `false` | `true`, `1`, or `yes` pauses background graph builds during configured peak windows; interactive queries are never paused. |
+| `KS_BUILD_PEAK_WINDOWS` / `KS_BUILD_PEAK_DAYS` | `09:00-12:00,14:00-18:00` / `Mon-Fri` | Same-day peak `HH:MM-HH:MM` windows (start inclusive, end exclusive) and weekday names/ranges for off-peak build gating. |
+| `KS_BUILD_PEAK_TZ` / `KS_BUILD_PEAK_HOLIDAYS` | `Asia/Shanghai` / empty | IANA timezone (`zoneinfo`) and comma-separated `YYYY-MM-DD` holiday dates excluded from peak windows. |
+| `CUDA_DEVICE_ORDER` | unset | Set `PCI_BUS_ID` on multi-GPU hosts so `CUDA_VISIBLE_DEVICES` matches physical PCI bus order deterministically. |
+| `KS_LLM_MAX_TOKENS` / `KS_SYNTH_MAX_TOKENS` / `PAPERVAULT_LIB_MAX_TOKENS` / `JUDGE_MAX_TOKENS` | unset | Optional explicit LLM output ceilings for Knowledge, synthesis, Library, and standalone `judge_mimo` calls; omitted on the wire when unset unless a caller passes an explicit limit. |
 | `KS_LLM_BACKOFF_JITTER` | `0.75` | Jitter added to direct key-pool retry backoff in seconds. |
 | `KS_GATEWAY_CONN_RETRIES` / `KS_GATEWAY_CONN_BACKOFF_CAP` | `6` / `15` | Unreachable-gateway connection retries and backoff cap in seconds, still bounded by the configured retry budget. |
 | `KS_SLOW_CALL_LOG_S` | `60` | Log successful knowledge LLM calls exceeding this duration in seconds. |
@@ -529,7 +534,7 @@ client too (Claude Code, Antigravity, Codex reviewers, and any script).
 
 ## Choosing a domain
 
-papervault ships tuned for space physics + AI4Science. To adapt it to another
+papervault ships tuned for **space physics, space computing, and AI4Science**. To adapt it to another
 field, edit the domain pack (`src/papervault/domain/space_physics/`) or point
 `PAPERVAULT_DOMAIN_PATH` at your own pack directory with the same files:
 `domain.toml`, `ontology.json`, `extraction_examples.txt`,
@@ -573,8 +578,15 @@ entries and unfamiliar languages or layouts remain unknown.
 ## Run papervault as a service (optional)
 
 `deploy/papervault.service` is a user-level systemd unit for the server. Its
-`WorkingDirectory`/`ExecStart` assume the clone lives at `~/projects/dev/papervault` —
-edit both paths to your clone location before `systemctl --user enable --now papervault`.
-Keep its `Environment=MALLOC_MMAP_THRESHOLD_=1048576` line (or the same setting in a
-drop-in) when you adapt it: glibc reads it only at process start, so it cannot live in
-`.env`, and without it memory freed after an OCR burst stays in the process.
+`WorkingDirectory`/`ExecStart` default to `%h/lab/papervault` — edit both paths
+to your clone location (`<repo>`) before `systemctl --user enable --now papervault`.
+Keep its resource and allocator directives (or the same settings in a drop-in)
+when you adapt it:
+
+- `LimitNOFILE=65536` — prevents file-descriptor exhaustion under concurrent HTTP/DB traffic.
+- `Environment=MALLOC_MMAP_THRESHOLD_=1048576` and `Environment=MALLOC_ARENA_MAX=2` —
+  glibc reads both only at process start (before `.env` loads); together they return large
+  allocations to the OS on free and cap per-thread arena RSS bloat.
+- `Environment=OMP_NUM_THREADS=1`, `Environment=OPENBLAS_NUM_THREADS=1`, and
+  `Environment=RAYON_NUM_THREADS=4` — cap native BLAS/tokenizer thread pools to avoid CPU
+  oversubscription during bursts.

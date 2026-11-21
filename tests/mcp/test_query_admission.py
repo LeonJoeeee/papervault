@@ -142,7 +142,7 @@ async def test_fast_query_records_one_completion_and_preserves_public_schema(que
     assert schema["properties"] == {"intent": {"title": "Intent", "type": "string"}}
 
 
-async def test_failed_background_query_releases_and_records_once(query_tool, monkeypatch):
+async def test_failed_background_query_releases_without_polluting_recent(query_tool, monkeypatch):
     from mcp.server.fastmcp.exceptions import ToolError
 
     async def fail(*, intent):
@@ -157,7 +157,8 @@ async def test_failed_background_query_releases_and_records_once(query_tool, mon
     with pytest.raises(ToolError, match="failed query"):
         await query_tool.tool.run({"intent": running["query_id"]})
     assert admission._depth["query"] == 0
-    assert list(admission._recent["query"]) == [250.0]
+    assert admission._recent.get("query", []) == []
+    assert admission._avg_service_s("query") == 300.0
     assert admission._session_active == {} and server._queries_by_id == {}
 
 
@@ -173,7 +174,18 @@ async def test_shutdown_releases_detached_admission_before_store_cleanup(query_t
     for name in ("_bg_task", "_startup_task", "_embed_probe_task"):
         monkeypatch.setattr(server, name, None)
     await server.stop_background()
-    assert len(admission._recent["query"]) == 1
+    assert admission._recent.get("query", []) == []
+
+
+@pytest.mark.parametrize("empty_intent", ["", "   ", "\t\n"])
+async def test_empty_intent_rejected_pre_admission_without_polluting_recent(query_tool, empty_intent):
+    result = await query_tool.tool.run({"intent": empty_intent})
+    assert result["status"] == "error"
+    assert query_tool.calls == []
+    assert admission._depth.get("query", 0) == 0
+    assert admission._session_active == {}
+    assert admission._recent.get("query", []) == []
+    assert admission._avg_service_s("query") == 300.0
 
 
 @pytest.mark.parametrize("kind", ["missing_id", "capacity", "shutdown"])

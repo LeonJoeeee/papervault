@@ -171,7 +171,17 @@ def _resumable_adapter(name: str, fn: Any, mcp: FastMCP | None) -> _ResumableAda
                     "query_id": qid,
                     "reason": "Query expired or server restarted; resubmit the original intent.",
                 },
-                empty_reply=None,
+                empty_reply=lambda: {
+                    "status": "error",
+                    "answer": "(empty query intent)",
+                    "cited_papers": [],
+                    "cited_sources": [],
+                    "retrieved_papers": [],
+                    "retrieved_sources": [],
+                    "abstract_only_papers": [],
+                    "kb_coverage": "empty",
+                    "reason": "intent must not be empty",
+                },
             )
     elif name == "search_papers" and mcp is not None:
         registry = getattr(mcp, "_paper_search_registry", None)
@@ -236,8 +246,11 @@ def _wrap(name: str, fn, mcp: FastMCP | None = None):
         def transfer(task):
             nonlocal transferred
             transferred = True
-            def finished(_):
-                _record(name, time.monotonic() - t0)
+            def finished(done_task):
+                # Only record successful, non-cancelled completions so fast failures/cancellations
+                # cannot collapse the rolling service-time estimate toward 0s.
+                if not done_task.cancelled() and done_task.exception() is None:
+                    _record(name, time.monotonic() - t0)
                 release()
             task.add_done_callback(finished)
 

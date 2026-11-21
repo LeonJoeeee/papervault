@@ -188,6 +188,23 @@ def _selfcheck_retry_delay() -> float:
     return min(300.0, max(1.0, delay))
 
 
+def _bg_task_done(task: asyncio.Task) -> None:
+    """Clear `_bg_task` if the background scheduler exits unexpectedly so recovery can restart it."""
+    global _bg_task
+    if _bg_task is task:
+        _bg_task = None
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error(
+            "S4 scheduler task exited unexpectedly (%s: %s); cleared for recovery",
+            type(exc).__name__, exc, exc_info=exc,
+        )
+    else:
+        log.warning("S4 scheduler task exited unexpectedly; cleared for recovery")
+
+
 async def _start_once() -> bool:
     mode = knowledge_runtime.knowledge_jobs_mode()
     await _ensure_knowledge_authority()
@@ -205,6 +222,7 @@ async def _start_once() -> bool:
         from papervault.knowledge.store.graph import get_graph
         rag = await get_graph()
         _bg_task = asyncio.create_task(main_loop(rag, interval=interval), name="ks-auto-ingest")
+    _bg_task.add_done_callback(_bg_task_done)
     log.info("S4 scheduler task started at server startup (interval=%ss)", interval)
     return True
 
@@ -241,11 +259,13 @@ async def start_background() -> None:
     authority disables knowledge queries/writers while library serving continues.
     """
     knowledge_runtime.knowledge_jobs_mode()  # Validate the local selector without database I/O.
-    global _startup_task
+    global _bg_task, _startup_task
     # Also called per HTTP session: it must never reopen serving while shutdown
     # is draining its fixed task snapshot. A restarted process gets fresh state.
     if _query_stopping:
         return
+    if _bg_task is not None and _bg_task.done():
+        _bg_task = None
     if _bg_task is not None or _startup_task is not None:
         return
     if _authority_task is not None and (not _auto_ingest_enabled() or
@@ -286,6 +306,9 @@ async def stop_background() -> None:
     for task in queries:
         task.cancel()
     await asyncio.gather(*queries, return_exceptions=True)
+    for handle in _query_prune_handles.values():
+        handle.cancel()
+    _query_prune_handles.clear()
     _queries_by_id.clear()
     _queries_by_intent.clear()
     if _startup_task is not None:
@@ -376,6 +399,7 @@ class _QueryEntry:
 _QUERY_CAPACITY = 128
 _queries_by_id: dict[str, _QueryEntry] = {}
 _queries_by_intent: dict[str, _QueryEntry] = {}
+_query_prune_handles: dict[str, asyncio.TimerHandle] = {}
 _query_stopping = False
 
 
@@ -391,10 +415,22 @@ def _query_setting(name: str, default: float) -> float:
 
 
 def _forget_query(entry: _QueryEntry) -> None:
+    handle = _query_prune_handles.pop(entry.query_id, None)
+    if handle is not None:
+        handle.cancel()
     if _queries_by_id.get(entry.query_id) is entry:
         _queries_by_id.pop(entry.query_id)
     if _queries_by_intent.get(entry.intent) is entry:
         _queries_by_intent.pop(entry.intent)
+
+
+def _prune_expired_query(entry: _QueryEntry) -> None:
+    _query_prune_handles.pop(entry.query_id, None)
+    if entry.completed_at is None:
+        return
+    retention = max(0.0, _query_setting("KS_MCP_QUERY_RETENTION_S", 900.0))
+    if time.monotonic() - entry.completed_at >= retention:
+        _forget_query(entry)
 
 
 def _find_query(intent: str) -> _QueryEntry | None:
@@ -412,15 +448,32 @@ def _query_finished(entry: _QueryEntry) -> None:
     entry.completed_at = time.monotonic()
     if not entry.task.cancelled():
         entry.task.exception()  # Detached failures are delivered on collection.
+    retention = max(0.0, _query_setting("KS_MCP_QUERY_RETENTION_S", 900.0))
+    if retention > 0:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        old = _query_prune_handles.pop(entry.query_id, None)
+        if old is not None:
+            old.cancel()
+        _query_prune_handles[entry.query_id] = loop.call_later(
+            retention, _prune_expired_query, entry,
+        )
 
 
 async def _execute_query(intent: str) -> dict[str, Any]:
-    from papervault.knowledge.query.aquery import query as _query
+    from papervault.knowledge.query import aquery as _aquery
 
     await _ensure_knowledge_authority()
-    result = await _query(intent=intent)
+    logged = [False]
+    token = _aquery._receipt_logged_in_scope.set(logged)
+    try:
+        result = await _aquery.query(intent=intent)
+    finally:
+        _aquery._receipt_logged_in_scope.reset(token)
     receipt = result.get("query_receipt")
-    if receipt is not None:
+    if receipt is not None and not logged[0]:
         log.info("query_receipt %s", receipt, extra={"query_receipt": receipt})
     return result
 
@@ -552,6 +605,18 @@ async def query(intent: str, ctx: Optional[Context] = None) -> dict[str, Any]:
     entry = _find_query(intent)
     if entry is None:
         intent = intent.strip()
+        if not intent:
+            return {
+                "status": "error",
+                "answer": "(empty query intent)",
+                "cited_papers": [],
+                "cited_sources": [],
+                "retrieved_papers": [],
+                "retrieved_sources": [],
+                "abstract_only_papers": [],
+                "kb_coverage": "empty",
+                "reason": "intent must not be empty",
+            }
         if re.fullmatch(r"q-[0-9a-f]{12}", intent):
             return {"status": "not_found", "query_id": intent,
                     "reason": "Query expired or server restarted; resubmit the original intent."}

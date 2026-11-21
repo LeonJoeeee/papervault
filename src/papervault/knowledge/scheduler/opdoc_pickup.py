@@ -108,8 +108,10 @@ from papervault.knowledge.ingest.operator_docs import (
     KINDS,
     AlreadyIngestedError,
     SourceDisabledError,
+    assert_not_already_ingested as check_not_already_ingested,
     check_source_enabled,
     ingest_document,
+    validate_key,
 )
 # The SAME isolated-subprocess structural PDF probe the paper extract path runs (%PDF magic +
 # a pypdf page-count parse in a throwaway child with a hard wall-clock alarm). Reused verbatim
@@ -366,8 +368,8 @@ async def drain_pending(rag) -> dict:
         ingest_path = str(path)
         staged_md: Path | None = None
         if path.suffix.lower() == _PDF_SUFFIX:
-            # Gate BEFORE OCR: a disabled source must not burn a MinerU/GPU pass every
-            # round. ingest_document re-checks (harmlessly) once we reach it.
+            # Gate BEFORE OCR: a disabled source, malformed key, or already-ingested key
+            # (when not force) must never burn a 30-min MinerU/GPU pass.
             try:
                 check_source_enabled(kind)
             except SourceDisabledError as e:
@@ -379,6 +381,37 @@ async def drain_pending(rag) -> dict:
                     )
                 counts["disabled"] += 1
                 continue
+
+            if not force:
+                try:
+                    await check_not_already_ingested(kind, key)
+                except AlreadyIngestedError:
+                    log.info(
+                        "opdoc pickup: %s already ingested (push-once, pre-OCR) → processed/ (skipped OCR)",
+                        key,
+                    )
+                    _move(path, processed_dir)
+                    _disabled_logged.discard(str(path))
+                    _mineru_down_logged.discard(str(path))
+                    counts["already"] += 1
+                    continue
+                except ValueError as e:
+                    log.error("opdoc pickup: %s malformed key (pre-OCR) → failed/ (%r)", key, e)
+                    _move(path, failed_dir)
+                    _disabled_logged.discard(str(path))
+                    _mineru_down_logged.discard(str(path))
+                    counts["failed"] += 1
+                    continue
+            else:
+                try:
+                    validate_key(kind, key)
+                except ValueError as e:
+                    log.error("opdoc pickup: %s malformed key (pre-OCR) → failed/ (%r)", key, e)
+                    _move(path, failed_dir)
+                    _disabled_logged.discard(str(path))
+                    _mineru_down_logged.discard(str(path))
+                    counts["failed"] += 1
+                    continue
 
             # ── Pre-OCR structural validation (issue #89) ──────────────────────────────────
             # A PDF with a VALID `%PDF` magic but a broken xref/trailer (an operator's truncated

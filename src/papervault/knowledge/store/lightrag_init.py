@@ -33,8 +33,11 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import ctypes
+import gc
 import logging
 import os
+import sys
 import threading
 import time
 
@@ -60,6 +63,16 @@ _IDLE_UNLOAD_GENERATION = 0
 _IDLE_UNLOAD_ACTIVE = 0
 
 
+def _trim_malloc() -> None:
+    """Return freed CPU arenas to the OS on Linux (best-effort)."""
+    if sys.platform != "linux":
+        return
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — best-effort glibc arena release
+        pass
+
+
 def _unload_idle_models(generation: int) -> None:
     global _BGE_MODEL, _BGE_RERANKER, _IDLE_UNLOAD_TIMER
     with _IDLE_UNLOAD_LOCK:
@@ -71,11 +84,13 @@ def _unload_idle_models(generation: int) -> None:
         started = time.perf_counter()
         _BGE_MODEL = None
         _BGE_RERANKER = None
+        gc.collect()
         try:
             import torch
             torch.cuda.empty_cache()
         except Exception:
             log.exception("bge idle unload: CUDA cache release failed")
+        _trim_malloc()
         log.info("bge embedder and reranker unloaded after idle in %.3fs",
                  time.perf_counter() - started)
 
@@ -335,11 +350,14 @@ def reset_rerank_failures(reset_sem: bool = False) -> None:
 def _predict_with_oom_retry(model, pairs):
     """CrossEncoder.predict with CUDA-OOM survival (Fix B).
 
-    On an OOM RuntimeError, empty the CUDA cache and retry at a smaller batch_size
-    (32→8→2→1). Non-OOM errors propagate immediately. If even batch_size=1 OOMs, re-raise the
-    last OOM (genuinely no room — handled as a terminal failure by the caller)."""
+    Starts at `_RERANK_BATCH_SIZE` itself (clamped >= 1) and on an OOM RuntimeError
+    empties the CUDA cache and steps down through smaller power-of-two batch sizes
+    (32→16→8→4→2→1). Non-OOM errors propagate immediately. If even batch_size=1 OOMs,
+    re-raise the last OOM (genuinely no room — handled as a terminal failure by the caller)."""
     last = None
-    for bs in ([b for b in (32, 8, 2, 1) if b <= _RERANK_BATCH_SIZE] or [1]):
+    initial = max(1, _RERANK_BATCH_SIZE)
+    ladder = list(dict.fromkeys([initial, *(b for b in (32, 16, 8, 4, 2, 1) if b < initial)]))
+    for bs in ladder:
         try:
             return model.predict(pairs, batch_size=bs)
         except RuntimeError as e:  # torch.cuda.OutOfMemoryError is a RuntimeError subclass

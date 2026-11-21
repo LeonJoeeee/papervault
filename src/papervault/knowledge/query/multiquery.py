@@ -70,9 +70,13 @@ _MAX_TOTAL_TOKENS = int(os.getenv("KS_MAX_TOTAL_TOKENS", "300000"))
 # fused set actually reaches 50+ distinct chunks. Default 'true' = byte-identical to the baselined path.
 _MQ_ENABLE_RERANK = os.getenv("KS_MQ_ENABLE_RERANK", "true").lower() == "true"
 # #5 drill L2 (2026-06-14): cap chunks-per-paper in the served window so a redundant multi-chunk
-# paper can't evict DISTINCT gold from the 60-chunk cap (served sets carry 44-54 distinct/60; a
-# paper with 4-5 chunks directly costs distinct-paper recall). 0 = unlimited = baseline behaviour.
-_MQ_MAX_CHUNKS_PER_PAPER = int(os.getenv("KS_MQ_MAX_CHUNKS_PER_PAPER", "0"))
+# paper or textbook can't monopolize the synth context and evict DISTINCT papers. Default 4;
+# 0 = unlimited (env-overridable via KS_MQ_MAX_CHUNKS_PER_PAPER).
+_MQ_MAX_CHUNKS_PER_PAPER = int(os.getenv("KS_MQ_MAX_CHUNKS_PER_PAPER", "4"))
+# Bounded additive RRF boost for canon (textbook) chunks within the primary (canon + fulltext) band:
+# applied as `_CANON_BOOST / _RRF_K` so genuinely relevant textbook foundations surface cleanly
+# without letting tangential tail textbook chunks evict top consensus research papers.
+_CANON_BOOST = float(os.getenv("KS_MQ_CANON_BOOST", "0.10"))
 
 # Path 1 (recall-ceiling root-cause 2026-06-18): citation/authority rerank. The recall misses
 # concentrate on FOUNDATIONAL papers (Raissi2019=16k cites, Lagaris1997, Parker1965) that the
@@ -109,32 +113,53 @@ _STD_MAX_TERMS = 6
 _COV_RANK = {"empty": 0, "weak": 1, "thin": 2, "strong": 3}
 _MIN_COV = os.environ.get("KS_MQ_MIN_COVERAGE", "thin").strip().lower()
 
-_DECOMPOSE_SYSTEM = """You decompose a researcher's information need into focused retrieval facets \
-for a graph + vector literature knowledge base. You output ONLY a JSON array, nothing else.
-
-EXAMPLE (FORMAT reference only — your facet count and content come from the user message; this just \
-shows the required SHAPE: object 0 = the anchor/core concept, then distinct-angle facets, each with \
-query + hl + ll, no synonym padding):
+_DECOMPOSE_SYSTEM = (
+    "You decompose a researcher's information need into focused retrieval facets for a graph + "
+    f"vector literature knowledge base working in **{get_domain().label}**, and estimate how many "
+    "distinct sources (`n_sources`, an integer 1..15) a thorough answer needs. "
+    "You output ONLY a JSON object with keys `n_sources` and `facets`, nothing else.\n\n"
+) + """EXAMPLES (FORMAT reference only — your facet count and content come from the user message; these show the required SHAPE: object 0 of `facets` = the anchor/core concept, then distinct-angle facets, each with query + hl + ll, no synonym padding):
 Information need: I'm inverting Voyager cosmic-ray spectra in the outer heliosphere with physics-informed neural networks — what's known about training stability and the transport-equation setup?
-[
-  {"query": "physics-informed neural networks for cosmic-ray transport inversion", "hl": ["physics-informed neural network", "cosmic-ray transport", "inverse problem"], "ll": ["PINN", "Parker transport equation", "loss balancing", "Voyager"]},
-  {"query": "PINN training stability and failure modes", "hl": ["training dynamics", "gradient pathologies", "convergence"], "ll": ["loss weighting", "neural tangent kernel", "stiff PDE", "collocation sampling"]},
-  {"query": "Voyager cosmic-ray measurements in the outer heliosphere and heliopause", "hl": ["outer heliosphere", "local interstellar spectrum", "heliopause crossing"], "ll": ["Voyager 1", "Voyager 2", "CRS instrument", "modulation boundary"]}
-]"""
+{
+  "n_sources": 6,
+  "facets": [
+    {"query": "physics-informed neural networks for cosmic-ray transport inversion", "hl": ["physics-informed neural network", "cosmic-ray transport", "inverse problem"], "ll": ["PINN", "Parker transport equation", "loss balancing", "Voyager"]},
+    {"query": "PINN training stability and failure modes", "hl": ["training dynamics", "gradient pathologies", "convergence"], "ll": ["loss weighting", "neural tangent kernel", "stiff PDE", "collocation sampling"]},
+    {"query": "Voyager cosmic-ray measurements in the outer heliosphere and heliopause", "hl": ["outer heliosphere", "local interstellar spectrum", "heliopause crossing"], "ll": ["Voyager 1", "Voyager 2", "CRS instrument", "modulation boundary"]}
+  ]
+}
+
+Information need: Compare radiation-tolerant FPGA neural inference and inter-satellite task offloading under LEO constellation power constraints.
+{
+  "n_sources": 8,
+  "facets": [
+    {"query": "orbital edge computing on-board neural inference and task offloading", "hl": ["orbital edge computing", "on-board AI", "task offloading"], "ll": ["LEO constellation", "inter-satellite link", "power budget", "latency"]},
+    {"query": "radiation-tolerant FPGA quantized neural network inference and fault mitigation", "hl": ["radiation tolerance", "fault mitigation", "quantized inference"], "ll": ["FPGA", "single-event upset", "triple modular redundancy", "total ionizing dose"]},
+    {"query": "inter-satellite workload scheduling under orbital energy and thermal limits", "hl": ["constellation scheduling", "energy management", "thermal control"], "ll": ["offloading scheduler", "ISL bandwidth", "battery state", "solar array power"]}
+  ]
+}"""
 _DECOMPOSE_PROMPT = """Information need:
 {intent}
 
-Break this into {n} focused retrieval FACETS. Each facet targets a DISTINCT sub-question,
-competing hypothesis, method, experiment, or quantity that must be retrieved separately to answer
-the need fully — together they should span the different papers the full answer needs.
+1. Estimate "n_sources": how many distinct library papers a thorough answer would need to cite:
+   - one fact / one method / one phenomenon -> 2-4
+   - a mechanism spanning a few works -> 4-7
+   - broad synthesis / multi-way comparison / several competing hypotheses or regimes -> 8-15
+   - off-domain question this library almost certainly cannot answer -> 1
+
+2. Break the information need into {n} focused retrieval FACETS. Each facet targets a DISTINCT
+sub-question, competing hypothesis, method, experiment, or quantity that must be retrieved
+separately to answer the need fully — together they should span the different papers the full
+answer needs.
 
 For EACH facet output an object with:
   "query": a self-contained search phrase (the topic to look up, NOT a question to the user)
   "hl":    2-4 HIGH-LEVEL / conceptual keywords (themes, mechanisms, phenomena)
   "ll":    2-6 LOW-LEVEL / specific keywords (named entities, instruments, quantities, models)
 
-Return ONLY a JSON array of exactly {n} such objects. These keywords are used DIRECTLY for graph
-retrieval (no further extraction), so make them precise and discriminating."""
+Return ONLY a JSON object `{{"n_sources": <int>, "facets": [...]}}` with exactly {n} facet
+objects. These keywords are used DIRECTLY for graph retrieval (no further extraction), so make
+them precise and discriminating."""
 
 
 # ---- STANDARD variant: anchor + orthogonal-facet decompose ------------------------------------
@@ -213,13 +238,48 @@ Output: [
 """
 
 
-def _parse_facets(raw: str, cap: int) -> list[dict]:
-    """Parse an LLM JSON-array reply into [{query, hl, ll}], capped to `cap` (a PREFIX so the
-    anchor at index 0 is never displaced). Shared by both decompose variants. Returns [] on any
-    parse failure → callers fall back to the single-query baseline."""
+class _DecomposedFacets(list):
+    """List of validated facet dicts, optionally carrying an inline ``n_sources`` budget."""
+
+    def __init__(self, items: list[dict] = (), *, n_sources: int | None = None):
+        super().__init__(items)
+        self.n_sources = n_sources
+
+
+def _parse_n_sources_value(raw_n: Any) -> int | None:
+    if isinstance(raw_n, bool) or raw_n is None:
+        return None
+    if isinstance(raw_n, int):
+        val = raw_n
+    elif isinstance(raw_n, str) and raw_n.strip().isdigit():
+        val = int(raw_n.strip())
+    else:
+        return None
+    if val <= 0:
+        return None
+    return max(1, min(30, val))
+
+
+def _parse_facets_and_n_sources(raw: str, cap: int) -> _DecomposedFacets:
+    """Parse either ``{"n_sources": <int>, "facets": [...]}`` or a bare JSON array ``[...]``.
+
+    Capped to `cap` as a PREFIX so the anchor at index 0 is never displaced. Returns an empty
+    ``_DecomposedFacets`` on any parse failure → callers fall back to the single-query baseline.
+    """
     try:
-        s = raw[raw.find("["): raw.rfind("]") + 1]
-        arr = json.loads(s)
+        first_obj = raw.find("{")
+        first_arr = raw.find("[")
+        n_sources: int | None = None
+        if first_obj != -1 and (first_arr == -1 or first_obj < first_arr):
+            obj_text = raw[first_obj: raw.rfind("}") + 1]
+            parsed = json.loads(obj_text)
+            if not isinstance(parsed, dict) or "facets" not in parsed:
+                raise ValueError("decompose object must contain a 'facets' array")
+            arr = parsed["facets"]
+            n_sources = _parse_n_sources_value(parsed.get("n_sources"))
+        else:
+            s = raw[first_arr: raw.rfind("]") + 1]
+            arr = json.loads(s)
         if not isinstance(arr, list):
             raise ValueError("facets must be an array")
         facets: list[dict] = []
@@ -237,10 +297,15 @@ def _parse_facets(raw: str, cap: int) -> list[dict]:
             ll = [x.strip() for x in ll if x.strip()]
             if q and (hl or ll):
                 facets.append({"query": q, "hl": hl, "ll": ll})
-        return facets[:cap]
+        return _DecomposedFacets(facets[:cap], n_sources=n_sources)
     except Exception as e:  # noqa: BLE001
         logger.warning("multiquery decompose parse failed: %s | raw=%.200s", e, raw)
-        return []
+        return _DecomposedFacets()
+
+
+def _parse_facets(raw: str, cap: int) -> list[dict]:
+    """Parse an LLM JSON-array (or ``{n_sources, facets}``) reply into [{query, hl, ll}]."""
+    return list(_parse_facets_and_n_sources(raw, cap))
 
 
 # Decompose (V-MQ + STANDARD) outer deadline (Phase 0, 2026-06-04 — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md).
@@ -300,7 +365,7 @@ async def _estimate_n_sources(intent: str) -> int:
     try:
         raw = await asyncio.wait_for(
             mimo_complete(_FANOUT_PROMPT.format(intent=intent), system_prompt=_FANOUT_SYSTEM,
-                          temperature=0.0, **_decompose_route_kwargs()),
+                          temperature=0.0, timeout=_DECOMPOSE_TIMEOUT_S, **_decompose_route_kwargs()),
             timeout=_DECOMPOSE_TIMEOUT_S,
         )
         if not (raw or "").strip():
@@ -330,6 +395,7 @@ async def _decompose(intent: str, n: int = _N_SUBQ) -> list[dict]:
                 # max_tokens is omitted by default (unless KS_LLM_MAX_TOKENS is explicitly set) so
                 # CoT never starves the output, and the 300s decompose timeout bounds runaway cost.
                 system_prompt=_DECOMPOSE_SYSTEM, temperature=0.3,
+                timeout=_DECOMPOSE_TIMEOUT_S,
                 **_decompose_route_kwargs(),
             ),
             timeout=_DECOMPOSE_TIMEOUT_S,
@@ -337,7 +403,7 @@ async def _decompose(intent: str, n: int = _N_SUBQ) -> list[dict]:
     except Exception as e:  # noqa: BLE001
         logger.warning("multiquery decompose failed: %s", e)
         return []
-    return _parse_facets(raw, n)
+    return _parse_facets_and_n_sources(raw, n)
 
 
 async def _decompose_standard(intent: str, n: int = _STD_MAX_TERMS) -> list[dict]:
@@ -356,6 +422,7 @@ async def _decompose_standard(intent: str, n: int = _STD_MAX_TERMS) -> list[dict
                 # CoT can't starve the output -> empty -> silent single-query fallback; the 300s
                 # decompose timeout bounds runaway cost.
                 system_prompt=_STD_DECOMPOSE_SYSTEM, temperature=0.3,
+                timeout=_DECOMPOSE_TIMEOUT_S,
                 **_decompose_route_kwargs(),
             ),
             timeout=_DECOMPOSE_TIMEOUT_S,
@@ -366,9 +433,13 @@ async def _decompose_standard(intent: str, n: int = _STD_MAX_TERMS) -> list[dict
     return _parse_facets(raw, n)
 
 
-def _rrf(ranked_lists: list[list[dict]], key_fn, top: int | None = None, k: int = _RRF_K) -> list[dict]:
-    """Reciprocal Rank Fusion over several reranked item lists. key_fn(item) gives the dedup key;
-    the first-seen item dict is kept as the representative. Returns the fused list (top `top`)."""
+def _rrf_scored(
+    ranked_lists: list[list[dict]],
+    key_fn,
+    top: int | None = None,
+    k: int = _RRF_K,
+) -> list[tuple[dict, float]]:
+    """Reciprocal Rank Fusion returning ``[(representative_item, rrf_score), ...]`` sorted DESC."""
     scores: dict[Any, float] = {}
     rep: dict[Any, dict] = {}
     for lst in ranked_lists:
@@ -381,7 +452,47 @@ def _rrf(ranked_lists: list[list[dict]], key_fn, top: int | None = None, k: int 
     ordered = sorted(scores, key=lambda kk: -scores[kk])
     if top is not None:
         ordered = ordered[:top]
-    return [rep[kk] for kk in ordered]
+    return [(rep[kk], scores[kk]) for kk in ordered]
+
+
+def _rrf(ranked_lists: list[list[dict]], key_fn, top: int | None = None, k: int = _RRF_K) -> list[dict]:
+    """Reciprocal Rank Fusion over several reranked item lists. key_fn(item) gives the dedup key;
+    the first-seen item dict is kept as the representative. Returns the fused list (top `top`)."""
+    return [item for item, _score in _rrf_scored(ranked_lists, key_fn, top=top, k=k)]
+
+
+def _undirected_rel_key(r: dict) -> tuple[str, str] | None:
+    """Undirected dedup key for a LightRAG relationship dict (A-B == B-A)."""
+    src, tgt = r.get("src_id"), r.get("tgt_id")
+    if src is None and tgt is None:
+        return None
+    a, b = str(src or ""), str(tgt or "")
+    return (a, b) if a <= b else (b, a)
+
+
+def _order_chunks_by_tier(scored_chunks: list[tuple[dict, float]]) -> list[dict]:
+    """Order fused chunks with authority demotion and bounded relevance-preserving canon boost.
+
+    - Primary band (``canon`` + ``fulltext``) stays ahead of ``abstract_only`` and ``preliminary``
+      (``notebook:``, ``web:``).
+    - Within the primary band, ``canon`` chunks receive a bounded additive boost
+      (``_CANON_BOOST / _RRF_K``) rather than an unconditional hard sort ahead of all research
+      papers, so genuinely relevant textbook foundations surface cleanly while tangential tail
+      textbook chunks never evict top consensus research papers.
+    """
+    primary: list[tuple[int, dict, float]] = []
+    lower: list[tuple[int, int, dict]] = []
+    boost = _CANON_BOOST / max(1, _RRF_K)
+    for idx, (chunk, score) in enumerate(scored_chunks):
+        tier = source_tier(chunk)
+        if tier in ("canon", "fulltext"):
+            adj = score + (boost if tier == "canon" else 0.0)
+            primary.append((idx, chunk, adj))
+        else:
+            lower.append((SOURCE_TIER_RANK.get(tier, 3), idx, chunk))
+    primary.sort(key=lambda entry: (-entry[2], entry[0]))
+    lower.sort(key=lambda entry: (entry[0], entry[1]))
+    return [chunk for _, chunk, _ in primary] + [chunk for _, _, chunk in lower]
 
 
 def _empty_data() -> dict[str, Any]:
@@ -399,22 +510,35 @@ def _annotated_chunk_lists(datas: list[dict]) -> list[list[dict]]:
     return lists
 
 
-_citation_cache: dict | None = None
+_citation_cache: dict[str, int] | None = None
+_citation_cache_sig: tuple[str, int, int] | None = None
 
 
-def _citation_map() -> dict:
-    """Lazy-load {paper_key: citation_count} (exported from paper-library, mirrors the shared
-    llm_keys.json pattern). Empty dict on any failure → the citation prior is inert (safe)."""
-    global _citation_cache
-    if _citation_cache is None:
-        try:
-            import json
-            with open(_CITATION_MAP_PATH) as f:
-                _citation_cache = {k: int(v) for k, v in json.load(f).items()}
-            logger.info("citation map loaded: %d papers from %s", len(_citation_cache), _CITATION_MAP_PATH)
-        except Exception as e:  # noqa: BLE001
-            logger.warning("citation map load failed (%s) — citation prior inert", e)
-            _citation_cache = {}
+def _citation_map() -> dict[str, int]:
+    """Lazy-load {paper_key: citation_count} with stat-based reload on (path, mtime_ns, size).
+    Empty dict on any failure → the citation prior is inert (safe)."""
+    global _citation_cache, _citation_cache_sig
+    path = _CITATION_MAP_PATH
+    try:
+        st = os.stat(path)
+        sig = (path, st.st_mtime_ns, st.st_size)
+    except OSError as e:
+        if _citation_cache is None or _citation_cache_sig is not None:
+            logger.warning("citation map stat failed (%s) — citation prior inert", e)
+        _citation_cache = {}
+        _citation_cache_sig = None
+        return _citation_cache
+    if _citation_cache is not None and _citation_cache_sig == sig:
+        return _citation_cache
+    try:
+        with open(path) as f:
+            _citation_cache = {k: int(v) for k, v in json.load(f).items()}
+        _citation_cache_sig = sig
+        logger.info("citation map loaded: %d papers from %s", len(_citation_cache), path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("citation map load failed (%s) — citation prior inert", e)
+        _citation_cache = {}
+        _citation_cache_sig = None
     return _citation_cache
 
 
@@ -460,23 +584,33 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
         base_data = base["data"] if base_ok else _empty_data()
         base_meta = base.get("metadata") if isinstance(base, dict) else None
         cov = aq._assess_coverage(base_meta, base_data)
-        if cov == "empty" or _COV_RANK.get(cov, 0) < _COV_RANK.get(_MIN_COV, 2):
+        pinfo = (base_meta or {}).get("processing_info") or {}
+        n_entities = pinfo.get("total_entities_found")
+        # Weak (abstract-only) anchor coverage with >= 5 graph entities is still in-domain:
+        # allow multi-query fan-out so facets can discover full-text papers (final kb_coverage
+        # remains capped at "weak" if served evidence stays abstract-only).
+        gate_cov = (
+            ("strong" if n_entities >= 20 else "thin")
+            if (cov == "weak" and isinstance(n_entities, (int, float)) and n_entities >= 5)
+            else cov
+        )
+        if cov == "empty" or _COV_RANK.get(gate_cov, 0) < _COV_RANK.get(_MIN_COV, 2):
             return base_data, base_meta, False
-        # Fanout estimation is admitted only after the anchor passes the gate.
+        facets = await decomposition
+        if not facets:
+            return base_data, base_meta, False
+        # Use inline n_sources from _decompose when present (zero extra LLM round-trip);
+        # fall back to _estimate_n_sources ONLY when n_sources was omitted.
         if os.getenv("KS_MQ_FANOUT", "1") == "1":
-            estimate = asyncio.create_task(_estimate_n_sources(intent))
-            planning_tasks.append(estimate)
-            # Surface either planner's failure promptly, but do not wait for an
-            # estimator whose budget cannot be used when decomposition is empty.
-            done, _ = await asyncio.wait(planning_tasks, return_when=asyncio.FIRST_COMPLETED)
-            if estimate in done:
-                estimate.result()
-            facets = await decomposition
-            if not facets:
-                return base_data, base_meta, False
-            _n_src = await estimate
+            decomposed_n = getattr(facets, "n_sources", None)
+            if decomposed_n is not None:
+                _n_src = decomposed_n
+            else:
+                estimate = asyncio.create_task(_estimate_n_sources(intent))
+                planning_tasks.append(estimate)
+                _n_src = await estimate
         else:
-            facets, _n_src = await decomposition, 0
+            _n_src = 0
     finally:
         for task in planning_tasks:
             if not task.done():
@@ -540,17 +674,18 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
             _exc_types, intent[:160],
         )
 
-    _ranked_chunks = _rrf(
+    _scored_chunks = _rrf_scored(
         _annotated_chunk_lists(datas),
-        key_fn=lambda c: (_source_label(c.get("file_path") or "")[0], c.get("content") or c.get("chunk_id")),
+        key_fn=lambda c: (_source_label(c.get("file_path") or "")[0], c.get("chunk_id") or c.get("content")),
         # Tier priority must apply before any served-window cut.
         top=None,
     )
     if _CITATION_PRIOR:
         # Path 1: authority rerank the full pool BEFORE the served cut / diversity step, so a
         # foundational paper crowded out of the top-60 by its descendants gets lifted into the window.
-        _ranked_chunks = _citation_rerank(_ranked_chunks)
-    _ranked_chunks.sort(key=lambda c: SOURCE_TIER_RANK[source_tier(c)])
+        _reranked = _citation_rerank([c for c, _s in _scored_chunks])
+        _scored_chunks = [(c, 1.0 / (_RRF_K + idx)) for idx, c in enumerate(_reranked)]
+    _ranked_chunks = _order_chunks_by_tier(_scored_chunks)
     if _MQ_MAX_CHUNKS_PER_PAPER:
         # L2 diversification: greedily fill chunk_top_k from the RRF order, skipping a chunk once its
         # paper already holds _MQ_MAX_CHUNKS_PER_PAPER chunks → frees served slots for distinct papers.
@@ -567,7 +702,7 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
     else:
         chunks = _ranked_chunks[:_served_cap]
     entities = _rrf([d.get("entities") or [] for d in datas], key_fn=lambda e: e.get("entity_name"), top=aq._TOP_K)
-    rels = _rrf([d.get("relationships") or [] for d in datas], key_fn=lambda r: (r.get("src_id"), r.get("tgt_id")), top=aq._TOP_K)
+    rels = _rrf([d.get("relationships") or [] for d in datas], key_fn=_undirected_rel_key, top=aq._TOP_K)
 
     seen: set = set()
     refs: list[dict] = []
@@ -589,9 +724,12 @@ async def retrieve_fused(intent: str, rag: Any) -> tuple[dict[str, Any], dict[st
 
 
 def _chunk_key(c: dict) -> str:
-    """Identity key for a chunk. content[:200] is the stable primary (same passage retrieved under
-    different queries fuses onto ONE identity); falls back to file_path, then a per-object _uid
-    sentinel so an identity-less chunk stays distinct rather than colliding to ''."""
+    """Identity key for a chunk. Uses stable ``chunk_id`` when present, falling back to
+    ``content[:200]``, then ``file_path``, then a per-object ``_uid`` sentinel so an
+    identity-less chunk stays distinct rather than colliding to ''."""
+    cid = c.get("chunk_id")
+    if cid:
+        return f"id:{cid}"
     body = (c.get("content") or "")[:200]
     if body:
         return f"c:{body}"
@@ -609,7 +747,10 @@ def _entity_key(e: dict) -> str:
 def _rel_key(r: dict) -> str:
     src = r.get("src_id") or ""
     tgt = r.get("tgt_id") or ""
-    return f"r:{src}\x1f{tgt}" if (src or tgt) else f"_uid:{id(r)}"
+    if not (src or tgt):
+        return f"_uid:{id(r)}"
+    a, b = sorted((str(src), str(tgt)))
+    return f"r:{a}\x1f{b}"
 
 
 def rrf_fuse(ranklists: list[list[dict]], key_fn, *, k: int = _RRF_K) -> dict[str, float]:
@@ -749,6 +890,7 @@ async def retrieve_standard(intent: str, rag: Any) -> tuple[dict[str, Any], dict
         return QueryParam(
             mode=aq._QUERY_MODE, top_k=aq._TOP_K, chunk_top_k=_STD_SUB_CHUNK_TOP_K,
             enable_rerank=False, hl_keywords=f["hl"], ll_keywords=f["ll"],
+            max_total_tokens=_MAX_TOTAL_TOKENS,
         )
 
     # Anchor first (index 0) so it leads every round-robin cycle; facets follow in order.

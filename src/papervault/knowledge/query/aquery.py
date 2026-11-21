@@ -12,6 +12,7 @@ import os
 import re
 import time
 from collections import Counter
+from contextvars import ContextVar
 from copy import deepcopy
 from typing import Any
 
@@ -21,6 +22,10 @@ from papervault.knowledge.query.synth import _source_label, annotate_sources, so
 from papervault.llm_routing import route
 
 logger = logging.getLogger("ks.query.aquery")
+_DEFAULT_SYNTH_ANSWER = synth_answer
+_receipt_logged_in_scope: ContextVar[list[bool] | None] = ContextVar(
+    "_receipt_logged_in_scope", default=None,
+)
 
 _QUERY_MODE = "mix"   # SDD §6.4: graph+vector. naive → entities/relationships empty (F11).
 # V1 wide-recall→rerank (SDD §6.9.1): top_k 20→40 widens the graph entity/relation candidate
@@ -70,7 +75,9 @@ def _retrieved_keys(data: dict[str, Any], *, sources: bool = False) -> list[str]
         if label == "unknown":
             continue
         if sources:
-            valid = _is_source_key(fp)
+            # _source_label normalizes slash-form operator paths (textbook/Key, notebook/Key,
+            # web/Key) into colon-prefixed labels so both forms are recognized uniformly.
+            valid = _is_source_key(label)
         else:
             valid = fp.startswith("paper/") or ("/" not in fp and ":" not in fp)
         if valid and label not in keys:
@@ -110,7 +117,83 @@ def _abstract_only_papers(data: dict[str, Any]) -> list[str]:
     return sorted(keys)
 
 
-def _assess_coverage(metadata: dict[str, Any] | None, data: dict[str, Any]) -> str:
+_STANDALONE_LOCATOR_RE = re.compile(
+    r"^(?:ch(?:ap(?:ter)?)?\.?|sec(?:tion)?s?\.?|pp?\.?|eq(?:uation)?s?\.?|"
+    r"fig(?:ure)?s?\.?|table|tbl\.?|appendix|app\.?)(?:\s|$|\d)",
+    re.IGNORECASE,
+)
+_LOCATOR_TAIL_RE = re.compile(
+    r"\s+(?:ch(?:ap(?:ter)?)?\.?|sec(?:tion)?s?\.?|pp?\.?|eq(?:uation)?s?\.?|"
+    r"fig(?:ure)?s?\.?|table|tbl\.?|appendix|app\.?)\b.*$",
+    re.IGNORECASE,
+)
+_CITATION_LIKE_RE = re.compile(
+    r"^(?:"
+    r"(?:textbook|notebook|web):[A-Za-z0-9._\-]+"
+    r"|[A-Za-z][A-Za-z0-9._\-]*(?:19|20)\d{2}[a-z]?"
+    r"|[A-Z][A-Za-z\-]+(?:\s+et\s+al\.?)?\s+(?:19|20)\d{2}[a-z]?"
+    r")$"
+)
+
+
+def _normalize_citation_token(token: str) -> str:
+    if "/" in token:
+        prefix = token.split("/", 1)[0]
+        if f"{prefix}:" in _SOURCE_PREFIXES:
+            label, _ = _source_label(token)
+            if label != "unknown":
+                return label
+    return token
+
+
+def _parse_inline_citations(
+    answer: str | None,
+    known_keys: set[str],
+) -> tuple[Counter[str], list[str]]:
+    """Parse verified inline citation keys and detect citation-like unverified brackets.
+
+    Supports single keys (`[Reames2023]`, `[ Reames2023 ]`), multi-key brackets
+    (`[Reames2023, Parker1965]`, `[A; B]`), and locator-annotated citations
+    (`[textbook:Schlickeiser2002, Ch. 5]`, `[Reames2023, Sec. 3.2]`, `[Reames2023, pp. 12-15]`).
+    """
+    counts: Counter[str] = Counter()
+    unverified: list[str] = []
+    if not answer:
+        return counts, unverified
+    for match in re.finditer(r"\[([^\[\]\n]+)\]", answer):
+        inner = match.group(1).strip()
+        if not inner:
+            continue
+        norm_inner = _normalize_citation_token(inner)
+        if norm_inner in known_keys:
+            counts[norm_inner] += 1
+            continue
+        # Skip markdown links [label](url) that did not directly match a known key.
+        if answer[match.end(): match.end() + 1] == "(":
+            continue
+        for raw_seg in re.split(r"[,;]", inner):
+            seg = raw_seg.strip()
+            if not seg or _STANDALONE_LOCATOR_RE.match(seg):
+                continue
+            norm_seg = _normalize_citation_token(seg)
+            if norm_seg in known_keys:
+                counts[norm_seg] += 1
+                continue
+            cand = _normalize_citation_token(_LOCATOR_TAIL_RE.sub("", seg).strip())
+            if cand in known_keys:
+                counts[cand] += 1
+                continue
+            if cand and _CITATION_LIKE_RE.match(cand) and cand not in unverified:
+                unverified.append(cand)
+    return counts, unverified
+
+
+def _assess_coverage(
+    metadata: dict[str, Any] | None,
+    data: dict[str, Any],
+    *,
+    _annotated: bool = False,
+) -> str:
     """kb_coverage from graph signal (SDD §6.4). None-safe.
 
     e = metadata.processing_info.total_entities_found = len(final_entities), the graph-search
@@ -127,7 +210,8 @@ def _assess_coverage(metadata: dict[str, Any] | None, data: dict[str, Any]) -> s
     cosine (still present in v3, threshold 0.2) is only an auxiliary signal; graph-signal
     coverage is the deliberate design choice (§6.4 注), not 'no cosine'.
     """
-    chunks = [c for c in annotate_sources(data)["chunks"] if (c.get("content") or "").strip()]
+    annotated = data if _annotated else annotate_sources(data)
+    chunks = [c for c in annotated.get("chunks") or [] if (c.get("content") or "").strip()]
     if not chunks:
         return "empty"
     pinfo = (metadata or {}).get("processing_info")
@@ -149,21 +233,29 @@ def build_outfeed(
     query_mode: str = _QUERY_MODE, variant: str = "single", rerank_degraded: bool = False,
     synthesis_model: str | None = None, synthesis_latency_s: float = 0.0,
     serving_manifest: dict[str, Any] | None = None,
+    _annotated: bool = False,
 ) -> dict[str, Any]:
     """Pure production/eval contract over one captured retrieval and its answer.
 
     No-synthesis eval retains retrieval-ranked candidates as cited_papers for recall
-    compatibility. All synthesized outputs admit only exact inline keys in that pool.
+    compatibility. All synthesized outputs admit only verified inline keys in that pool.
     The model records the requested routing level; the gateway's underlying model is
     undisclosed and is never inferred from configuration.
     """
-    data = annotate_sources(data)
-    coverage = _assess_coverage(metadata, data)
+    if not _annotated:
+        data = annotate_sources(data)
+    coverage = _assess_coverage(metadata, data, _annotated=True)
     papers = _retrieved_keys(data)
     sources = _retrieved_keys(data, sources=True)
     if coverage == "empty" and not no_synth:
         answer = _EMPTY["answer"]
-    counts = Counter(re.findall(r"\[([^\[\]\n]+)\]", answer or ""))
+    if no_synth:
+        counts: Counter[str] = Counter()
+        unverified: list[str] = []
+    else:
+        counts, unverified = _parse_inline_citations(answer, set(papers) | set(sources))
+        if unverified:
+            logger.warning("unverified inline citations in answer: %s", unverified)
     def cited(keys):
         if no_synth:
             return list(keys)
@@ -176,6 +268,7 @@ def build_outfeed(
         "generation_id": generation_id, "query_mode": query_mode, "variant": variant,
         "kb_coverage": coverage, "retrieved_chunk_count": len(data["chunks"]),
         "retrieved_paper_count": len(papers), "cited_paper_count": len(cited_papers),
+        "unverified_citations": unverified,
         "rerank_degraded": rerank_degraded, "synthesis_model": synthesis_model,
         "synthesis_latency_s": synthesis_latency_s, "no_synth": no_synth,
     }
@@ -212,17 +305,23 @@ async def synthesize_outfeed(
 ) -> dict[str, Any]:
     """Apply the coverage gate before synthesis, then assemble one observable out-feed."""
     data = annotate_sources(data)
-    coverage = _assess_coverage(metadata, data)
+    coverage = _assess_coverage(metadata, data, _annotated=True)
     answer = None
     model, latency = None, 0.0
     if not no_synth and coverage != "empty":
         model = route("synth")
         started = time.monotonic()
-        answer = await synth_answer(data, intent, kb_coverage=coverage)
+        if synth_answer is _DEFAULT_SYNTH_ANSWER:
+            answer = await synth_answer(data, intent, kb_coverage=coverage, _annotated=True)
+        else:
+            answer = await synth_answer(data, intent, kb_coverage=coverage)
         latency = time.monotonic() - started
     out = build_outfeed(data, metadata, answer, no_synth=no_synth,
-                        synthesis_model=model, synthesis_latency_s=latency, **receipt_fields)
+                        synthesis_model=model, synthesis_latency_s=latency,
+                        _annotated=True, **receipt_fields)
     logger.info("query_receipt %s", out["query_receipt"], extra={"query_receipt": out["query_receipt"]})
+    if (logged := _receipt_logged_in_scope.get()) is not None:
+        logged[0] = True
     return out
 
 

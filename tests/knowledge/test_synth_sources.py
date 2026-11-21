@@ -19,8 +19,12 @@ _CONTRADICTING = (
     ("An2017", ("An2017", "empirical")),
     ("Suvorovand", ("Suvorovand", "empirical")),
     ("textbook:Griffiths", ("textbook:Griffiths", "established")),
+    ("textbook/Griffiths#s2", ("textbook:Griffiths", "established")),
     ("notebook:idea", ("notebook:idea", "preliminary")),
+    ("notebook/idea#s1", ("notebook:idea", "preliminary")),
     ("web:nasa", ("web:nasa", "preliminary")),
+    ("web/nasa", ("web:nasa", "preliminary")),
+    ("textbook/", ("unknown", "preliminary")),
     ("", ("unknown", "preliminary")),
     ("unknown_source", ("unknown", "preliminary")),
     ("unknown", ("unknown", "preliminary")),
@@ -59,3 +63,33 @@ def test_prompt_carries_one_bracketed_operator_source_rule():
 
 def test_system_prompt_cites_operator_sources_with_the_same_bracket_form():
     assert "[textbook:" in _SYNTH_SYSTEM
+
+
+def test_preliminary_sources_have_lowest_source_tier():
+    from papervault.knowledge.query.synth import SOURCE_TIER_RANK, source_tier
+
+    assert source_tier({"file_path": "textbook:Schlickeiser2002", "content": "x"}) == "canon"
+    assert source_tier({"file_path": "paper/Reames2023", "content": "x"}) == "fulltext"
+    assert source_tier({"file_path": "notebook:idea-1", "content": "x"}) == "preliminary"
+    assert source_tier({"file_path": "web:nasa", "content": "x"}) == "preliminary"
+    assert source_tier({"file_path": "notebook/idea-1", "content": "x"}) == "preliminary"
+    assert SOURCE_TIER_RANK["canon"] < SOURCE_TIER_RANK["fulltext"] < SOURCE_TIER_RANK["abstract_only"] < SOURCE_TIER_RANK["preliminary"]
+
+
+def test_build_prompt_trims_tail_chunks_to_token_ceiling(monkeypatch, caplog):
+    import logging
+    from papervault.knowledge.query import synth
+
+    monkeypatch.setattr(synth, "_SYNTH_MAX_PROMPT_TOKENS", 60)
+    data = {
+        "chunks": [
+            {"file_path": "paper/Keep1", "content": "Important first finding about solar wind."},
+            {"file_path": "paper/Drop2", "content": " ".join(["overflow"] * 200)},
+            {"file_path": "paper/Drop3", "content": " ".join(["tail"] * 200)},
+        ],
+    }
+    with caplog.at_level(logging.WARNING, logger="ks.query.synth"):
+        prompt = _build_prompt(data, "Summarize.")
+    assert "Keep1" in prompt
+    assert "Drop3" not in prompt
+    assert "trimmed" in caplog.text.lower()

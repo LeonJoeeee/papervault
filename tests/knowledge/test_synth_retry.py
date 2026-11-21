@@ -195,3 +195,16 @@ async def test_synth_answer_omits_max_tokens_by_default_and_forwards_when_set(mo
     monkeypatch.setattr(synth_mod, "_SYNTH_MAX_TOKENS", 12000)
     assert await synth_answer(_DATA, _INTENT) == "synthesized answer [X2023]"
     assert seen_kwargs[-1]["max_tokens"] == 12000
+    assert seen_kwargs[-1]["retries"] == 0
+
+
+async def test_quota_429_is_not_retried_by_synth(monkeypatch):
+    class _Quota429(Exception):
+        status_code = 429
+
+    err = _Quota429("Weekly usage limit reached")
+    assert _is_transient_synth_error(err) is False
+    calls = _install(monkeypatch, [err, "should never be reached"])
+    out = await synth_answer(_DATA, _INTENT)
+    assert out.startswith(SYNTH_FAILED_PREFIX)
+    assert len(calls) == 1

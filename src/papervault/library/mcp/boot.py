@@ -85,7 +85,7 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
             await asyncio.sleep(10)
             try:
                 async with concurrency.lib_write_lock:
-                    library.flush_if_dirty()
+                    await asyncio.to_thread(library.flush_if_dirty)
             except Exception:  # noqa: BLE001 — flusher must never die
                 log.exception("dirty-flusher failed (will retry)")
 
@@ -107,7 +107,7 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
             report = await asyncio.to_thread(migrate_status, library)
             if should_persist(report):
                 async with concurrency.lib_write_lock:
-                    library.save()
+                    await asyncio.to_thread(library.save)
                 stub_deletions = report.get("by_rule", {}).get(STUB_DELETION_RULE, 0)
                 log.info("download_status migration: normalized %d/%d records "
                          "(%d stub deletions) %s",
@@ -189,6 +189,6 @@ async def start_background(server, log) -> Callable[[], Awaitable[None]]:
         # Graceful-shutdown flush: debounced state must reach disk before exit —
         # NEW records have no disk artifact and are NOT reconcile-recoverable.
         async with concurrency.lib_write_lock:
-            library.save(force=True)
+            await asyncio.to_thread(library.save, force=True)
 
     return shutdown

@@ -271,6 +271,81 @@ def cmd_correction_adjudicate(args) -> int:
     return 0
 
 
+def _effective_vault_root() -> Path:
+    from papervault import config
+    env_root = os.environ.get("PAPERVAULT_VAULT") or os.environ.get("PAPER_LIBRARY_PATH")
+    return Path(os.path.expanduser(str(env_root or config.VAULT_PATH)))
+
+
+def _check_read_only_authority(root: Path) -> None:
+    """Enforce the durable catalog-authority fence for read-only CLI commands.
+
+    ``Library(read_only=True)`` skips acquiring a writer lease, so read-only CLI
+    commands explicitly verify ``.catalog-handoff.json`` to avoid silently
+    reading a stale ``index.json`` after a Postgres cutover or mid-handoff.
+    """
+    from papervault.store.fencing import WriterFenced, handoff_state
+
+    authority = os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json")
+    if authority not in {"json", "postgres"}:
+        raise ValueError("PAPERVAULT_CATALOG_AUTHORITY must be json or postgres")
+    state = handoff_state(root)
+    if state:
+        phase = state.get("phase")
+        if phase not in {"resumed", "rolled_back"}:
+            raise WriterFenced(
+                f"catalog handoff is in progress (phase={phase!r}); "
+                "refusing read against ambiguous catalog authority"
+            )
+        expected = "postgres" if phase == "resumed" else "json"
+        if authority != expected:
+            raise WriterFenced(
+                f"PAPERVAULT_CATALOG_AUTHORITY={authority!r} disagrees with "
+                f"durable catalog authority {expected!r} (phase={phase!r})"
+            )
+
+
+def _open_read_only_library() -> Library:
+    _check_read_only_authority(_effective_vault_root())
+    return Library(read_only=True)
+
+
+def _refuse_if_service_running(action: str) -> bool:
+    """Refuse offline mutating CLI commands while papervault.service is active.
+
+    Fails closed on timeout, D-Bus errors, or unexpected probe output; only a
+    missing ``systemctl`` binary (``FileNotFoundError`` — minimal container/CI)
+    proceeds permissively.
+    """
+    from papervault.ops_guards import active_service_units
+    try:
+        running = active_service_units(
+            ("papervault.service",),
+            states=_SERVICE_RUNNING_STATES,
+            strict=True,
+        )
+    except RuntimeError as exc:
+        if "systemctl unavailable" in str(exc):
+            return False
+        _err(
+            f"cannot verify papervault.service state before `{action}` ({exc}); "
+            "refusing to write without confirming the service is stopped."
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001 — fail closed on timeout / D-Bus failure
+        _err(
+            f"cannot verify papervault.service state before `{action}` ({exc}); "
+            "refusing to write without confirming the service is stopped."
+        )
+        return True
+    if running:
+        _err(f"{', '.join(running)} is running — it saves its in-memory index "
+             f"and would overwrite or conflict with `{action}`. Stop it first "
+             "(systemctl --user stop papervault.service), then re-run.")
+        return True
+    return False
+
+
 def cmd_add(args) -> int:
     """`python -m papervault.library.cli add <ident>` — enqueue one paper for background ingest.
 
@@ -280,6 +355,8 @@ def cmd_add(args) -> int:
     """
     from .services.add_service import AddService
 
+    if _refuse_if_service_running("add"):
+        return 2
     lib = Library()
     result = AddService(lib).add(args.identifier, force_refresh=args.force_refresh)
 
@@ -313,6 +390,8 @@ def cmd_add_batch(args) -> int:
         _err("no identifiers provided")
         return 1
 
+    if _refuse_if_service_running("add-batch"):
+        return 2
     lib = Library()
     svc = BatchAddService(lib, max_workers=args.workers)
 
@@ -330,7 +409,7 @@ def cmd_add_batch(args) -> int:
 
 def cmd_list(args) -> int:
     """`python -m papervault.library.cli list [filters]` — tabular library view."""
-    lib = Library()
+    lib = _open_read_only_library()
 
     def keep(p) -> bool:
         if args.review and not p.is_review:
@@ -367,7 +446,7 @@ def cmd_search(args) -> int:
     """`python -m papervault.library.cli search <query>` — in-library search with optional LLM rerank."""
     from .services.search_service import SearchService
 
-    lib = Library()
+    lib = _open_read_only_library()
     out = SearchService(lib).search(
         args.query, limit=args.limit, rerank=not args.no_rerank,
     )
@@ -386,7 +465,7 @@ def cmd_search(args) -> int:
 
 def cmd_show(args) -> int:
     """`python -m papervault.library.cli show <key>` — full metadata for one paper."""
-    lib = Library()
+    lib = _open_read_only_library()
     p = lib.get(args.key)
     if p is None:
         _err(f"no paper with key {args.key!r}")
@@ -402,7 +481,7 @@ def cmd_show(args) -> int:
 
 def cmd_read(args) -> int:
     """`python -m papervault.library.cli read <key>` — print extracted text."""
-    lib = Library()
+    lib = _open_read_only_library()
     if lib.get(args.key) is None:
         _err(f"no paper with key {args.key!r}")
         return 1
@@ -423,7 +502,7 @@ def cmd_read(args) -> int:
 
 def cmd_bibtex(args) -> int:
     """`python -m papervault.library.cli bibtex` — export BibTeX (full library or subset)."""
-    lib = Library()
+    lib = _open_read_only_library()
     keys = None
     if args.keys:
         keys = [k.strip() for k in args.keys.split(",") if k.strip()]
@@ -453,7 +532,7 @@ def cmd_cite_check(args) -> int:
     if args.allowed_keys:
         allowed = [k.strip() for k in args.allowed_keys.split(",") if k.strip()]
 
-    lib = Library()
+    lib = _open_read_only_library()
     report = cite_check.check(tex_path.read_text(), lib, allowed=allowed)
 
     if args.json:
@@ -756,22 +835,24 @@ def cmd_audit(args) -> int:
         except OSError as exc:
             _err(f"cannot read --retry-extract-keys file {args.retry_extract_keys}: {exc}")
             return 2
-        if not args.dry_run:
-            from papervault.ops_guards import active_service_units
-            running = active_service_units(("papervault.service",),
-                                           states=_SERVICE_RUNNING_STATES)
-            if running:
-                _err(f"{', '.join(running)} is running — it saves its whole in-memory "
-                     "index and would overwrite this reset. Stop it first "
-                     "(systemctl --user stop papervault.service), then re-run.")
-                return 2
+
+    is_mutating = bool(
+        args.fix
+        or args.retry_failed
+        or args.retry_low_quality
+        or args.retry_metadata_only
+        or (args.retry_extract_keys and not args.dry_run)
+        or (args.resolve_stub_dois and not args.dry_run)
+    )
+    if is_mutating and _refuse_if_service_running("audit"):
+        return 2
 
     from .services.operator_actions import reopen_records
     actor = args.actor
     def reopen(papers, action, *, extraction=False):
         reopen_records(lib, papers, extraction=extraction,
                        reason=args.reason or f"audit: {action}", actor=actor)
-    lib = Library()
+    lib = Library() if is_mutating else _open_read_only_library()
     payload: dict = {}
     do_drift_scan = args.fix or not (
         args.queue or args.retry_failed or args.retry_low_quality
@@ -987,7 +1068,7 @@ def cmd_status(args) -> int:
     healthy, and what just happened" rather than the full state-machine
     breakdown. Designed for ``watch -n 60 python -m papervault.library.cli status`` style use.
     """
-    lib = Library()
+    lib = _open_read_only_library()
     papers = lib.all_papers()
 
     from .models import (
@@ -1103,7 +1184,7 @@ def cmd_status(args) -> int:
 
 def cmd_topics(args) -> int:
     """`python -m papervault.library.cli topics list|show <slug>` — topic membership inspection."""
-    lib = Library()
+    lib = _open_read_only_library()
     if args.topic_command == "list":
         slugs = sorted(p.stem for p in lib.topics_dir.glob("*.json"))
         for s in slugs:
@@ -1121,11 +1202,24 @@ def cmd_topics(args) -> int:
 
 def cmd_config(args) -> int:
     """`python -m papervault.library.cli config` — print effective config."""
-    lib = Library()
+    root = _effective_vault_root()
+    _check_read_only_authority(root)
+    authority = os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json")
+    if (
+        authority == "json"
+        and not (root / "index.json").exists()
+        and not (root / "index.json.bak").exists()
+    ):
+        root_str = str(root)
+        paper_count = 0
+    else:
+        lib = Library(read_only=True)
+        root_str = str(lib.root)
+        paper_count = len(lib.all_papers())
     info = {
-        "library_root": str(lib.root),
-        "library_root_env": "$PAPER_LIBRARY_PATH" if "PAPER_LIBRARY_PATH" in __import__("os").environ else "(default)",
-        "papers_in_library": len(lib.all_papers()),
+        "library_root": root_str,
+        "library_root_env": "$PAPER_LIBRARY_PATH" if "PAPER_LIBRARY_PATH" in os.environ else "(default)",
+        "papers_in_library": paper_count,
         "version": _version(),
     }
     if args.json:
@@ -1156,7 +1250,9 @@ def cmd_zotero_sync(args) -> int:
         _err(f"ZOTERO_USER_ID must be integer, got {user_id_raw!r}")
         return 2
 
-    lib = Library()
+    if not args.dry_run and _refuse_if_service_running("zotero-sync"):
+        return 2
+    lib = _open_read_only_library() if args.dry_run else Library()
     sync = ZoteroSync(lib, api_key=api_key, user_id=user_id)
 
     def _progress(stage: str, done: int, total: int) -> None:
@@ -1177,11 +1273,15 @@ def cmd_zotero_sync(args) -> int:
 
 
 def _version() -> str:
-    try:
-        from importlib.metadata import version
-        return version("paper-library")
-    except Exception:
-        return "unknown"
+    from importlib.metadata import PackageNotFoundError, version
+    for dist in ("papervault", "paper-library"):
+        try:
+            return version(dist)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            return "unknown"
+    return "unknown"
 
 
 # -------------------------------- argparse ---------------------------------

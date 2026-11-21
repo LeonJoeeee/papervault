@@ -54,8 +54,28 @@ def _optional_int_env(name: str) -> int | None:
     return int(raw) if raw else None
 
 
-GATEWAY = os.getenv("KS_GATEWAY_URL", "http://127.0.0.1:4000/v1")
-VKEY = os.getenv("KS_VIRTUAL_KEY", "")
+def _resolve_endpoint() -> tuple[str, str]:
+    """Resolve judge endpoint URL and API key.
+
+    If either legacy ``KS_GATEWAY_URL`` or ``KS_VIRTUAL_KEY`` is set, both
+    values resolve strictly within the legacy/gateway domain (never mixing
+    direct-provider credentials with a gateway URL or vice versa). Otherwise
+    fall back to ``papervault.config`` (gateway vs direct transport).
+    """
+    from papervault import config
+
+    legacy_url = os.getenv("KS_GATEWAY_URL", "").strip()
+    legacy_key = os.getenv("KS_VIRTUAL_KEY", "").strip()
+    if legacy_url or legacy_key:
+        url = legacy_url or "http://127.0.0.1:4000/v1"
+        key = legacy_key or (config.GATEWAY_KEY.strip() if config.USE_GATEWAY else "")
+        return url, key
+    if config.USE_GATEWAY:
+        return config.GATEWAY_URL.strip(), config.GATEWAY_KEY.strip()
+    return config.LLM_BASE_URL.strip(), config.LLM_API_KEY.strip()
+
+
+GATEWAY, VKEY = _resolve_endpoint()
 MAX_TOKENS: int | None = _optional_int_env("JUDGE_MAX_TOKENS")
 MAX_ATTEMPTS = int(os.getenv("JUDGE_MAX_ATTEMPTS", "2"))  # was 4; lowered so a stuck hard-Q judge fails fast → idempotent resume catches it (overnight robustness)
 
@@ -229,17 +249,33 @@ async def _judge_one(client, sem, tag, qid, gold_entry, force, counters):
 
 
 async def _run(tags, concurrency, force):
-    if not VKEY:
-        raise SystemExit("KS_VIRTUAL_KEY not set — export it or run under the KS env")
+    from papervault import config
+
+    gateway, vkey = _resolve_endpoint()
+    if not vkey:
+        raise SystemExit(
+            "No judge API key configured — set KS_VIRTUAL_KEY or configure "
+            "PAPERVAULT_LLM_GATEWAY_KEY / PAPERVAULT_LLM_API_KEY in .env"
+        )
+    if config.USE_GATEWAY and not gateway:
+        raise SystemExit(
+            "PAPERVAULT_LLM_GATEWAY_URL is empty while gateway mode is enabled"
+        )
     gold = _load_gold()
     qids = list(gold.keys())
     jobs = [(t, q) for t in tags for q in qids]
-    client = AsyncOpenAI(base_url=GATEWAY, api_key=VKEY,
-                         timeout=float(os.getenv("JUDGE_CALL_TIMEOUT", "300")), max_retries=0)
+    client_kwargs: dict[str, object] = {
+        "api_key": vkey,
+        "timeout": float(os.getenv("JUDGE_CALL_TIMEOUT", "300")),
+        "max_retries": 0,
+    }
+    if gateway:
+        client_kwargs["base_url"] = gateway
+    client = AsyncOpenAI(**client_kwargs)
     sem = asyncio.Semaphore(concurrency)
     counters = {"ok": 0, "skip": 0, "fail": 0}
     print(f"judging {len(jobs)} (tag,qid) over {len(tags)} tags @ concurrency {concurrency} "
-          f"via {GATEWAY} route={route('eval_judge')} force={force}", flush=True)
+          f"via {gateway or '(default)'} route={route('eval_judge')} force={force}", flush=True)
     tasks = [asyncio.create_task(_judge_one(client, sem, t, q, gold[q], force, counters))
              for (t, q) in jobs]
     done = 0

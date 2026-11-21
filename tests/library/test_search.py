@@ -1512,3 +1512,57 @@ async def test_breaker_opening_during_wait_skips_fetch(monkeypatch, polite, open
     fetch.assert_not_awaited()
     assert [(o.status, o.code) for o in observations] == [('skipped', 'circuit_open')]
     assert degraded == {'semantic_scholar': 1}
+
+
+@pytest.mark.asyncio
+async def test_wait_for_search_admission_respects_deadline_on_window_sleep(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(search, "FETCH_QUEUE_TIMEOUT_S", 0.05)
+    fake_ledger = SimpleNamespace(
+        gate=lambda scope: SimpleNamespace(allowed=False, reason="window", retry_after=30.0)
+    )
+    monkeypatch.setattr(search, "get_ledger", lambda: fake_ledger)
+    with pytest.raises(search.FetchQueueTimeout):
+        await asyncio.wait_for(search._wait_for_search_admission("arxiv"), timeout=0.5)
+
+
+def test_pace_lock_is_keyed_per_event_loop_and_backend(monkeypatch):
+    monkeypatch.setattr(search, "_LAST_CALL", {})
+    locks_seen = []
+
+    async def run_once():
+        await search._pace("arxiv", 0.001)
+        loop = asyncio.get_running_loop()
+        locks_seen.append((loop, search._PACE_LOCK.get((loop, "arxiv"))))
+
+    asyncio.run(run_once())
+    asyncio.run(run_once())
+    assert len(locks_seen) == 2
+    assert locks_seen[0][0] is not locks_seen[1][0]
+
+
+def test_pace_serializes_last_call_across_concurrent_threads_and_loops(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(search, "_LAST_CALL", {})
+    barrier = threading.Barrier(2)
+    finished_at: list[float] = []
+
+    def worker():
+        async def run():
+            barrier.wait(timeout=2.0)
+            await search._pace("arxiv", 0.08)
+            finished_at.append(time.monotonic())
+
+        asyncio.run(run())
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2.0)
+    assert len(finished_at) == 2
+    finished_at.sort()
+    assert finished_at[1] - finished_at[0] >= 0.065

@@ -107,9 +107,36 @@ def test_space_computing_extraction_example_uses_closed_ontology_and_valid_recor
         else:
             assert fields[0] == "relation" and len(fields) == 5
             relations.append(fields[1:3])
-    assert entities["Orbital Edge Computing Constellation"] == "mission"
+    assert entities["PhiSat-1"] == "mission"
+    assert entities["Orbital Edge Computing"] == "application"
     assert entities["Radiation-Tolerant FPGA"] == "instrument"
     assert entities["Quantized Neural Inference"] == "method"
     assert entities["Single-Event Upset"] == "phenomenon"
     assert entities["Total Ionizing Dose"] == "quantity"
+    assert entities["Silicon-on-Insulator"] == "material"
+    assert entities["Quantization Power Reduction"] == "finding"
     assert relations and all(source in entities and target in entities for source, target in relations)
+
+
+def test_all_ontology_types_covered_across_examples_and_exclusions_clean():
+    pack = get_domain()
+    allowed = {t.lower() for t in pack.entity_types}
+    seen_types: set[str] = set()
+    for ex in pack.extraction_examples:
+        rendered = ex.format(tuple_delimiter="<|#|>", completion_delimiter="<|COMPLETE|>")
+        assert "{" not in rendered and "}" not in rendered
+        output = rendered.split("<Output>", 1)[1].strip().splitlines()
+        assert output[-1] == "<|COMPLETE|>"
+        entities: set[str] = set()
+        for line in output[:-1]:
+            fields = line.split("<|#|>")
+            if fields[0] == "entity":
+                assert len(fields) == 4 and fields[2] in allowed
+                entities.add(fields[1])
+                seen_types.add(fields[2])
+            else:
+                assert fields[0] == "relation" and len(fields) == 5
+                assert fields[1] in entities and fields[2] in entities
+    assert seen_types == allowed
+    assert "9." not in pack.extraction_exclusions
+    assert "---Examples---" not in pack.extraction_exclusions

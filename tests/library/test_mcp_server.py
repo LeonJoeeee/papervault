@@ -2575,3 +2575,100 @@ async def test_search_papers_waiter_isolation_unbounded_wait_and_exception_evict
     assert s._paper_search_registry.by_query == {}
     await s._paper_search_registry.shutdown()
 
+
+@pytest.mark.asyncio
+async def test_get_paper_uses_classify_skipping_resting_firecrawl_and_exhausted_extract(
+    populated_lib, monkeypatch
+):
+    from papervault.library.models import MAX_EXTRACT_ATTEMPTS
+
+    # 1) Resting firecrawl-md paper (ok, no PDF, firecrawl_pdf_hunt_exhausted=True) -> TERMINAL (no download!)
+    fc = populated_lib.get("Potgieter2013")
+    fc.download_status = "ok"
+    fc.download_source = "firecrawl"
+    fc.firecrawl_pdf_hunt_exhausted = True
+    populated_lib.md_path(fc.key).write_text("---\nsource: firecrawl\n---\nComplete body text.")
+
+    # 2) Exhausted-attempt PDF paper (ok, has PDF, no md, extract_attempts >= MAX) -> TERMINAL (no extract!)
+    ex, _ = populated_lib.upsert({
+        "title": "Exhausted OCR paper", "authors": ["Exhausted, A."],
+        "year": 2023, "doi": "10.1234/exhausted-ocr",
+    })
+    ex.download_status = "ok"
+    ex.extract_attempts = MAX_EXTRACT_ATTEMPTS
+    populated_lib.pdf_path(ex.key).write_bytes(b"%PDF-1.4 fake")
+    populated_lib.save()
+
+    server, dq, eq = _server_with_recording_queues(populated_lib, monkeypatch)
+    r1 = await _get_one(server, fc.key)
+    r2 = await _get_one(server, ex.key)
+    assert r1["status"] == "found" and r2["status"] == "found"
+    assert r2["text_status"] == "extract_failed"
+    assert dq.added == []
+    assert eq.added == []
+
+
+@pytest.mark.asyncio
+async def test_paper_and_extract_resources_apply_resolve_alias_and_serving_excluded(
+    populated_lib, server
+):
+    from papervault.library.models import Paper
+    from papervault.library.state_v2 import Merge, TerminalState
+
+    alias = Paper(
+        key="AliasRes2024", title="Old alias record", doi="10.1234/old-alias",
+        terminal_state=TerminalState(merge=Merge.ALIAS, alias_key="Wei2024", quarantine=True),
+    )
+    populated_lib._papers[alias.key] = alias
+    populated_lib._reindex(alias)
+
+    # Alias resolves transparently on both library://paper/{key} and library://extract/{key}.md
+    paper_payload = json.loads(await _read(server, "library://paper/AliasRes2024"))
+    assert paper_payload["key"] == "Wei2024"
+    md_text = await _read(server, "library://extract/AliasRes2024.md")
+    assert md_text == populated_lib.md_path("Wei2024").read_text()
+
+    # Excluded canonical returns not_found on library://paper and "" on library://extract
+    populated_lib.get("Wei2024").domain_status = "off_domain"
+    excluded_paper = json.loads(await _read(server, "library://paper/Wei2024"))
+    assert excluded_paper["error"] == "not_found"
+    excluded_alias = json.loads(await _read(server, "library://paper/AliasRes2024"))
+    assert excluded_alias["error"] == "not_found"
+    assert await _read(server, "library://extract/AliasRes2024.md") == ""
+
+
+@pytest.mark.asyncio
+async def test_search_registry_actively_evicts_expired_entries_while_idle(
+    populated_lib, monkeypatch
+):
+    from papervault.library.mcp import server as srv
+
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_RETENTION_S", "0.05")
+    monkeypatch.setenv("PAPERVAULT_MCP_SEARCH_WAIT_S", "1.0")
+    monkeypatch.setattr(srv, "get_llm", lambda: SimpleNamespace())
+    monkeypatch.setattr(srv, "parse_intent", lambda q, llm=None: _fake_plan(search_terms=[q]))
+
+    async def empty_ext(terms, **kw):
+        return [], {}
+
+    async def empty_ingest(cands, *, llm=None):
+        return {}, 0
+
+    async def empty_return(cands, intent, *, search_terms=None, filters=None, llm=None):
+        return {}, 0
+
+    monkeypatch.setattr(srv, "search_external_async", empty_ext)
+    monkeypatch.setattr(srv, "judge_ingest", empty_ingest)
+    monkeypatch.setattr(srv, "judge_return", empty_return)
+
+    s = srv.build_server(library=populated_lib)
+    res = await _call(s, "search_papers", {"query": "idle ttl cleanup test"})
+    assert res["status"] == "ok"
+    reg = s._paper_search_registry
+    assert len(reg.by_id) == 1
+    # Wait past retention WITHOUT calling find() — active TTL timer must evict it.
+    await asyncio.sleep(0.12)
+    assert reg.by_id == {}
+    assert reg.by_query == {}
+    await reg.shutdown()
+

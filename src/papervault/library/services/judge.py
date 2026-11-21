@@ -25,10 +25,14 @@ See ``docs/architecture.md``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
+import os
 import re
+import threading
+import time
 from typing import Any, Callable, Optional
 
 from papervault.domain import get_domain
@@ -40,50 +44,91 @@ logger = logging.getLogger(__name__)
 BATCH_SIZE = 30
 MAX_RETRIES = 2          # → up to 3 attempts per batch
 _BACKOFF_BASE = 2.0
+_DEFAULT_BATCH_TIMEOUT_S = 120.0
+_STATS_LOCK = threading.Lock()
+_JUDGE_STATS = {
+    "partial_retries": 0,
+    "unrecovered_missing_items": 0,
+    "batch_timeouts": 0,
+}
 
 # Tiers that count as in-domain (keep for ingest); "3" = off-domain reject.
 INGEST_TIERS = {"1A", "1B", "1C", "2A", "2B", "2C"}
 
 
+def _batch_timeout_s() -> float:
+    raw = os.getenv("PAPERVAULT_JUDGE_BATCH_TIMEOUT_S")
+    if raw is None or not raw.strip():
+        return _DEFAULT_BATCH_TIMEOUT_S
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid PAPERVAULT_JUDGE_BATCH_TIMEOUT_S=%r; using %.1fs",
+            raw, _DEFAULT_BATCH_TIMEOUT_S,
+        )
+        return _DEFAULT_BATCH_TIMEOUT_S
+    return value if math.isfinite(value) and value > 0 else _DEFAULT_BATCH_TIMEOUT_S
+
+
+def judge_stats() -> dict[str, int]:
+    """Return thread-safe counters for partial-batch retries, timeouts, and missing items."""
+    with _STATS_LOCK:
+        return dict(_JUDGE_STATS)
+
+
+def _inc_stat(field: str, delta: int = 1) -> None:
+    with _STATS_LOCK:
+        _JUDGE_STATS[field] += delta
+
+
 # ───────────────────────── shared machinery ─────────────────────────
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
-_ITEM_RE = re.compile(r"\{[^{}]*\}")  # flat (non-nested) item object
 
 
 def _extract_json_obj(raw: str) -> dict:
     """Parse a gate LLM reply into ``{"items": [...]}``.
 
-    Fast path: strip markdown ``` fences, grab the greedy ``{...}`` envelope, json.loads it
-    (unchanged behaviour whenever the whole batch is well-formed).
-
-    SALVAGE path: a *single* malformed item in a 30-batch used to make ``json.loads`` raise,
-    which the caller (``_scored_judge._one``) turns into a fail-CLOSED DROP of ALL 30
-    judgments — even though the per-item parsers (``_parse_ingest`` / ``_parse_score``)
-    already tolerate a bad item. So when the envelope parse fails, regex-extract each FLAT
-    ``{...}`` item carrying an ``"i"`` index and json.loads each INDEPENDENTLY, returning only
-    the survivors → the per-item loop then drops ONLY the genuinely-broken item, not the batch.
-    Flat per-item (NOT brace-balancing): one malformed middle item breaks balance for
-    everything after it (brace-walk recovers ~15/30 vs flat ~23/30 on real MiMo output)."""
-    text = _FENCE_RE.sub("", raw or "")
-    m = re.search(r"\{.*\}", text, re.S)
-    if not m:
+    Uses ``json.JSONDecoder.raw_decode`` instead of greedy regex so trailing prose
+    containing braces never invalidates a valid envelope, and per-item salvage
+    preserves items whose ``reason`` contains LaTeX braces like ``\\frac{a}{b}``.
+    """
+    text = _FENCE_RE.sub("", raw or "").strip()
+    if "{" not in text:
         raise ValueError(f"no JSON object in LLM response: {(raw or '')[:200]}")
-    try:
-        return json.loads(m.group(0))
-    except json.JSONDecodeError:
-        items = [obj for chunk in _ITEM_RE.findall(text) if '"i"' in chunk
-                 for obj in (_try_loads(chunk),) if obj is not None]
-        if not items:
-            raise  # nothing salvageable → genuine failure; caller DROPs (counted)
-        return {"items": items}
 
+    decoder = json.JSONDecoder()
+    pos = 0
+    first_dict: dict | None = None
+    salvaged: list[dict] = []
+    last_err: json.JSONDecodeError | None = None
+    while True:
+        idx = text.find("{", pos)
+        if idx == -1:
+            break
+        try:
+            obj, end = decoder.raw_decode(text, idx)
+        except json.JSONDecodeError as exc:
+            last_err = exc
+            pos = idx + 1
+            continue
+        if isinstance(obj, dict):
+            if isinstance(obj.get("items"), list):
+                return obj
+            if "i" in obj:
+                salvaged.append(obj)
+            if first_dict is None:
+                first_dict = obj
+        pos = end
 
-def _try_loads(chunk: str):
-    try:
-        return json.loads(chunk)
-    except json.JSONDecodeError:
-        return None
+    if salvaged:
+        return {"items": salvaged}
+    if first_dict is not None:
+        return first_dict
+    if last_err is not None:
+        raise last_err
+    raise ValueError(f"no JSON object in LLM response: {(raw or '')[:200]}")
 
 
 def _candidate_to_item(i: int, c: dict) -> dict:
@@ -110,6 +155,63 @@ class _ZeroMatchedError(Exception):
     """Reply parsed without exception, but matched zero expected candidate indices."""
 
 
+def _accepts_timeout(fn: Callable) -> bool:
+    """Return True if ``fn`` accepts a ``timeout`` keyword argument."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == "timeout"
+        and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        or p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in params
+    )
+
+
+async def _call_once(system_prompt: str, user_prompt: str, llm: Any) -> str:
+    """Run one semaphore-bounded, timeout-bounded LLM judge attempt.
+
+    Cancelling the awaiter propagates immediately while keeping ``llm_sem`` held
+    until the background thread actually finishes. Passes remaining timeout into
+    ``llm.call`` when supported so the underlying HTTP request cancels cleanly
+    instead of leaking zombie provider threads across retries.
+    """
+    sem = concurrency.llm_sem  # per-CALL cap includes cancelled callers' workers
+    timeout_s = _batch_timeout_s()
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(sem.acquire(), timeout=timeout_s)
+    except TimeoutError:
+        _inc_stat("batch_timeouts")
+        raise TimeoutError(f"judge batch semaphore wait timed out after {timeout_s:.1f}s") from None
+
+    remaining = timeout_s - (time.monotonic() - started)
+    if remaining <= 0:
+        sem.release()
+        _inc_stat("batch_timeouts")
+        raise TimeoutError(f"judge batch timed out after {timeout_s:.1f}s")
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    call_kwargs = {"timeout": remaining} if _accepts_timeout(llm.call) else {}
+    worker = asyncio.create_task(asyncio.to_thread(llm.call, messages, **call_kwargs))
+
+    def finished(task):
+        sem.release()
+        if not task.cancelled():
+            task.exception()  # Retrieve failures even after caller cancellation.
+
+    worker.add_done_callback(finished)
+    try:
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
+    except TimeoutError:
+        _inc_stat("batch_timeouts")
+        raise TimeoutError(f"judge batch LLM call timed out after {timeout_s:.1f}s") from None
+
+
 async def _call_with_retry(
     system_prompt: str,
     user_prompt: str,
@@ -127,23 +229,9 @@ async def _call_with_retry(
     last: Optional[Exception] = None
     for attempt in range(MAX_RETRIES + 1):
         try:
-            sem = concurrency.llm_sem  # per-CALL cap includes cancelled callers' workers
-            await sem.acquire()
-            worker = asyncio.create_task(asyncio.to_thread(
-                llm.call,
-                [{"role": "system", "content": system_prompt},
-                 {"role": "user", "content": user_prompt}],
-            ))
-
-            def finished(task):
-                sem.release()
-                if not task.cancelled():
-                    task.exception()  # Retrieve failures even after caller cancellation.
-
-            worker.add_done_callback(finished)
-            raw = await asyncio.shield(worker)
+            raw = await _call_once(system_prompt, user_prompt, llm)
             return raw if validate is None else validate(raw)
-        except Exception as e:  # noqa: BLE001 — transient LLM or parse/match hiccup; retry
+        except Exception as e:  # noqa: BLE001 — transient LLM, timeout, or parse/match hiccup; retry
             last = e
             if attempt < MAX_RETRIES:
                 await asyncio.sleep(_BACKOFF_BASE * (2 ** attempt))
@@ -162,48 +250,79 @@ async def _scored_judge(
     llm: Any,
 ) -> tuple[dict[int, dict], int]:
     """Batched + parallel scored judgment. Returns ``({global_idx: judgment},
-    dropped_batches)``. A batch that fails all retries — including persistent
-    malformed replies or replies that parse OK but match ZERO expected indices
-    (the index-rebasing silent-drop mode, §6) — contributes NOTHING (conservative
-    drop, never fail-open) and counts as one DROPPED batch. When the final attempt
-    parses OK with zero matched indices, a ``logging.warning`` is emitted;
-    ``dropped_batches`` is threaded out to the caller and surfaced as
-    ``judge_batches_dropped`` (§8) so a silent recall loss is machine-visible."""
+    dropped_batches)``.
+
+    When a reply returns judgments for only a subset of the batch, only the
+    missing candidate indices are retried (up to ``MAX_RETRIES`` retries total)
+    so partial batches do not silently drop half the candidate pool. Any items
+    still unrecovered after retries are omitted fail-closed and surfaced via
+    warning logs and ``judge_stats()``. A batch that recovers zero items across
+    all attempts counts as one DROPPED batch.
+    """
     if not candidates:
         return {}, 0
     indexed = list(enumerate(candidates))
     batches = [indexed[k:k + batch_size] for k in range(0, len(indexed), batch_size)]
 
     async def _one(batch: list[tuple[int, dict]]) -> tuple[dict[int, dict], int]:
-        items = [_candidate_to_item(i, c) for i, c in batch]
         expected = {i for i, _ in batch}
-        user_prompt = build_user_prompt(items)
+        accumulated: dict[int, dict] = {}
+        remaining_batch = list(batch)
+        last_err: Optional[Exception] = None
+        last_zero_matched = False
 
-        def _parse_and_check(raw: str) -> dict[int, dict]:
-            parsed = parse_items(raw, expected)
-            if expected and not parsed:
-                raise _ZeroMatchedError()
-            return parsed
+        for attempt in range(MAX_RETRIES + 1):
+            items = [_candidate_to_item(i, c) for i, c in remaining_batch]
+            expected_sub = {i for i, _ in remaining_batch}
+            user_prompt = build_user_prompt(items)
+            try:
+                raw = await _call_once(system_prompt, user_prompt, llm)
+                parsed = parse_items(raw, expected_sub)
+                if not parsed:
+                    last_err = _ZeroMatchedError()
+                    last_zero_matched = True
+                else:
+                    accumulated.update(parsed)
+                    last_err = None
+                    last_zero_matched = False
+                    missing = expected - set(accumulated)
+                    if not missing:
+                        return accumulated, 0
+                    remaining_batch = [(i, c) for i, c in batch if i in missing]
+                    if attempt < MAX_RETRIES:
+                        _inc_stat("partial_retries")
+                        logger.warning(
+                            "judge: partial batch (%d/%d judged, missing %d); "
+                            "retrying missing subset (attempt %d/%d)",
+                            len(accumulated), len(batch), len(missing),
+                            attempt + 1, MAX_RETRIES + 1,
+                        )
+            except Exception as e:  # noqa: BLE001 — transient LLM, timeout, or parse hiccup; retry
+                last_err = e
+                last_zero_matched = False
 
-        try:
-            parsed = await _call_with_retry(
-                system_prompt, user_prompt, llm, validate=_parse_and_check,
+            if attempt < MAX_RETRIES:
+                await asyncio.sleep(_BACKOFF_BASE * (2 ** attempt))
+
+        if accumulated:
+            missing_sorted = sorted(expected - set(accumulated))
+            _inc_stat("unrecovered_missing_items", len(missing_sorted))
+            logger.warning(
+                "judge: batch of %d incomplete after %d attempts (%d/%d judged, "
+                "%d unrecovered missing indices=%r)",
+                len(batch), MAX_RETRIES + 1, len(accumulated), len(batch),
+                len(missing_sorted), missing_sorted[:10],
             )
-        except _ZeroMatchedError:
-            # Final attempt parsed cleanly but nothing matched the expected global
-            # indices — the index-rebasing later-batch silent-drop mode (§6).
-            # Surface it as a WARN + a dropped batch rather than logger.error.
+            return accumulated, 0
+
+        if last_zero_matched:
             logger.warning(
                 "judge: batch of %d parsed OK but 0 items matched expected idx "
                 "(possible index-rebasing); dropping", len(batch),
             )
             return {}, 1
-        except Exception as e:  # noqa: BLE001 — persistent LLM failure OR unparseable response: DROP
-            # fail-CLOSED: a refusal / empty / truncated / malformed-JSON reply must
-            # be a conservative DROP (counted), NEVER an exception that crashes search.
-            logger.error("judge: dropping batch of %d (no fail-open): %s", len(batch), e)
-            return {}, 1
-        return parsed, 0
+        logger.error("judge: dropping batch of %d (no fail-open): %s", len(batch), last_err)
+        return {}, 1
 
     merged: dict[int, dict] = {}
     dropped = 0

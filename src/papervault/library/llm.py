@@ -33,7 +33,9 @@ from papervault.llm_routing import (
     ModelTarget,
     clear_fallback_cooldowns as clear_fallback_cooldowns,
     format_targets,
+    http_status_code,
     is_model_cooled_down,
+    is_quota_exhaustion_error,
     litellm_wire_kwargs,
     parse_targets,
     record_model_cooldown,
@@ -155,6 +157,9 @@ def _open_stream(kwargs):
                 _close_stream(stream)
 
     first_chunk_s = _FIRST_CHUNK_S
+    req_timeout = kwargs.get("timeout")
+    if isinstance(req_timeout, (int, float)) and req_timeout > 0:
+        first_chunk_s = min(first_chunk_s, req_timeout) if first_chunk_s > 0 else req_timeout
     deadline = time.monotonic() + first_chunk_s if first_chunk_s > 0 else None
     context = contextvars.copy_context()
     threading.Thread(target=context.run, args=(open_first,), daemon=True).start()
@@ -178,9 +183,20 @@ def _create_completion(**kwargs):
     """Join answer deltas and usage, rejecting an EOF without a provider finish."""
     if kwargs.get("max_tokens") is None:
         kwargs.pop("max_tokens", None)
+    req_timeout = kwargs.pop("timeout", None)
+    effective_timeout = (
+        float(req_timeout)
+        if isinstance(req_timeout, (int, float)) and req_timeout > 0
+        else _CLIENT_TIMEOUT_S
+    )
+    stream_deadline = (
+        time.monotonic() + float(req_timeout)
+        if isinstance(req_timeout, (int, float)) and req_timeout > 0
+        else None
+    )
     stream, iterator, chunk = _open_stream({
         **kwargs, "stream": True, "stream_options": {"include_usage": True},
-        "num_retries": 0, "timeout": _CLIENT_TIMEOUT_S,
+        "num_retries": 0, "timeout": effective_timeout,
     })
     parts = []
     usage = None
@@ -207,6 +223,8 @@ def _create_completion(**kwargs):
                 # proves the provider finished; raw SDK iterators use the chunk.
                 if reason and getattr(stream, "received_finish_reason", reason):
                     finish = reason
+            if stream_deadline is not None and time.monotonic() >= stream_deadline and finish is None:
+                raise TimeoutError(f"stream exceeded timeout of {effective_timeout:g}s")
             chunk = next(iterator, None)
     except Exception as exc:  # noqa: BLE001 — normalize transport/stream errors only
         code = _error_code(exc)
@@ -249,11 +267,21 @@ def _is_failover_eligible(exc: Exception) -> bool:
     from openai import APITimeoutError
 
     code = _error_code(exc)
+    if is_quota_exhaustion_error(exc, code):
+        return True
     if code is not None:
         return code in {408, 429} or 500 <= code <= 599
     return isinstance(
         exc,
-        (StreamTruncated, TimeoutError, APITimeoutError, litellm.Timeout, httpx.TimeoutException),
+        (
+            StreamTruncated,
+            TimeoutError,
+            APITimeoutError,
+            litellm.Timeout,
+            litellm.APIConnectionError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+        ),
     )
 
 
@@ -293,12 +321,12 @@ class LLM:
         self.num_retries = num_retries
         self.targets = tuple(targets) if targets is not None else None
 
-    def call(self, messages, **_ignored):
+    def call(self, messages, *, timeout: float | None = None, **_ignored):
         started = time.monotonic()
         response = None
         degraded = True
         try:
-            response, degraded = self._call(messages)
+            response, degraded = self._call(messages, timeout=timeout)
             return response.choices[0].message.content or ""
         finally:
             callback = _call_observer.get()
@@ -315,18 +343,37 @@ class LLM:
                 except Exception:
                     logger.warning("LLM call observation unavailable")
 
-    def _call(self, messages):
+    def _call(self, messages, *, timeout: float | None = None):
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
         t0 = time.monotonic()
-        deadline = t0 + _RETRY_BUDGET_S
+        budget_s = (
+            min(_RETRY_BUDGET_S, float(timeout))
+            if isinstance(timeout, (int, float)) and timeout > 0
+            else _RETRY_BUDGET_S
+        )
+        deadline = t0 + budget_s
+        call_deadline = (
+            t0 + float(timeout)
+            if isinstance(timeout, (int, float)) and timeout > 0
+            else None
+        )
+
+        def _timeout_kw() -> dict:
+            if call_deadline is None:
+                return {}
+            rem = call_deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError(f"LLM call budget of {float(timeout):g}s exhausted")
+            return {"timeout": min(_CLIENT_TIMEOUT_S, rem)}
+
         mt_kw = {"max_tokens": self.max_tokens} if self.max_tokens is not None else {}
         if self.targets is None:
             for attempt in range(2):
                 try:
                     resp = _create_completion(
                         model=self.model, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, **mt_kw,
+                        api_key=self.api_key, **mt_kw, **_timeout_kw(),
                     )
                     break
                 except Exception as exc:  # noqa: BLE001 — retain pool status handling
@@ -352,7 +399,7 @@ class LLM:
                 try:
                     resp = _create_completion(
                         **wire, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, **mt_kw,
+                        api_key=self.api_key, **mt_kw, **_timeout_kw(),
                     )
                     log_usage(logger, "pl", target.model, time.monotonic() - t0, resp)
                     return resp, target_idx > 0
@@ -382,7 +429,7 @@ class LLM:
                 try:
                     resp = _create_completion(
                         **wire, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, **mt_kw,
+                        api_key=self.api_key, **mt_kw, **_timeout_kw(),
                     )
                     log_usage(logger, "pl", target.model, time.monotonic() - t0, resp)
                     return resp, (target_idx > 0 or attempt > 0)
@@ -428,14 +475,8 @@ def _env_fallback_groups() -> list[dict]:
 
 def _error_code(exc: Exception):
     """Best-effort HTTP status from an LLM/litellm exception; None if unknown.
-    Falls back to the type name (``*AuthenticationError*`` → 401)."""
-    code = getattr(exc, "status_code", None)
-    if code is None and "authentication" in type(exc).__name__.lower():
-        return 401
-    try:
-        return int(code) if code is not None else None
-    except (ValueError, TypeError):
-        return None
+    Falls back to ``response.status_code`` and type name (``*AuthenticationError*`` → 401)."""
+    return http_status_code(exc)
 
 
 class KeyPool:
@@ -503,26 +544,27 @@ class KeyPool:
         return active
 
     def _client(self, g: dict) -> LLM:
-        if self._targets is not None:
-            wire_model = litellm_wire_kwargs(self._targets[0])["model"]
-            key = (wire_model, g["base_url"], g["api_key"], self._targets)
+        with self._lock:
+            if self._targets is not None:
+                wire_model = litellm_wire_kwargs(self._targets[0])["model"]
+                key = (wire_model, g["base_url"], g["api_key"], self._targets)
+                c = self._clients.get(key)
+                if c is None:
+                    c = LLM(
+                        model=wire_model,
+                        base_url=g["base_url"],
+                        api_key=g["api_key"],
+                        max_tokens=self._max_tokens,
+                        targets=self._targets,
+                    )
+                    self._clients[key] = c
+                return c
+            key = (g.get("model") or _DEFAULT_MODEL, g["base_url"], g["api_key"])
             c = self._clients.get(key)
             if c is None:
-                c = LLM(
-                    model=wire_model,
-                    base_url=g["base_url"],
-                    api_key=g["api_key"],
-                    max_tokens=self._max_tokens,
-                    targets=self._targets,
-                )
+                c = LLM(model=key[0], base_url=key[1], api_key=key[2], max_tokens=self._max_tokens)
                 self._clients[key] = c
             return c
-        key = (g.get("model") or _DEFAULT_MODEL, g["base_url"], g["api_key"])
-        c = self._clients.get(key)
-        if c is None:
-            c = LLM(model=key[0], base_url=key[1], api_key=key[2], max_tokens=self._max_tokens)
-            self._clients[key] = c
-        return c
 
     # ---- the call: random failover, stateless ----
     def call(self, *args, **kwargs):
@@ -535,10 +577,10 @@ class KeyPool:
         for g in groups:
             try:
                 return self._client(g).call(*args, **kwargs)
-            except Exception as e:  # noqa: BLE001 — fail over; auto-disable only on 401/403
+            except Exception as e:  # noqa: BLE001 — fail over; auto-disable only on non-quota 401/403
                 last_exc = e
                 code = _error_code(e)
-                if code in _PERMANENT_CODES:
+                if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
                     self._disable_key(g["api_key"], code, type(e).__name__)
         raise last_exc                               # every active key failed this call
 

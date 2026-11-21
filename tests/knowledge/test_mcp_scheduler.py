@@ -277,3 +277,33 @@ async def test_invalid_startup_wait_logs_default_and_still_starts(monkeypatch, c
         assert "KS_STARTUP_AWAIT_SEC" in caplog.text and "3" in caplog.text
     finally:
         await srv.stop_background()
+
+
+async def test_unexpected_scheduler_exit_clears_bg_task_for_recovery(monkeypatch, caplog):
+    import papervault.knowledge.scheduler.round as rnd
+
+    _patch_enabled(monkeypatch, True)
+    calls, _, scheduler_started, rag = _stub_graph_and_loop(monkeypatch)
+    runs = 0
+    real_loop = rnd.main_loop
+
+    async def crash_once(r, *, interval):
+        nonlocal runs
+        runs += 1
+        if runs == 1:
+            raise RuntimeError("scheduler crashed")
+        await real_loop(r, interval=interval)
+
+    monkeypatch.setattr(rnd, "main_loop", crash_once)
+    try:
+        with caplog.at_level(logging.ERROR, logger="ks.mcp.server"):
+            await srv.start_background()
+            await asyncio.sleep(0.05)
+        assert srv._bg_task is None
+        assert "exited unexpectedly" in caplog.text
+        await srv.start_background()
+        await asyncio.wait_for(scheduler_started.wait(), timeout=0.5)
+        assert srv._bg_task is not None and not srv._bg_task.done()
+        assert calls["scheduler"] == [rag]
+    finally:
+        await srv.stop_background()

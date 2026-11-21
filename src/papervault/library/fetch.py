@@ -199,14 +199,21 @@ def crossref_enrich_lookup(doi: str) -> tuple[str, dict]:
         )
     except Exception:
         return ("transient", {})
-    if r.status_code == 404:
+    if r.status_code in (400, 404, 410):
         return ("miss", {})
     if not r.ok:                      # 429 / 5xx / soft-block
         return ("transient", {})
     try:
-        msg = r.json().get("message", {})
-    except Exception:
-        return ("transient", {})
+        data = r.json()
+    except (ValueError, TypeError):
+        headers = getattr(r, "headers", None) or {}
+        content_type = str(headers.get("Content-Type") or headers.get("content-type") or "").lower()
+        if "xml" in content_type:     # Crossref XML transform redirect (e.g. *.xml DOI) -> definitive miss
+            return ("miss", {})
+        return ("transient", {})      # HTML gateway/WAF error page or truncated JSON -> retry next sweep
+    if not isinstance(data, dict) or not isinstance(data.get("message"), dict):
+        return ("miss", {})
+    msg = data["message"]
     return ("ok", {
         "venue": (msg.get("container-title") or [""])[0],
         "volume": str(msg.get("volume") or "").strip(),
@@ -356,15 +363,12 @@ def fetch_by_doi(doi: str) -> Optional[dict]:
 # (_UA defined at top of module from config.CONTACT_EMAIL)
 
 
-def fetch_abstract_by_doi(doi: str) -> str:
-    """Best-effort ABSTRACT for a DOI. Tries OpenAlex (reconstruct the
-    abstract_inverted_index — broadest coverage) then Semantic Scholar. Returns
-    "" on miss. Network-bound and blocking: call it OFF the event loop / write
-    lock (e.g. via asyncio.to_thread in a reconcile sweep), never inline in the
-    ingest gate."""
+def _fetch_abstract_by_doi_3state(doi: str) -> tuple[str, str]:
+    """3-state DOI abstract lookup: ("ok", abstract) | ("miss", "") | ("transient", "")."""
     doi = (doi or "").strip()
     if not doi:
-        return ""
+        return ("miss", "")
+    saw_transient = False
     # OpenAlex by DOI -> reconstruct the inverted index.
     try:
         url = f"https://api.openalex.org/works/https://doi.org/{doi}"
@@ -374,23 +378,48 @@ def fetch_abstract_by_doi(doi: str) -> str:
             time.sleep(2.0)
             r = polite_get(requests.get, url, params=params, timeout=30, headers={"User-Agent": _UA})
         if r.ok:
-            inv = (r.json() or {}).get("abstract_inverted_index") or {}
+            try:
+                inv = (r.json() or {}).get("abstract_inverted_index") or {}
+            except (ValueError, TypeError):
+                inv = {}
             if inv:
                 pos = sorted((i, w) for w, idxs in inv.items() for i in idxs)
                 ab = " ".join(w for _, w in pos).strip()
                 if len(ab) >= 60:
-                    return ab
+                    return ("ok", ab)
+        elif r.status_code not in (400, 404, 410):
+            saw_transient = True
     except Exception:
-        pass
+        saw_transient = True
     # Semantic Scholar by DOI.
     try:
-        ss = _fetch_ss_by_doi(doi)
-        ab = ((ss or {}).get("abstract") or "").strip()
-        if len(ab) >= 60:
-            return ab
+        url = f"https://api.semanticscholar.org/graph/v1/paper/DOI:{doi}"
+        api_key = os.environ.get("SEMANTIC_SCHOLAR_API_KEY", "").strip()
+        auth = {"headers": {"x-api-key": api_key}} if api_key else {}
+        params = {"fields": "abstract"}
+        r = polite_get(requests.get, url, params=params, timeout=30, **auth)
+        if r.ok:
+            try:
+                ab = ((r.json() or {}).get("abstract") or "").strip()
+            except (ValueError, TypeError):
+                ab = ""
+            if len(ab) >= 60:
+                return ("ok", ab)
+        elif r.status_code not in (400, 404, 410):
+            saw_transient = True
     except Exception:
-        pass
-    return ""
+        saw_transient = True
+    return ("transient", "") if saw_transient else ("miss", "")
+
+
+def fetch_abstract_by_doi(doi: str) -> str:
+    """Best-effort ABSTRACT for a DOI. Tries OpenAlex (reconstruct the
+    abstract_inverted_index — broadest coverage) then Semantic Scholar. Returns
+    "" on miss. Network-bound and blocking: call it OFF the event loop / write
+    lock (e.g. via asyncio.to_thread in a reconcile sweep), never inline in the
+    ingest gate."""
+    status, abstract = _fetch_abstract_by_doi_3state(doi)
+    return abstract if status == "ok" else ""
 
 
 def fetch_by_arxiv(arxiv_id: str) -> Optional[dict]:

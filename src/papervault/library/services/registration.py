@@ -15,6 +15,7 @@ import copy
 import hashlib
 import json
 import logging
+import os
 import re
 import threading
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -127,6 +128,15 @@ def candidate_identity(candidate: dict) -> str:
     return "external:" + hashlib.sha256(json.dumps(payload).encode()).hexdigest()
 
 
+def _serving_trace_verbose() -> bool:
+    """Gate high-volume per-candidate serving_trace lines via PAPERVAULT_SERVING_TRACE.
+
+    Defaults on for existing caller/test compatibility; set PAPERVAULT_SERVING_TRACE=0
+    in production deployments to emit compact stage summaries only.
+    """
+    return os.environ.get("PAPERVAULT_SERVING_TRACE", "1").strip().lower() not in {"0", "false", "no", "off"}
+
+
 class ServingTrace:
     """Bounded operational events in the existing manifest, independent of catalog IO."""
 
@@ -164,6 +174,10 @@ class ServingTrace:
             logger.warning("serving trace unavailable (%s)", event["stage"])
 
     def record(self, stage: str, *, candidate: dict | None = None, **fields):
+        # Always emit compact stage summaries (intent/retrieval/registration_summary);
+        # suppress high-volume per-candidate lines unless PAPERVAULT_SERVING_TRACE=1.
+        if (candidate is not None or "key" in fields) and not _serving_trace_verbose():
+            return
         event = {"event": "serving_trace", "trace_id": self.trace_id, "stage": stage,
                  "at": datetime.now(timezone.utc).isoformat()}
         if candidate is not None:
@@ -195,6 +209,7 @@ def _view(library, papers, *, deep_copy: bool = True, frozen: bool = False):
     view._papers = {key: paper.model_copy(deep=True) if deep_copy else paper
                     for key, paper in papers.items()}
     view._by_doi, view._by_arxiv, view._by_title = {}, {}, {}
+    view._key_index_entries = {}
     view._lookup_indexes = {}
     if frozen:
         view._lookup_indexes = {field: _FieldLookup(frozen=True)
@@ -391,18 +406,26 @@ class RegistrationService:
             task = asyncio.create_task(asyncio.to_thread(self._register, candidates,
                                                          actor=actor, reason=reason))
             cancelled = False
-            while True:
+            while not task.done():
                 try:
-                    outcomes = await asyncio.shield(task)
-                    break
+                    await asyncio.shield(task)
                 except asyncio.CancelledError:
                     cancelled = True
+                except Exception:
+                    break
+            if task.cancelled():
+                outcomes = [{"identity": candidate_identity(c), "status": "failed",
+                             "reason": "command_failed", "key": None, "download": "not_requested"}
+                            for c in candidates]
+                cancelled = True
+            else:
+                try:
+                    outcomes = task.result()
                 except Exception:
                     logger.exception("registration command failed (%s)", reason)
                     outcomes = [{"identity": candidate_identity(c), "status": "failed",
                                  "reason": "command_failed", "key": None, "download": "not_requested"}
                                 for c in candidates]
-                    break
             for outcome in outcomes:
                 if outcome["download"] == "admitted":
                     try:
@@ -472,7 +495,7 @@ class RegistrationService:
                 records = {r.key: r for r in repo.all()}
                 papers = {key: Paper.model_validate(r.payload) for key, r in records.items()}
                 view = _view(lib, papers, deep_copy=False, frozen=True)
-                live_view = self._live_snapshot()
+                live_view = self._live_snapshot(deep_copy=False)
 
                 # Resolve routing keys, then reload their authoritative rows at
                 # acceptance before applying any candidate metadata. PG's write
@@ -494,61 +517,66 @@ class RegistrationService:
                     view._reindex(paper)
                     refreshed.add(row.key)
 
-                # Reload IO may overlap worker changes. Admission needs a fresh
-                # isolated live snapshot, which also supplies the acknowledgment
-                # baseline without serializing unrelated rows under the lock.
-                live_view = self._live_snapshot()
+                # Reload IO may overlap worker changes. Isolate only the
+                # candidate-matched & refreshed rows under the lock instead of
+                # deep-copying all 29.8k papers twice.
+                live_view = self._live_snapshot(
+                    deep_copy=False, copy_candidates=candidates, copy_keys=refreshed,
+                )
                 outcomes, changed = self._stage(view, candidates, live_view=live_view)
                 captured = {key: live_view.get(key).model_dump(mode="json")
                             for key in changed if live_view.get(key) is not None}
                 accepted, revisions = [], {}
                 recorded_observations = None
-                for key, outcome in changed.items():
-                    paper = view.get(key)
-                    before = records.get(key)
-                    normalized = Paper.model_validate(before.payload).model_dump(mode="json") if before else None
-                    previous = backend.normalized.get(key)
-                    if normalized is not None and previous is not None and key in captured:
-                        # Retain unsaved worker metadata when authority has not
-                        # changed that field since our last load/save. A remote
-                        # change uses the fresh capture instead. Identities are
-                        # always refreshed explicitly at publication below.
-                        for name in Paper.model_fields.keys() - _IDENTIFIERS:
-                            if normalized.get(name) == previous.get(name):
-                                captured[key][name] = copy.deepcopy(previous.get(name))
-                    payload = (_overlay(before.payload, normalized, paper.model_dump(mode="json"))
-                               if before else paper.model_dump(mode="json"))
-                    record = Record.from_payload(key, payload)
-                    revision = before.revision if before else 0
-                    jobs = backend._jobs([record], {key: revision})
-                    if outcome["download"] == "admitted":
-                        jobs += (PendingJob("registration-download:" + key, "download", key,
-                                            detail={"command_id": reason}),)
-                    audit = AuditEvent(actor, "registration", {
-                        "command_id": reason, "reason": reason,
-                        "outcome": outcome["status"], "download": outcome["download"],
-                        "source_identities": payload.get("source_identities", []),
-                        "observations": outcome["observations"],
-                        "identity_conflicts": outcome.get("identity_conflicts", []),
-                        "observations_sha256": payload_hash(outcome["observations"]),
-                        "payload_sha256": record.payload_sha256,
-                    }, pending_jobs=jobs)
-                    did_change = repo.upsert(record, audit=audit, expected_revision=revision)
-                    if not did_change:
-                        # A no-op duplicate still has new evidence. A replay
-                        # of the same command/observations cannot append twice.
-                        if recorded_observations is None:
-                            recorded_observations = {
-                                (row["key"], row["observation"]) for row in repo.connection.execute(sql.SQL(
-                                    "SELECT key, detail->>'observations_sha256' AS observation FROM {} "
-                                    "WHERE actor=%s AND event='registration' AND detail->>'command_id'=%s"
-                                ).format(repo._table("audit")), (actor, reason))}
-                        observation = (key, audit.detail["observations_sha256"])
-                        if observation not in recorded_observations:
-                            repo._finish(key, replace(audit, pending_jobs=()))
-                            recorded_observations.add(observation)
-                    revisions[key] = revision + int(did_change)
-                    accepted.append(record)
+                defer_ctx = (repo.defer_alias_validation()
+                             if hasattr(repo, "defer_alias_validation") else nullcontext())
+                with defer_ctx:
+                    for key, outcome in changed.items():
+                        paper = view.get(key)
+                        before = records.get(key)
+                        normalized = Paper.model_validate(before.payload).model_dump(mode="json") if before else None
+                        previous = backend.normalized.get(key)
+                        if normalized is not None and previous is not None and key in captured:
+                            # Retain unsaved worker metadata when authority has not
+                            # changed that field since our last load/save. A remote
+                            # change uses the fresh capture instead. Identities are
+                            # always refreshed explicitly at publication below.
+                            for name in Paper.model_fields.keys() - _IDENTIFIERS:
+                                if normalized.get(name) == previous.get(name):
+                                    captured[key][name] = copy.deepcopy(previous.get(name))
+                        payload = (_overlay(before.payload, normalized, paper.model_dump(mode="json"))
+                                   if before else paper.model_dump(mode="json"))
+                        record = Record.from_payload(key, payload)
+                        revision = before.revision if before else 0
+                        jobs = backend._jobs([record], {key: revision})
+                        if outcome["download"] == "admitted":
+                            jobs += (PendingJob("registration-download:" + key, "download", key,
+                                                detail={"command_id": reason}),)
+                        audit = AuditEvent(actor, "registration", {
+                            "command_id": reason, "reason": reason,
+                            "outcome": outcome["status"], "download": outcome["download"],
+                            "source_identities": payload.get("source_identities", []),
+                            "observations": outcome["observations"],
+                            "identity_conflicts": outcome.get("identity_conflicts", []),
+                            "observations_sha256": payload_hash(outcome["observations"]),
+                            "payload_sha256": record.payload_sha256,
+                        }, pending_jobs=jobs)
+                        did_change = repo.upsert(record, audit=audit, expected_revision=revision)
+                        if not did_change:
+                            # A no-op duplicate still has new evidence. A replay
+                            # of the same command/observations cannot append twice.
+                            if recorded_observations is None:
+                                recorded_observations = {
+                                    (row["key"], row["observation"]) for row in repo.connection.execute(sql.SQL(
+                                        "SELECT key, detail->>'observations_sha256' AS observation FROM {} "
+                                        "WHERE actor=%s AND event='registration' AND detail->>'command_id'=%s"
+                                    ).format(repo._table("audit")), (actor, reason))}
+                            observation = (key, audit.detail["observations_sha256"])
+                            if observation not in recorded_observations:
+                                repo._finish(key, replace(audit, pending_jobs=()))
+                                recorded_observations.add(observation)
+                        revisions[key] = revision + int(did_change)
+                        accepted.append(record)
                 # A collision rolls back records, audit and jobs together.
                 # Keep reservations through commit and live publication, while
                 # releasing the identity lock before commit IO begins.
@@ -588,6 +616,8 @@ class RegistrationService:
                 backend._accept(accepted, revisions, lib._papers, captured)
                 for record in accepted:
                     lib._reindex(lib.get(record.key))
+                if accepted:
+                    lib._bib_dirty = True
             for key, conflicts in publication_conflicts:
                 try:
                     lib.log({"event": "registration_identity_conflict", "key": key,
@@ -677,10 +707,27 @@ class RegistrationService:
                                   "decision": decision})
         return conflicts + self._local_identity_conflicts(view, paper, live)
 
-    def _live_snapshot(self):
+    def _live_snapshot(self, *, deep_copy: bool = True, copy_candidates=None, copy_keys=None):
         with self.library._merge_execution_lock:
-            view = _view(self.library, self.library._papers, frozen=True)
+            view = _view(self.library, self.library._papers, deep_copy=deep_copy, frozen=True)
             view._identity_reservations = set(self.library._identity_reservations)
+            if not deep_copy and (copy_candidates or copy_keys):
+                to_copy = set(copy_keys or ())
+                for candidate in (copy_candidates or ()):
+                    matched = _find(view, candidate)
+                    if matched is not None:
+                        to_copy.add(matched.key)
+                    for name in ("doi", "arxiv_id"):
+                        if candidate.get(name):
+                            hit = view.find(**{name: candidate[name]})
+                            if hit is not None:
+                                to_copy.add(hit.key)
+                for key in to_copy:
+                    paper = view._papers.get(key)
+                    if paper is not None:
+                        copied = paper.model_copy(deep=True)
+                        view._papers[key] = copied
+                        view._reindex(copied)
         return view
 
     def _stage(self, view, candidates, *, live_view=None):

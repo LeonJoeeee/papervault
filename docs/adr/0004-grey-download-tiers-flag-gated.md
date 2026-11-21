@@ -1,6 +1,6 @@
 # 0004 — Grey-zone download tiers ship flag-gated, default OFF
 
-Status: Accepted (2026-07-17), Amended (2026-07-17, 2026-10-09)
+Status: Accepted (2026-07-17), Amended (2026-07-17, 2026-08-02, 2026-10-09)
 
 ## Context
 The download cascade includes shadow-library fallbacks (Sci-Hub, Anna's Archive) and anti-bot scraping tiers (curl-cffi / cloudscraper / scrapling) that materially raise paywalled-paper retrieval but carry legal exposure once publicly distributed. In the originating lab deployment the Sci-Hub tier ran enabled. Because this repo is the single upstream (ADR-0001), deleting the code would also strip the capability from the lab instance.
@@ -26,3 +26,8 @@ after the source review in [#158](https://github.com/LeonJoeeee/papervault/issue
 SSRN had no historical deliveries, and cloudscraper duplicated the retained `citation_pdf_url`
 discovery with a different transport. The keep-code decision above continues to apply to the
 remaining grey tiers; cloudscraper and its optional dependency are removed.
+
+**Amendment (2026-08-02, recorded 2026-11-21):** The repository completed its public flip on
+2026-08-02, satisfying the 2026-07-17 amendment's hard gate: `.env.example` restored
+`PAPER_PIPELINE_USE_SCIHUB=1` to commented-out (default OFF) shipped configuration, leaving
+all grey download tiers strictly opt-in for public distributions.

@@ -9,9 +9,8 @@ server. Claude Code, Codex CLI, Antigravity CLI/IDE and other MCP clients share 
 | `get_paper` | Resolve a citation key, DOI, arXiv ID or fuzzy title and return metadata plus a serve-safe full-text path when available. |
 | `query` | Retrieve evidence from the knowledge graph and synthesize an answer with verified paper citations. |
 
-Version **0.10.15** expands the default research domain and venue authority to include
-space computing alongside space physics and AI4Science.
-The product is pre-release (closed beta). Read the [PRD](docs/PRD.md) for scope,
+The factory domain pack and venue authority cover **space physics, space computing, and
+AI4Science**. Read the [PRD](docs/PRD.md) for scope and design philosophy,
 [architecture](docs/architecture.md) for boundaries, [installation guide](docs/INSTALL.md)
 for deployment, and [baselines](docs/baselines.md#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
 for dated measurements. The [constitution and refactor plan](docs/adr/0007-papervault-constitution.md)
@@ -85,35 +84,38 @@ or lifecycle logic.
 Every text LLM call selects one of nine roles via `PAPERVAULT_LLM_<ROLE>`
 (`<model>[@<modifier>][,<fallback>...]`; unset or blank uses the defaults below).
 Modifiers are validated per model family against the transparent LLM Gateway
-`v0.7.3` catalog: `glm-*`/`relay-glm-*` accept bare or `@low|@high|@max`
-(always-on thinking); `gpt-6-astra*`/`gpt-6.1-sol*` accept bare or `@low..@max`;
-`gpt-6.1-terra*`/`gpt-6-luna*` accept bare or `@none..@max`; `deepseek-v4*`/
-`deepseek-flash*`/`relay-deepseek-*` accept bare, `@low|@high|@max`, or
-`@nothinking` (`@none`); `mimo-v2.6-*`/`relay-mimo-v2.6-*` accept bare,
-`@thinking`, or `@nothinking` (`@none`); and other OpenAI-compatible model IDs
-(e.g. `gpt-4.1-mini`) accept bare, `@none..@max`, or `@thinking|@nothinking`.
-`max_tokens` is omitted on the wire by default unless an explicit ceiling env
-(`KS_LLM_MAX_TOKENS`, `PAPERVAULT_LIB_MAX_TOKENS`, `KS_SYNTH_MAX_TOKENS`,
-`JUDGE_MAX_TOKENS`) or caller cap is set. Multi-target routes fail over
-immediately on transient upstream errors (`429`, `408`, `5xx`, timeout,
-`StreamTruncated`) and cool down the failed primary for
-`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` (default `120`s) before re-probing;
-`eval_judge` defaults to single-target `glm-5.3@max` so benchmarks preserve the
-ruler invariant unless an explicit multi-target chain is set. Retired
-`flash`..`ultra` and `papervault-*` aliases raise `ValueError`. A supplied
-test/client handle bypasses role selection for that call.
+catalog: `glm-*`/`relay-glm-*` accept bare or `@low|@high|@max`
+(always-on thinking); `gpt-6.2-astra*`/`gpt-6.2-sol*`/`gpt-6-astra*`/`gpt-6.1-sol*`
+accept bare or `@low..@max`; `gpt-6.1-terra*`/`gpt-6-luna*` accept bare or
+`@none..@max`; `deepseek-v4*`/`deepseek-flash*`/`relay-deepseek-*` accept bare,
+`@low|@high|@max`, or `@nothinking` (`@none`); `mimo-v2.6-*`/`relay-mimo-v2.6-*`
+accept bare, `@thinking`, or `@nothinking` (`@none`); and other
+OpenAI-compatible model IDs (e.g. `gpt-4.1-mini`) accept bare, `@none..@max`, or
+`@thinking|@nothinking`. `max_tokens` is omitted on the wire by default unless
+an explicit ceiling env (`KS_LLM_MAX_TOKENS`, `PAPERVAULT_LIB_MAX_TOKENS`,
+`KS_SYNTH_MAX_TOKENS`, `JUDGE_MAX_TOKENS`) or caller cap is set. Multi-target
+routes follow the three-tier GLM subscription → `relay-*` balance → Codex
+subscription order and fail over immediately on transient upstream errors (`429`,
+`408`, `5xx`, timeout, `StreamTruncated`) as well as upstream quota/balance
+exhaustion (`402`, or quota-indicated `400/403/429`), cooling down each failed
+non-final leg for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` (default `120`s) before
+re-probing; `eval_judge` defaults to two-tier same-family
+`glm-5.3@max,relay-glm-5.3@max` (no cross-family GPT fallback) so benchmarks
+preserve the ruler invariant. Retired `flash`..`ultra` and `papervault-*`
+aliases raise `ValueError`. A supplied test/client handle bypasses role
+selection for that call.
 
 | Plane and stage | Role | Default |
 | --- | --- | --- |
 | S1 search intent: API terms and local KG concepts in one call | `intent` | `gpt-6.1-terra@high` |
-| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `gpt-6.1-terra@medium` |
-| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,gpt-6.1-terra@low` |
-| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.3@max,gpt-6.1-terra@high` |
-| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `gpt-6.1-terra@low` |
-| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `gpt-6.1-terra@high` |
-| S2 evidence-grounded answer synthesis, including eval | `synth` | `gpt-6-astra@xhigh` |
-| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.3@max` |
+| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
+| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` |
+| S2 evidence-grounded answer synthesis, including eval | `synth` | `gpt-6.2-astra@xhigh` |
+| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.3@max,relay-glm-5.3@max` |
 
 Embedding (BGE-M3), reranking and OCR use their existing local/service paths and
 do not select text LLM roles. The prompt examples calibrate the planner, both
@@ -166,9 +168,11 @@ path within those boundaries; they are not six separate services.
    cut**, helping landmark papers reach judgment. It also weights the vouched
    supplement. Explicit recency/importance ordering bypasses this prior.
 
-   `PAPERVAULT_SEARCH_KG=0` disables this optional arm. If unset, it is enabled
-   only when `PAPERVAULT_STORAGE_BACKEND=postgres`; `PAPERVAULT_SEARCH_KG=1`
-   explicitly enables it. Configure the knowledge database with `POSTGRES_*`
+   `PAPERVAULT_SEARCH_KG=0` disables this optional arm, and `PAPERVAULT_SEARCH_KG=1`
+   explicitly enables it. When unset, the runtime currently checks only the legacy
+   `PAPERVAULT_STORAGE_BACKEND=postgres` flag (not `PAPERVAULT_CATALOG_AUTHORITY=postgres`),
+   so PostgreSQL catalog deployments (`PAPERVAULT_CATALOG_AUTHORITY=postgres`) must set
+   `PAPERVAULT_SEARCH_KG=1` explicitly to enable KG candidate discovery. Configure the knowledge database with `POSTGRES_*`
    (not the catalog DSN), `POSTGRES_WORKSPACE` and `NEO4J_*`; any explicit Neo4j
    workspace must match. Queries use PostgreSQL read-only transactions with
    `hnsw.ef_search=120` and Neo4j read sessions, without schema initialization.
@@ -182,8 +186,8 @@ path within those boundaries; they are not six separate services.
    against the domain-pack tiers and paper classification. Source publication types
    take precedence when conclusive; an LLM paper/non-paper judgment fills missing
    metadata. Production search passes a shared judge handle to its gates, defaulting
-   to `PAPERVAULT_LLM_JUDGE=gpt-6.1-terra@medium`; the separate extraction `gate` role
-   defaults to `glm-5.3-flash@high,gpt-6.1-terra@medium`. The stage name does not select a model.
+   to `PAPERVAULT_LLM_JUDGE=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium`;
+   the separate extraction `gate` role shares that same three-tier default. The stage name does not select a model.
 4. **Stage 4 — relevance and quality gates.** `registration_rejection` screens the
    external pool for conference/meeting abstracts, non-papers, contentless stubs and
    invalid new-record metadata before preview. Newly allocated records need named
@@ -709,7 +713,7 @@ UV_CACHE_DIR=/tmp/uv-cache uv sync --extra dev
 
 [Evaluation](docs/eval.md) explains gold sets, reference-machine runs and benchmark
 arbitration. Raw eval outputs contain paper text and stay local/untracked under
-`PAPERVAULT_EVAL_DIR`; publish summary evidence on the issue or PR. CI tests scoring
+`PAPERVAULT_EVAL_DIR`; record summary evidence in `docs/baselines.md`. CI tests scoring
 logic without GPU/DB/network and does not replace reference-hardware retrieval gates.
 [Baselines](docs/baselines.md) separates dated legacy rulers, post-refactor measurements
 and isolated recovery/maintenance rehearsals.
@@ -719,17 +723,16 @@ and isolated recovery/maintenance rehearsals.
 papervault is consumed **by pin** ([ADR-0001](docs/adr/0001-public-repo-is-upstream.md)):
 deployments track an annotated git tag (`vX.Y.Z[-stage]`), never `main`.
 
-The repo carries **one version**, and every change PR bumps it per the semver call
-stated in its description. The declared fields move together: `pyproject.toml`
-`[project].version`, the `papervault` entry in `uv.lock` (refresh with `uv lock`),
+The repo carries **one version**, bumped at **release time** rather than on ordinary
+feature or fix slices (preventing parallel worktree collisions). On an authorized release
+bump, all five declared fields move together: `pyproject.toml` `[project].version`, the
+`papervault` entry in `uv.lock` (refresh with `uv lock`),
 `plugin/.claude-plugin/plugin.json`, `plugin/plugin.json`, and the `papervault`
 entry in `.claude-plugin/marketplace.json`. `tests/test_plugin_version_sync.py`
-fails when they drift. This compatible factory-domain/venue expansion uses the issue-requested
-patch version **0.10.15**.
+fails when any of the five drifts.
 
-A release is a tag naming the version already on `main` (`vX.Y.Z`, optionally
-`-stage`); the release commit changes no version field. CI builds wheel/sdist on
-every commit. The historical `v0.1.6-beta` tag predates the one-version rule.
+A release tags that synchronized commit (`vX.Y.Z`, optionally `-stage`). CI builds
+wheel/sdist on every commit. The historical `v0.1.6-beta` tag predates the one-version rule.
 
 ## License
 

@@ -16,10 +16,12 @@ entity{tuple_delimiter}Quasi-Linear Theory{tuple_delimiter}method{tuple_delimite
 entity{tuple_delimiter}SOHO{tuple_delimiter}mission{tuple_delimiter}A solar observatory whose measurements refined the onset-delay versus solar-wind-density correlation.
 entity{tuple_delimiter}Focused Transport Equation{tuple_delimiter}model{tuple_delimiter}A transport model balancing streaming and pitch-angle scattering that reproduces SEP intensity-time profiles for gradual events.
 entity{tuple_delimiter}Onset Delay{tuple_delimiter}quantity{tuple_delimiter}The delay in solar-energetic-particle arrival, observed to correlate with ambient solar wind density.
+entity{tuple_delimiter}Radial Mean-Free-Path Scaling{tuple_delimiter}finding{tuple_delimiter}Empirical finding from Parker Solar Probe that the particle mean free path increases with radial distance and the parallel diffusion coefficient scales roughly as r^1.17 in this regime.
 relation{tuple_delimiter}Solar Energetic Particles{tuple_delimiter}Coronal Mass Ejection{tuple_delimiter}acceleration, source{tuple_delimiter}Solar energetic particles are accelerated during coronal mass ejections.
 relation{tuple_delimiter}Parallel Diffusion Coefficient{tuple_delimiter}Solar Energetic Particles{tuple_delimiter}transport, governing parameter{tuple_delimiter}The parallel diffusion coefficient governs the transport of solar energetic particles.
 relation{tuple_delimiter}Focused Transport Equation{tuple_delimiter}Solar Energetic Particles{tuple_delimiter}modeling, intensity profiles{tuple_delimiter}The focused transport equation reproduces observed solar-energetic-particle intensity-time profiles.
 relation{tuple_delimiter}Parker Solar Probe{tuple_delimiter}Parallel Diffusion Coefficient{tuple_delimiter}observation, radial dependence{tuple_delimiter}Parker Solar Probe observations bear on the radial increase of the parallel diffusion coefficient.
+relation{tuple_delimiter}Parker Solar Probe{tuple_delimiter}Radial Mean-Free-Path Scaling{tuple_delimiter}empirical finding, scaling{tuple_delimiter}Parker Solar Probe observations establish the radial mean-free-path scaling with radial distance.
 {completion_delimiter}
 ===EXAMPLE===
 <Entity_types>
@@ -50,18 +52,21 @@ relation{tuple_delimiter}Residual Loss{tuple_delimiter}Collocation Points{tuple_
 
 <Input Text>
 ```
-Galactic cosmic rays are modulated by the solar wind as they propagate into the inner heliosphere, producing an anti-correlation between cosmic-ray intensity and solar activity. The AMS-02 detector aboard the International Space Station has measured the proton and helium spectra with high precision, while the PAMELA experiment provided earlier measurements of the positron fraction. These data constrain the local interstellar spectrum used in solar modulation models. The force-field approximation offers a single-parameter description of modulation, although it breaks down at low rigidities.
+Galactic cosmic rays are modulated by the solar wind as they propagate into the inner heliosphere, producing an anti-correlation between cosmic-ray intensity and solar activity. The AMS-02 detector aboard the International Space Station produced the AMS-02 Daily Proton Flux Dataset measuring proton and helium spectra with high precision, while the PAMELA experiment provided earlier measurements of the positron fraction. These data constrain the local interstellar spectrum used in solar modulation models. The force-field approximation offers a single-parameter description of modulation, although it breaks down at low rigidities.
 ```
 
 <Output>
 entity{tuple_delimiter}Galactic Cosmic Rays{tuple_delimiter}phenomenon{tuple_delimiter}High-energy charged particles from outside the solar system, modulated by the solar wind in the inner heliosphere.
 entity{tuple_delimiter}Solar Modulation{tuple_delimiter}phenomenon{tuple_delimiter}The suppression of galactic cosmic-ray intensity by the solar wind, anti-correlated with solar activity.
 entity{tuple_delimiter}AMS-02{tuple_delimiter}instrument{tuple_delimiter}A particle detector aboard the International Space Station that measures cosmic-ray proton and helium spectra with high precision.
+entity{tuple_delimiter}AMS-02 Daily Proton Flux Dataset{tuple_delimiter}dataset{tuple_delimiter}High-precision proton and helium spectral dataset produced by AMS-02 that constrains the local interstellar spectrum in solar modulation models.
 entity{tuple_delimiter}PAMELA{tuple_delimiter}instrument{tuple_delimiter}A space experiment that provided early measurements of the cosmic-ray positron fraction.
 entity{tuple_delimiter}Positron Fraction{tuple_delimiter}quantity{tuple_delimiter}The ratio of positrons to total electrons-plus-positrons in cosmic rays, measured by PAMELA.
 entity{tuple_delimiter}Local Interstellar Spectrum{tuple_delimiter}quantity{tuple_delimiter}The cosmic-ray spectrum outside the heliosphere, constrained by detector data and used in modulation models.
 entity{tuple_delimiter}Force-Field Approximation{tuple_delimiter}model{tuple_delimiter}A single-parameter description of solar modulation that breaks down at low rigidities.
 relation{tuple_delimiter}Galactic Cosmic Rays{tuple_delimiter}Solar Modulation{tuple_delimiter}modulation, anti-correlation{tuple_delimiter}Galactic cosmic rays undergo solar modulation, anti-correlated with solar activity.
+relation{tuple_delimiter}AMS-02{tuple_delimiter}AMS-02 Daily Proton Flux Dataset{tuple_delimiter}measurement, data product{tuple_delimiter}AMS-02 produced the daily proton and helium spectral dataset.
+relation{tuple_delimiter}AMS-02 Daily Proton Flux Dataset{tuple_delimiter}Local Interstellar Spectrum{tuple_delimiter}constraint, spectra{tuple_delimiter}The AMS-02 daily proton flux dataset constrains the local interstellar spectrum used in modulation models.
 relation{tuple_delimiter}AMS-02{tuple_delimiter}Galactic Cosmic Rays{tuple_delimiter}measurement, spectra{tuple_delimiter}AMS-02 measures the proton and helium spectra of galactic cosmic rays.
 relation{tuple_delimiter}Force-Field Approximation{tuple_delimiter}Solar Modulation{tuple_delimiter}modeling, single-parameter{tuple_delimiter}The force-field approximation describes solar modulation with a single parameter.
 relation{tuple_delimiter}Local Interstellar Spectrum{tuple_delimiter}Solar Modulation{tuple_delimiter}input, modeling constraint{tuple_delimiter}The local interstellar spectrum constrains solar modulation models.
@@ -72,22 +77,28 @@ relation{tuple_delimiter}Local Interstellar Spectrum{tuple_delimiter}Solar Modul
 
 <Input Text>
 ```
-An orbital edge computing constellation processes satellite remote-sensing images on board instead of downlinking every raw frame. Each satellite uses a radiation-tolerant FPGA for quantized neural inference, reducing payload power consumption by 40% relative to full-precision inference at the same image rate. Triple modular redundancy (TMR) masks a single-event upset (SEU) in one replicated compute path. The FPGA is qualified to a total ionizing dose (TID) of 30 krad(Si). An inter-satellite task offloading scheduler routes overflow workloads over inter-satellite links when a satellite reaches its power limit.
+The PhiSat-1 mission demonstrates orbital edge computing by processing satellite remote-sensing images on board instead of downlinking every raw frame. Each node uses a radiation-tolerant FPGA fabricated on a silicon-on-insulator (SOI) substrate for quantized neural inference, reducing payload power consumption by 40% relative to full-precision inference at the same image rate. Triple modular redundancy (TMR) masks a single-event upset (SEU) in one replicated compute path. The FPGA is qualified to a total ionizing dose (TID) of 30 krad(Si). An inter-satellite task offloading scheduler routes overflow workloads over inter-satellite links when a satellite reaches its power limit.
 ```
 
 <Output>
-entity{tuple_delimiter}Orbital Edge Computing Constellation{tuple_delimiter}mission{tuple_delimiter}A satellite constellation that processes remote-sensing images on board rather than downlinking every raw frame.
-entity{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}instrument{tuple_delimiter}A spaceborne FPGA used for quantized neural inference and qualified to a total ionizing dose of 30 krad(Si).
+entity{tuple_delimiter}PhiSat-1{tuple_delimiter}mission{tuple_delimiter}A satellite mission demonstrating orbital edge computing by processing remote-sensing images on board rather than downlinking every raw frame.
+entity{tuple_delimiter}Orbital Edge Computing{tuple_delimiter}application{tuple_delimiter}On-board processing of satellite remote-sensing images to avoid downlinking every raw frame.
+entity{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}instrument{tuple_delimiter}A spaceborne FPGA fabricated on a silicon-on-insulator substrate, used for quantized neural inference and qualified to a total ionizing dose of 30 krad(Si).
+entity{tuple_delimiter}Silicon-on-Insulator{tuple_delimiter}material{tuple_delimiter}A semiconductor substrate material (abbreviated SOI) used to fabricate the radiation-tolerant FPGA.
 entity{tuple_delimiter}Quantized Neural Inference{tuple_delimiter}method{tuple_delimiter}A reduced-precision inference method that lowers payload power consumption by 40% relative to full-precision inference at the same image rate.
 entity{tuple_delimiter}Payload Power Consumption{tuple_delimiter}quantity{tuple_delimiter}Electrical power consumed by on-board processing; reduced by 40% with quantized inference at the same image rate.
+entity{tuple_delimiter}Quantization Power Reduction{tuple_delimiter}finding{tuple_delimiter}Measured result that quantized neural inference reduces payload power consumption by 40% relative to full-precision inference at the same image rate.
 entity{tuple_delimiter}Triple Modular Redundancy{tuple_delimiter}method{tuple_delimiter}A fault-mitigation technique (TMR) that masks an upset in one replicated compute path.
 entity{tuple_delimiter}Single-Event Upset{tuple_delimiter}phenomenon{tuple_delimiter}A radiation-induced fault (SEU) in a compute path that triple modular redundancy can mask.
 entity{tuple_delimiter}Total Ionizing Dose{tuple_delimiter}quantity{tuple_delimiter}The accumulated radiation dose (TID) used to qualify the FPGA, with a stated qualification level of 30 krad(Si).
 entity{tuple_delimiter}Inter-Satellite Task Offloading Scheduler{tuple_delimiter}method{tuple_delimiter}An algorithm that routes overflow workloads over inter-satellite links when a satellite reaches its power limit.
-relation{tuple_delimiter}Orbital Edge Computing Constellation{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}on-board computing, hardware{tuple_delimiter}Each satellite in the constellation uses a radiation-tolerant FPGA to process remote-sensing images on board.
+relation{tuple_delimiter}PhiSat-1{tuple_delimiter}Orbital Edge Computing{tuple_delimiter}demonstration, application{tuple_delimiter}The PhiSat-1 mission demonstrates orbital edge computing for on-board remote-sensing image processing.
+relation{tuple_delimiter}PhiSat-1{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}on-board computing, hardware{tuple_delimiter}PhiSat-1 uses a radiation-tolerant FPGA to process remote-sensing images on board.
+relation{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}Silicon-on-Insulator{tuple_delimiter}fabrication, substrate{tuple_delimiter}The radiation-tolerant FPGA is fabricated on a silicon-on-insulator substrate.
 relation{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}Quantized Neural Inference{tuple_delimiter}acceleration, inference{tuple_delimiter}The FPGA executes quantized neural inference for on-board image processing.
 relation{tuple_delimiter}Quantized Neural Inference{tuple_delimiter}Payload Power Consumption{tuple_delimiter}power reduction, efficiency{tuple_delimiter}Quantized inference reduces payload power consumption by 40% at the same image rate relative to full-precision inference.
+relation{tuple_delimiter}Quantized Neural Inference{tuple_delimiter}Quantization Power Reduction{tuple_delimiter}empirical finding, efficiency{tuple_delimiter}Quantized neural inference achieves a 40% reduction in payload power consumption at the same image rate.
 relation{tuple_delimiter}Triple Modular Redundancy{tuple_delimiter}Single-Event Upset{tuple_delimiter}fault mitigation, redundancy{tuple_delimiter}Triple modular redundancy masks a single-event upset in one replicated compute path.
 relation{tuple_delimiter}Radiation-Tolerant FPGA{tuple_delimiter}Total Ionizing Dose{tuple_delimiter}qualification, radiation tolerance{tuple_delimiter}The FPGA is qualified to a total ionizing dose of 30 krad(Si).
-relation{tuple_delimiter}Inter-Satellite Task Offloading Scheduler{tuple_delimiter}Orbital Edge Computing Constellation{tuple_delimiter}task offloading, power constraint{tuple_delimiter}The scheduler routes overflow workloads between satellites when a constellation member reaches its power limit.
+relation{tuple_delimiter}Inter-Satellite Task Offloading Scheduler{tuple_delimiter}Orbital Edge Computing{tuple_delimiter}task offloading, power constraint{tuple_delimiter}The scheduler routes overflow workloads over inter-satellite links when an orbital edge computing node reaches its power limit.
 {completion_delimiter}

@@ -698,3 +698,26 @@ def test_operator_section_reconcile_batches_status_reads(monkeypatch):
     statuses.assert_awaited_once_with(['book#s0', 'book#s1'])
     assert [call.kwargs['status'] for call in upsert.await_args_list] == ['done', 'error']
     rag.aget_docs_by_ids.assert_not_awaited()
+
+
+def test_read_text_runs_off_loop(monkeypatch, tmp_path):
+    import threading
+
+    monkeypatch.setenv("PAPERVAULT_OPERATOR_SOURCES", "1")
+    _patch_ledger(monkeypatch)
+    p = tmp_path / "book.md"
+    p.write_text("# A\nalpha beta gamma", encoding="utf-8")
+
+    loop_thread = threading.get_ident()
+    seen: dict[str, int] = {}
+
+    def _spy_read(path):
+        seen["thread"] = threading.get_ident()
+        return path.read_text(encoding="utf-8")
+
+    out = _run(od.ingest_document(
+        FakeRag(doc_status="processed"), "textbook", "textbook:Schlickeiser2002", str(p),
+        tokenizer=FakeTok(), max_tokens=100, read_text=_spy_read,
+    ))
+    assert out["done"] == 1
+    assert seen["thread"] != loop_thread

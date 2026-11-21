@@ -26,6 +26,7 @@ from papervault.store import knowledge_runtime
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 from typing import Optional
@@ -105,25 +106,118 @@ async def _is_stale_dup_marker(rag, did: str, doc) -> bool:
     return not await rag.full_docs.get_by_id(did)
 
 
+async def find_doc_by_file_basename(
+    rag,
+    basename: str,
+    *,
+    prefer_duplicates: bool = False,
+) -> tuple[str, dict] | None:
+    """Look up a doc_status row by canonical ``file_path`` basename, INCLUDING ``is_duplicate=true`` rows.
+
+    LightRAG 1.5.7's ``PGDocStatusStorage.get_doc_by_file_basename`` filters out rows whose
+    ``metadata->>'is_duplicate'`` is true, hiding ``dup-*`` rejection markers from both
+    ``_clear_insert_path`` and ``reconcile_library``. When backed by PG (``doc_status.db.query`` +
+    ``doc_status.workspace``), query ``LIGHTRAG_DOC_STATUS`` without the exclusion predicate; for
+    in-memory/mock stores without a PG ``db`` handle, fall back cleanly to
+    ``doc_status.get_doc_by_file_basename``.
+    """
+    if not basename or basename == "unknown_source":
+        return None
+    ds = getattr(rag, "doc_status", None)
+    if ds is None:
+        return None
+    db = getattr(ds, "db", None)
+    workspace = getattr(ds, "workspace", None)
+    if db is not None and workspace is not None and callable(getattr(db, "query", None)):
+        order = (
+            "COALESCE((metadata->>'is_duplicate')::boolean, false) DESC, created_at DESC, id DESC"
+            if prefer_duplicates
+            else "COALESCE((metadata->>'is_duplicate')::boolean, false) DESC, created_at ASC, id ASC"
+        )
+        sql = (
+            "SELECT * FROM LIGHTRAG_DOC_STATUS "
+            f"WHERE workspace=$1 AND file_path = $2 ORDER BY {order} LIMIT 1"
+        )
+        result = await db.query(sql, [workspace, basename], True)
+        if not result:
+            return None
+        row = result[0]
+        chunks_list = row.get("chunks_list", [])
+        if isinstance(chunks_list, str):
+            try:
+                chunks_list = json.loads(chunks_list)
+            except Exception:  # noqa: BLE001
+                chunks_list = []
+        metadata = row.get("metadata", {})
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except Exception:  # noqa: BLE001
+                metadata = {}
+        doc = {
+            "content_length": row.get("content_length"),
+            "content_summary": row.get("content_summary"),
+            "status": row.get("status"),
+            "chunks_count": row.get("chunks_count"),
+            "file_path": row.get("file_path"),
+            "chunks_list": chunks_list,
+            "metadata": metadata if isinstance(metadata, dict) else {},
+            "error_msg": row.get("error_msg"),
+            "track_id": row.get("track_id"),
+            "content_hash": row.get("content_hash"),
+        }
+        return str(row["id"]), doc
+    if hasattr(ds, "get_doc_by_file_basename"):
+        return await ds.get_doc_by_file_basename(basename)
+    return None
+
+
+async def _find_processed_doc_by_content_hash(
+    rag,
+    content_hash: str,
+    *,
+    exclude_doc_id: str,
+) -> Optional[str]:
+    """Return an existing PROCESSED doc_id sharing ``content_hash`` when supported by doc_status."""
+    if not content_hash:
+        return None
+    ds = getattr(rag, "doc_status", None)
+    finder = getattr(ds, "get_doc_by_content_hash", None)
+    if not callable(finder):
+        return None
+    match = await finder(content_hash, exclude_doc_id=exclude_doc_id)
+    if not match:
+        return None
+    twin_id, twin_doc = match
+    if twin_id != exclude_doc_id and doc_status_of(twin_doc) == DocStatus.PROCESSED:
+        return twin_id
+    return None
+
+
 async def _clear_insert_path(rag, key: str) -> tuple[Optional[str], int]:
     """Purge stale `dup-*` markers holding this paper's file_path (#131 Bound 2).
 
     Returns (blocking_doc_id, purged): blocking_doc_id is the id of a row that is NOT a stale
     marker yet still holds the file_path (LightRAG's filename dedup would reject the insert
-    against it), or None when the path is clear. Only stale markers are ever deleted.
-    `get_doc_by_file_basename` returns the oldest match, so this re-queries after each delete.
+    against it), or None when the path is clear. Only stale markers returned by LightRAG's own
+    ``doc_status.get_doc_by_file_basename`` are ever deleted: under LightRAG 1.5.7 PostgreSQL,
+    ``get_doc_by_file_basename`` already excludes ``is_duplicate=true`` rows from filename
+    conflicts, leaving those ``dup-*`` audit rows intact for ``reconcile_library``.
     """
     knowledge_runtime.assert_knowledge_authority("legacy")
+    ds = getattr(rag, "doc_status", None)
+    if ds is None or not hasattr(ds, "get_doc_by_file_basename"):
+        return None, 0
     basename = normalize_document_file_path(file_path(key))
     purged = 0
     while True:
-        match = await rag.doc_status.get_doc_by_file_basename(basename)
+        match = await ds.get_doc_by_file_basename(basename)
         if not match:
             return None, purged
         mid, mdoc = match
         if purged >= _MAX_MARKER_PURGE or not await _is_stale_dup_marker(rag, mid, mdoc):
             return mid, purged
-        await rag.doc_status.delete([mid])
+        await ds.delete([mid])
         purged += 1
         log.info("distill_batch: purged stale duplicate marker %s blocking %s (#131)", mid, basename)
 
@@ -321,18 +415,20 @@ async def record_duplicate(ingest_source: str, source_id: str, own_doc_id: str,
                         duplicate_of=twin_doc_id, duplicate_content_hash=content_hash)
 
 
-def _prepare_text(rec: PaperRecord, want_abstract: bool) -> tuple[str | None, str | None]:
+def _prepare_text(rec: PaperRecord, want_abstract: bool) -> tuple[str | None, str | None, str | None]:
     """Read, clean and hash in a worker while preserving module-local reader injection."""
     if want_abstract:
         cleaned = build_abstract_doc(rec)
         if not cleaned:
-            return None, None
+            return None, None, None
     else:
         text = read_extract_raw(rec)
         if not text or not text.strip():
-            return None, None
+            return None, None, None
         cleaned = clean(text)
-    return cleaned, _dedup_key(cleaned)
+    dk = _dedup_key(cleaned)
+    content_hash = compute_text_content_hash(sanitize_text_for_encoding(cleaned))
+    return cleaned, dk, content_hash
 
 
 async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
@@ -384,7 +480,7 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
             counters["replaced"] += 1
             log.info("distill_batch: %s replaced its %s doc (#144)", rec.key,
                      "full-text" if want_abstract else "abstract-only")
-        cleaned, dk = await asyncio.to_thread(_prepare_text, rec, want_abstract)
+        cleaned, dk, content_hash = await asyncio.to_thread(_prepare_text, rec, want_abstract)
         if cleaned is None:
             # The abstract or extract vanished since fingerprinting; retain metadata state.
             await ledger.upsert("paper", rec.key, doc_id=doc_id(rec.key), status="done_meta", fingerprint=META)
@@ -395,12 +491,19 @@ async def distill_batch(rag, items: list[tuple[PaperRecord, str]]) -> dict:
             # 不留 processing(否则永卡):标 done_meta(dup),指向同内容已入队那篇。
             # ★指纹写 *真实 fp*(不是 META):本篇有全文,fingerprint(rec) 下轮恒返真实 hash;
             #   若这里写 META,下轮 diff(fp != META)会判 to_redistill 永久 churn(SDD §6.1 line 221 口径)。
-            content_hash = await asyncio.to_thread(
-                lambda: compute_text_content_hash(sanitize_text_for_encoding(cleaned)))
             await record_duplicate("paper", rec.key, doc_id(rec.key), doc_id(seen_clean[dk]),
                                    content_hash, fp)
             counters["dup"] += 1
             log.info("distill_batch: content-dup %s == %s → done_meta(dup)", rec.key, seen_clean[dk])
+            continue
+        existing_twin = await _find_processed_doc_by_content_hash(
+            rag, content_hash, exclude_doc_id=doc_id(rec.key),
+        )
+        if existing_twin is not None:
+            await record_duplicate("paper", rec.key, doc_id(rec.key), existing_twin, content_hash, fp)
+            counters["dup"] += 1
+            log.info("distill_batch: cross-batch content-dup %s == %s → done_meta(dup)",
+                     rec.key, existing_twin)
             continue
         blocker, purged = await _clear_insert_path(rag, rec.key)
         counters["purged_markers"] += purged

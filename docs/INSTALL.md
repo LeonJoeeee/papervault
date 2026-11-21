@@ -101,22 +101,23 @@ from its role (`<model>[@<modifier>][,<fallback>...]`). Defaults are:
 
 | Role | Default route | Override |
 | --- | --- | --- |
-| Graph extraction/merge | `glm-5.3@max,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
-| Query keyword extraction | `gpt-6.1-terra@low` | `PAPERVAULT_LLM_KEYWORD` |
-| Answer synthesis | `gpt-6-astra@xhigh` | `PAPERVAULT_LLM_SYNTH` |
-| Extract clarity/completeness gates | `glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_GATE` |
-| PDF metadata verification | `glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_VERIFY` |
+| Graph extraction/merge | `glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
+| Query keyword extraction | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_KEYWORD` |
+| Answer synthesis | `gpt-6.2-astra@xhigh` | `PAPERVAULT_LLM_SYNTH` |
+| Extract clarity/completeness gates | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_GATE` |
+| PDF metadata verification | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_VERIFY` |
 | Library search intent | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_INTENT` |
-| Library judges/resolver/re-rank | `gpt-6.1-terra@medium` | `PAPERVAULT_LLM_JUDGE` |
-| Decomposition (production multiquery and eval) | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_DECOMPOSE` |
-| Eval judges | `glm-5.3@max` | `PAPERVAULT_LLM_EVAL_JUDGE` |
+| Library judges/resolver/re-rank | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_JUDGE` |
+| Decomposition (production multiquery and eval) | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` | `PAPERVAULT_LLM_DECOMPOSE` |
+| Eval judges | `glm-5.3@max,relay-glm-5.3@max` | `PAPERVAULT_LLM_EVAL_JUDGE` |
 
-Modifiers are validated per family against the transparent LLM Gateway `v0.7.3`
+Modifiers are validated per family against the transparent LLM Gateway
 catalog (after stripping an optional `openai/` prefix):
 - `glm-*`, `relay-glm-*` (always-on thinking): bare or `@low`, `@high`, `@max`
   (`@none`, `@nothinking`, `@thinking`, `@medium`, and `@xhigh` raise `ValueError`).
-- `gpt-6-astra*`, `gpt-6.1-sol*` (always-on Codex): bare or `@low`, `@medium`,
-  `@high`, `@xhigh`, `@max` (`@none`, `@thinking`, and `@nothinking` raise `ValueError`).
+- `gpt-6.2-astra*`, `gpt-6.2-sol*`, `gpt-6-astra*`, `gpt-6.1-sol*` (always-on Codex):
+  bare or `@low`, `@medium`, `@high`, `@xhigh`, `@max` (`@none`, `@thinking`,
+  and `@nothinking` raise `ValueError`).
 - `gpt-6.1-terra*`, `gpt-6-luna*` (disable-capable Codex): bare or `@none`,
   `@low`, `@medium`, `@high`, `@xhigh`, `@max` (`@thinking` and `@nothinking` raise `ValueError`).
 - `deepseek-v4*`, `deepseek-flash*`, `relay-deepseek-*`: bare, `@low`, `@high`,
@@ -126,14 +127,17 @@ catalog (after stripping an optional `openai/` prefix):
 - Other OpenAI-compatible model IDs (e.g. `PAPERVAULT_LLM_JUDGE=gpt-4.1-mini`):
   bare, `@none..@max`, `@thinking`, or `@nothinking`.
 
-Multi-target routes fail over immediately from a throttled or timed-out primary
-(`429`, `408`, `5xx`, timeout, `StreamTruncated`) to the next target and cool
-down the primary for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` seconds (default
-`120`, `<= 0` disables) before probing it again; single-target roles never
-cross-model fallback. `eval_judge` defaults to single-target `glm-5.3@max` to
-preserve a single-family benchmark ruler invariant, while still honoring an
-explicit multi-target override such as
-`PAPERVAULT_LLM_EVAL_JUDGE=glm-5.3@max,relay-glm-5.3@max`.
+Multi-target routes follow the three-tier GLM subscription → `relay-*` balance →
+Codex subscription hierarchy and fail over immediately from a throttled,
+timed-out, or quota-exhausted non-final target (`429`, `408`, `5xx`, timeout,
+`StreamTruncated`, `402`, or quota-indicated `400/403/429`) to the next target,
+cooling down each failed non-final leg for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`
+seconds (default `120`, `<= 0` disables) before probing it again; genuine
+non-quota `400/401/403/422` errors fail fast and single-target roles (`intent`,
+`synth`) never cross-model fallback. `eval_judge` defaults to two-tier
+same-family `glm-5.3@max,relay-glm-5.3@max` (without Tier 3 GPT fallback) to
+preserve a single-family benchmark ruler invariant across Zhipu subscription
+windows.
 
 The retired symbolic level names (`flash`, `standard`, `pro`, `max`, `ultra` and
 `papervault-*`) are rejected with `ValueError` naming `PAPERVAULT_LLM_<ROLE>`.
@@ -174,8 +178,15 @@ are useful for diagnosis or capacity tuning; defaults come from the current runt
 | `KS_STARTUP_AWAIT_SEC` | `3` | Maximum startup wait in seconds; initialization/retries continue in the background after it expires. `0` skips waiting. |
 | `KS_SKIP_EMBED_SELFCHECK` | `0` | `1`, `true` or `yes` bypasses the embedding boot probe; use only for diagnosis or a separately verified stack. |
 | `KS_EMBED_MAX_ASYNC` / `KS_EMBED_GPU_MAX_ASYNC` | `16` / `1` | LightRAG embedding-call queue concurrency versus actual GPU forward-pass concurrency. |
+| `KS_EMBED_BATCH_NUM` / `KS_EMBED_TIMEOUT` | `32` / `120` | LightRAG embedding batch size and per-call embedding timeout in seconds. |
 | `KS_EMBED_OFFLOAD` | `1` | Offload embedding to a worker thread; `0` restores blocking inference on the server loop. |
-| `KS_LLM_MAX_TOKENS` / `KS_SYNTH_MAX_TOKENS` / `PAPERVAULT_LIB_MAX_TOKENS` | unset | Optional explicit LLM output ceilings for Knowledge, synthesis, and Library calls; omitted on the wire when unset unless a caller passes an explicit limit. |
+| `KS_BGE_WORKER_MODE` | `subprocess` | `subprocess` runs local BGE-M3 embedding and reranking in an on-demand worker subprocess so the MCP server never imports PyTorch or holds a CUDA context; `inprocess` restores legacy in-process loading. |
+| `KS_BGE_WORKER_EMBED_TIMEOUT_S` / `KS_BGE_WORKER_RERANK_TIMEOUT_S` | `180` / `600` | Per-request BGE worker RPC deadlines in seconds (`<= 0` disables); timed-out workers are killed and reaped so subsequent calls recover cleanly. |
+| `KS_BUILD_OFFPEAK_ONLY` | `false` | `true`, `1`, or `yes` pauses background graph builds during configured peak windows; interactive queries are never paused. |
+| `KS_BUILD_PEAK_WINDOWS` / `KS_BUILD_PEAK_DAYS` | `09:00-12:00,14:00-18:00` / `Mon-Fri` | Same-day peak `HH:MM-HH:MM` windows (start inclusive, end exclusive) and weekday names/ranges for off-peak build gating. |
+| `KS_BUILD_PEAK_TZ` / `KS_BUILD_PEAK_HOLIDAYS` | `Asia/Shanghai` / empty | IANA timezone (`zoneinfo`) and comma-separated `YYYY-MM-DD` holiday dates excluded from peak windows. |
+| `CUDA_DEVICE_ORDER` | unset | Set `PCI_BUS_ID` on multi-GPU hosts so `CUDA_VISIBLE_DEVICES` matches physical PCI bus order deterministically. |
+| `KS_LLM_MAX_TOKENS` / `KS_SYNTH_MAX_TOKENS` / `PAPERVAULT_LIB_MAX_TOKENS` / `JUDGE_MAX_TOKENS` | unset | Optional explicit LLM output ceilings for Knowledge, synthesis, Library, and standalone `judge_mimo` calls; omitted on the wire when unset unless a caller passes an explicit limit. |
 | `KS_LLM_BACKOFF_JITTER` | `0.75` | Jitter added to direct key-pool retry backoff in seconds. |
 | `KS_GATEWAY_CONN_RETRIES` / `KS_GATEWAY_CONN_BACKOFF_CAP` | `6` / `15` | Unreachable-gateway connection retries and backoff cap in seconds, still bounded by the configured retry budget. |
 | `KS_SLOW_CALL_LOG_S` | `60` | Log successful knowledge LLM calls exceeding this duration in seconds. |
@@ -257,15 +268,23 @@ through the same `:30000` endpoint after idle GPU unload, including any
 service-owned backend wakeup. Host measurements and service deployment remain
 outside the lane's unit-test evidence.
 
-## BGE idle release
+## BGE worker mode and idle release
 
-The in-process BGE embedder and reranker have a separate opt-in idle release:
-`KS_BGE_IDLE_UNLOAD=1` and `KS_BGE_IDLE_TIMEOUT=600`. After both unload, a
-normal `query` or `search_papers` reloads the model it needs. Measure GPU memory
-and the `bge embedder loaded in ...s` / `bge reranker loaded in ...s` log entries
-on the target GPU. To roll back BGE idle release, set `KS_BGE_IDLE_UNLOAD=0`
-and restart papervault under the operator's deployment procedure; connected
-MCP clients must reconnect. These BGE settings do not control MinerU.
+By default (`KS_BGE_WORKER_MODE=subprocess`), the local BGE-M3 embedder and
+reranker run inside an on-demand worker subprocess so the long-lived
+`papervault-mcp` server process never imports PyTorch or initializes a CUDA
+context. Set `KS_BGE_WORKER_MODE=inprocess` to restore legacy in-process
+loading.
+
+Both modes support opt-in idle release via `KS_BGE_IDLE_UNLOAD=1` and
+`KS_BGE_IDLE_TIMEOUT=600`. In `subprocess` mode, idle release terminates the
+worker subprocess cleanly—returning 100% of its PyTorch RAM and CUDA context
+(0 MiB idle VRAM) to the OS—and the next `query` or `search_papers` respawns
+it on demand. Measure GPU memory and the `bge embedder loaded in ...s` /
+`bge reranker loaded in ...s` log entries on the target GPU. To roll back BGE
+idle release, set `KS_BGE_IDLE_UNLOAD=0` and restart papervault under the
+operator's deployment procedure; connected MCP clients must reconnect. These
+BGE settings do not control MinerU.
 
 ## Acquisition-v2 format deploys: drain barrier
 
@@ -525,7 +544,7 @@ client too (Claude Code, Antigravity, Codex reviewers, and any script).
 
 ## Choosing a domain
 
-papervault ships tuned for space physics + AI4Science. To adapt it to another
+papervault ships tuned for **space physics, space computing, and AI4Science**. To adapt it to another
 field, edit the domain pack (`src/papervault/domain/space_physics/`) or point
 `PAPERVAULT_DOMAIN_PATH` at your own pack directory with the same files:
 `domain.toml`, `ontology.json`, `extraction_examples.txt`,
@@ -569,8 +588,15 @@ entries and unfamiliar languages or layouts remain unknown.
 ## Run papervault as a service (optional)
 
 `deploy/papervault.service` is a user-level systemd unit for the server. Its
-`WorkingDirectory`/`ExecStart` assume the clone lives at `~/projects/dev/papervault` —
-edit both paths to your clone location before `systemctl --user enable --now papervault`.
-Keep its `Environment=MALLOC_MMAP_THRESHOLD_=1048576` line (or the same setting in a
-drop-in) when you adapt it: glibc reads it only at process start, so it cannot live in
-`.env`, and without it memory freed after an OCR burst stays in the process.
+`WorkingDirectory`/`ExecStart` default to `%h/lab/papervault` — edit both paths
+to your clone location (`<repo>`) before `systemctl --user enable --now papervault`.
+Keep its resource and allocator directives (or the same settings in a drop-in)
+when you adapt it:
+
+- `LimitNOFILE=65536` — prevents file-descriptor exhaustion under concurrent HTTP/DB traffic.
+- `Environment=MALLOC_MMAP_THRESHOLD_=1048576` and `Environment=MALLOC_ARENA_MAX=2` —
+  glibc reads both only at process start (before `.env` loads); together they return large
+  allocations to the OS on free and cap per-thread arena RSS bloat.
+- `Environment=OMP_NUM_THREADS=1`, `Environment=OPENBLAS_NUM_THREADS=1`, and
+  `Environment=RAYON_NUM_THREADS=4` — cap native BLAS/tokenizer thread pools to avoid CPU
+  oversubscription during bursts.

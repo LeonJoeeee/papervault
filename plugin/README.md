@@ -46,5 +46,6 @@ new session. See the repository's install guide for the full JSON example.
 
 Version policy: both plugin manifests follow the repo's single package version,
 together with `.claude-plugin/marketplace.json`, `pyproject.toml`, and `uv.lock`
-(stated in the repo README's Releases section). The version sync test guards all
-five sources.
+(stated in the repo README's Releases section). Ordinary feature/fix slices do not
+bump versions; all five sources move together on authorized release bumps, guarded
+by `tests/test_plugin_version_sync.py`.

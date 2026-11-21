@@ -26,7 +26,7 @@ from openai import APIConnectionError
 from papervault.knowledge.ingest.abstract_doc import is_abstract_text, strip_abstract_header
 from papervault.knowledge.ingest.operator_docs import strip_section_suffix
 from papervault.knowledge.store.llm import StreamTruncated, _error_code, mimo_complete
-from papervault.llm_routing import route
+from papervault.llm_routing import is_quota_exhaustion_error, route
 
 logger = logging.getLogger("ks.query.synth")
 
@@ -53,6 +53,27 @@ def _optional_int_env(name: str) -> int | None:
 # official output ceiling behind Gateway v0.7.3 (and avoids artificial truncation on deep answers).
 # Optional KS_SYNTH_MAX_TOKENS=<int> sets an explicit synthesis output ceiling when desired.
 _SYNTH_MAX_TOKENS: int | None = _optional_int_env("KS_SYNTH_MAX_TOKENS")
+# Defensive ceiling on synth prompt input tokens; excess tail chunks are trimmed gracefully.
+# <= 0 disables the ceiling.
+_SYNTH_MAX_PROMPT_TOKENS: int = int(os.getenv("KS_SYNTH_MAX_PROMPT_TOKENS", "160000"))
+_PROMPT_TOKENIZER: Any = None
+
+
+def _count_prompt_tokens(text: str) -> int:
+    global _PROMPT_TOKENIZER
+    if _PROMPT_TOKENIZER is None:
+        try:
+            from lightrag.utils import TiktokenTokenizer
+
+            _PROMPT_TOKENIZER = TiktokenTokenizer()
+        except Exception:  # noqa: BLE001 — fallback to char estimate if tokenizer unavailable
+            _PROMPT_TOKENIZER = False
+    if _PROMPT_TOKENIZER:
+        try:
+            return len(_PROMPT_TOKENIZER.encode(text))
+        except Exception:  # noqa: BLE001
+            pass
+    return (len(text) + 3) // 4
 
 # Synth's OWN business deadline (Phase 0, 2026-06-04 — docs/history/2026-06-04-gateway/2026-06-04-llm-gateway.md). A deep
 # 16k-token cited synthesis legitimately takes ~600s under contention (~20-45 tok/s), so the old
@@ -189,24 +210,32 @@ def _source_label(file_path: str) -> tuple[str, str]:
         # Distill owns these basenames; do not impose an author/year key regex.
         return (file_path, _CRED_BY_SOURCE["paper"])
     source, _, sid = file_path.partition("/")
+    sid = strip_section_suffix(sid.strip())
+    if not sid:
+        return ("unknown", "preliminary")
     cred = _CRED_BY_SOURCE.get(source, "preliminary")
     return (f"{source}:{sid}", cred)
 
 
 # Used by retrieval, out-feed, and synthesis so one evidence classification governs all three.
-SOURCE_TIER_RANK = {"canon": 0, "fulltext": 1, "abstract_only": 2}
+# Preliminary operator sources (notebook:, web:) rank below peer-reviewed papers and abstracts.
+SOURCE_TIER_RANK = {"canon": 0, "fulltext": 1, "abstract_only": 2, "preliminary": 3}
 
 
 def source_tier(item: dict[str, Any]) -> str:
-    """Classify retained evidence; abstract-only evidence never gains full-text authority.
+    """Classify retained evidence; abstract-only and preliminary evidence never gain full-text authority.
 
     Textbooks are the current canon. Ingested classic papers may carry an explicit
     canon annotation; citation counts and model judgments never manufacture that status.
+    Unpublished notebooks and web sources stay in the preliminary tier below peer-reviewed papers.
     """
     if item.get("source_tier") == "abstract_only" or is_abstract_text(item.get("content")):
         return "abstract_only"
-    if (item.get("file_path") or "").startswith("textbook:") or item.get("source_tier") == "canon":
+    fp = (item.get("file_path") or "").strip()
+    if fp.startswith(("textbook:", "textbook/")) or item.get("source_tier") == "canon":
         return "canon"
+    if fp.startswith(("notebook:", "web:", "notebook/", "web/")) or item.get("source_tier") == "preliminary":
+        return "preliminary"
     return "fulltext"
 
 
@@ -243,14 +272,87 @@ def annotate_sources(data: dict[str, Any]) -> dict[str, Any]:
     return {**data, "chunks": chunks, "references": refs}
 
 
-def _build_prompt(data: dict[str, Any], intent: str, kb_coverage: str | None = None) -> str:
-    """Assemble the synth prompt from aquery_data's structured `data` dict.
+def _render_prompt(blocks: list[str], intent: str) -> str:
+    context = "\n\n====\n\n".join(blocks) if blocks else "(no material retrieved)"
+    return f"""User intent:
+{intent}
 
-    Sends entities (typed nodes), relationships (edges), and source chunks — each
-    chunk prefixed with its citeable source label + credibility band so the LLM can
-    cite real [paper_key]s and honor tentativeness.
+Retrieved knowledge:
+====
+{context}
+====
+
+Answer the intent using the retrieved knowledge above. Cite EVERY substantive claim
+inline with the bracketed source key shown in each chunk's source label.
+Use ALL the relevant material and synthesize ACROSS sources — don't collapse a multi-paper body
+of evidence into a single-paper summary. Pick whatever structure (prose / bullets /
+sections / table) and length best fits the question + the depth of coverage. If the
+material doesn't support the intent well, say so cleanly."""
+
+
+_CHUNKS_PREAMBLE = (
+    "Source chunks (each chunk below has a source key or an explicit no-citation marker; to "
+    "cite it, wrap ONLY the key, unchanged, in square brackets, e.g. [Reames2023] for a "
+    "paper or [textbook:Baumjohann2012] for a textbook/notebook/web source (keep its "
+    "colon) — never write the word paper_key or the credibility tag inside the brackets):\n"
+)
+
+
+def _truncate_chunk_to_budget(
+    prefix: str,
+    content: str,
+    blocks: list[str],
+    intent: str,
+    max_tokens: int,
+) -> tuple[str, str]:
+    """Truncate a single chunk's ``content`` so the full rendered prompt fits ``<= max_tokens``.
+
+    Returns ``(rendered_prompt, truncated_block)``. If the non-chunk wrapper + chunk header
+    already leaves zero tokens for content, returns the header with empty content (or drops
+    content cleanly) so the prompt never silently blows past the ceiling.
     """
-    data = annotate_sources(data)
+    marker = " ... [truncated]"
+    empty_block = prefix.rstrip("\n")
+    empty_prompt = _render_prompt(blocks + [_CHUNKS_PREAMBLE + empty_block], intent)
+    if _count_prompt_tokens(empty_prompt) >= max_tokens:
+        return empty_prompt, empty_block
+
+    lo, hi = 0, len(content)
+    best_prompt = empty_prompt
+    best_block = empty_block
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if mid == 0:
+            cand_body = ""
+        elif mid < len(content):
+            cand_body = content[:mid].rstrip() + marker
+        else:
+            cand_body = content
+        cand_block = f"{prefix}{cand_body}" if cand_body else empty_block
+        cand_prompt = _render_prompt(blocks + [_CHUNKS_PREAMBLE + cand_block], intent)
+        if _count_prompt_tokens(cand_prompt) <= max_tokens:
+            best_prompt, best_block = cand_prompt, cand_block
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return best_prompt, best_block
+
+
+def _build_prompt_with_chunks(
+    data: dict[str, Any],
+    intent: str,
+    kb_coverage: str | None = None,
+    *,
+    _annotated: bool = False,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Assemble the synth prompt and return ``(prompt, presented_chunks)``.
+
+    ``presented_chunks`` contains ONLY the chunk dicts actually included in the rendered prompt
+    (excluding any tail chunks trimmed to satisfy ``KS_SYNTH_MAX_PROMPT_TOKENS``) so citation
+    verification stays strictly grounded in what synthesis saw.
+    """
+    if not _annotated:
+        data = annotate_sources(data)
     blocks: list[str] = []
 
     entities = data.get("entities") or []
@@ -273,50 +375,98 @@ def _build_prompt(data: dict[str, Any], intent: str, kb_coverage: str | None = N
             rel_lines.append(f"- {src} — {tgt}: {desc}")
         blocks.append("Knowledge-graph relationships:\n" + "\n".join(rel_lines))
 
-    chunks = data.get("chunks") or []
-    if chunks:
-        chunk_blocks = []
-        for c in chunks:
-            label, cred = _source_label(c.get("file_path") or c.get("paper_key") or "")
-            content = (c.get("content") or "").strip()
-            if label != "unknown" and cred == _CRED_BY_SOURCE["paper"] and source_tier(c) == "abstract_only":
-                # #144: the label carries the class; the header line (square brackets) is dropped so
-                # it never reads as a citation lookalike next to the one bracketed-key rule (#122).
-                cred = ABSTRACT_ONLY_CRED
-                content = strip_abstract_header(content)
-            if label == "unknown":
-                header = f"(no citeable source key; do not invent a citation | credibility: {cred})"
-            else:
-                header = f"(source key: {label} | credibility: {cred})"
-            chunk_blocks.append(f"{header}\n(source tier: {source_tier(c)})\n{content}")
-        blocks.append(
-            "Source chunks (each chunk below has a source key or an explicit no-citation marker; to "
-            "cite it, wrap ONLY the key, unchanged, in square brackets, e.g. [Reames2023] for a "
-            "paper or [textbook:Baumjohann2012] for a textbook/notebook/web source (keep its "
-            "colon) — never write the word paper_key or the credibility tag inside the brackets):\n"
-            + "\n\n---\n\n".join(chunk_blocks)
-        )
-
     if kb_coverage == "weak":
         blocks.insert(0, "Coverage: weak. Evidence is limited to abstracts; explicitly state this "
                       "limitation and do not infer full-text methods or results.")
 
-    context = "\n\n====\n\n".join(blocks) if blocks else "(no material retrieved)"
+    chunks = data.get("chunks") or []
+    # Each entry: (chunk_dict, prefix_with_trailing_nl, body_content, full_chunk_block)
+    chunk_entries: list[tuple[dict[str, Any], str, str, str]] = []
+    for c in chunks:
+        label, cred = _source_label(c.get("file_path") or c.get("paper_key") or "")
+        content = (c.get("content") or "").strip()
+        tier = source_tier(c)
+        if label != "unknown" and cred == _CRED_BY_SOURCE["paper"] and tier == "abstract_only":
+            # #144: the label carries the class; the header line (square brackets) is dropped so
+            # it never reads as a citation lookalike next to the one bracketed-key rule (#122).
+            cred = ABSTRACT_ONLY_CRED
+            content = strip_abstract_header(content)
+        if label == "unknown":
+            header = f"(no citeable source key; do not invent a citation | credibility: {cred})"
+        else:
+            header = f"(source key: {label} | credibility: {cred})"
+        prefix = f"{header}\n(source tier: {tier})\n"
+        chunk_entries.append((c, prefix, content, f"{prefix}{content}"))
 
-    return f"""User intent:
-{intent}
+    full_blocks = list(blocks)
+    if chunk_entries:
+        full_blocks.append(_CHUNKS_PREAMBLE + "\n\n---\n\n".join(e[3] for e in chunk_entries))
+    prompt = _render_prompt(full_blocks, intent)
+    presented_chunks: list[dict[str, Any]] = [e[0] for e in chunk_entries]
 
-Retrieved knowledge:
-====
-{context}
-====
+    max_tokens = _SYNTH_MAX_PROMPT_TOKENS
+    if max_tokens > 0 and chunk_entries and len(prompt) * 4 > max_tokens:
+        total_tokens = _count_prompt_tokens(prompt)
+        if total_tokens > max_tokens:
+            base_tokens = _count_prompt_tokens(_render_prompt(blocks + [_CHUNKS_PREAMBLE], intent))
+            sep_tokens = _count_prompt_tokens("\n\n---\n\n")
+            kept_entries: list[tuple[dict[str, Any], str, str, str]] = []
+            used = base_tokens
+            for idx, entry in enumerate(chunk_entries):
+                cb_tok = _count_prompt_tokens(entry[3]) + (sep_tokens if idx > 0 else 0)
+                if used + cb_tok > max_tokens:
+                    break
+                kept_entries.append(entry)
+                used += cb_tok
+            if kept_entries:
+                prompt = _render_prompt(
+                    blocks + [_CHUNKS_PREAMBLE + "\n\n---\n\n".join(e[3] for e in kept_entries)],
+                    intent,
+                )
+                while kept_entries and _count_prompt_tokens(prompt) > max_tokens:
+                    kept_entries.pop()
+                    if kept_entries:
+                        prompt = _render_prompt(
+                            blocks + [_CHUNKS_PREAMBLE + "\n\n---\n\n".join(e[3] for e in kept_entries)],
+                            intent,
+                        )
+            truncated_first = False
+            if not kept_entries:
+                # Even the first chunk alone exceeded max_tokens (or there was only 1 chunk):
+                # keep chunk 0 and truncate its body cleanly to fit the configured ceiling.
+                first = chunk_entries[0]
+                prompt, _trunc_block = _truncate_chunk_to_budget(
+                    first[1], first[2], blocks, intent, max_tokens,
+                )
+                kept_entries = [first]
+                truncated_first = True
+            presented_chunks = [e[0] for e in kept_entries]
+            trimmed = len(chunk_entries) - len(kept_entries)
+            if trimmed > 0 or truncated_first:
+                logger.warning(
+                    "synth prompt exceeded KS_SYNTH_MAX_PROMPT_TOKENS=%d (%d tokens); "
+                    "trimmed %d/%d tail chunks%s",
+                    max_tokens, total_tokens, trimmed, len(chunk_entries),
+                    " and truncated lead chunk" if truncated_first else "",
+                )
+    return prompt, presented_chunks
 
-Answer the intent using the retrieved knowledge above. Cite EVERY substantive claim
-inline with the bracketed source key shown in each chunk's source label.
-Use ALL the relevant material and synthesize ACROSS sources — don't collapse a multi-paper body
-of evidence into a single-paper summary. Pick whatever structure (prose / bullets /
-sections / table) and length best fits the question + the depth of coverage. If the
-material doesn't support the intent well, say so cleanly."""
+
+def _build_prompt(
+    data: dict[str, Any],
+    intent: str,
+    kb_coverage: str | None = None,
+    *,
+    _annotated: bool = False,
+) -> str:
+    """Assemble the synth prompt from aquery_data's structured `data` dict.
+
+    Sends entities (typed nodes), relationships (edges), and source chunks — each
+    chunk prefixed with its citeable source label + credibility band so the LLM can
+    cite real [paper_key]s and honor tentativeness.
+    """
+    prompt, _kept = _build_prompt_with_chunks(data, intent, kb_coverage, _annotated=_annotated)
+    return prompt
 
 
 # Bounded internal retry for the synth MiMo call (issue #70). By the time synth runs, RETRIEVAL
@@ -343,16 +493,17 @@ def _is_transient_synth_status(code: int | None) -> bool:
     return code == 408 or code == 429 or 500 <= code <= 599
 
 
-def _is_transient_synth_error(exc: Exception) -> bool:
+def _is_transient_synth_error(exc: Exception, *, _seen: set[int] | None = None) -> bool:
     """True iff a synth MiMo failure is a TRANSIENT hiccup worth a bounded internal retry.
 
     Transient (RETRY): a timeout (synth's own business-deadline ``wait_for``, or a transport-level
     ``APITimeoutError``), a connection reset / gateway-unreachable (``APIConnectionError``), a
-    streamed completion cut before its finish_reason (``StreamTruncated``), or an
-    HTTP 429 / 5xx from the gateway. Deterministic (FAIL FAST): a 4xx validation/auth error (400 /
-    401 / 403 / 404 / 422), and anything else — notably the KeyPool's terminal ``RuntimeError("All
-    configured LLM keys failed …")``, which already represents EXHAUSTED internal failover (its
-    worst case is every deployment 403-blocked, a deterministic outage that a re-send won't fix).
+    streamed completion cut before its finish_reason (``StreamTruncated``), an HTTP 408 / 429
+    (non-quota) / 5xx from the gateway, or a direct-mode ``KeyPool`` ``RuntimeError`` chained via
+    ``__cause__`` to one of those transient upstream errors (since synth disables inner KeyPool
+    rounds with ``retries=0`` to avoid 3x3 amplification). Deterministic (FAIL FAST): a 4xx
+    validation/auth error (400 / 401 / 403 / 404 / 422), quota exhaustion, or a bare
+    ``RuntimeError`` with no transient cause (e.g. all deployments 403-blocked).
     ``asyncio.CancelledError`` is a ``BaseException`` and is never reached here (never retried)."""
     # A timeout — synth's own wait_for deadline (asyncio.TimeoutError) or the transport-level
     # APITimeoutError (a subclass of APIConnectionError, handled just below).
@@ -366,8 +517,23 @@ def _is_transient_synth_error(exc: Exception) -> bool:
     if isinstance(exc, StreamTruncated):
         return True
     # HTTP-status-bearing errors: reuse the store layer's best-effort status extraction so the
-    # transient/permanent classification convention lives in ONE place.
-    return _is_transient_synth_status(_error_code(exc))
+    # transient/permanent classification convention lives in ONE place. Quota/balance exhaustion
+    # (including quota-indicated 429) will not recover in seconds — fail fast instead of retrying.
+    code = _error_code(exc)
+    if is_quota_exhaustion_error(exc, code):
+        return False
+    if _is_transient_synth_status(code):
+        return True
+    # Direct-mode KeyPool wraps its last upstream error in RuntimeError(...) from last_error.
+    # Because synth_answer passes retries=0 to avoid nested retries, inspect __cause__ so a
+    # single-key direct-mode transient 503/timeout/StreamTruncated still retries cleanly while
+    # 401/403/400/quota or cause-less RuntimeError still fails fast.
+    if isinstance(exc, RuntimeError) and isinstance(exc.__cause__, Exception):
+        seen = set() if _seen is None else _seen
+        if id(exc.__cause__) not in seen:
+            seen.add(id(exc))
+            return _is_transient_synth_error(exc.__cause__, _seen=seen)
+    return False
 
 
 async def synth_answer(
@@ -376,13 +542,17 @@ async def synth_answer(
     timeout_s: float = _SYNTH_TIMEOUT_S,
     *,
     kb_coverage: str | None = None,
+    _annotated: bool = False,
+    _presented_chunks_out: list[dict[str, Any]] | None = None,
 ) -> str:
     """Exit LLM → prose answer string (NO cited_papers here; aquery.py owns that).
 
     On LLM failure, returns a clean honesty fallback string rather than raising —
     the out-feed must still return a well-formed {answer, cited_papers, kb_coverage}.
     """
-    prompt = _build_prompt(data, intent, kb_coverage)
+    prompt, kept_chunks = _build_prompt_with_chunks(data, intent, kb_coverage, _annotated=_annotated)
+    if _presented_chunks_out is not None:
+        _presented_chunks_out[:] = kept_chunks
     level = route("synth")
     # Bounded retry (issue #70): retry ONLY transient hiccups (see _is_transient_synth_error);
     # fail fast on deterministic ones; fall back to _SYNTH_FAILED_MSG once retries are exhausted.
@@ -396,6 +566,10 @@ async def synth_answer(
                 "system_prompt": _SYNTH_SYSTEM,
                 "temperature": 0.2,
                 "model": level,
+                # Avoid 3×3=9 nested retries: synth_answer owns the bounded outer retry loop
+                # (including S16 empty-200 recovery), so disable inner same-target retries in llm.py.
+                "retries": 0,
+                "timeout": timeout_s,
             }
             if _SYNTH_MAX_TOKENS is not None:
                 synth_kwargs["max_tokens"] = _SYNTH_MAX_TOKENS

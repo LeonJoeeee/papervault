@@ -414,6 +414,8 @@ class Paper(BaseModel):
             record.pop("merge_budget", None)
         if not self.identity_route_rejections:
             record.pop("identity_route_rejections", None)
+        if self.abstract_attempted_at is None:
+            record.pop("abstract_attempted_at", None)
         return record
 
     # Metadata-enrichment guard — WORKER-OWNED (never source-supplied). ISO-8601
@@ -439,6 +441,11 @@ class Paper(BaseModel):
     #       attempted.
     resolved_doi_at: Optional[str] = None
     resolve_attempted_at: Optional[str] = None
+    # Worker-owned guard for the reconcile abstract backfill sweep (mirrors
+    # enriched_at / resolve_attempted_at): stamped on non-transient misses so
+    # unfillable rows stop re-probing every sweep unless a new extract arrives
+    # or the cooldown expires.
+    abstract_attempted_at: Optional[str] = None
 
     # Zotero sync state. Populated by integrations.zotero.ZoteroSync after a
     # successful create_items call. When non-empty, the sync skips this paper

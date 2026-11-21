@@ -108,8 +108,10 @@ from papervault.knowledge.ingest.operator_docs import (
     KINDS,
     AlreadyIngestedError,
     SourceDisabledError,
+    assert_not_already_ingested as check_not_already_ingested,
     check_source_enabled,
     ingest_document,
+    validate_key,
 )
 # The SAME isolated-subprocess structural PDF probe the paper extract path runs (%PDF magic +
 # a pypdf page-count parse in a throwaway child with a hard wall-clock alarm). Reused verbatim
@@ -220,6 +222,30 @@ def _move(path: Path, dest_dir: Path) -> None:
         log.exception("opdoc pickup: failed to move %s to %s/ (%r)", path.name, dest_dir.name, e)
 
 
+def _move_no_clobber(path: Path, dest_dir: Path) -> None:
+    """Move a duplicate/already-ingested drop into dest_dir WITHOUT overwriting an existing
+    healthy same-name file already in dest_dir. If `dest_dir / path.name` already exists,
+    routes to the first unused `<stem>.dup<N><suffix>` sibling so the original artifact is
+    preserved byte-for-byte."""
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        target = dest_dir / path.name
+        if target.exists():
+            idx = 1
+            while True:
+                cand = dest_dir / f"{path.stem}.dup{idx}{path.suffix}"
+                if not cand.exists():
+                    target = cand
+                    break
+                idx += 1
+        sidecar = path.with_name(path.name + _FORCE_SIDECAR_SUFFIX)
+        shutil.move(str(path), str(target))
+        if sidecar.exists():
+            shutil.move(str(sidecar), str(target.with_name(target.name + _FORCE_SIDECAR_SUFFIX)))
+    except Exception as e:  # noqa: BLE001 — a move failure must not abort the drain
+        log.exception("opdoc pickup: failed to move %s to %s/ (%r)", path.name, dest_dir.name, e)
+
+
 async def _ocr_to_staged_md(pdf_path: Path) -> Path:
     """OCR a dropped PDF to markdown via the SHARED MinerU pipeline and stage the md.
 
@@ -261,19 +287,24 @@ async def _ocr_to_staged_md(pdf_path: Path) -> Path:
     return await asyncio.to_thread(_write)
 
 
-def _discard_staged(staged_md: Path | None, dest_dir: Path) -> None:
+def _discard_staged(staged_md: Path | None, dest_dir: Path, *, overwrite: bool = True) -> None:
     """Move a staged OCR md (if any) into dest_dir alongside its PDF, best-effort.
 
     Keeping the OCR output next to the processed/failed PDF preserves EXACTLY what was ingested
-    (or what failed to ingest) without re-OCRing — a cheap debugging artifact. A no-op for a
-    native `.md` drop (`staged_md is None`). Never raises: a stray staged md lives in the
-    unscanned `.ocr` subdir, so a failed move here can never leak back into the drain."""
+    (or what failed to ingest) without re-OCRing — a cheap debugging artifact. When `overwrite`
+    is False (already-ingested duplicate) and a same-name md already exists in `dest_dir`, the
+    staged copy is unlinked so the existing healthy artifact is never clobbered. A no-op for a
+    native `.md` drop (`staged_md is None`). Never raises."""
     if staged_md is None:
         return
     try:
         if staged_md.exists():
             dest_dir.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(staged_md), str(dest_dir / staged_md.name))
+            target = dest_dir / staged_md.name
+            if not overwrite and target.exists():
+                staged_md.unlink()
+            else:
+                shutil.move(str(staged_md), str(target))
     except Exception as e:  # noqa: BLE001 — a staged-md move failure must not abort the drain
         log.warning(
             "opdoc pickup: failed to move staged md %s to %s/ (%r)",
@@ -366,8 +397,8 @@ async def drain_pending(rag) -> dict:
         ingest_path = str(path)
         staged_md: Path | None = None
         if path.suffix.lower() == _PDF_SUFFIX:
-            # Gate BEFORE OCR: a disabled source must not burn a MinerU/GPU pass every
-            # round. ingest_document re-checks (harmlessly) once we reach it.
+            # Gate BEFORE OCR: a disabled source, malformed key, or already-ingested key
+            # (when not force) must never burn a 30-min MinerU/GPU pass.
             try:
                 check_source_enabled(kind)
             except SourceDisabledError as e:
@@ -380,15 +411,20 @@ async def drain_pending(rag) -> dict:
                 counts["disabled"] += 1
                 continue
 
+            try:
+                validate_key(kind, key)
+            except ValueError as e:
+                log.error("opdoc pickup: %s malformed key (pre-OCR) → failed/ (%r)", key, e)
+                _move(path, failed_dir)
+                _disabled_logged.discard(str(path))
+                _mineru_down_logged.discard(str(path))
+                counts["failed"] += 1
+                continue
+
             # ── Pre-OCR structural validation (issue #89) ──────────────────────────────────
-            # A PDF with a VALID `%PDF` magic but a broken xref/trailer (an operator's truncated
-            # download) makes MinerU's pdfium loader retry-loop for ~30 min, freezing this SERIAL
-            # drain (and the whole scheduler) until OCR errors out on its own. Catch it CHEAPLY
-            # here with the SAME isolated-subprocess pypdf probe the paper extract path runs
-            # (%PDF magic + a page-count parse in a throwaway child with a hard wall-clock alarm),
-            # run OFF-LOOP so the probe never blocks the scheduler loop. A corrupt/unparseable
-            # file → failed/ + a `.reason` note, OCR skipped ENTIRELY. This is the PRIMARY
-            # corruption defence; `_ocr_to_staged_md`'s bounded call is the backstop for a miss.
+            # Run the fast structural probe BEFORE the already-ingested check and BEFORE OCR
+            # so a corrupt/truncated PDF is always quarantined to failed/ (and can never touch
+            # processed/ or stall MinerU's pdfium loader).
             probe = await asyncio.to_thread(pdf_probe, str(path))
             if probe.bad:
                 log.error(
@@ -401,6 +437,20 @@ async def drain_pending(rag) -> dict:
                 _write_corrupt_pdf_reason(failed_dir, path.name, key, probe.reason)
                 counts["failed"] += 1
                 continue
+
+            if not force:
+                try:
+                    await check_not_already_ingested(kind, key)
+                except AlreadyIngestedError:
+                    log.info(
+                        "opdoc pickup: %s already ingested (push-once, pre-OCR) → processed/ (skipped OCR)",
+                        key,
+                    )
+                    _move_no_clobber(path, processed_dir)
+                    _disabled_logged.discard(str(path))
+                    _mineru_down_logged.discard(str(path))
+                    counts["already"] += 1
+                    continue
 
             try:
                 staged_md = await _ocr_to_staged_md(path)
@@ -431,9 +481,10 @@ async def drain_pending(rag) -> dict:
             result = await ingest_document(rag, kind, key, ingest_path, force=force)
         except AlreadyIngestedError:
             # Push-once: the key is already in the graph — nothing to do, it's DONE.
+            # Preserve any existing healthy artifact in processed/ without clobbering it.
             log.info("opdoc pickup: %s already ingested (push-once) → processed/", key)
-            _move(path, processed_dir)
-            _discard_staged(staged_md, processed_dir)
+            _move_no_clobber(path, processed_dir)
+            _discard_staged(staged_md, processed_dir, overwrite=False)
             _disabled_logged.discard(str(path))
             counts["already"] += 1
         except SourceDisabledError as e:

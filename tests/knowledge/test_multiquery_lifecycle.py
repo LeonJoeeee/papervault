@@ -115,12 +115,11 @@ async def test_malformed_decomposition_keeps_healthy_anchor(monkeypatch, variant
         assert result[2] is False
 
 
-async def test_empty_decomposition_cancels_and_awaits_unneeded_estimator(monkeypatch):
+async def test_empty_decomposition_never_launches_estimator(monkeypatch):
     estimate = _Pending()
     base = _result()
 
     async def decompose(intent):
-        await estimate.started.wait()
         return []
 
     async def retrieve(query, params):
@@ -129,71 +128,91 @@ async def test_empty_decomposition_cancels_and_awaits_unneeded_estimator(monkeyp
     monkeypatch.setattr(mq, "_decompose", decompose)
     monkeypatch.setattr(mq, "_estimate_n_sources", estimate)
     monkeypatch.setenv("KS_MQ_FANOUT", "1")
-    query = asyncio.create_task(mq.retrieve_fused("intent", SimpleNamespace(aquery_data=retrieve)))
-    try:
-        await asyncio.wait_for(estimate.cleaning.wait(), 0.5)
-        assert not query.done(), "query returned before estimator cleanup completed"
-        estimate.release.set()
-        data, meta, fused = await asyncio.wait_for(query, 0.5)
-        assert data is base["data"] and meta is base["metadata"] and not fused
-        assert estimate.stopped.is_set() and estimate.task.done()
-    finally:
-        estimate.release.set()
-        await _finish(query, estimate.task)
+    data, meta, fused = await asyncio.wait_for(
+        mq.retrieve_fused("intent", SimpleNamespace(aquery_data=retrieve)), 0.5
+    )
+    assert data is base["data"] and meta is base["metadata"] and not fused
+    assert not estimate.started.is_set()
+
+
+async def test_inline_n_sources_skips_estimator(monkeypatch):
+    estimate = _Pending()
+    seen_params = []
+
+    async def decompose(intent):
+        return mq._DecomposedFacets(_FACETS, n_sources=9)
+
+    async def retrieve(query, params):
+        seen_params.append((query, params))
+        return _result("Anchor" if query == "intent" else query)
+
+    monkeypatch.setattr(mq, "_decompose", decompose)
+    monkeypatch.setattr(mq, "_estimate_n_sources", estimate)
+    monkeypatch.setenv("KS_MQ_FANOUT", "1")
+    data, _, fused = await asyncio.wait_for(
+        mq.retrieve_fused("intent", SimpleNamespace(aquery_data=retrieve)), 0.5
+    )
+    assert fused is True
+    assert not estimate.started.is_set()
+    # n_sources=9 scaled the facet budget above the floor (32 -> 63).
+    facet_params = [p for q, p in seen_params if q != "intent"]
+    assert facet_params and facet_params[0].chunk_top_k == 63
 
 
 @pytest.mark.parametrize("failed", ["decomposition", "estimator"])
-async def test_planning_failure_cancels_and_awaits_other_task(monkeypatch, failed):
-    sibling = _Pending()
+async def test_planning_failure_propagates_cleanly(monkeypatch, failed):
+    estimate_calls = []
 
     async def fail(intent):
-        await sibling.started.wait()
         raise RuntimeError("planning failed")
 
-    async def retrieve(query, params):
-        return _result()
+    async def bare_facets(intent):
+        return list(_FACETS)
 
-    monkeypatch.setattr(mq, "_decompose", fail if failed == "decomposition" else sibling)
-    monkeypatch.setattr(mq, "_estimate_n_sources", fail if failed == "estimator" else sibling)
-    monkeypatch.setenv("KS_MQ_FANOUT", "1")
-    query = asyncio.create_task(mq.retrieve_fused("intent", SimpleNamespace(aquery_data=retrieve)))
-    try:
-        await asyncio.wait_for(sibling.cleaning.wait(), 0.5)
-        assert not query.done(), "planning error escaped before sibling cleanup"
-        sibling.release.set()
-        with pytest.raises(RuntimeError, match="planning failed"):
-            await asyncio.wait_for(query, 0.5)
-        assert sibling.stopped.is_set() and sibling.task.done()
-    finally:
-        sibling.release.set()
-        await _finish(query, sibling.task)
-
-
-async def test_caller_cancellation_drains_decomposition_and_estimator(monkeypatch):
-    decomposition, estimator = _Pending(), _Pending()
+    async def record_estimate(intent):
+        estimate_calls.append(intent)
+        return 6
 
     async def retrieve(query, params):
         return _result()
 
-    monkeypatch.setattr(mq, "_decompose", decomposition)
-    monkeypatch.setattr(mq, "_estimate_n_sources", estimator)
+    monkeypatch.setattr(mq, "_decompose", fail if failed == "decomposition" else bare_facets)
+    monkeypatch.setattr(mq, "_estimate_n_sources", fail if failed == "estimator" else record_estimate)
+    monkeypatch.setenv("KS_MQ_FANOUT", "1")
+    with pytest.raises(RuntimeError, match="planning failed"):
+        await asyncio.wait_for(
+            mq.retrieve_fused("intent", SimpleNamespace(aquery_data=retrieve)), 0.5
+        )
+    if failed == "decomposition":
+        assert estimate_calls == []
+
+
+@pytest.mark.parametrize("stage", ["decomposition", "estimator"])
+async def test_caller_cancellation_drains_planning_stage(monkeypatch, stage):
+    pending = _Pending()
+
+    async def bare_facets(intent):
+        return list(_FACETS)
+
+    async def retrieve(query, params):
+        return _result()
+
+    monkeypatch.setattr(mq, "_decompose", pending if stage == "decomposition" else bare_facets)
+    monkeypatch.setattr(mq, "_estimate_n_sources", pending if stage == "estimator" else _Pending())
     monkeypatch.setenv("KS_MQ_FANOUT", "1")
     query = asyncio.create_task(mq.retrieve_fused("intent", SimpleNamespace(aquery_data=retrieve)))
     try:
-        await asyncio.wait_for(asyncio.gather(decomposition.started.wait(), estimator.started.wait()), 0.5)
+        await asyncio.wait_for(pending.started.wait(), 0.5)
         query.cancel()
-        await asyncio.wait_for(asyncio.gather(decomposition.cleaning.wait(), estimator.cleaning.wait()), 0.5)
+        await asyncio.wait_for(pending.cleaning.wait(), 0.5)
         assert not query.done()
-        decomposition.release.set()
-        estimator.release.set()
+        pending.release.set()
         with pytest.raises(asyncio.CancelledError):
             await query
-        assert decomposition.stopped.is_set() and estimator.stopped.is_set()
-        assert decomposition.task.done() and estimator.task.done()
+        assert pending.stopped.is_set() and pending.task.done()
     finally:
-        decomposition.release.set()
-        estimator.release.set()
-        await _finish(query, decomposition.task, estimator.task)
+        pending.release.set()
+        await _finish(query, pending.task)
 
 
 @pytest.mark.parametrize("variant", ["fused", "standard"])

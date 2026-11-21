@@ -13,6 +13,7 @@ from papervault.llm_routing import (
     format_target,
     format_targets,
     is_model_cooled_down,
+    is_quota_exhaustion_error,
     litellm_wire_kwargs,
     openai_wire_kwargs,
     parse_targets,
@@ -22,14 +23,14 @@ from papervault.llm_routing import (
 
 ROLE_DEFAULTS = [
     ("intent", "gpt-6.1-terra@high"),
-    ("build", "glm-5.3@max,gpt-6.1-terra@high"),
-    ("keyword", "gpt-6.1-terra@low"),
-    ("synth", "gpt-6-astra@xhigh"),
-    ("gate", "glm-5.3-flash@high,gpt-6.1-terra@medium"),
-    ("verify", "glm-5.3-flash@low,gpt-6.1-terra@low"),
-    ("judge", "gpt-6.1-terra@medium"),
-    ("decompose", "gpt-6.1-terra@high"),
-    ("eval_judge", "glm-5.3@max"),
+    ("build", "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high"),
+    ("keyword", "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"),
+    ("synth", "gpt-6.2-astra@xhigh"),
+    ("gate", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"),
+    ("verify", "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"),
+    ("judge", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"),
+    ("decompose", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high"),
+    ("eval_judge", "glm-5.3@max,relay-glm-5.3@max"),
 ]
 
 
@@ -72,32 +73,36 @@ def test_agreed_role_default_and_round_trip(role, want):
 
 def test_role_default_target_objects():
     assert parse_targets(route("synth")) == (
-        ModelTarget("gpt-6-astra", reasoning_effort="xhigh"),
+        ModelTarget("gpt-6.2-astra", reasoning_effort="xhigh"),
     )
-    for role in ("intent", "decompose"):
+    assert parse_targets(route("intent")) == (
+        ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
+    )
+    for role in ("verify", "keyword"):
         assert parse_targets(route(role)) == (
-            ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
+            ModelTarget("glm-5.3-flash", reasoning_effort="low"),
+            ModelTarget("relay-glm-5.3-flash", reasoning_effort="low"),
+            ModelTarget("gpt-6.1-terra", reasoning_effort="low"),
         )
-    assert parse_targets(route("keyword")) == (
-        ModelTarget("gpt-6.1-terra", reasoning_effort="low"),
-    )
-    assert parse_targets(route("judge")) == (
-        ModelTarget("gpt-6.1-terra", reasoning_effort="medium"),
-    )
-    assert parse_targets(route("verify")) == (
-        ModelTarget("glm-5.3-flash", reasoning_effort="low"),
-        ModelTarget("gpt-6.1-terra", reasoning_effort="low"),
-    )
-    assert parse_targets(route("gate")) == (
+    for role in ("gate", "judge"):
+        assert parse_targets(route(role)) == (
+            ModelTarget("glm-5.3-flash", reasoning_effort="high"),
+            ModelTarget("relay-glm-5.3-flash", reasoning_effort="high"),
+            ModelTarget("gpt-6.1-terra", reasoning_effort="medium"),
+        )
+    assert parse_targets(route("decompose")) == (
         ModelTarget("glm-5.3-flash", reasoning_effort="high"),
-        ModelTarget("gpt-6.1-terra", reasoning_effort="medium"),
+        ModelTarget("relay-glm-5.3-flash", reasoning_effort="high"),
+        ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
     )
     assert parse_targets(route("build")) == (
         ModelTarget("glm-5.3", reasoning_effort="max"),
+        ModelTarget("relay-glm-5.3", reasoning_effort="max"),
         ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
     )
     assert parse_targets(route("eval_judge")) == (
         ModelTarget("glm-5.3", reasoning_effort="max"),
+        ModelTarget("relay-glm-5.3", reasoning_effort="max"),
     )
 
 
@@ -149,8 +154,11 @@ def test_glm_and_relay_glm_modifier_rules_and_wire_kwargs():
 
 
 def test_codex_family_modifier_rules_and_wire_kwargs():
-    # Always-on Codex models (gpt-6-astra*, gpt-6.1-sol*): bare or @low..@max.
+    # Always-on Codex models (gpt-6.2-astra*, gpt-6.2-sol*, gpt-6-astra*, gpt-6.1-sol*): bare or @low..@max.
     for raw_model, want_model in (
+        ("gpt-6.2-astra", "gpt-6.2-astra"),
+        ("gpt-6.2-sol", "gpt-6.2-sol"),
+        ("openai/GPT-6.2-Astra", "GPT-6.2-Astra"),
         ("gpt-6-astra", "gpt-6-astra"),
         ("gpt-6.1-sol", "gpt-6.1-sol"),
         ("openai/GPT-6-Astra-Preview", "GPT-6-Astra-Preview"),
@@ -324,6 +332,13 @@ def test_arbitrary_openai_compatible_modifier_rules_and_canonical_formatting():
         "relay-glm-5.3@xhigh",
         "openai/GLM-5.3-Flash@medium",
         # Codex always-on rejections: @none, @thinking, @nothinking, unknown
+        "gpt-6.2-astra@none",
+        "gpt-6.2-astra@thinking",
+        "gpt-6.2-astra@nothinking",
+        "gpt-6.2-astra@bogus",
+        "gpt-6.2-sol@none",
+        "gpt-6.2-sol@thinking",
+        "gpt-6.2-sol@nothinking",
         "gpt-6-astra@none",
         "gpt-6-astra@thinking",
         "gpt-6-astra@nothinking",
@@ -390,10 +405,10 @@ def test_retired_legacy_env_vars_ignored(monkeypatch):
         "MIMO_MODEL",
     ):
         monkeypatch.setenv(var, "legacy-ignored-model")
-    assert route("build") == "glm-5.3@max,gpt-6.1-terra@high"
-    assert route("keyword") == "gpt-6.1-terra@low"
-    assert route("verify") == "glm-5.3-flash@low,gpt-6.1-terra@low"
-    assert route("eval_judge") == "glm-5.3@max"
+    assert route("build") == "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high"
+    assert route("keyword") == "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"
+    assert route("verify") == "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"
+    assert route("eval_judge") == "glm-5.3@max,relay-glm-5.3@max"
 
 
 def test_wire_kwargs_builders():
@@ -527,13 +542,14 @@ def test_doctor_accepts_concrete_route_defaults(tmp_path, monkeypatch, capsys):
     cli._check_config(report)
     assert report.failures == 0
     output = capsys.readouterr().out
-    assert "build=glm-5.3@max,gpt-6.1-terra@high" in output
-    assert "synth=gpt-6-astra@xhigh" in output
-    assert "keyword=gpt-6.1-terra@low" in output
-    assert "judge=gpt-6.1-terra@medium" in output
-    assert "gate=glm-5.3-flash@high,gpt-6.1-terra@medium" in output
-    assert "verify=glm-5.3-flash@low,gpt-6.1-terra@low" in output
-    assert "eval_judge=glm-5.3@max" in output
+    assert "build=glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high" in output
+    assert "synth=gpt-6.2-astra@xhigh" in output
+    assert "keyword=glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low" in output
+    assert "judge=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium" in output
+    assert "gate=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium" in output
+    assert "verify=glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low" in output
+    assert "decompose=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high" in output
+    assert "eval_judge=glm-5.3@max,relay-glm-5.3@max" in output
 
 
 def test_doctor_reports_retired_or_invalid_role_override(tmp_path, monkeypatch, capsys):
@@ -573,9 +589,10 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
     monkeypatch.setattr(asyncio, "sleep", _no_sleep)
 
     class FakeHTTPError(Exception):
-        def __init__(self, status_code: int):
-            super().__init__(f"HTTP {status_code}")
+        def __init__(self, status_code: int, message: str | None = None, *, body=None):
+            super().__init__(message if message is not None else f"HTTP {status_code}")
             self.status_code = status_code
+            self.body = body
 
     def make_client(outcomes):
         calls = []
@@ -619,55 +636,11 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
     )
     monkeypatch.setattr(judge_mimo.JA, "validate_judge_json", lambda d, n_gold_nuggets=None: None)
 
-    # --- A. Default eval_judge='glm-5.3@max': single-target ruler invariant (no cross-family failover) ---
-    clear_fallback_cooldowns()
-    srb_single, srb_single_calls = make_client([FakeHTTPError(429), FakeHTTPError(429)])
-    with pytest.raises(FakeHTTPError):
-        await srb._judge(
-            srb_single, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
-        )
-    assert [c["model"] for c in srb_single_calls] == ["glm-5.3", "glm-5.3"]
-    assert all(
-        c["reasoning_effort"] == "max" and "extra_body" not in c
-        for c in srb_single_calls
-    )
-    assert not is_model_cooled_down("glm-5.3")
-
-    u1_single, u1_single_calls = make_client(
-        [TimeoutError("t1"), json.dumps({"faithful": True, "reason": "ok"})]
-    )
-    assert (
-        await _ab_u1_judge._judge(
-            u1_single,
-            asyncio.Semaphore(1),
-            {"head": "A", "tail": "B", "description": "rel", "source_chunks": ["A causes B"]},
-        )
-        is True
-    )
-    assert [c["model"] for c in u1_single_calls] == ["glm-5.3", "glm-5.3"]
-    assert all(c["reasoning_effort"] == "max" for c in u1_single_calls)
-
-    jm_single, jm_single_calls = make_client([FakeHTTPError(429), valid_judge_reply])
-    counters_single = {"ok": 0, "skip": 0, "fail": 0}
-    res_single = await judge_mimo._judge_one(
-        jm_single,
-        asyncio.Semaphore(1),
-        "vmq_r1",
-        "q1",
-        {"qid": "q1", "gold_keys": ["K1"], "nuggets": ["n1"]},
-        True,
-        counters_single,
-    )
-    assert res_single == ("vmq_r1", "q1", "ok", "attempt=2")
-    assert [c["model"] for c in jm_single_calls] == ["glm-5.3", "glm-5.3"]
-    assert all(c["reasoning_effort"] == "max" for c in jm_single_calls)
-
-    # --- B. Explicit multi-target PAPERVAULT_LLM_EVAL_JUDGE override fails over & honors cooldown ---
-    monkeypatch.setenv("PAPERVAULT_LLM_EVAL_JUDGE", "glm-5.3@max,relay-glm-5.3@max")
+    # --- A. Default eval_judge='glm-5.3@max,relay-glm-5.3@max': two-tier same-family ruler invariant ---
     clear_fallback_cooldowns()
     srb_client, srb_calls = make_client(
         [
-            FakeHTTPError(429),
+            FakeHTTPError(429, "Zhipu weekly limit 1308"),
             json.dumps({"items": [{"idx": 0, "score": 0.9}]}),
             json.dumps({"items": [{"idx": 0, "score": 0.8}]}),
         ]
@@ -676,7 +649,7 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
         scores_1 = await srb._judge(
             srb_client, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
         )
-        # Second call while glm-5.3 is cooled down skips primary directly:
+        # Second call while glm-5.3 is cooled down skips primary directly to relay-glm-5.3:
         scores_2 = await srb._judge(
             srb_client, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
         )
@@ -685,14 +658,31 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
     assert all(c["reasoning_effort"] == "max" and "extra_body" not in c for c in srb_calls)
     assert any("glm-5.3 -> relay-glm-5.3" in r.getMessage() for r in caplog.records)
 
-    # Deterministic 401 does NOT fail over:
+    # When both same-family GLM legs are exhausted, eval_judge raises rather than crossing into GPT:
     clear_fallback_cooldowns()
-    auth_client, auth_calls = make_client(
-        [FakeHTTPError(401), json.dumps({"items": [{"idx": 0, "score": 1.0}]})]
+    srb_both_down, srb_both_calls = make_client(
+        [
+            FakeHTTPError(429, "weekly limit"),
+            FakeHTTPError(402, "Payment Required"),
+            FakeHTTPError(402, "Payment Required"),
+        ]
     )
     with pytest.raises(FakeHTTPError):
-        await srb._judge(auth_client, "solar wind", [{"title": "Paper A", "year": 2024}])
-    assert [c["model"] for c in auth_calls] == ["glm-5.3"]
+        await srb._judge(
+            srb_both_down, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
+        )
+    assert [c["model"] for c in srb_both_calls] == ["glm-5.3", "relay-glm-5.3", "relay-glm-5.3"]
+    assert all(c["model"] in {"glm-5.3", "relay-glm-5.3"} for c in srb_both_calls)
+
+    # Deterministic non-quota 401/403 does NOT fail over:
+    for non_quota_err in (FakeHTTPError(401), FakeHTTPError(403, "Forbidden: model access denied")):
+        clear_fallback_cooldowns()
+        auth_client, auth_calls = make_client(
+            [non_quota_err, json.dumps({"items": [{"idx": 0, "score": 1.0}]})]
+        )
+        with pytest.raises(FakeHTTPError):
+            await srb._judge(auth_client, "solar wind", [{"title": "Paper A", "year": 2024}])
+        assert [c["model"] for c in auth_calls] == ["glm-5.3"]
 
     # CancelledError propagates immediately without failover:
     cancel_client, cancel_calls = make_client([asyncio.CancelledError()])
@@ -729,6 +719,60 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
     assert res == ("vmq_r1", "q1", "ok", "attempt=1")
     assert [c["model"] for c in jm_calls] == ["glm-5.3", "relay-glm-5.3"]
 
+    # --- B. Explicit single-target override stays on glm-5.3 across outer retries ---
+    monkeypatch.setenv("PAPERVAULT_LLM_EVAL_JUDGE", "glm-5.3@max")
+    clear_fallback_cooldowns()
+    jm_single, jm_single_calls = make_client([FakeHTTPError(429), valid_judge_reply])
+    counters_single = {"ok": 0, "skip": 0, "fail": 0}
+    res_single = await judge_mimo._judge_one(
+        jm_single,
+        asyncio.Semaphore(1),
+        "vmq_r1",
+        "q1",
+        {"qid": "q1", "gold_keys": ["K1"], "nuggets": ["n1"]},
+        True,
+        counters_single,
+    )
+    assert res_single == ("vmq_r1", "q1", "ok", "attempt=2")
+    assert [c["model"] for c in jm_single_calls] == ["glm-5.3", "glm-5.3"]
+    assert not is_model_cooled_down("glm-5.3")
+
+    # --- C. 3-hop failover: glm -> relay (402 / 403 quota) -> gpt-6.1-terra ---
+    monkeypatch.setenv(
+        "PAPERVAULT_LLM_EVAL_JUDGE",
+        "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high",
+    )
+    for relay_quota_err in (
+        FakeHTTPError(402, "Insufficient balance"),
+        FakeHTTPError(403, "预扣费额度失败, 用户剩余额度不足 (insufficient_user_quota)"),
+    ):
+        clear_fallback_cooldowns()
+        hop3_client, hop3_calls = make_client(
+            [
+                FakeHTTPError(400, body={"error": {"code": "1308", "message": "已达到 5 小时使用上限"}}),
+                relay_quota_err,
+                json.dumps({"items": [{"idx": 0, "score": 0.95}]}),
+                json.dumps({"items": [{"idx": 0, "score": 0.85}]}),
+            ]
+        )
+        first = await srb._judge(
+            hop3_client, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
+        )
+        # Both glm-5.3 and relay-glm-5.3 are now in cooldown -> second call goes straight to Tier 3:
+        assert is_model_cooled_down("glm-5.3")
+        assert is_model_cooled_down("relay-glm-5.3")
+        second = await srb._judge(
+            hop3_client, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
+        )
+        assert first == [0.95] and second == [0.85]
+        assert [c["model"] for c in hop3_calls] == [
+            "glm-5.3",
+            "relay-glm-5.3",
+            "gpt-6.1-terra",
+            "gpt-6.1-terra",
+        ]
+        assert [c["reasoning_effort"] for c in hop3_calls] == ["max", "max", "high", "high"]
+
 
 def test_extraction_registration_effective_recipe_records_max_tokens_and_digest(tmp_path, monkeypatch):
     import json
@@ -742,7 +786,10 @@ def test_extraction_registration_effective_recipe_records_max_tokens_and_digest(
 
     monkeypatch.setattr(lib_llm, "_DEFAULT_MAX_TOKENS", None)
     default_recipe = effective_recipe("mineru2.5-pro")
-    assert default_recipe["gate"]["configured_model"] == "glm-5.3-flash@high,gpt-6.1-terra@medium"
+    assert (
+        default_recipe["gate"]["configured_model"]
+        == "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"
+    )
     assert default_recipe["gate"]["max_tokens"] is None
     canon_default, digest_default = canonical_recipe(default_recipe)
     assert canon_default["gate"]["max_tokens"] is None
@@ -902,3 +949,99 @@ async def test_eval_judges_omit_default_max_tokens_and_honor_judge_max_tokens(tm
         {"ok": 0, "skip": 0, "fail": 0},
     )
     assert calls[-1]["max_tokens"] == 16000
+
+
+@pytest.mark.parametrize(
+    "status_code,message,body,code_attr,want",
+    [
+        # HTTP 402 is unconditionally quota/balance exhaustion:
+        (402, "HTTP 402", None, None, True),
+        (402, "Payment Required", None, None, True),
+        # HTTP 400 / 403 / 429 with quota/balance indicators:
+        (403, "Insufficient user quota", None, None, True),
+        (403, "预扣费额度失败, 用户剩余额度: $0.0002", None, None, True),
+        (403, "账户余额不足", None, None, True),
+        (400, "Your credit balance is too low to access the API", None, None, True),
+        (403, "Account credits exhausted", None, None, True),
+        (429, "Weekly usage limit reached", None, None, True),
+        (429, "5-hour usage window exceeded", None, None, True),
+        (400, "已达到 5小时 使用限额", None, None, True),
+        (403, "GLM Coding Plan 套餐已用尽", None, None, True),
+        # Zhipu subscription/billing codes 1113, 1304, 1308, 1309:
+        (400, "API error", {"error": {"code": "1308", "message": "limit"}}, None, True),
+        (400, "API error", {"error": {"code": 1309, "message": "plan"}}, None, True),
+        (403, "Error code: 1304", None, None, True),
+        (400, "upstream failure", None, "1113", True),
+        # Genuine non-quota 400 / 401 / 403 / 422 errors fail fast (False):
+        (400, "Invalid parameter: messages[0].content is required", None, None, False),
+        (400, "Invalid request (request_id=9f8a1b2c-1308-4d5e-8f9a-0123456789ab)", None, None, False),
+        (403, "Forbidden: token lacks model permission (trace_1304_xyz)", None, None, False),
+        (401, "Invalid API key (quota check skipped)", None, None, False),
+        (422, "Unprocessable entity: schema mismatch (quota field)", None, None, False),
+        (404, "Model not found", None, None, False),
+    ],
+)
+def test_is_quota_exhaustion_error_matrix(status_code, message, body, code_attr, want):
+    class _Err(Exception):
+        pass
+
+    err = _Err(message)
+    err.status_code = status_code
+    if body is not None:
+        err.body = body
+    if code_attr is not None:
+        err.code = code_attr
+    assert is_quota_exhaustion_error(err) is want
+
+
+def test_quota_cooldown_lifecycle_and_env_override(monkeypatch):
+    monkeypatch.delenv("PAPERVAULT_LLM_QUOTA_COOLDOWN_S", raising=False)
+    monkeypatch.delenv("PAPERVAULT_LLM_FALLBACK_COOLDOWN_S", raising=False)
+    assert llm_routing.quota_cooldown_seconds() == 600.0
+
+    record_model_cooldown("glm-5.3", now=100.0, quota=True)
+    assert is_model_cooled_down("glm-5.3", now=699.9)
+    assert not is_model_cooled_down("glm-5.3", now=700.0)
+
+    monkeypatch.setenv("PAPERVAULT_LLM_QUOTA_COOLDOWN_S", "900")
+    assert llm_routing.quota_cooldown_seconds() == 900.0
+
+    # Inherit disable when fallback cooldown is <= 0 and quota cooldown is unset.
+    monkeypatch.delenv("PAPERVAULT_LLM_QUOTA_COOLDOWN_S", raising=False)
+    monkeypatch.setenv("PAPERVAULT_LLM_FALLBACK_COOLDOWN_S", "0")
+    assert llm_routing.quota_cooldown_seconds() == 0.0
+    record_model_cooldown("glm-5.3", now=1000.0, quota=True)
+    assert not is_model_cooled_down("glm-5.3", now=1000.0)
+
+
+@pytest.mark.asyncio
+async def test_openai_fallback_helper_fails_over_on_connection_error_and_merges_extra_body():
+    from types import SimpleNamespace
+    import httpx
+    import openai
+
+    calls: list[dict] = []
+    conn_err = openai.APIConnectionError(
+        request=httpx.Request("POST", "http://gw.example/v1/chat/completions")
+    )
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise conn_err
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    caller_extra = {"foo": "bar", "thinking": {"type": "enabled"}}
+    resp = await llm_routing.create_openai_chat_completion_with_fallback(
+        client,
+        parse_targets("deepseek-v4@nothinking,mimo-v2.6-pro@thinking"),
+        messages=[{"role": "user", "content": "hi"}],
+        extra_body=caller_extra,
+    )
+    assert resp.choices[0].message.content == "ok"
+    assert [c["model"] for c in calls] == ["deepseek-v4", "mimo-v2.6-pro"]
+    assert calls[0]["extra_body"] == {"foo": "bar", "thinking": {"type": "disabled"}}
+    assert calls[1]["extra_body"] == {"foo": "bar", "thinking": {"type": "enabled"}}
+    assert caller_extra == {"foo": "bar", "thinking": {"type": "enabled"}}
+    assert is_model_cooled_down("deepseek-v4")

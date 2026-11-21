@@ -1,3 +1,5 @@
+> **Ratification notice:** Ratified by the owner on **2026-10-18** via [ADR-0007](../adr/0007-papervault-constitution.md). Per ADR-0007's archival rule, the historical heading (`v2.1-rc2`) and candidate status line below are preserved verbatim.
+
 # papervault constitution v2.1-rc2 (systematic rewrite)
 
 Status: **candidate for ratification** — systematic rewrite incorporating the settled macro architecture and the reviews of v1.x and v2.0; v2.1 applies the five review amendments (layer/authority/lineage precision; serving effects; operator-document identity; publication-vs-coverage; read-operator contract). On acceptance this becomes `docs/specs/<date>-papervault-constitution.md` + an ADR. Governance: every rule states an integrity, retrieval, or operating rationale, supported by a real incident or established failure analysis; mechanisms and numerical thresholds live in ADRs and `docs/baselines.md`. The document stays readable in one sitting.

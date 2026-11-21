@@ -39,7 +39,7 @@ corpus, so the harness splits into what CI can prove and what only reference har
   above and populate it with the corpus you want scored.
 
 Production `KS_QUERY_VARIANT` defaults to `multiquery`, whose decomposition uses
-`PAPERVAULT_LLM_DECOMPOSE` (default `gpt-6.1-terra@high`), as does eval's `--variant multiquery`.
+`PAPERVAULT_LLM_DECOMPOSE` (default `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high`), as does eval's `--variant multiquery`.
 Eval selects its variant with `--variant` (`baseline` by default, also `multiquery`
 and `standard`); `KS_QUERY_VARIANT` does not override that CLI choice. Specify the
 variant explicitly when comparing production retrieval. Most query settings below
@@ -59,8 +59,10 @@ retrieved/cited counts and synthesis observations.
 ## Gold sets
 
 The bundled gold sets (`gold_fast.jsonl` = FAST arm, `gold_v4.jsonl` = FULL arm, plus trap
-sets) are **space physics** — they match the factory domain pack. Adapting papervault to another
-domain means authoring a gold set for that field; the harness itself is domain-agnostic.
+sets) cover **space physics and AI4Science** — although the factory `space_physics` domain pack was
+expanded in `v0.10.15` to include **space computing**, dedicated space-computing
+gold sets do not yet exist (coverage gap). Adapting papervault to another domain or closing
+that gap means authoring a gold set for that field; the harness itself is domain-agnostic.
 
 ## Arbitration discipline
 
@@ -77,8 +79,8 @@ the existing external archive. Bundled gold sets and prompt templates remain in
 `src/papervault/eval/`. The shared path resolver rejects artifact paths inside any `src/`
 directory, including symlink targets, and paths escaping the configured artifact root.
 Set `PAPERVAULT_EVAL_DIR` in the process environment before running the harness to select another
-external location; resolution alone creates no directories. Arbitration verdicts live on GitHub:
-quote the summary numbers on the relevant issue thread — never commit the raw results file.
+external location; resolution alone creates no directories. Arbitration verdicts and dated summary numbers live in `docs/baselines.md` (and any relevant PR/issue record):
+record the summary numbers there — never commit the raw results file.
 
 ## Operator hygiene
 
@@ -150,17 +152,18 @@ held constant between arms:
 | `KS_RERANK_MAX_ASYNC` / `RERANK_TIMEOUT` | `1` / `480` | Concurrent rerank calls and LightRAG worker timeout in seconds. |
 | `PAPERVAULT_EVAL_DIR` | `/data/paper-vault/eval-results` | Root for raw runs and judge artifacts; never a source directory. |
 | `KS_EVAL_ALLOW_COTENANCY` | unset | Exact `1` bypasses the stopped-service guard; workspace checks still apply. |
-| `PAPERVAULT_LLM_SYNTH` | `gpt-6-astra@xhigh` | Evidence-grounded synthesis route, shared by production and eval. |
-| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `gpt-6.1-terra@high` / `glm-5.3@max` | Decomposition and eval-judge routes (`eval_judge` defaults to single-target `glm-5.3@max` so benchmarks preserve the ruler invariant; explicit multi-target overrides such as `glm-5.3@max,relay-glm-5.3@max` fail over on transient upstream errors with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S=120`). |
+| `PAPERVAULT_LLM_SYNTH` | `gpt-6.2-astra@xhigh` | Evidence-grounded synthesis route, shared by production and eval. |
+| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` / `glm-5.3@max,relay-glm-5.3@max` | Decomposition and eval-judge routes (`eval_judge` defaults to two-tier same-family `glm-5.3@max,relay-glm-5.3@max` without Tier 3 GPT fallback so benchmarks preserve the ruler invariant across Zhipu quota windows, failing over on transient or quota-exhaustion upstream errors with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S=120`). |
 
-The retained standalone `judge_mimo` utility uses `KS_GATEWAY_URL` (default
-`http://127.0.0.1:4000/v1`) and requires `KS_VIRTUAL_KEY`; these utility names are
-separate from the production `PAPERVAULT_LLM_GATEWAY_*` transport settings. It also
-reads `JUDGE_GOLD` (`gold_v2.jsonl`), optional `JUDGE_MAX_TOKENS` (unset by
+The retained standalone `judge_mimo` utility honors explicit legacy `KS_GATEWAY_URL`
+and `KS_VIRTUAL_KEY` overrides when set, and otherwise falls back cleanly to
+`papervault.config` (`PAPERVAULT_LLM_GATEWAY_URL` / `PAPERVAULT_LLM_GATEWAY_KEY` when
+`PAPERVAULT_LLM_GATEWAY=1`, else `PAPERVAULT_LLM_BASE_URL` / `PAPERVAULT_LLM_API_KEY`).
+It also reads `JUDGE_GOLD` (`gold_v2.jsonl`), optional `JUDGE_MAX_TOKENS` (unset by
 default, omitting `max_tokens` on the wire unless set),
 `JUDGE_MAX_ATTEMPTS` (`2`) and `JUDGE_CALL_TIMEOUT` (`300` seconds). Its
-`--concurrency` CLI option controls concurrency. `_ab_u1_judge` shares those gateway
-settings and reads `AB_JUDGE_CONC` (`20`). `recall_curve` accepts
+`--concurrency` CLI option controls concurrency. `_ab_u1_judge` shares the same endpoint
+resolution and reads `AB_JUDGE_CONC` (`20`). `recall_curve` accepts
 `RECALL_CURVE_GOLD` (`gold_v4.jsonl`); `verdict_lctx` accepts `VERDICT_GOLD`
 (`gold_v4.jsonl`), `VERDICT_BASE_TAGS` (`lctx_v4_r1,lctx_v4_r2,lctx_v4_r3`) and
 `VERDICT_VAR_SEEDS` (`1,2,3`). Set those selectors explicitly for reproducible reruns

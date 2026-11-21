@@ -8,8 +8,11 @@ at startup and in ``papervault doctor``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Sequence
@@ -24,7 +27,7 @@ _RETIRED_GATEWAY_ALIASES = frozenset(f"papervault-{lvl}" for lvl in _RETIRED_LEV
 
 _GLM_PREFIXES = ("glm-", "relay-glm-")
 _GLM_EFFORTS = frozenset({"low", "high", "max"})
-_CODEX_ALWAYS_ON_PREFIXES = ("gpt-6-astra", "gpt-6.1-sol")
+_CODEX_ALWAYS_ON_PREFIXES = ("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol")
 _CODEX_ALWAYS_ON_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _CODEX_DISABLE_CAPABLE_PREFIXES = ("gpt-6.1-terra", "gpt-6-luna")
 _CODEX_DISABLE_CAPABLE_EFFORTS = frozenset(EFFORTS)
@@ -34,18 +37,19 @@ _MIMO_GATEWAY_PREFIXES = ("mimo-v2.6-", "relay-mimo-v2.6-")
 
 _DEFAULT_ROUTES: dict[str, str] = {
     "intent": "gpt-6.1-terra@high",
-    "build": "glm-5.3@max,gpt-6.1-terra@high",
-    "keyword": "gpt-6.1-terra@low",
-    "synth": "gpt-6-astra@xhigh",
-    "gate": "glm-5.3-flash@high,gpt-6.1-terra@medium",
-    "verify": "glm-5.3-flash@low,gpt-6.1-terra@low",
-    "judge": "gpt-6.1-terra@medium",
-    "decompose": "gpt-6.1-terra@high",
-    "eval_judge": "glm-5.3@max",
+    "build": "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high",
+    "keyword": "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low",
+    "synth": "gpt-6.2-astra@xhigh",
+    "gate": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium",
+    "verify": "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low",
+    "judge": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium",
+    "decompose": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high",
+    "eval_judge": "glm-5.3@max,relay-glm-5.3@max",
 }
 ROLES = tuple(_DEFAULT_ROUTES)
 
 _DEFAULT_COOLDOWN_S = 120.0
+_DEFAULT_QUOTA_COOLDOWN_S = 600.0
 _FALLBACK_LOCK = threading.Lock()
 _FALLBACK_COOLDOWNS: dict[str, float] = {}
 
@@ -267,9 +271,20 @@ def fallback_cooldown_seconds() -> float:
     return val if val > 0 else 0.0
 
 
+def quota_cooldown_seconds() -> float:
+    """Active quota/balance-exhaustion cooldown window in seconds (``<= 0`` disables cooldown)."""
+    raw = os.getenv("PAPERVAULT_LLM_QUOTA_COOLDOWN_S", "").strip()
+    if not raw:
+        if fallback_cooldown_seconds() <= 0:
+            return 0.0
+        return _DEFAULT_QUOTA_COOLDOWN_S
+    val = float(raw)
+    return val if val > 0 else 0.0
+
+
 def is_model_cooled_down(model: str, *, now: float | None = None) -> bool:
     """Return True iff ``model`` is currently inside an active fallback cooldown window."""
-    if fallback_cooldown_seconds() <= 0:
+    if fallback_cooldown_seconds() <= 0 and quota_cooldown_seconds() <= 0:
         return False
     key = model.strip()
     ts = time.monotonic() if now is None else now
@@ -283,17 +298,18 @@ def is_model_cooled_down(model: str, *, now: float | None = None) -> bool:
         return True
 
 
-def record_model_cooldown(model: str, *, now: float | None = None) -> float:
+def record_model_cooldown(model: str, *, now: float | None = None, quota: bool = False) -> float:
     """Record a cooldown window for ``model`` and return the applied duration in seconds."""
     key = model.strip()
-    ttl = fallback_cooldown_seconds()
+    ttl = quota_cooldown_seconds() if quota else fallback_cooldown_seconds()
     if ttl <= 0:
-        with _FALLBACK_LOCK:
-            _FALLBACK_COOLDOWNS.pop(key, None)
+        if fallback_cooldown_seconds() <= 0 and quota_cooldown_seconds() <= 0:
+            with _FALLBACK_LOCK:
+                _FALLBACK_COOLDOWNS.pop(key, None)
         return 0.0
     ts = time.monotonic() if now is None else now
     with _FALLBACK_LOCK:
-        _FALLBACK_COOLDOWNS[key] = ts + ttl
+        _FALLBACK_COOLDOWNS[key] = max(_FALLBACK_COOLDOWNS.get(key, 0.0), ts + ttl)
     return ttl
 
 
@@ -301,6 +317,26 @@ def clear_fallback_cooldowns() -> None:
     """Clear all process-local fallback cooldown entries (for deterministic tests)."""
     with _FALLBACK_LOCK:
         _FALLBACK_COOLDOWNS.clear()
+
+
+_QUOTA_STATUS_CODES = frozenset({400, 402, 403, 429})
+_QUOTA_SUBSTRINGS = (
+    "quota",
+    "insufficient",
+    "balance",
+    "credit",
+    "exhausted",
+    "套餐",
+    "额度",
+    "余额",
+    "限额",
+    "预扣费",
+    "欠费",
+    "weekly",
+    "5小时",
+    "5-hour",
+)
+_ZHIPU_QUOTA_CODE_RE = re.compile(r"(?<![0-9a-z_-])(?:1113|1304|1308|1309)(?![0-9a-z_-])")
 
 
 def http_status_code(exc: BaseException) -> int | None:
@@ -316,17 +352,74 @@ def http_status_code(exc: BaseException) -> int | None:
         return None
 
 
+def _exception_error_text(exc: BaseException) -> str:
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        with contextlib.suppress(Exception):
+            s = str(cur)
+            if s:
+                parts.append(s)
+        for attr in ("message", "code", "type"):
+            val = getattr(cur, attr, None)
+            if val is not None and isinstance(val, (str, int)):
+                parts.append(str(val))
+        body = getattr(cur, "body", None)
+        if body is not None:
+            with contextlib.suppress(Exception):
+                if isinstance(body, (dict, list)):
+                    parts.append(json.dumps(body, ensure_ascii=False))
+                elif isinstance(body, bytes):
+                    parts.append(body.decode("utf-8", errors="replace"))
+                else:
+                    parts.append(str(body))
+        resp = getattr(cur, "response", None)
+        if resp is not None:
+            with contextlib.suppress(Exception):
+                text = getattr(resp, "text", None)
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        cur = cur.__cause__ or cur.__context__
+    return " ".join(parts).lower()
+
+
+def is_quota_exhaustion_error(exc: BaseException, code: int | None = None) -> bool:
+    """Return True iff ``exc`` indicates upstream quota, billing, or relay balance exhaustion.
+
+    Recognizes ``HTTP 402`` unconditionally, or ``HTTP 400/402/403/429`` responses carrying
+    quota/balance indicators or Zhipu subscription/billing codes (``1113|1304|1308|1309``).
+    Genuine non-quota ``400/401/403/422`` errors return False so callers continue failing fast.
+    """
+    resolved = http_status_code(exc) if code is None else code
+    if resolved == 402:
+        return True
+    if resolved not in _QUOTA_STATUS_CODES:
+        return type(exc).__name__ == "BudgetExceededError" and resolved is None
+    if type(exc).__name__ == "BudgetExceededError":
+        return True
+    haystack = _exception_error_text(exc)
+    if not haystack:
+        return False
+    return any(tok in haystack for tok in _QUOTA_SUBSTRINGS) or bool(
+        _ZHIPU_QUOTA_CODE_RE.search(haystack)
+    )
+
+
 def _is_openai_failover_eligible(exc: Exception, code: int | None) -> bool:
+    if is_quota_exhaustion_error(exc, code):
+        return True
     if code is not None:
         return code in {408, 429} or 500 <= code <= 599
     if isinstance(exc, TimeoutError):
         return True
     try:
-        from openai import APITimeoutError
+        from openai import APIConnectionError, APITimeoutError
 
-        return isinstance(exc, APITimeoutError)
+        return isinstance(exc, (APITimeoutError, APIConnectionError))
     except Exception:  # noqa: BLE001
-        return type(exc).__name__ == "APITimeoutError"
+        return type(exc).__name__ in {"APITimeoutError", "APIConnectionError"}
 
 
 async def create_openai_chat_completion_with_fallback(
@@ -341,9 +434,10 @@ async def create_openai_chat_completion_with_fallback(
 
     Used by async OpenAI-SDK callers (``judge_mimo``, ``_ab_u1_judge``,
     ``scripts/search_relevance_baseline.py``). Non-final targets in active cooldown are
-    skipped; transient upstream errors (``429``, ``408``, ``500..599``, timeouts) on a
-    non-final target record cooldown, log a warning, and fail over immediately in the
-    same call without burning same-target retries. ``CancelledError`` and deterministic
+    skipped; transient upstream errors (``429``, ``408``, ``500..599``, timeouts, connection
+    errors) and quota/balance exhaustion responses (``402`` or quota-indicated ``400/403/429``)
+    on a non-final target record cooldown, log a warning, and fail over immediately in the
+    same call without burning same-target retries. ``CancelledError`` and genuine non-quota
     ``4xx`` errors always re-raise immediately.
     """
     if not targets:
@@ -354,9 +448,18 @@ async def create_openai_chat_completion_with_fallback(
         is_final = target_idx == len(targets) - 1
         if not is_final and is_model_cooled_down(target.model):
             continue
+        call_kwargs = dict(kwargs)
         wire = openai_wire_kwargs(target)
+        wire_extra = wire.pop("extra_body", None)
+        if wire_extra is not None:
+            caller_extra = call_kwargs.get("extra_body")
+            if isinstance(caller_extra, dict):
+                call_kwargs["extra_body"] = {**caller_extra, **wire_extra}
+            else:
+                call_kwargs["extra_body"] = dict(wire_extra)
+        call_kwargs.update(wire)
         try:
-            return await client.chat.completions.create(**kwargs, **wire)
+            return await client.chat.completions.create(**call_kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -365,7 +468,10 @@ async def create_openai_chat_completion_with_fallback(
             code = http_status_code(exc)
             if not _is_openai_failover_eligible(exc, code):
                 raise
-            ttl = record_model_cooldown(target.model)
+            ttl = record_model_cooldown(
+                target.model,
+                quota=is_quota_exhaustion_error(exc, code),
+            )
             fallback_model = targets[target_idx + 1].model
             if deadline is not None and deadline - time.monotonic() <= 0.0:
                 active_log.warning(

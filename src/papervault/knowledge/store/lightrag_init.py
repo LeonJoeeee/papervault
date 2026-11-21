@@ -33,25 +33,35 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+import ctypes
+import gc
 import logging
 import os
+import sys
 import threading
 import time
 
 from papervault.knowledge.config import CONFIG
+from papervault.knowledge.store.bge_worker import (
+    _BGEWorkerClient,
+    get_default_worker,
+    predict_with_oom_retry as _shared_predict_with_oom_retry,
+)
 
 log = logging.getLogger("ks.store.lightrag_init")
 
 _BGE_MODEL: object = None
 _BGE_RERANKER: object = None
+_BGE_WORKER: _BGEWorkerClient = get_default_worker()
 # Guards the two lazy GPU-model singletons (issue #31). The models are now LOADED inside the
 # offload worker thread (not on the event loop), so first-use construction can race across
 # threads (embed sem may be >1; rerank sem defaults 2). Double-checked locking keeps the load
 # single-flight without adding any steady-state cost (the None fast-path skips the lock).
 _MODEL_LOAD_LOCK = threading.Lock()
 
-# One idle clock covers both models. Activity is counted around synchronous inference,
-# including lazy load, so the timer cannot discard a model while a worker uses it.
+# One idle clock covers both models (and the on-demand worker subprocess). Activity is counted
+# around synchronous inference, including lazy load, so the timer cannot discard a model or
+# terminate the worker while an operation uses it.
 _IDLE_UNLOAD_ENABLED = os.getenv("KS_BGE_IDLE_UNLOAD", "0") == "1"
 _IDLE_UNLOAD_TIMEOUT = float(os.getenv("KS_BGE_IDLE_TIMEOUT", "600"))
 _IDLE_UNLOAD_LOCK = threading.Lock()
@@ -60,32 +70,111 @@ _IDLE_UNLOAD_GENERATION = 0
 _IDLE_UNLOAD_ACTIVE = 0
 
 
-def _unload_idle_models(generation: int) -> None:
-    global _BGE_MODEL, _BGE_RERANKER, _IDLE_UNLOAD_TIMER
-    with _IDLE_UNLOAD_LOCK:
-        if generation != _IDLE_UNLOAD_GENERATION or _IDLE_UNLOAD_ACTIVE:
-            return
-        _IDLE_UNLOAD_TIMER = None
-        if _BGE_MODEL is None and _BGE_RERANKER is None:
-            return
-        started = time.perf_counter()
+def _worker_mode() -> str:
+    """Execution mode for local BGE embedder + reranker (`subprocess` default, or `inprocess`)."""
+    raw = os.getenv("KS_BGE_WORKER_MODE", "subprocess").strip().lower()
+    if not raw:
+        return "subprocess"
+    if raw not in ("subprocess", "inprocess"):
+        log.warning(
+            "Invalid KS_BGE_WORKER_MODE=%r (expected 'subprocess' or 'inprocess'); "
+            "using 'subprocess'",
+            raw,
+        )
+        return "subprocess"
+    return raw
+
+
+def _trim_malloc() -> None:
+    """Return freed CPU arenas to the OS on Linux (best-effort)."""
+    if sys.platform != "linux":
+        return
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:  # noqa: BLE001 — best-effort glibc arena release
+        pass
+
+
+def _release_loaded_models_locked() -> bool:
+    """Release any resident in-process models and/or shut down the BGE worker subprocess.
+
+    Caller MUST hold `_IDLE_UNLOAD_LOCK`. Never imports `torch` when only the
+    subprocess worker was active.
+    """
+    global _BGE_MODEL, _BGE_RERANKER
+    had_inprocess = _BGE_MODEL is not None or _BGE_RERANKER is not None
+    had_worker = _BGE_WORKER.is_running()
+    if not had_inprocess and not had_worker:
+        return False
+    started = time.perf_counter()
+    if had_worker:
+        _BGE_WORKER.shutdown()
+    if had_inprocess:
         _BGE_MODEL = None
         _BGE_RERANKER = None
+    gc.collect()
+    if had_inprocess:
         try:
             import torch
             torch.cuda.empty_cache()
         except Exception:
             log.exception("bge idle unload: CUDA cache release failed")
-        log.info("bge embedder and reranker unloaded after idle in %.3fs",
-                 time.perf_counter() - started)
+    _trim_malloc()
+    log.info(
+        "bge embedder and reranker unloaded after idle in %.3fs (inprocess=%s, worker=%s)",
+        time.perf_counter() - started,
+        had_inprocess,
+        had_worker,
+    )
+    return True
+
+
+def _unload_idle_models(generation: int) -> None:
+    global _IDLE_UNLOAD_TIMER
+    with _IDLE_UNLOAD_LOCK:
+        if generation != _IDLE_UNLOAD_GENERATION or _IDLE_UNLOAD_ACTIVE:
+            return
+        _IDLE_UNLOAD_TIMER = None
+        _release_loaded_models_locked()
+
+
+def unload_bge_models(*, force: bool = False) -> bool:
+    """Explicitly unload in-process BGE models and/or shut down the worker subprocess.
+
+    Returns True if anything was unloaded/terminated. Unless `force=True`, skips
+    unloading while an embed/rerank call is actively in flight.
+    """
+    global _IDLE_UNLOAD_GENERATION, _IDLE_UNLOAD_TIMER
+    with _IDLE_UNLOAD_LOCK:
+        if not force and _IDLE_UNLOAD_ACTIVE:
+            return False
+        _IDLE_UNLOAD_GENERATION += 1
+        if _IDLE_UNLOAD_TIMER is not None:
+            _IDLE_UNLOAD_TIMER.cancel()
+            _IDLE_UNLOAD_TIMER = None
+        return _release_loaded_models_locked()
+
+
+def shutdown_bge_worker(timeout: float = 5.0) -> bool:
+    """Gracefully terminate and reap the BGE worker subprocess (for server/process exit)."""
+    global _IDLE_UNLOAD_GENERATION, _IDLE_UNLOAD_TIMER
+    if _IDLE_UNLOAD_LOCK.acquire(timeout=timeout):
+        try:
+            _IDLE_UNLOAD_GENERATION += 1
+            if _IDLE_UNLOAD_TIMER is not None:
+                _IDLE_UNLOAD_TIMER.cancel()
+                _IDLE_UNLOAD_TIMER = None
+        finally:
+            _IDLE_UNLOAD_LOCK.release()
+    return _BGE_WORKER.shutdown(timeout=timeout, force_if_busy=True)
 
 
 @contextmanager
 def _model_activity():
     global _IDLE_UNLOAD_ACTIVE, _IDLE_UNLOAD_GENERATION, _IDLE_UNLOAD_TIMER
-    if not _IDLE_UNLOAD_ENABLED:
-        yield
-        return
+    # Always track active inference (even when KS_BGE_IDLE_UNLOAD=0) so explicit
+    # `unload_bge_models(force=False)` sees in-flight work and returns False
+    # immediately instead of blocking on the worker lock.
     with _IDLE_UNLOAD_LOCK:
         _IDLE_UNLOAD_GENERATION += 1
         if _IDLE_UNLOAD_TIMER is not None:
@@ -99,12 +188,13 @@ def _model_activity():
             _IDLE_UNLOAD_ACTIVE -= 1
             if _IDLE_UNLOAD_ACTIVE == 0:
                 _IDLE_UNLOAD_GENERATION += 1
-                _IDLE_UNLOAD_TIMER = threading.Timer(
-                    _IDLE_UNLOAD_TIMEOUT, _unload_idle_models,
-                    args=(_IDLE_UNLOAD_GENERATION,),
-                )
-                _IDLE_UNLOAD_TIMER.daemon = True
-                _IDLE_UNLOAD_TIMER.start()
+                if _IDLE_UNLOAD_ENABLED:
+                    _IDLE_UNLOAD_TIMER = threading.Timer(
+                        _IDLE_UNLOAD_TIMEOUT, _unload_idle_models,
+                        args=(_IDLE_UNLOAD_GENERATION,),
+                    )
+                    _IDLE_UNLOAD_TIMER.daemon = True
+                    _IDLE_UNLOAD_TIMER.start()
 
 # Rerank concurrency gate + integrity counter (2026-06-07, eval-trust drill).
 # Unlike embedding (embedding_func_max_async=16 in graph.py), LightRAG calls rerank_model_func
@@ -171,6 +261,9 @@ def _get_bge_model() -> object:
     return _BGE_MODEL
 
 
+_DEFAULT_GET_BGE_MODEL = _get_bge_model
+
+
 # Embedding GPU-offload gate (issue #31, 2026-07-23 — MCP event-loop robustness).
 # BGE-M3 `model.encode` is a SYNCHRONOUS CUDA call. Historically it ran DIRECTLY on the S4
 # single event loop, so a query's query/keyword embedding froze the loop for the encode's
@@ -205,12 +298,22 @@ def _get_embed_sem() -> "asyncio.Semaphore":
     return _EMBED_SEM
 
 
+def _use_subprocess_embedder() -> bool:
+    return (
+        _worker_mode() == "subprocess"
+        and _BGE_MODEL is None
+        and _get_bge_model is _DEFAULT_GET_BGE_MODEL
+    )
+
+
 def _bge_encode_sync(texts: list[str]):
     import numpy as np
 
     # Load INSIDE the worker thread (issue #31): the first-use model load is a multi-second
     # synchronous CUDA op — keeping it off the event loop is the whole point of the offload.
     with _model_activity():
+        if _use_subprocess_embedder():
+            return _BGE_WORKER.embed(texts, batch_size=32, max_length=8192)
         model = _get_bge_model()
         # BGE-M3 supports 8192; the live chunker feeds chunk_token_size=2400 (tiktoken) chunks
         # (BGE-M3 tokenizer counts them ~2617 mean / ~3485 max). max_length=512 silently truncated
@@ -300,6 +403,9 @@ def _get_bge_reranker() -> object:
     return _BGE_RERANKER
 
 
+_DEFAULT_GET_BGE_RERANKER = _get_bge_reranker
+
+
 def _get_rerank_sem() -> "asyncio.Semaphore":
     """Lazy per-process semaphore bounding concurrent GPU rerank (Fix A).
 
@@ -335,23 +441,56 @@ def reset_rerank_failures(reset_sem: bool = False) -> None:
 def _predict_with_oom_retry(model, pairs):
     """CrossEncoder.predict with CUDA-OOM survival (Fix B).
 
-    On an OOM RuntimeError, empty the CUDA cache and retry at a smaller batch_size
-    (32→8→2→1). Non-OOM errors propagate immediately. If even batch_size=1 OOMs, re-raise the
-    last OOM (genuinely no room — handled as a terminal failure by the caller)."""
-    last = None
-    for bs in ([b for b in (32, 8, 2, 1) if b <= _RERANK_BATCH_SIZE] or [1]):
-        try:
-            return model.predict(pairs, batch_size=bs)
-        except RuntimeError as e:  # torch.cuda.OutOfMemoryError is a RuntimeError subclass
-            if "out of memory" not in str(e).lower():
-                raise
-            last = e
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:  # noqa: BLE001 — best-effort cache drop
-                pass
-    raise last
+    Starts at `_RERANK_BATCH_SIZE` itself (clamped >= 1) and on an OOM RuntimeError
+    empties the CUDA cache and steps down through smaller power-of-two batch sizes
+    (32→16→8→4→2→1). Non-OOM errors propagate immediately. If even batch_size=1 OOMs,
+    re-raise the last OOM (genuinely no room — handled as a terminal failure by the caller)."""
+    return _shared_predict_with_oom_retry(model, pairs, _RERANK_BATCH_SIZE)
+
+
+_DEFAULT_PREDICT_WITH_OOM_RETRY = _predict_with_oom_retry
+
+
+def _use_subprocess_reranker() -> bool:
+    return (
+        _worker_mode() == "subprocess"
+        and _BGE_RERANKER is None
+        and _get_bge_reranker is _DEFAULT_GET_BGE_RERANKER
+        and _predict_with_oom_retry is _DEFAULT_PREDICT_WITH_OOM_RETRY
+    )
+
+
+def _apply_rerank_pool_cap(documents: list[str], top_n: int | None) -> list[str]:
+    if _RERANK_POOL_CAP and len(documents) > _RERANK_POOL_CAP:
+        cap = max(_RERANK_POOL_CAP, top_n or 0)
+        if len(documents) > cap:
+            log.debug("rerank pool capped %d -> %d (KS_RERANK_POOL_CAP)", len(documents), cap)
+            return documents[:cap]
+    return documents
+
+
+def _bge_rerank_sync(
+    query: str, documents: list[str], top_n: int | None = None
+) -> list[dict[str, int | float]]:
+    """Synchronous rerank path (dispatches to worker subprocess or in-process CrossEncoder)."""
+    if not documents:
+        return []
+    documents = _apply_rerank_pool_cap(documents, top_n)
+    with _model_activity():
+        if _use_subprocess_reranker():
+            return _BGE_WORKER.rerank(
+                query,
+                documents,
+                top_n=top_n,
+                batch_size=_RERANK_BATCH_SIZE,
+                max_length=_RERANK_MAX_LENGTH,
+            )
+        pairs = [(query, d) for d in documents]
+        scores = _predict_with_oom_retry(_get_bge_reranker(), pairs)
+    ranked = sorted(range(len(documents)), key=lambda i: scores[i], reverse=True)
+    if top_n:  # falsy (0/None) → keep all; real caller always passes a positive int (test codifies this)
+        ranked = ranked[:top_n]
+    return [{"index": i, "relevance_score": float(scores[i])} for i in ranked]
 
 
 def rerank_failure_count() -> int:
@@ -388,23 +527,16 @@ async def _bge_rerank(
     global _RERANK_FAILURES
     if not documents:
         return []
-    if _RERANK_POOL_CAP and len(documents) > _RERANK_POOL_CAP:
-        cap = max(_RERANK_POOL_CAP, top_n or 0)
-        if len(documents) > cap:
-            log.debug("rerank pool capped %d -> %d (KS_RERANK_POOL_CAP)", len(documents), cap)
-            documents = documents[:cap]
-    pairs = [(query, d) for d in documents]
-    # Load AND predict inside the worker thread (issue #31): _get_bge_reranker() runs a
-    # multi-second CrossEncoder load + preflight on first use — doing it here, off the event
-    # loop, keeps the handshake path live at cold start. A load/preflight failure surfaces via
-    # the except below (counted + logged loud), preserving the F21 fail-loud contract.
-    def _load_and_predict(_pairs):
-        with _model_activity():
-            return _predict_with_oom_retry(_get_bge_reranker(), _pairs)
-
+    capped_docs = _apply_rerank_pool_cap(documents, top_n)
+    # Load AND predict inside the worker thread (issue #31): _get_bge_reranker() / worker
+    # startup runs a multi-second CrossEncoder load + preflight on first use — doing it here,
+    # off the event loop, keeps the handshake path live at cold start. A load/preflight failure
+    # surfaces via the except below (counted + logged loud), preserving the F21 fail-loud contract.
     sem = _get_rerank_sem()
     await sem.acquire()
-    worker = asyncio.create_task(asyncio.to_thread(_load_and_predict, pairs))
+    worker = asyncio.create_task(
+        asyncio.to_thread(_bge_rerank_sync, query, capped_docs, top_n)
+    )
 
     def finished(task):
         sem.release()
@@ -413,16 +545,12 @@ async def _bge_rerank(
 
     worker.add_done_callback(finished)
     try:
-        scores = await asyncio.shield(worker)
+        return await asyncio.shield(worker)
     except Exception as e:  # noqa: BLE001 — terminal: record + loud, never silently degrade
         _RERANK_FAILURES += 1
         log.error(
             "bge rerank FAILED on %d docs (%s: %s) — chunks returned UNRANKED; this run's "
             "rerank is DEGRADED (failure #%d). Lower KS_RERANK_MAX_ASYNC or free GPU0.",
-            len(documents), type(e).__name__, str(e)[:120], _RERANK_FAILURES,
+            len(capped_docs), type(e).__name__, str(e)[:120], _RERANK_FAILURES,
         )
         return []
-    ranked = sorted(range(len(documents)), key=lambda i: scores[i], reverse=True)
-    if top_n:  # falsy (0/None) → keep all; real caller always passes a positive int (test codifies this)
-        ranked = ranked[:top_n]
-    return [{"index": i, "relevance_score": float(scores[i])} for i in ranked]

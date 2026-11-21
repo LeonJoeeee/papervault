@@ -52,6 +52,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 from openai import APIConnectionError, APITimeoutError, AsyncOpenAI
 
 from papervault import config
@@ -59,6 +60,7 @@ from papervault.llm_routing import (
     ModelTarget,
     clear_fallback_cooldowns as clear_fallback_cooldowns,
     is_model_cooled_down,
+    is_quota_exhaustion_error,
     openai_wire_kwargs,
     parse_targets,
     record_model_cooldown,
@@ -386,6 +388,86 @@ async def _create_completion(client: AsyncOpenAI, model: str, messages: list[dic
     return _Collected("".join(parts), usage, finish)
 
 
+def _extract_content(resp: Any, *, has_tools: bool = False) -> str:
+    """Extract text content, guarding against empty-after-thinking and length truncation.
+
+    - Empty content on a non-tool response (including ``finish_reason == "length"`` when
+      reasoning exhausted the token budget before emitting visible text) raises
+      ``StreamTruncated`` so multi-target routes fail over and retries engage rather than
+      returning ``""`` and poisoning caches.
+    - Non-empty content truncated by ``finish_reason == "length"`` is wrapped in LightRAG's
+      ``TruncatedResponse`` (a ``str`` subclass) so callers still receive a ``str`` while
+      LightRAG 1.5.7's ``is_truncated_response()`` skips persisting the partial payload.
+    """
+    choice = resp.choices[0]
+    message = choice.message
+    content = message.content or ""
+    finish = getattr(choice, "finish_reason", None)
+    tool_calls = getattr(message, "tool_calls", None)
+    if not content.strip() and not has_tools and not tool_calls:
+        if finish == "length":
+            raise StreamTruncated(
+                "response truncated by max_tokens before emitting content (finish_reason=length)"
+            )
+        raise StreamTruncated(f"empty content response (finish_reason={finish})")
+    if finish == "length" and content:
+        try:
+            from lightrag.utils import TruncatedResponse
+
+            return TruncatedResponse(content)
+        except Exception:  # noqa: BLE001 — fallback to plain str if unavailable
+            return content
+    return content
+
+
+def _per_target_timeout(
+    *,
+    is_final: bool,
+    n_targets: int,
+    caller_timeout: float | None,
+    deadline: float,
+    budget_s: float | None = None,
+) -> float | None:
+    """Bounded per-target timeout so a hung non-final tier raises APITimeoutError and fails over."""
+    if n_targets <= 1:
+        if caller_timeout is not None:
+            return min(caller_timeout, _CLIENT_TIMEOUT)
+        return None
+    has_budget = budget_s is None or budget_s > 0
+    remaining = max(0.05, deadline - time.monotonic())
+    if not is_final:
+        if caller_timeout is not None:
+            cap = min(caller_timeout * 0.45, _CLIENT_TIMEOUT)
+            return min(cap, remaining * 0.6) if has_budget else cap
+        if _GW_RETRY_BUDGET_S > 0:
+            return min(_GW_RETRY_BUDGET_S * 0.45, remaining * 0.6, _CLIENT_TIMEOUT)
+        return None
+    if caller_timeout is not None:
+        return min(remaining, _CLIENT_TIMEOUT) if has_budget else min(caller_timeout, _CLIENT_TIMEOUT)
+    return None
+
+
+async def _create_completion_bounded(
+    client: AsyncOpenAI,
+    model: str,
+    messages: list[dict[str, str]],
+    attempt_kwargs: dict[str, Any],
+    leg_timeout: float | None,
+) -> Any:
+    """Run ``_create_completion`` with an optional per-target timeout translated to APITimeoutError."""
+    if leg_timeout is None:
+        return await _create_completion(client, model, messages, attempt_kwargs)
+    call_kwargs = {**attempt_kwargs, "timeout": leg_timeout}
+    try:
+        return await asyncio.wait_for(
+            _create_completion(client, model, messages, call_kwargs),
+            timeout=leg_timeout,
+        )
+    except asyncio.TimeoutError as e:
+        base_url = str(getattr(client, "base_url", None) or "http://llm-gateway/v1")
+        raise APITimeoutError(request=httpx.Request("POST", base_url)) from e
+
+
 def _error_code(exc: Exception) -> int | None:
     """Best-effort HTTP status from an openai/httpx exception; None if unknown.
     Falls back to the type name (``*AuthenticationError*`` → 401)."""
@@ -401,11 +483,13 @@ def _error_code(exc: Exception) -> int | None:
 
 
 def _is_failover_eligible(exc: Exception) -> bool:
-    """True iff ``exc`` is a transient upstream error eligible for immediate cross-model failover."""
+    """True iff ``exc`` is a transient or quota-exhaustion upstream error eligible for immediate cross-model failover."""
     code = _error_code(exc)
+    if is_quota_exhaustion_error(exc, code):
+        return True
     if code is not None:
         return code in _TRANSIENT_STATUSES or 500 <= code <= 599
-    return isinstance(exc, (StreamTruncated, APITimeoutError, TimeoutError))
+    return isinstance(exc, (StreamTruncated, APITimeoutError, APIConnectionError, TimeoutError))
 
 
 class KeyPool:
@@ -508,6 +592,7 @@ class KeyPool:
         history_messages: list[dict] | None = None,
         **kwargs: Any,
     ) -> str:
+        retries = kwargs.pop("retries", None)
         # Omit max_tokens on the wire when both caller max_tokens and _DEFAULT_MAX_TOKENS are None
         # (stripping max_tokens=None if passed); forward explicit caller or KS_LLM_MAX_TOKENS ints.
         effective_max_tokens = kwargs.get("max_tokens")
@@ -525,7 +610,7 @@ class KeyPool:
         if config.USE_GATEWAY:
             return await self._complete_via_gateway(
                 prompt, system_prompt=system_prompt,
-                history_messages=history_messages, **kwargs,
+                history_messages=history_messages, retries=retries, **kwargs,
             )
         self._reload_if_changed()
         base_groups = list(self._groups)
@@ -549,13 +634,14 @@ class KeyPool:
             override_targets: tuple[ModelTarget, ...] | None = parse_targets(model_override)
             if len(override_targets) > 1:
                 return await self._complete_direct_multi_target(
-                    base_groups, messages, base_kwargs, override_targets,
+                    base_groups, messages, base_kwargs, override_targets, retries=retries,
                 )
         else:
             override_targets = None
 
+        max_rounds = _MAX_ROUNDS if retries is None else max(1, int(retries) + 1)
         last_error: Exception | None = None
-        for round_idx in range(_MAX_ROUNDS):
+        for round_idx in range(max_rounds):
             groups = list(base_groups)
             random.shuffle(groups)   # per-request random order; NO cross-request state
             for g in groups:
@@ -577,7 +663,7 @@ class KeyPool:
                         # Slow but OK — the call we want to see before an outer worker timeout kills it.
                         logger.info("mimo slow-ok %.0fs endpoint=%s round=%d", dt, ep, round_idx)
                     log_usage(logger, "ks", target.model, dt, resp)
-                    return resp.choices[0].message.content or ""
+                    return _extract_content(resp, has_tools=bool(attempt_kwargs.get("tools")))
                 except asyncio.CancelledError:
                     # Killed from OUTSIDE (e.g. LightRAG's worker timeout cancels this still-running
                     # call). This is the slow-call-that-got-axed case — log WHERE + how long it ran,
@@ -595,21 +681,21 @@ class KeyPool:
                     # vs slow generation, and on which endpoint). Additive only — flow unchanged.
                     logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s round=%d",
                                    dt, ep, code, type(e).__name__, round_idx)
-                    if code in _PERMANENT_CODES:
+                    if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
                         # PERMANENT: disable on first occurrence + drop from this call's pool.
                         await self._disable_key(g["api_key"], code, type(e).__name__)
                         base_groups = [x for x in base_groups
                                        if x.get("api_key") != g["api_key"]]
-                    # else TRANSIENT (429 / timeout / 5xx): just fail over, nothing remembered.
+                    # else TRANSIENT (429 / timeout / 5xx / quota): just fail over, nothing remembered.
                     continue
             if not base_groups:
                 break
-            if round_idx < _MAX_ROUNDS - 1:
+            if round_idx < max_rounds - 1:
                 await asyncio.sleep(_BASE_BACKOFF * (2 ** round_idx) + random.uniform(0, _BACKOFF_JITTER))
 
         # Chained to the last upstream error so callers can classify it (build breaker, #143).
         raise RuntimeError(
-            f"All configured LLM keys failed after {_MAX_ROUNDS} rounds. "
+            f"All configured LLM keys failed after {max_rounds} rounds. "
             f"Last error: {type(last_error).__name__}: {last_error}"
         ) from last_error
 
@@ -619,9 +705,20 @@ class KeyPool:
         messages: list[dict[str, str]],
         base_kwargs: dict[str, Any],
         targets: tuple[ModelTarget, ...],
+        *,
+        retries: int | None = None,
     ) -> str:
         """Multi-target route execution over direct KeyPool endpoints (PAPERVAULT_LLM_GATEWAY=0)."""
-        deadline = time.monotonic() + _GW_RETRY_BUDGET_S
+        raw_timeout = base_kwargs.pop("timeout", None)
+        caller_timeout = float(raw_timeout) if raw_timeout is not None and float(raw_timeout) > 0 else None
+        t_call = time.monotonic()
+        budget_s = (
+            min(caller_timeout, _GW_RETRY_BUDGET_S)
+            if caller_timeout is not None
+            else _GW_RETRY_BUDGET_S
+        )
+        deadline = t_call + budget_s
+        max_rounds = _MAX_ROUNDS if retries is None else max(1, int(retries) + 1)
         for target_idx, target in enumerate(targets):
             is_final = target_idx == len(targets) - 1
             if not is_final and is_model_cooled_down(target.model, now=time.monotonic()):
@@ -638,14 +735,23 @@ class KeyPool:
                 for g in groups:
                     ep = _endpoint_label(g)
                     t0 = time.monotonic()
+                    leg_timeout = _per_target_timeout(
+                        is_final=False,
+                        n_targets=len(targets),
+                        caller_timeout=caller_timeout,
+                        deadline=deadline,
+                        budget_s=budget_s,
+                    )
                     try:
                         client = self._client(g)
-                        resp = await _create_completion(client, model, messages, attempt_kwargs)
+                        resp = await _create_completion_bounded(
+                            client, model, messages, attempt_kwargs, leg_timeout,
+                        )
                         dt = time.monotonic() - t0
                         if dt >= _SLOW_CALL_S:
                             logger.info("mimo slow-ok %.0fs endpoint=%s round=0", dt, ep)
                         log_usage(logger, "ks", target.model, dt, resp)
-                        return resp.choices[0].message.content or ""
+                        return _extract_content(resp, has_tools=bool(attempt_kwargs.get("tools")))
                     except asyncio.CancelledError:
                         logger.warning("mimo CANCELLED after %.0fs endpoint=%s round=0 "
                                        "(outer timeout / shutdown — call did not finish)",
@@ -656,7 +762,7 @@ class KeyPool:
                         code = _error_code(e)
                         logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s round=0",
                                        dt, ep, code, type(e).__name__)
-                        if code in _PERMANENT_CODES:
+                        if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
                             await self._disable_key(g["api_key"], code, type(e).__name__)
                             base_groups = [x for x in base_groups
                                            if x.get("api_key") != g["api_key"]]
@@ -683,20 +789,29 @@ class KeyPool:
                 continue
 
             last_error: Exception | None = None
-            for round_idx in range(_MAX_ROUNDS):
+            for round_idx in range(max_rounds):
                 groups = list(base_groups)
                 random.shuffle(groups)
                 for g in groups:
                     ep = _endpoint_label(g)
                     t0 = time.monotonic()
+                    leg_timeout = _per_target_timeout(
+                        is_final=True,
+                        n_targets=len(targets),
+                        caller_timeout=caller_timeout,
+                        deadline=deadline,
+                        budget_s=budget_s,
+                    )
                     try:
                         client = self._client(g)
-                        resp = await _create_completion(client, model, messages, attempt_kwargs)
+                        resp = await _create_completion_bounded(
+                            client, model, messages, attempt_kwargs, leg_timeout,
+                        )
                         dt = time.monotonic() - t0
                         if dt >= _SLOW_CALL_S:
                             logger.info("mimo slow-ok %.0fs endpoint=%s round=%d", dt, ep, round_idx)
                         log_usage(logger, "ks", target.model, dt, resp)
-                        return resp.choices[0].message.content or ""
+                        return _extract_content(resp, has_tools=bool(attempt_kwargs.get("tools")))
                     except asyncio.CancelledError:
                         logger.warning("mimo CANCELLED after %.0fs endpoint=%s round=%d "
                                        "(outer timeout / shutdown — call did not finish)",
@@ -708,19 +823,19 @@ class KeyPool:
                         code = _error_code(e)
                         logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s round=%d",
                                        dt, ep, code, type(e).__name__, round_idx)
-                        if code in _PERMANENT_CODES:
+                        if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
                             await self._disable_key(g["api_key"], code, type(e).__name__)
                             base_groups = [x for x in base_groups
                                            if x.get("api_key") != g["api_key"]]
                         continue
                 if not base_groups:
                     break
-                if round_idx < _MAX_ROUNDS - 1:
+                if round_idx < max_rounds - 1:
                     await asyncio.sleep(
                         _BASE_BACKOFF * (2 ** round_idx) + random.uniform(0, _BACKOFF_JITTER)
                     )
             raise RuntimeError(
-                f"All configured LLM keys failed after {_MAX_ROUNDS} rounds. "
+                f"All configured LLM keys failed after {max_rounds} rounds. "
                 f"Last error: {type(last_error).__name__}: {last_error}"
             ) from last_error
 
@@ -730,6 +845,8 @@ class KeyPool:
         prompt: str,
         system_prompt: str | None = None,
         history_messages: list[dict] | None = None,
+        *,
+        retries: int | None = None,
         **kwargs: Any,
     ) -> str:
         """Thin path: build the same messages and whitelist standard request parameters
@@ -748,13 +865,26 @@ class KeyPool:
         raw_model = base_kwargs.pop("model", None)
         targets = parse_targets(raw_model or _DEFAULT_MODEL)
 
-        # Drop per-request timeout / extra_headers intended for the direct KeyPool path;
-        # outer asyncio.wait_for at call sites enforces caller deadlines locally.
-        base_kwargs.pop("timeout", None)
+        # Preserve caller timeout for bounded per-target budgeting (so a hung non-final target
+        # raises APITimeoutError and fails over instead of letting an outer wait_for cancel the
+        # whole chain); drop extra_headers intended for direct KeyPool endpoints.
+        raw_timeout = base_kwargs.pop("timeout", None)
+        caller_timeout = float(raw_timeout) if raw_timeout is not None and float(raw_timeout) > 0 else None
         base_kwargs.pop("extra_headers", None)
 
+        max_transient_retries = _GW_TRANSIENT_RETRIES if retries is None else max(0, int(retries))
+        max_conn_retries = (
+            _GW_CONN_MAX_RETRIES
+            if retries is None
+            else min(_GW_CONN_MAX_RETRIES, max(0, int(retries)))
+        )
         t_call = time.monotonic()
-        deadline = t_call + _GW_RETRY_BUDGET_S   # ABSOLUTE: spans every attempt and every backoff
+        budget_s = (
+            min(caller_timeout, _GW_RETRY_BUDGET_S)
+            if caller_timeout is not None
+            else _GW_RETRY_BUDGET_S
+        )
+        deadline = t_call + budget_s   # ABSOLUTE: spans every attempt and every backoff
         for target_idx, target in enumerate(targets):
             is_final = target_idx == len(targets) - 1
             if not is_final and is_model_cooled_down(target.model, now=time.monotonic()):
@@ -767,15 +897,24 @@ class KeyPool:
             retry_state = {"tries": 0, "sleep": 0.0}   # bounded transient retries (issue #102)
             while True:
                 t0 = time.monotonic()
+                leg_timeout = _per_target_timeout(
+                    is_final=is_final,
+                    n_targets=len(targets),
+                    caller_timeout=caller_timeout,
+                    deadline=deadline,
+                    budget_s=budget_s,
+                )
                 try:
                     client = self._gateway_client()
-                    resp = await _create_completion(client, model, messages, attempt_kwargs)
+                    resp = await _create_completion_bounded(
+                        client, model, messages, attempt_kwargs, leg_timeout,
+                    )
                     dt = time.monotonic() - t0
                     if dt >= _SLOW_CALL_S:
                         # Slow but OK — the call we want to see before an outer worker timeout kills it.
                         logger.info("mimo slow-ok %.0fs endpoint=%s", dt, ep)
                     log_usage(logger, "ks", target.model, dt, resp)
-                    return resp.choices[0].message.content or ""
+                    return _extract_content(resp, has_tools=bool(attempt_kwargs.get("tools")))
                 except asyncio.CancelledError:
                     # Killed from OUTSIDE (LightRAG worker timeout / synth wait_for / shutdown). Log
                     # WHERE + how long, then RE-RAISE (never swallow cancellation).
@@ -800,20 +939,23 @@ class KeyPool:
                             ):
                                 break
                             raise
-                        if not self._gateway_retry(e, ep, t0, deadline, retry_state):
+                        if not self._gateway_retry(
+                            e, ep, t0, deadline, retry_state,
+                            max_retries=max_transient_retries, budget_s=budget_s,
+                        ):
                             raise
                         await asyncio.sleep(retry_state["sleep"])
                         continue
                     conn_try += 1
                     remaining = deadline - time.monotonic()
                     delay = _retry_delay(conn_try, _GW_CONN_BACKOFF_CAP)
-                    if conn_try > _GW_CONN_MAX_RETRIES or remaining - delay <= max(_FIRST_CHUNK_S, 0.0):
+                    if conn_try > max_conn_retries or remaining - delay <= max(_FIRST_CHUNK_S, 0.0):
                         logger.warning("mimo gateway UNREACHABLE after %d conn-retries endpoint=%s "
                                        "(%.0fs of %.0fs budget left) — giving up",
-                                       conn_try - 1, ep, max(0.0, remaining), _GW_RETRY_BUDGET_S)
+                                       conn_try - 1, ep, max(0.0, remaining), budget_s)
                         raise
                     logger.warning("mimo gateway unreachable (conn err) endpoint=%s — backoff %.1fs (try %d/%d)",
-                                   ep, delay, conn_try, _GW_CONN_MAX_RETRIES)
+                                   ep, delay, conn_try, max_conn_retries)
                     await asyncio.sleep(delay)
                     continue
                 except Exception as e:  # noqa: BLE001
@@ -828,7 +970,10 @@ class KeyPool:
                         ):
                             break
                         raise
-                    if not self._gateway_retry(e, ep, t0, deadline, retry_state):
+                    if not self._gateway_retry(
+                        e, ep, t0, deadline, retry_state,
+                        max_retries=max_transient_retries, budget_s=budget_s,
+                    ):
                         raise
                     await asyncio.sleep(retry_state["sleep"])
                     continue
@@ -854,7 +999,9 @@ class KeyPool:
         if not _is_failover_eligible(e):
             return False
         now = time.monotonic()
-        ttl = record_model_cooldown(primary, now=now)
+        ttl = record_model_cooldown(
+            primary, now=now, quota=is_quota_exhaustion_error(e, code),
+        )
         remaining = deadline - now
         if remaining <= max(_FIRST_CHUNK_S, 0.0):
             logger.warning("mimo primary failover skipped (budget exhausted: %.1fs left) "
@@ -865,30 +1012,45 @@ class KeyPool:
                        dt, primary, fallback, code, type(e).__name__, ttl)
         return True
 
-    def _gateway_retry(self, e: Exception, ep: str, t0: float, deadline: float, state: dict) -> bool:
+    def _gateway_retry(
+        self,
+        e: Exception,
+        ep: str,
+        t0: float,
+        deadline: float,
+        state: dict,
+        *,
+        max_retries: int | None = None,
+        budget_s: float | None = None,
+    ) -> bool:
         """Log the failed attempt; decide whether it gets one of the bounded TRANSIENT retries
         (issue #102): a stream cut before/while answering (``StreamTruncated``), a transport
-        timeout (``APITimeoutError``), 408/429, 5xx. Deterministic 4xx (400 validation / 401 /
-        403 / 404 / 422) never do. A retry is granted only if, after the backoff, there is still
-        room for its first chunk inside the absolute budget — otherwise it would just eat the
-        caller's cap. On True, ``state["sleep"]`` carries the backoff to wait before retrying."""
+        timeout (``APITimeoutError``), non-quota 408/429, 5xx. Deterministic 4xx (400 validation /
+        401 / 403 / 404 / 422) and quota-exhaustion responses never do. A retry is granted only if,
+        after the backoff, there is still room for its first chunk inside the absolute budget —
+        otherwise it would just eat the caller's cap. On True, ``state["sleep"]`` carries the
+        backoff to wait before retrying."""
         dt = time.monotonic() - t0
         code = _error_code(e)
         logger.warning("mimo attempt-fail %.0fs endpoint=%s code=%s err=%s",
                        dt, ep, code, type(e).__name__)
-        transient = isinstance(e, (StreamTruncated, APITimeoutError)) or (
+        if is_quota_exhaustion_error(e, code):
+            return False
+        limit = _GW_TRANSIENT_RETRIES if max_retries is None else max_retries
+        transient = isinstance(e, (StreamTruncated, APITimeoutError, TimeoutError)) or (
             code is not None and (code in _TRANSIENT_STATUSES or 500 <= code <= 599))
         remaining = deadline - time.monotonic()
         delay = _retry_delay(state["tries"] + 1, _GW_TRANSIENT_BACKOFF_CAP)
-        if not (transient and state["tries"] < _GW_TRANSIENT_RETRIES
+        if not (transient and state["tries"] < limit
                 and remaining - delay > max(_FIRST_CHUNK_S, 0.0)):
             return False
         state["tries"] += 1
         state["sleep"] = delay
+        eff_budget = _GW_RETRY_BUDGET_S if budget_s is None else budget_s
         logger.warning("mimo gateway transient failure (%s) endpoint=%s — retrying in %.1fs "
                        "(try %d/%d, %.0fs of %.0fs budget left)",
-                       type(e).__name__, ep, delay, state["tries"], _GW_TRANSIENT_RETRIES,
-                       remaining, _GW_RETRY_BUDGET_S)
+                       type(e).__name__, ep, delay, state["tries"], limit,
+                       remaining, eff_budget)
         return True
 
     # ---- 401/403 auto-disable: the only persistent state, written to the shared file ----

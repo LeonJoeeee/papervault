@@ -1,11 +1,10 @@
--- Knowledge System v3 — PostgreSQL schema initialization
+-- papervault — PostgreSQL schema initialization
 -- Auto-run by Docker on first container init (mounted at /docker-entrypoint-initdb.d/)
--- Per docs/plans/knowledge-system-v3.md §5.2
 
 -- Enable pgvector (LightRAG embeddings)
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Sidecar chunk metadata table (§5.2)
+-- Sidecar chunk metadata table
 -- LightRAG stores chunk content + vector + graph internally (zero-mod)
 -- This table stores per-chunk metadata: layer / type / source / tags
 CREATE TABLE IF NOT EXISTS chunk_metadata (

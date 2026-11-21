@@ -50,6 +50,7 @@ log = logging.getLogger("ks.store.graph")
 PROD_WORKSPACE = "l0"
 DEV_WORKSPACE = "l0_probe"
 _ALLOW_PROD_ENV = "KS_ALLOW_PROD_WORKSPACE"
+_logged_workspaces: set[tuple[str, bool]] = set()
 
 
 class UnsafeWorkspaceError(RuntimeError):
@@ -85,7 +86,12 @@ def assert_safe_workspace() -> str:
             f"refusing to open prod workspace {PROD_WORKSPACE!r}: set {_ALLOW_PROD_ENV}=1 to "
             f"opt in on purpose (dev/probe/test should use {DEV_WORKSPACE!r})."
         )
-    log.info("workspace=%s (prod_opt_in=%s)", neo, allow_prod)
+    workspace_key = (neo, allow_prod)
+    if workspace_key not in _logged_workspaces:
+        _logged_workspaces.add(workspace_key)
+        log.info("workspace=%s (prod_opt_in=%s)", neo, allow_prod)
+    else:
+        log.debug("workspace=%s (prod_opt_in=%s)", neo, allow_prod)
     return neo
 
 # 研究本体(SDD §6.0 / run.py:55):丢 Person/Organization,作者/期刊/引文串不进图。

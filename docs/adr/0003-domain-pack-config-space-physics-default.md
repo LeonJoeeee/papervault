@@ -1,6 +1,6 @@
 # 0003 — Domain ships as an editable config pack; space physics is the factory default
 
-Status: Accepted (2026-07-17)
+Status: Accepted (2026-07-17), Amended (2026-10-26)
 
 ## Context
 The search ingest gate (domain rubric + few-shot judgments), the knowledge-graph entity ontology, the extraction few-shots, MCP instruction text, and the eval gold sets are all space-physics-specific and were hardcoded in the source services. The first release targets space-physics researchers (the originating group's beta); other fields are welcome but not accommodated.
@@ -10,3 +10,5 @@ Externalize the domain texts into operator-editable config files — the "domain
 
 ## Consequences
 Swapping domains = editing files, zero code changes. Quality outside space physics is the adapting operator's responsibility, stated plainly in docs. Gold sets remain space-physics; the eval harness documents how to build one for another field.
+
+**Amendment (2026-10-26, v0.10.15):** Expanded the bundled `space_physics` factory domain pack (search rubric, extraction guidance, and venue authority tiers) to cover **space computing** alongside space physics and AI4Science while retaining the existing 11 entity types and pack name (`space_physics`). Dedicated space-computing evaluation gold sets are not yet bundled (documented in `docs/eval.md`).

@@ -48,6 +48,7 @@ from papervault.library.models import (
     DOWNLOAD_STATUS_FAILED,
     DOWNLOAD_STATUS_METADATA_ONLY,
     DOWNLOAD_STATUS_TERMINAL,
+    MAX_EXTRACT_ATTEMPTS,
     MIN_TXT_SERVE_BYTES,
     Paper,
 )
@@ -58,7 +59,8 @@ from papervault.library.services.intent_parser import parse_intent
 from papervault.library.services.judge import judge_ingest, judge_return
 from papervault.library.services.download_queue import DownloadQueue
 from papervault.library.services.extract_queue import ExtractQueue
-from papervault.library.services.classify import pending_ocr_identity
+from papervault.library.merge_v2 import resolve_alias
+from papervault.library.services.classify import DOWNLOAD, EXTRACT, classify, pending_ocr_identity
 from papervault.library.services.registration import (
     RegistrationQueue, RegistrationService, serving_excluded,
     metadata_is_paper as _metadata_is_paper, normalized_source_identities,  # noqa: F401 - compatibility import
@@ -226,6 +228,11 @@ def _attach_text_reference(rec: dict, paper: Paper, library: Library) -> None:
             rec["text_path"] = str(library.txt_path(paper.key))
             return
         # Near-empty txt — do NOT serve it as full text. Fall through.
+    if (library.has_pdf(paper.key)
+            and status not in DOWNLOAD_STATUS_TERMINAL
+            and (current.extract_attempts or 0) >= MAX_EXTRACT_ATTEMPTS):
+        rec["text_status"] = "extract_failed"
+        return
     rec["text_status"] = _TERMINAL_TEXT_STATUS.get(status, "pending")
 
 
@@ -316,6 +323,7 @@ class _SearchEntry:
     completed_at: float | None = None
     collected: bool = False
     stage_message: str = ""
+    expiry_handle: asyncio.TimerHandle | None = None
 
 
 async def _progress_heartbeat(ctx: Context, stop: asyncio.Event, entry: _SearchEntry) -> None:
@@ -397,6 +405,9 @@ class _PaperSearchRegistry:
         return {"status": "error", "results": [], "message": _EMPTY_QUERY_MESSAGE}
 
     def forget(self, entry: _SearchEntry) -> None:
+        if entry.expiry_handle is not None:
+            entry.expiry_handle.cancel()
+            entry.expiry_handle = None
         if self.by_id.get(entry.search_id) is entry:
             self.by_id.pop(entry.search_id, None)
         if self.by_query.get(entry.query) is entry:
@@ -404,6 +415,22 @@ class _PaperSearchRegistry:
 
     def _forget_search(self, entry: _SearchEntry) -> None:
         self.forget(entry)
+
+    def _expire_if_due(self, entry: _SearchEntry) -> None:
+        entry.expiry_handle = None
+        if self.by_id.get(entry.search_id) is not entry or entry.completed_at is None:
+            return
+        retention = max(0.0, _search_setting("PAPERVAULT_MCP_SEARCH_RETENTION_S", 900.0))
+        remaining = retention - (time.monotonic() - entry.completed_at)
+        if remaining <= 0:
+            self.forget(entry)
+            return
+        try:
+            entry.expiry_handle = asyncio.get_running_loop().call_later(
+                remaining, self._expire_if_due, entry,
+            )
+        except RuntimeError:
+            pass
 
     def find(self, raw_query: str) -> _SearchEntry | None:
         """Shared with admission: resume/collect calls need no new executing permit."""
@@ -417,11 +444,19 @@ class _PaperSearchRegistry:
             return None
         return self.by_id.get(key) or self.by_query.get(key)
 
-    @staticmethod
-    def _search_finished(entry: _SearchEntry) -> None:
+    def _search_finished(self, entry: _SearchEntry) -> None:
         entry.completed_at = time.monotonic()
         if not entry.task.cancelled():
             entry.task.exception()  # Detached failures are delivered on collection.
+        if not self.stopping and self.by_id.get(entry.search_id) is entry:
+            retention = max(0.0, _search_setting("PAPERVAULT_MCP_SEARCH_RETENTION_S", 900.0))
+            try:
+                loop = asyncio.get_running_loop()
+                if entry.expiry_handle is not None:
+                    entry.expiry_handle.cancel()
+                entry.expiry_handle = loop.call_later(retention, self._expire_if_due, entry)
+            except RuntimeError:
+                pass
 
     async def _execute_search(self, entry: _SearchEntry) -> dict[str, Any]:
         async def progress(_step: float, message: str) -> None:
@@ -477,7 +512,12 @@ class _PaperSearchRegistry:
     async def shutdown(self) -> None:
         """Idempotently stop accepting new searches and cancel/drain all active tasks."""
         self.stopping = True
-        tasks = [entry.task for entry in list(self.by_id.values()) if not entry.task.done()]
+        entries = list(self.by_id.values())
+        for entry in entries:
+            if entry.expiry_handle is not None:
+                entry.expiry_handle.cancel()
+                entry.expiry_handle = None
+        tasks = [entry.task for entry in entries if not entry.task.done()]
         for task in tasks:
             task.cancel()
         if tasks:
@@ -1030,22 +1070,14 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
             if paper.key in seen_keys:
                 continue  # alias of a paper already returned in this batch
             seen_keys.add(paper.key)
-            # Kick off download/extract if the full text isn't ready, so a `pending`
-            # paper progresses toward readable in the background (fire-and-forget; the
-            # record carries text_status=pending until the queues finish).
-            #
-            # I-TERM-ENQ (SDD §5): NEVER re-arm a TERMINAL paper from this
-            # foreground path. A metadata_only / download_failed / extract_failed
-            # paper is honestly terminal — re-enqueuing fires a redundant URGENT
-            # re-download or (expensive GPU) re-OCR that the recovery scan already
-            # skips, and contradicts the "stop polling" contract. The gate is
-            # download_status NOT in TERMINAL (same as the recovery scan).
-            if (getattr(download_queue, "_started", False)
-                    and (paper.download_status or "") not in DOWNLOAD_STATUS_TERMINAL):
-                if not library.has_pdf(paper.key):
+            # Kick off download/extract strictly via the unified classify() router
+            # so resting firecrawl-md, exhausted-attempt, excluded, and terminal
+            # papers are never redundantly re-queued from foreground get_paper.
+            if getattr(download_queue, "_started", False):
+                action = classify(paper, library)
+                if action == DOWNLOAD:
                     download_queue.add(paper.key, priority=concurrency.PRIORITY_URGENT)
-                elif (not library.has_extract(paper.key, "md")
-                      or pending_ocr_identity(paper, library)):
+                elif action == EXTRACT:
                     extract_queue.add(paper.key, priority=concurrency.PRIORITY_URGENT)
             rec = _paper_dict(paper, library)
             rec["identifier"] = ident
@@ -1262,10 +1294,11 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
     def _paper(key: str) -> str:
         """One paper by citation key → the 9-field minimal record (title, authors,
         year, venue, abstract, doi, arxiv_id, citation_count) plus EXACTLY ONE
-        text reference (text_path or text_status). An unknown key returns the
-        structured not_found shape {"error":"not_found","key":…}."""
-        paper = library.get(key)
-        if paper is None:
+        text reference (text_path or text_status). An unknown, unresolved-alias,
+        or excluded key returns the structured not_found shape
+        {"error":"not_found","key":…}."""
+        paper = resolve_alias(library, key)
+        if paper is None or serving_excluded(paper):
             return json.dumps({"error": "not_found", "key": key})
         return json.dumps(_paper_dict(paper, library), ensure_ascii=False, indent=2)
 
@@ -1299,26 +1332,27 @@ BibTeX rendering and \\cite validation are NOT MCP tools — run the ``papervaul
         the caller can tell "wrong/mistyped key" from "this real paper has no
         servable full text" — the latter keeps the fail-closed ``""``.
         """
-        paper = library.get(key)
-        if paper is None:
+        if library.get(key) is None:
             # Distinct from the fail-closed "" below: the KEY is absent, not a
             # held paper with no servable text. Mirror library://paper/{key}.
             return json.dumps({"error": "not_found", "key": key})
-        if serving_excluded(paper) or pending_ocr_identity(paper, library):
+        paper = resolve_alias(library, key)
+        if paper is None or serving_excluded(paper) or pending_ocr_identity(paper, library):
             return ""
-        if not library.has_extract(key, fmt):
+        resolved_key = paper.key
+        if not library.has_extract(resolved_key, fmt):
             return ""
         if fmt == "md":
-            return library.md_path(key).read_text()
+            return library.md_path(resolved_key).read_text()
         # txt: NARROWED to the no-pdf migration rows (¬has_pdf ∧ ¬has_md) plus
         # the chokepoint's non-terminal + byte-floor guards. A PDF paper (the
         # pypdf interim writer is gone) never reaches here usefully.
-        if library.has_pdf(key) or library.has_extract(key, "md"):
+        if library.has_pdf(resolved_key) or library.has_extract(resolved_key, "md"):
             return ""
         status = paper.download_status or ""
         if status in DOWNLOAD_STATUS_TERMINAL:
             return ""
-        txt_path = library.txt_path(key)
+        txt_path = library.txt_path(resolved_key)
         try:
             if txt_path.stat().st_size < _MIN_TXT_SERVE_BYTES:
                 return ""

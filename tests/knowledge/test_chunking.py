@@ -113,3 +113,77 @@ def test_real_paper_size_and_boundaries(tok, name):
         # (a sentence flowing into a display-math block has no terminal '.')
         clean = body[-1:] in TERMINALS or any(body.endswith(s) for s in src_sents)
         assert clean, f"{name} chunk {c['chunk_order_index']} cut mid-sentence: ...{body[-60:]!r}"
+
+
+def test_preserves_paragraphs_headings_and_markdown_tables(tok):
+    table = "\n".join([
+        "| Mission | Energy | Flux |",
+        "| --- | --- | --- |",
+        "| Voyager 1 | 10 MeV | 1.2e-3 |",
+        "| ACE | 20 MeV | 4.5e-4 |",
+    ])
+    doc = (
+        "# Introduction\n\n"
+        "First paragraph explains cosmic rays. It has two sentences.\n\n"
+        "## Observations\n\n"
+        f"{table}\n\n"
+        "Concluding paragraph summarizes the measurements."
+    )
+    chunks = chunking_by_sentence_boundary(tok, doc, None, False, 30, 500)
+    assert len(chunks) == 1
+    content = chunks[0]["content"]
+    assert "# Introduction\n\n" in content
+    assert "## Observations\n\n" in content
+    assert table in content
+
+    # Oversized markdown table splits on row boundaries and repeats header+separator on every chunk.
+    big_rows = ["| ColA | ColB | ColC |", "| --- | --- | --- |"] + [
+        f"| Row{i} alpha beta | value_{i} gamma delta | note_{i} epsilon |" for i in range(60)
+    ]
+    big_table = "\n".join(big_rows)
+    table_chunks = chunking_by_sentence_boundary(tok, big_table, None, False, 10, 120)
+    assert len(table_chunks) >= 3
+    seen_rows = set()
+    for c in table_chunks:
+        assert c["tokens"] <= 120
+        assert c["tokens"] == len(tok.encode(c["content"]))
+        lines = c["content"].splitlines()
+        assert lines[0] == "| ColA | ColB | ColC |"
+        assert lines[1] == "| --- | --- | --- |"
+        assert len(lines) >= 3
+        for line in lines:
+            assert line.startswith("|") and line.endswith("|")
+        seen_rows.update(lines[2:])
+    assert len(seen_rows) == 60
+
+
+def test_overlap_carry_trimmed_so_large_next_unit_never_exceeds_limit(tok):
+    small = " ".join(f"Short sentence {i} ends cleanly." for i in range(12))
+    large = " ".join(f"token{i}" for i in range(75)) + "."
+    doc = small + " " + large
+    chunks = chunking_by_sentence_boundary(tok, doc, None, False, 40, 90)
+    assert len(chunks) >= 2
+    for c in chunks:
+        assert c["tokens"] <= 90
+        assert c["tokens"] == len(tok.encode(c["content"]))
+    assert "token74." in chunks[-1]["content"]
+
+
+def test_incremental_tokenization_stays_linear(tok):
+    calls = 0
+
+    class _CountingTok:
+        def encode(self, text):
+            nonlocal calls
+            calls += 1
+            return tok.encode(text)
+
+        def decode(self, ids):
+            return tok.decode(ids)
+
+    text = " ".join(f"Sentence number {i} contains enough words to test scaling." for i in range(300))
+    chunks = chunking_by_sentence_boundary(_CountingTok(), text, None, False, OVL, CTS)
+    assert len(chunks) >= 2
+    assert all(c["tokens"] <= CTS for c in chunks)
+    # Linear in sentence count (~300 units + boundary verifications), nowhere near O(N^2) (~45,000).
+    assert calls < 500, f"expected linear encode calls, got {calls}"

@@ -1022,3 +1022,99 @@ async def test_status_reads_batch_and_preserve_minimal_fallback(fake_ledger, mon
     else:
         rag.aget_docs_by_ids.assert_not_awaited()
         batch.assert_awaited_once_with(["paper:A", "paper:B"])
+
+
+async def test_reconcile_library_skips_basename_lookup_for_plain_done_meta_rows(fake_ledger):
+    from papervault.knowledge.scheduler.reconcile import reconcile_library
+
+    fake_ledger.rows = {
+        "M1": LedgerRecord("l0_probe", "paper", "M1", "META", "paper:M1", "done_meta"),
+        "M2": LedgerRecord("l0_probe", "paper", "M2", "META", "paper:M2", "done_meta"),
+    }
+    rag = FakeRag()
+    result = await reconcile_library(rag, {})
+    assert result["duplicates"] == 0
+    assert not any(kind == "get_doc_by_file_basename" for kind, _ in rag.calls)
+
+
+async def test_pg_duplicate_audit_rows_preserved_on_clear_and_read_by_reconcile(
+    fake_ledger, monkeypatch,
+):
+    """Under LightRAG 1.5.7 PostgreSQL, PGDocStatusStorage.get_doc_by_file_basename excludes
+    is_duplicate=true rows from filename conflicts. Therefore:
+    1) _clear_insert_path leaves PG dup-* audit rows intact instead of deleting audit history.
+    2) reconcile_library still reads those is_duplicate=true rows via find_doc_by_file_basename."""
+    from lightrag.utils_pipeline import compute_text_content_hash
+    from papervault.knowledge.scheduler.reconcile import reconcile_library
+
+    class _PgDb:
+        def __init__(self, rows: dict[str, dict]):
+            self._rows = rows
+            self.queries: list[tuple[str, list]] = []
+
+        async def query(self, sql, params=None, multi_rows=False):
+            self.queries.append((sql, list(params or [])))
+            _ws, basename = params[0], params[1]
+            matches = [
+                {"id": did, **row}
+                for did, row in self._rows.items()
+                if row.get("file_path") == basename
+            ]
+            if not matches:
+                return None
+            if "is_duplicate" in sql:
+                matches.sort(
+                    key=lambda r: (0 if (r.get("metadata") or {}).get("is_duplicate") else 1)
+                )
+            return matches[:1] if multi_rows else matches[0]
+
+    # 1. _clear_insert_path leaves PG is_duplicate=true audit row intact (LightRAG 1.5.7 excludes it).
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec: "body of Stale")
+    rag1 = FakeRag(markers={"dup-stale": _marker("Stale", "paper:Stale")})
+    rag1.doc_status.workspace = "l0_probe"
+    rag1.doc_status.db = _PgDb(rag1.rows)
+    rag1.doc_status.get_doc_by_file_basename = (
+        lambda bn: asyncio.sleep(0, result=None)  # simulates 1.5.7 excluding is_duplicate=true
+    )
+    blocker, purged = await distill._clear_insert_path(rag1, "Stale")
+    assert blocker is None and purged == 0
+    assert "dup-stale" in rag1.rows
+
+    # 2. reconcile_library adopts content_hash twin from hidden PG dup-* marker.
+    fake_ledger.rows["Dup"] = LedgerRecord("l0_probe", "paper", "Dup", "fpDup", "paper:Dup", "processing")
+    marker = _marker("Dup", "paper:Orig")
+    marker["metadata"]["duplicate_kind"] = "content_hash"
+    marker["content_hash"] = compute_text_content_hash("...")
+    rag2 = FakeRag(doc_statuses={"paper:Orig": "processed"}, markers={"dup-Dup": marker},
+                   full_docs_ids={"paper:Orig"})
+    rag2.doc_status.workspace = "l0_probe"
+    rag2.doc_status.db = _PgDb(rag2.rows)
+    rag2.doc_status.get_doc_by_file_basename = lambda bn: asyncio.sleep(0, result=None)
+    res = await reconcile_library(rag2, {})
+    assert res["duplicates"] == 1
+    assert fake_ledger.rows["Dup"].duplicate_of == "paper:Orig"
+
+
+async def test_distill_batch_prechecks_content_hash_via_doc_status_index(fake_ledger, monkeypatch):
+    from lightrag.utils_pipeline import compute_text_content_hash
+    from lightrag.utils import sanitize_text_for_encoding
+
+    body = "Shared scientific extract body."
+    monkeypatch.setattr(distill, "read_extract_raw", lambda rec: body)
+    expected_hash = compute_text_content_hash(sanitize_text_for_encoding(body))
+
+    rag = FakeRag(doc_statuses={"paper:Existing": "processed"})
+
+    async def get_by_hash(content_hash, *, exclude_doc_id=None):
+        if content_hash == expected_hash and exclude_doc_id != "paper:Existing":
+            return ("paper:Existing", {"status": "processed", "content_hash": expected_hash})
+        return None
+
+    rag.doc_status.get_doc_by_content_hash = get_by_hash
+    counters = await distill.distill_batch(rag, [(_rec("NewTwin"), "fpNew")])
+    assert counters["dup"] == 1 and counters["queued"] == 0
+    assert not any(kind == "enqueue" for kind, _ in rag.calls)
+    row = fake_ledger.rows["NewTwin"]
+    assert (row.status, row.duplicate_of, row.duplicate_content_hash) == (
+        "done_meta", "paper:Existing", expected_hash,
+    )

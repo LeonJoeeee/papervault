@@ -8,12 +8,17 @@ from download threads. It is independent of index backups and process memory.
 
 from __future__ import annotations
 
+import asyncio
+import atexit
+import copy
+import hashlib
 import json
 import math
 import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from typing import Literal
@@ -23,12 +28,139 @@ from pydantic import BaseModel, ConfigDict, Field
 from papervault.config import reopen_v2_enabled
 
 from .compat_v2 import BUDGET_LEDGER_FORMAT_VERSION, check_readable, check_versions
-from .state_v2 import Merge, Retrieval, admission, check_index_readable, effective_policy, resolved_identity
+from .state_v2 import Merge, Retrieval, _index_file_stamp, admission, check_index_readable, effective_policy, resolved_identity
 
 MAX_CAMPAIGN_CAP = 200
 WEEK_SECONDS = 7 * 86400
 DEFAULT_LEASE_SECONDS = 3600
 _ledger_lock = threading.RLock()
+_LEDGER_CACHE_MAX = 64
+_LEDGER_READ_CACHE: dict[str, tuple[tuple, list[dict]]] = {}
+_LEDGER_ABSENT_CACHE: dict[str, tuple] = {}
+_PG_ABSENT_POOLS_LOCK = threading.Lock()
+_PG_ABSENT_POOLS: dict[str, object] = {}
+
+
+def _close_absent_pools() -> None:
+    with _PG_ABSENT_POOLS_LOCK:
+        pools = list(_PG_ABSENT_POOLS.values())
+        _PG_ABSENT_POOLS.clear()
+    for pool in pools:
+        try:
+            pool.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_absent_pools)
+
+
+@contextmanager
+def _pg_absent_connection(dsn: str):
+    import psycopg
+    from papervault.store.persistence import _REAL_PSYCOPG_CONNECT
+
+    if psycopg.connect is not _REAL_PSYCOPG_CONNECT:
+        with psycopg.connect(dsn, autocommit=True, connect_timeout=5) as conn:
+            yield conn
+        return
+    with _PG_ABSENT_POOLS_LOCK:
+        pool = _PG_ABSENT_POOLS.get(dsn)
+        if pool is None:
+            from psycopg_pool import ConnectionPool
+            pool = ConnectionPool(
+                dsn,
+                min_size=1,
+                max_size=2,
+                open=True,
+                kwargs={"autocommit": True, "connect_timeout": 5},
+                check=ConnectionPool.check_connection,
+            )
+            _PG_ABSENT_POOLS[dsn] = pool
+    with pool.connection() as conn:
+        yield conn
+
+
+def _ledger_file_stamp(path: Path) -> tuple[tuple, str | None]:
+    """Return a cache stamp (and already-read text for small files) for ``path``."""
+    with path.open("rb") as stream:
+        st = os.fstat(stream.fileno())
+        if st.st_size <= 65536:
+            raw_bytes = stream.read()
+            digest = hashlib.blake2b(raw_bytes, digest_size=16).digest()
+            return (st.st_ino, st.st_mtime_ns, st.st_size, digest), raw_bytes.decode("utf-8")
+        head = stream.read(4096)
+        stream.seek(max(0, st.st_size - 4096))
+        tail = stream.read(4096)
+        return (st.st_ino, st.st_mtime_ns, st.st_size, head, tail), None
+
+
+def _extract_rev_stamp(row) -> tuple[int, int]:
+    if row is None:
+        return (0, 0)
+    if isinstance(row, dict):
+        return (int(row["max_rev"]), int(row["cnt"]))
+    return (int(row[0]), int(row[1]))
+
+
+def _pg_check_absent_ledger(root: Path, cache_key: str) -> None:
+    """Verify no persisted claims/merges exist in PG, caching by (max_rev, count)."""
+    from psycopg import sql
+    from papervault.store.persistence import _ORIG_POSTGRES_PERSISTENCE_LOAD, PostgresPersistence
+    from .services.identity_backfill import read_identity_records
+
+    # Honor test monkeypatches directly without caching synthetic results.
+    if (getattr(read_identity_records, "__module__", "") != "papervault.library.services.identity_backfill"
+            or PostgresPersistence.load is not _ORIG_POSTGRES_PERSISTENCE_LOAD):
+        if any(p.reopen_claim is not None or p.merge_budget is not None
+               for p in read_identity_records(root)):
+            raise LedgerError("budget ledger missing for persisted claims")
+        return
+
+    schema = os.environ.get("PAPERVAULT_CATALOG_SCHEMA", "catalog")
+    stamp_query = sql.SQL(
+        "SELECT COALESCE(MAX(revision), 0) AS max_rev, COUNT(*) AS cnt FROM {}"
+    )
+    claim_query = sql.SQL(
+        "SELECT 1 FROM {} "
+        "WHERE (payload ? 'reopen_claim' AND jsonb_typeof(payload->'reopen_claim') <> 'null') "
+        "   OR (payload ? 'merge_budget' AND jsonb_typeof(payload->'merge_budget') <> 'null') "
+        "LIMIT 1"
+    )
+
+    def _verify_on_conn(conn, table_ident, dsn_tag: str, schema_name: str) -> None:
+        max_rev, cnt = _extract_rev_stamp(conn.execute(stamp_query.format(table_ident)).fetchone())
+        absent_stamp = ("postgres", dsn_tag, schema_name, max_rev, cnt)
+        with _ledger_lock:
+            if _LEDGER_ABSENT_CACHE.get(cache_key) == absent_stamp:
+                return
+        if conn.execute(claim_query.format(table_ident)).fetchone() is not None:
+            raise LedgerError("budget ledger missing for persisted claims")
+        with _ledger_lock:
+            if len(_LEDGER_ABSENT_CACHE) >= _LEDGER_CACHE_MAX and cache_key not in _LEDGER_ABSENT_CACHE:
+                _LEDGER_ABSENT_CACHE.pop(next(iter(_LEDGER_ABSENT_CACHE)))
+            _LEDGER_ABSENT_CACHE[cache_key] = absent_stamp
+
+    backend = PostgresPersistence.from_environment()
+    try:
+        if getattr(backend, "repository", None) is not None and (
+                getattr(backend.repository, "__func__", None) is not PostgresPersistence.repository):
+            with backend.repository() as repo:
+                _verify_on_conn(
+                    repo.connection,
+                    repo._table("records"),
+                    f"repo:{id(backend.repository)}",
+                    getattr(repo, "schema", schema),
+                )
+            return
+        dsn = os.environ.get("PAPERVAULT_CATALOG_DSN", "")
+        if not dsn:
+            raise ValueError("postgres authority requires PAPERVAULT_CATALOG_DSN")
+        with _pg_absent_connection(dsn) as conn:
+            _verify_on_conn(conn, sql.Identifier(schema, "records"), dsn, schema)
+    finally:
+        if getattr(backend.repository, "__func__", None) is PostgresPersistence.repository:
+            backend.close()
 
 
 class ReopenClaim(BaseModel):
@@ -52,20 +184,29 @@ class BudgetLedger:
         self.clock = clock
 
     def _read(self) -> list[dict]:
+        cache_key = str(self.path)
         try:
-            raw = self.path.read_text(encoding="utf-8")
+            stamp, raw = _ledger_file_stamp(self.path)
         except FileNotFoundError:
             # Absence is initial zero only for a vault with no durable history.
             # A removed ledger must never reset budgets or weekly authorization.
-            if os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json") == "postgres":
-                from .services.identity_backfill import read_identity_records
+            authority = os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json")
+            if authority == "postgres":
                 try:
-                    if any(p.reopen_claim is not None or p.merge_budget is not None
-                           for p in read_identity_records(self.path.parent)):
-                        raise LedgerError("budget ledger missing for persisted claims")
-                except (OSError, ValueError, RuntimeError) as exc:
+                    _pg_check_absent_ledger(self.path.parent, cache_key)
+                except LedgerError:
+                    raise
+                except (OSError, ValueError, RuntimeError, Exception) as exc:
                     raise LedgerError(f"budget ledger missing; cannot establish initial accounting: {exc}") from exc
                 return []
+            absent_stamp = (
+                "json",
+                _index_file_stamp(self.path.parent / "index.json"),
+                _index_file_stamp(self.path.parent / "index.json.bak"),
+            )
+            with _ledger_lock:
+                if _LEDGER_ABSENT_CACHE.get(cache_key) == absent_stamp:
+                    return []
             for name in ("index.json", "index.json.bak"):
                 try:
                     check_index_readable(self.path.parent)
@@ -77,9 +218,25 @@ class BudgetLedger:
                     continue
                 except (OSError, UnicodeError, ValueError, AttributeError, TypeError) as exc:
                     raise LedgerError(f"budget ledger missing; cannot establish initial accounting: {exc}") from exc
+            with _ledger_lock:
+                if len(_LEDGER_ABSENT_CACHE) >= _LEDGER_CACHE_MAX and cache_key not in _LEDGER_ABSENT_CACHE:
+                    _LEDGER_ABSENT_CACHE.pop(next(iter(_LEDGER_ABSENT_CACHE)))
+                _LEDGER_ABSENT_CACHE[cache_key] = absent_stamp
             return []
         except (OSError, UnicodeError) as exc:
             raise LedgerError(f"unreadable budget ledger: {exc}") from exc
+
+        with _ledger_lock:
+            # Ledger exists on disk; clear any absent-clean cache so later deletion rechecks.
+            _LEDGER_ABSENT_CACHE.pop(cache_key, None)
+            cached = _LEDGER_READ_CACHE.get(cache_key)
+            if cached is not None and cached[0] == stamp:
+                return copy.deepcopy(cached[1])
+        if raw is None:
+            try:
+                raw = self.path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise LedgerError(f"unreadable budget ledger: {exc}") from exc
         try:
             if not raw or not raw.endswith("\n"):
                 raise ValueError("empty or truncated ledger")
@@ -177,7 +334,11 @@ class BudgetLedger:
                 else:
                     raise ValueError("unknown ledger event")
                 history.append(row)
-            return rows
+            with _ledger_lock:
+                if len(_LEDGER_READ_CACHE) >= _LEDGER_CACHE_MAX and cache_key not in _LEDGER_READ_CACHE:
+                    _LEDGER_READ_CACHE.pop(next(iter(_LEDGER_READ_CACHE)))
+                _LEDGER_READ_CACHE[cache_key] = (stamp, copy.deepcopy(rows))
+            return copy.deepcopy(rows)
         except (ValueError, KeyError, TypeError) as exc:
             raise LedgerError(f"unreadable budget ledger: {exc}") from exc
 
@@ -198,6 +359,10 @@ class BudgetLedger:
             os.fsync(directory)
         finally:
             os.close(directory)
+        cache_key = str(self.path)
+        with _ledger_lock:
+            _LEDGER_READ_CACHE.pop(cache_key, None)
+            _LEDGER_ABSENT_CACHE.pop(cache_key, None)
 
     def check_campaign(self, *, cap: int) -> None:
         if type(cap) is not int or not 1 <= cap <= MAX_CAMPAIGN_CAP:
@@ -429,7 +594,24 @@ class ClaimStore:
 
     def save(self) -> None:
         check_index_readable(self.library.root)
-        self.library.save(force=True, durable=True)
+        self.library.save(force=True, force_bib=False, durable=True)
+
+    @staticmethod
+    async def _run_off_loop(fn, *args, **kwargs):
+        """Run blocking claim/save I/O off-loop without releasing self.lock while running."""
+        task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if task.cancelled():
+            raise asyncio.CancelledError
+        result = task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def claim(self, key: str, *, expected_state, expected_generation: int,
                     campaign_id: str, ttl: float = DEFAULT_LEASE_SECONDS) -> ReopenClaim | None:
@@ -451,7 +633,7 @@ class ClaimStore:
             paper.reopen_claim = token
             paper.terminal_state = replace(paper.acquisition_state, retrieval=Retrieval.ELIGIBLE, cause="")
             paper.download_status = "pending"
-            self.save()
+            await self._run_off_loop(self.save)
             return token
 
     def current(self, token: ReopenClaim):
@@ -517,7 +699,7 @@ class ClaimStore:
                 if (not executor_proof and phase != "refund"
                         and (current.reopen_claim.phase != "queued" or phase != "reserve")):
                     return False
-                return self._not_sent(current, token)
+                return await self._run_off_loop(self._not_sent, current, token)
             if not self._orphaned(paper, token):
                 return False
             # A reservation precedes dispatch durably. Absence from the record
@@ -530,7 +712,7 @@ class ClaimStore:
             if (paper.download_status == "pending"
                     and paper.acquisition_state.retrieval in {Retrieval.ELIGIBLE, Retrieval.IN_PROGRESS}):
                 paper.download_status = "failed"
-            self.save()
+            await self._run_off_loop(self.save)
             return True
 
     def allowed(self, token: ReopenClaim, *, executing: bool = False) -> bool:
@@ -547,15 +729,53 @@ class ClaimStore:
 
     def _quarantine(self, paper, reason: str) -> None:
         paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
-        self.save()
+        if not getattr(self, "_quarantine_skip_save", False):
+            self.save()
         self.library.log({"event": "reopen_quarantine", "key": paper.key, "reason": reason,
                           "generation": paper.reopen_claim.generation if paper.reopen_claim else record_generation(paper)})
+
+    async def _quarantine_async(self, paper, reason: str) -> None:
+        # Persist the quarantined copy off-loop before mutating the live Paper
+        # reference, then finalize through self._quarantine() on the event loop
+        # (skipping the already-completed save) so _quarantine hooks run on the
+        # loop thread and callers (e.g. watch_lease -> record_censored) execute
+        # in the same loop turn as paper.acquisition_state.quarantine flips.
+        quarantined_state = replace(paper.acquisition_state, quarantine=True)
+        staged = paper.model_copy(update={"terminal_state": quarantined_state})
+        key = paper.key
+        previous = self.library._papers.get(key)
+        self.library._papers[key] = staged
+        saved = False
+
+        def _do_save() -> None:
+            nonlocal saved
+            self.save()
+            saved = True
+
+        def _finalize_live() -> None:
+            if self.library._papers.get(key) is staged and previous is paper:
+                self.library._papers[key] = paper
+            self._quarantine_skip_save = True
+            try:
+                self._quarantine(paper, reason)
+            finally:
+                self._quarantine_skip_save = False
+
+        try:
+            await self._run_off_loop(_do_save)
+        except BaseException:
+            if saved:
+                _finalize_live()
+            elif previous is not None:
+                self.library._papers[key] = previous
+            raise
+        _finalize_live()
 
     async def quarantine(self, token: ReopenClaim, *, reason: str) -> None:
         async with self.lock:
             paper = self.current(token)
             if paper is not None:
-                self._quarantine(paper, reason)
+                await self._quarantine_async(paper, reason)
 
     async def expire(self, key: str, *, token: ReopenClaim | None = None) -> bool:
         async with self.lock:
@@ -565,7 +785,7 @@ class ClaimStore:
                     or paper.reopen_claim.phase not in {"queued", "dispatched"}
                     or self.clock() < paper.reopen_claim.lease_expiry):
                 return False
-            self._quarantine(paper, "lease expired without drain evidence")
+            await self._quarantine_async(paper, "lease expired without drain evidence")
             return True
 
     async def pre_dispatch(self, token: ReopenClaim) -> bool:
@@ -581,21 +801,21 @@ class ClaimStore:
                 admission_denied(self.library, token, "settled_attempt")
                 return False
             if paper.reopen_claim.phase == "dispatched" or phase == "dispatch":
-                self._quarantine(paper, "dispatch outcome uncertain; refusing replay")
+                await self._quarantine_async(paper, "dispatch outcome uncertain; refusing replay")
                 admission_denied(self.library, token, "uncertain_dispatch")
                 return False
             if self.clock() >= paper.reopen_claim.lease_expiry:
-                self._quarantine(paper, "lease expired before dispatch")
+                await self._quarantine_async(paper, "lease expired before dispatch")
                 admission_denied(self.library, token, "expired_lease")
                 return False
             if not self.allowed(token):
                 admission_denied(self.library, token, "acquisition_guard")
-                self._not_sent(paper, token)
+                await self._run_off_loop(self._not_sent, paper, token)
                 return False
             self.ledger.dispatch(token)
             paper.reopen_claim = token.model_copy(update={"phase": "dispatched"})
             paper.terminal_state = replace(paper.acquisition_state, retrieval=Retrieval.IN_PROGRESS)
-            self.save()
+            await self._run_off_loop(self.save)
             return True
 
     def _not_sent(self, paper, token: ReopenClaim) -> bool:
@@ -624,7 +844,7 @@ class ClaimStore:
             # its interrupted record write without refunding the budget twice.
             if not executor_proof and phase != "refund" and (paper.reopen_claim.phase != "queued" or phase != "reserve"):
                 return False
-            return self._not_sent(paper, token) if paper else False
+            return await self._run_off_loop(self._not_sent, paper, token) if paper else False
 
     async def release_quarantine(self, key: str, *, drained_lease_id: str = "",
                                  human_reason: str = "", expected_lease_id: str = "") -> bool:
@@ -639,7 +859,7 @@ class ClaimStore:
                         or expected_lease_id or drained_lease_id or not human_reason.strip()):
                     return False
                 paper.terminal_state = replace(paper.acquisition_state, quarantine=False)
-                self.save()
+                await self._run_off_loop(self.save)
                 return True
             fenced = self._release_fence(claim) if claim is not None else None
             if (paper is None or claim is None or not paper.acquisition_state.quarantine
@@ -661,5 +881,5 @@ class ClaimStore:
                     and paper.acquisition_state.retrieval in {Retrieval.ELIGIBLE, Retrieval.IN_PROGRESS}):
                 paper.download_status = "failed"
             paper.terminal_state = replace(paper.acquisition_state, quarantine=False)
-            self.save()
+            await self._run_off_loop(self.save)
             return True

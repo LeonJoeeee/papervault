@@ -237,3 +237,197 @@ def test_query_cancellation_drains_decomposition(monkeypatch):
             await query
         assert stopped.is_set()
     _run(scenario())
+
+
+def test_tail_textbook_chunk_cannot_evict_top_consensus_research_paper(monkeypatch):
+    """A low-ranked tangential textbook chunk must not evict #1 consensus research papers, while
+    a top-ranked textbook still surfaces cleanly and preliminary sources stay demoted."""
+    from papervault.knowledge.ingest.abstract_doc import ABSTRACT_HEADER
+
+    _patch_decompose(monkeypatch, 2)
+    monkeypatch.setattr(mq.aq, "_CHUNK_TOP_K", 3)
+    monkeypatch.setattr(mq, "_MQ_MAX_CHUNKS_PER_PAPER", 4)
+
+    base = _strong_base()
+    base["data"]["chunks"] = [
+        {"chunk_id": "p1", "file_path": "paper/Consensus1", "content": "Consensus paper 1"},
+        {"chunk_id": "p2", "file_path": "paper/Consensus2", "content": "Consensus paper 2"},
+        {"chunk_id": "p3", "file_path": "paper/Consensus3", "content": "Consensus paper 3"},
+        {"chunk_id": "nb", "file_path": "notebook:idea-1", "content": "Preliminary note"},
+        {"chunk_id": "wb", "file_path": "web:nasa", "content": "Preliminary web page"},
+        {"chunk_id": "ab", "file_path": "paper/Stub", "content": ABSTRACT_HEADER + "\nAbstract"},
+        *[
+            {"chunk_id": f"fill{i}", "file_path": f"paper/Fill{i}", "content": f"Filler {i}"}
+            for i in range(40)
+        ],
+        {"chunk_id": "tail_tb", "file_path": "textbook:Tangential2002#s99", "content": "Tangential textbook"},
+    ]
+    facet_a = _ok_facet("Consensus1")
+    facet_a["data"]["chunks"] = [
+        {"chunk_id": "p1", "file_path": "paper/Consensus1", "content": "Consensus paper 1"},
+        {"chunk_id": "p2", "file_path": "paper/Consensus2", "content": "Consensus paper 2"},
+    ]
+    facet_b = _ok_facet("Consensus1")
+    facet_b["data"]["chunks"] = [
+        {"chunk_id": "p1", "file_path": "paper/Consensus1", "content": "Consensus paper 1"},
+        {"chunk_id": "p3", "file_path": "paper/Consensus3", "content": "Consensus paper 3"},
+    ]
+    data, _, fused = _run(mq.retrieve_fused("anchor", _StubRag(base, [facet_a, facet_b])))
+    assert fused is True
+    served = [c["file_path"] for c in data["chunks"]]
+    assert served[0] == "paper/Consensus1"
+    assert "textbook:Tangential2002#s99" not in served
+    assert "notebook:idea-1" not in served and "web:nasa" not in served
+
+
+def test_preliminary_sources_demoted_below_fulltext_and_abstract_only():
+    from papervault.knowledge.ingest.abstract_doc import ABSTRACT_HEADER
+
+    scored = [
+        ({"file_path": "notebook:idea-1", "content": "note"}, 1.0),
+        ({"file_path": "web:nasa", "content": "web"}, 0.9),
+        ({"file_path": "paper/Abs", "content": ABSTRACT_HEADER + "\nabstract"}, 0.5),
+        ({"file_path": "paper/Full", "content": "full text"}, 0.2),
+    ]
+    ordered = mq._order_chunks_by_tier(scored)
+    assert [c["file_path"] for c in ordered] == [
+        "paper/Full", "paper/Abs", "notebook:idea-1", "web:nasa",
+    ]
+
+
+def test_decompose_parses_inline_n_sources_and_legacy_bare_array(monkeypatch):
+    async def obj_reply(*args, **kwargs):
+        return '{"n_sources": 11, "facets": [{"query": "q1", "hl": ["a"], "ll": ["b"]}]}'
+
+    monkeypatch.setattr(mq, "mimo_complete", obj_reply)
+    facets = _run(mq._decompose("broad query"))
+    assert list(facets) == [{"query": "q1", "hl": ["a"], "ll": ["b"]}]
+    assert facets.n_sources == 11
+
+    async def arr_reply(*args, **kwargs):
+        return '[{"query": "q2", "hl": ["a"], "ll": []}]'
+
+    monkeypatch.setattr(mq, "mimo_complete", arr_reply)
+    legacy = _run(mq._decompose("narrow query"))
+    assert list(legacy) == [{"query": "q2", "hl": ["a"], "ll": []}]
+    assert legacy.n_sources is None
+
+
+def test_weak_coverage_with_enough_entities_allows_multiquery_fanout(monkeypatch):
+    from papervault.knowledge.ingest.abstract_doc import ABSTRACT_HEADER
+
+    _patch_decompose(monkeypatch, 1)
+    weak_base = {
+        "status": "success",
+        "data": {
+            "entities": [], "relationships": [],
+            "chunks": [{"file_path": "paper/Abs", "content": ABSTRACT_HEADER + "\nAbstract only"}],
+            "references": [{"file_path": "paper/Abs"}],
+        },
+        "metadata": {"processing_info": {"total_entities_found": 10}},
+    }
+    data, _, fused = _run(mq.retrieve_fused("topic", _StubRag(weak_base, [_ok_facet("FullPaper")])))
+    assert fused is True
+    assert any(c["file_path"] == "paper/FullPaper" for c in data["chunks"])
+
+
+def test_citation_map_reloads_when_file_changes(tmp_path, monkeypatch):
+    import json
+    import os
+
+    cmap = tmp_path / "citation_map.json"
+    cmap.write_text(json.dumps({"A": 10}), encoding="utf-8")
+    monkeypatch.setattr(mq, "_CITATION_MAP_PATH", cmap)
+    monkeypatch.setattr(mq, "_citation_cache", None)
+    assert mq._citation_map() == {"A": 10}
+
+    cmap.write_text(json.dumps({"A": 10, "B": 99}), encoding="utf-8")
+    st = cmap.stat()
+    os.utime(cmap, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    assert mq._citation_map() == {"A": 10, "B": 99}
+
+
+def test_rrf_chunk_id_undirected_rel_retrieve_standard_tokens_and_domain_prompt(monkeypatch):
+    from papervault.domain import get_domain
+
+    # Default per-paper chunk cap is 4 (not uncapped 0).
+    assert mq._MQ_MAX_CHUNKS_PER_PAPER == 4
+    assert get_domain().label in mq._DECOMPOSE_SYSTEM
+    assert "radiation-tolerant" in mq._DECOMPOSE_SYSTEM.lower()
+
+    # chunk_id fuses chunks even if whitespace/content slightly varies.
+    fused_chunks = mq._rrf_scored(
+        [
+            [{"chunk_id": "cid-1", "content": "alpha", "file_path": "paper/A"}],
+            [{"chunk_id": "cid-1", "content": "alpha (variant)", "file_path": "paper/A"}],
+        ],
+        key_fn=mq._chunk_key,
+    )
+    assert len(fused_chunks) == 1
+
+    # Undirected relationship RRF key fuses (A, B) and (B, A) into one edge.
+    fused_rels = mq._rrf(
+        [
+            [{"src_id": "CME", "tgt_id": "SEP"}],
+            [{"src_id": "SEP", "tgt_id": "CME"}],
+        ],
+        key_fn=mq._undirected_rel_key,
+    )
+    assert len(fused_rels) == 1
+
+    # retrieve_standard forwards max_total_tokens=_MAX_TOTAL_TOKENS into QueryParam.
+    seen_params = []
+
+    async def fake_decompose(*args, **kwargs):
+        return [{"query": "f1", "hl": ["h"], "ll": ["l"]}]
+
+    class Rag:
+        async def aquery_data(self, q, param):
+            seen_params.append(param)
+            return _strong_base()
+
+    monkeypatch.setattr(mq, "_decompose_standard", fake_decompose)
+    _run(mq.retrieve_standard("intent", Rag()))
+    assert seen_params and seen_params[0].max_total_tokens == mq._MAX_TOTAL_TOKENS
+
+
+def test_per_paper_cap_uses_paper_key_when_file_path_absent(monkeypatch):
+    """Chunks carrying only paper_key (no file_path) must bucket by paper_key, not collapse into 'unknown'."""
+    _patch_decompose(monkeypatch, 1)
+    monkeypatch.setattr(mq.aq, "_CHUNK_TOP_K", 6)
+    monkeypatch.setattr(mq, "_MQ_MAX_CHUNKS_PER_PAPER", 1)
+    base = _strong_base()
+    base["data"]["chunks"] = [
+        {"chunk_id": "a1", "paper_key": "PaperA", "content": "PaperA chunk 1"},
+        {"chunk_id": "a2", "paper_key": "PaperA", "content": "PaperA chunk 2"},
+        {"chunk_id": "b1", "paper_key": "PaperB", "content": "PaperB chunk 1"},
+        {"chunk_id": "c1", "paper_key": "PaperC", "content": "PaperC chunk 1"},
+        {"chunk_id": "d1", "paper_key": "PaperD", "content": "PaperD chunk 1"},
+    ]
+    data, _, fused = _run(mq.retrieve_fused("anchor", _StubRag(base, [_ok_facet("FacetX")])))
+    assert fused is True
+    keys = [c.get("paper_key") or c.get("file_path") for c in data["chunks"]]
+    assert set(keys) >= {"PaperA", "PaperB", "PaperC", "PaperD"}
+    assert keys.count("PaperA") == 1
+
+
+def test_empty_citation_map_preserves_rrf_fusion_scores_against_canon_boost(monkeypatch):
+    """When citation_map is empty, _CITATION_PRIOR must NOT discard multi-facet RRF fusion scores."""
+    _patch_decompose(monkeypatch, 2)
+    monkeypatch.setattr(mq, "_CITATION_PRIOR", True)
+    monkeypatch.setattr(mq, "_citation_map", lambda: {})
+    monkeypatch.setattr(mq.aq, "_CHUNK_TOP_K", 2)
+
+    base = _strong_base()
+    base["data"]["chunks"] = [
+        {"chunk_id": "tb1", "file_path": "textbook:Book2002#s1", "content": "Single-facet textbook"},
+        {"chunk_id": "p1", "file_path": "paper/Consensus2023", "content": "Multi-facet consensus"},
+    ]
+    f1 = _ok_facet("Consensus2023")
+    f1["data"]["chunks"] = [{"chunk_id": "p1", "file_path": "paper/Consensus2023", "content": "Multi-facet consensus"}]
+    f2 = _ok_facet("Consensus2023")
+    f2["data"]["chunks"] = [{"chunk_id": "p1", "file_path": "paper/Consensus2023", "content": "Multi-facet consensus"}]
+    data, _, fused = _run(mq.retrieve_fused("anchor", _StubRag(base, [f1, f2])))
+    assert fused is True
+    # Consensus2023 appeared in 3 lists (RRF ~0.0497) vs Book2002 in 1 list + canon boost (~0.0183)
+    assert data["chunks"][0]["file_path"] == "paper/Consensus2023"

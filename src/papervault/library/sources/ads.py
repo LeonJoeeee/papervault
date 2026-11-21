@@ -27,6 +27,7 @@ FIELDS = ("title,author,year,abstract,doi,identifier,bibcode,pub,"
          "citation_count,read_count")
 MAX_RETRIES = 5
 RETRY_DELAY = 5.0
+RETRY_BUDGET_S = 25.0
 MAX_AUTHORS = 30
 
 _ARXIV_TOKEN_RE = re.compile(r"(?:(?:arxiv:|oai:arxiv\.org:)\s*)?([^\s:]+)", re.I)
@@ -83,12 +84,22 @@ def search_ads(query: str, max_results: int = 30) -> list[dict[str, Any]]:
     }
 
     failure = BackendDegraded("ADS no response")
+    deadline = time.monotonic() + RETRY_BUDGET_S
+    resp = None
     for attempt in range(MAX_RETRIES):
+        remaining = deadline - time.monotonic()
+        if attempt > 0 and remaining <= 0:
+            break
+        req_timeout = min(25.0, max(1.0, remaining))
         try:
-            resp = requests.get(API_URL, params=params, headers=headers, timeout=30)
+            resp = requests.get(API_URL, params=params, headers=headers, timeout=req_timeout)
             if resp.status_code == 429:
                 failure = backend_degraded(response=resp)
-                time.sleep(RETRY_DELAY)
+                if attempt < MAX_RETRIES - 1:
+                    remaining_now = deadline - time.monotonic()
+                    if remaining_now <= RETRY_DELAY:
+                        break
+                    time.sleep(RETRY_DELAY)
                 continue
             # A WAF captcha is not evidence of rejected credentials.
             if resp.headers.get("x-amzn-waf-action") == "captcha" or resp.status_code == 405:
@@ -101,12 +112,19 @@ def search_ads(query: str, max_results: int = 30) -> list[dict[str, Any]]:
                                       code="authentication_failed", retryability="permanent")
             resp.raise_for_status()
             break
-        except requests.ConnectionError as error:
+        except (requests.ConnectionError, requests.Timeout) as error:
             failure = backend_degraded(error)
-            time.sleep(RETRY_DELAY)
+            resp = None
+            if attempt < MAX_RETRIES - 1:
+                remaining_now = deadline - time.monotonic()
+                if remaining_now <= RETRY_DELAY:
+                    break
+                time.sleep(RETRY_DELAY)
         except requests.HTTPError as error:
             raise backend_degraded(error) from error
     else:
+        raise failure
+    if resp is None or not resp.ok:
         raise failure
 
     data = resp.json()

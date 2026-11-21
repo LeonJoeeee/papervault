@@ -13,15 +13,63 @@ instead of silently yielding empty records).
 """
 from __future__ import annotations
 
+import atexit
 import json
 import logging
+import os
 import re
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+import psycopg
+from psycopg import sql
+from psycopg.rows import dict_row
+
 logger = logging.getLogger("ks.ingest.paper_library_client")
+_REAL_PSYCOPG_CONNECT = psycopg.connect
+_PG_POOL_LOCK = threading.Lock()
+_PG_POOLS: dict[str, Any] = {}
+
+
+def _close_pg_pools() -> None:
+    with _PG_POOL_LOCK:
+        pools = list(_PG_POOLS.values())
+        _PG_POOLS.clear()
+    for pool in pools:
+        try:
+            pool.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_pg_pools)
+
+
+@contextmanager
+def _pg_connection(dsn: str):
+    if psycopg.connect is not _REAL_PSYCOPG_CONNECT:
+        with psycopg.connect(dsn, autocommit=True, connect_timeout=5, row_factory=dict_row) as conn:
+            yield conn
+        return
+    with _PG_POOL_LOCK:
+        pool = _PG_POOLS.get(dsn)
+        if pool is None:
+            from psycopg_pool import ConnectionPool
+            pool = ConnectionPool(
+                dsn,
+                min_size=1,
+                max_size=2,
+                open=True,
+                kwargs={"autocommit": True, "connect_timeout": 5, "row_factory": dict_row},
+                check=ConnectionPool.check_connection,
+            )
+            _PG_POOLS[dsn] = pool
+    with pool.connection() as conn:
+        yield conn
 
 # Resolve the vault from the SAME source the library plane writes through
 # (papervault.config.VAULT_PATH: PAPERVAULT_VAULT -> legacy PAPER_LIBRARY_PATH ->
@@ -82,6 +130,18 @@ class PaperRecord:
     merge_intent: Optional[dict[str, Any]] = None
 
     @property
+    def is_deterministic_garbage(self) -> bool:
+        """True when bibliographic metadata matches the two-way deterministic garbage fence.
+
+        Checked on NEW distillation intake (``diff()`` / ``reconcile_library()``) rather than
+        ``eligible`` so pre-fence already-distilled graph documents are not retroactively
+        mass-purged on upgrade.
+        """
+        from papervault.library.services.registration import deterministic_garbage_reason
+
+        return bool(deterministic_garbage_reason(self))
+
+    @property
     def eligible(self) -> bool:
         if self.domain_status is not None or self.merge_intent is not None:
             return False
@@ -109,16 +169,16 @@ class PaperRecord:
     def from_index_entry(cls, entry: dict[str, Any]) -> "PaperRecord":
         return cls(
             key=entry["key"],
-            title=entry.get("title", ""),
+            title=entry.get("title") or "",
             authors=entry.get("authors", []) or [],
             year=entry.get("year"),
-            venue=entry.get("venue", ""),
-            abstract=entry.get("abstract", ""),
-            doi=entry.get("doi", ""),
-            arxiv_id=entry.get("arxiv_id", ""),
-            url=entry.get("url", ""),
-            citation_count=entry.get("citation_count", 0),
-            is_review=entry.get("is_review", False),
+            venue=entry.get("venue") or "",
+            abstract=entry.get("abstract") or "",
+            doi=entry.get("doi") or "",
+            arxiv_id=entry.get("arxiv_id") or "",
+            url=entry.get("url") or "",
+            citation_count=entry.get("citation_count", 0) or 0,
+            is_review=bool(entry.get("is_review", False)),
             publication_types=entry.get("publication_types", []) or [],
             pdf_path=entry.get("pdf_path"),
             txt_path=entry.get("txt_path"),
@@ -126,7 +186,7 @@ class PaperRecord:
             distilled_at=entry.get("distilled_at"),
             insight=entry.get("insight"),
             insight_invalid_reason=entry.get("insight_invalid_reason"),
-            source_type=entry.get("source_type", "research_paper"),
+            source_type=entry.get("source_type", "research_paper") or "research_paper",
             domain_status=entry.get("domain_status"),
             download_status=entry.get("download_status") or "",
             terminal_state=entry.get("terminal_state"),
@@ -174,33 +234,118 @@ class PaperRecord:
         return None
 
 
+def _use_pg_catalog(vault_path: Path) -> tuple[str, str] | None:
+    """Return (dsn, schema) when reading the default vault under PG authority.
+
+    Fails closed when PG authority is enabled for ``DEFAULT_VAULT`` without
+    ``PAPERVAULT_CATALOG_DSN`` (never silently falls back to stale index.json).
+    Explicit non-default vault paths (e.g. isolated test vaults) continue to
+    read ``{vault_path}/index.json``.
+    """
+    if os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json") != "postgres":
+        return None
+    try:
+        if Path(vault_path).resolve() != Path(DEFAULT_VAULT).resolve():
+            return None
+    except OSError:
+        return None
+    dsn = os.environ.get("PAPERVAULT_CATALOG_DSN", "").strip()
+    if not dsn:
+        raise ValueError("postgres authority requires PAPERVAULT_CATALOG_DSN")
+    schema = os.environ.get("PAPERVAULT_CATALOG_SCHEMA", "catalog").strip() or "catalog"
+    if not re.fullmatch(r"catalog(?:_[a-z0-9_]+)?", schema):
+        raise ValueError("catalog schema must be catalog or catalog_<suffix>")
+    return dsn, schema
+
+
+def _pg_catalog_stamp(dsn: str, schema: str) -> tuple[int, int, int]:
+    with _pg_connection(dsn) as conn:
+        row = conn.execute(sql.SQL(
+            "SELECT COALESCE(SUM(revision), 0) AS sum_rev, "
+            "COALESCE(MAX(revision), 0) AS max_rev, COUNT(*) AS cnt FROM {}"
+        ).format(sql.Identifier(schema, "records"))).fetchone()
+    return int(row["sum_rev"]), int(row["max_rev"]), int(row["cnt"])
+
+
+def _read_pg_records(dsn: str, schema: str, *, include_quarantined: bool) -> dict[str, PaperRecord]:
+    with _pg_connection(dsn) as conn:
+        rows = conn.execute(sql.SQL(
+            "SELECT key, payload FROM {} ORDER BY key"
+        ).format(sql.Identifier(schema, "records"))).fetchall()
+    recs = {row["key"]: PaperRecord.from_index_entry(row["payload"]) for row in rows}
+    if include_quarantined:
+        return recs
+    return {k: r for k, r in recs.items() if r.eligible}
+
+
+@lru_cache(maxsize=1)
+def _load_pg_vault_index(
+    dsn: str, schema: str, sum_rev: int, max_rev: int, cnt: int,
+) -> dict[str, PaperRecord]:
+    return _read_pg_records(dsn, schema, include_quarantined=False)
+
+
+@lru_cache(maxsize=1)
+def _load_pg_vault_index_all(
+    dsn: str, schema: str, sum_rev: int, max_rev: int, cnt: int,
+) -> dict[str, PaperRecord]:
+    return _read_pg_records(dsn, schema, include_quarantined=True)
+
+
+def _dir_mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def catalog_state_token(vault_path: Path = DEFAULT_VAULT) -> tuple:
+    """Cheap monotonic-ish state token for scheduler idle change-detection."""
+    vault = Path(vault_path)
+    md_mtime = _dir_mtime_ns(vault / "extracts" / "md")
+    pg_target = _use_pg_catalog(vault)
+    if pg_target is not None:
+        dsn, schema = pg_target
+        sum_rev, max_rev, cnt = _pg_catalog_stamp(dsn, schema)
+        return ("pg", schema, sum_rev, max_rev, cnt, md_mtime)
+    index_file = (vault / "index.json").resolve()
+    st = index_file.stat()
+    return ("json", str(index_file), st.st_mtime_ns, st.st_size, md_mtime)
+
+
 def load_vault_index(
     vault_path: Path = DEFAULT_VAULT, *, include_quarantined: bool = False
 ) -> dict[str, PaperRecord]:
-    """Load papers from {vault}/index.json.
+    """Load papers from PostgreSQL catalog (when PG-authoritative for DEFAULT_VAULT)
+    or ``{vault}/index.json``.
 
     By DEFAULT returns the library's clean view — papers domain-quarantined at the
     source (``domain_status`` set: off_domain / non_paper / bad_extract, per
-    paper-library Phase 32), terminal policy exclusions, quarantines, merge
-    aliases and pending merges are excluded, so the KS graph build never ingests
-    off-domain contamination and no KS-side domain classifier is needed. Pass
-    ``include_quarantined=True`` for audits.
+    paper-library Phase 32), deterministic metadata garbage, terminal policy
+    exclusions, quarantines, merge aliases and pending merges are excluded, so the
+    KS graph build never ingests off-domain contamination and no KS-side domain
+    classifier is needed. Pass ``include_quarantined=True`` for audits.
 
-    Version-checks the index so a paper-library export-format change is loud (a
+    Version-checks index.json so a paper-library export-format change is loud (a
     warning) rather than silently mapping every field to its default.
     """
-    index_file = (vault_path / "index.json").resolve()
+    pg_target = _use_pg_catalog(Path(vault_path))
+    if pg_target is not None:
+        dsn, schema = pg_target
+        sum_rev, max_rev, cnt = _pg_catalog_stamp(dsn, schema)
+        loader = _load_pg_vault_index_all if include_quarantined else _load_pg_vault_index
+        cached = loader(dsn, schema, sum_rev, max_rev, cnt)
+        return {key: replace(rec) for key, rec in cached.items()}
+    index_file = (Path(vault_path) / "index.json").resolve()
     stat = index_file.stat()
-    cached = _load_vault_index(str(index_file), stat.st_mtime_ns, stat.st_size,
-                               bool(include_quarantined))
+    if include_quarantined:
+        cached = _load_vault_index_all(str(index_file), stat.st_mtime_ns, stat.st_size)
+    else:
+        cached = _load_vault_index(str(index_file), stat.st_mtime_ns, stat.st_size)
     return {key: replace(rec) for key, rec in cached.items()}
 
 
-@lru_cache(maxsize=4)
-def _load_vault_index(
-    index_file: str, mtime_ns: int, size: int, include_quarantined: bool,
-) -> dict[str, PaperRecord]:
-    """Keep a bounded set of parsed snapshots, including their eligibility decisions."""
+def _read_json_vault_index(index_file: str, *, include_quarantined: bool) -> dict[str, PaperRecord]:
     with open(index_file) as f:
         index = json.load(f)
     version = index.get("version")
@@ -217,6 +362,22 @@ def _load_vault_index(
     if include_quarantined:
         return recs
     return {k: r for k, r in recs.items() if r.eligible}
+
+
+@lru_cache(maxsize=1)
+def _load_vault_index(
+    index_file: str, mtime_ns: int, size: int,
+) -> dict[str, PaperRecord]:
+    """Keep at most one parsed clean snapshot in RAM."""
+    return _read_json_vault_index(index_file, include_quarantined=False)
+
+
+@lru_cache(maxsize=1)
+def _load_vault_index_all(
+    index_file: str, mtime_ns: int, size: int,
+) -> dict[str, PaperRecord]:
+    """Keep at most one parsed full audit snapshot in RAM."""
+    return _read_json_vault_index(index_file, include_quarantined=True)
 
 
 def iter_distilled(vault_path: Path = DEFAULT_VAULT) -> Iterator[PaperRecord]:

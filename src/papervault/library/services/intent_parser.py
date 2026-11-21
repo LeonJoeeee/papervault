@@ -476,14 +476,26 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
         with observe_llm_calls(calls.append):
             if llm is None:
                 llm = get_llm(model=route("intent"))
-            raw = llm.call([
+            messages = [
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": f"Intent: {query}\nOutput:"},
-            ])
-        code = "intent_response_invalid"
-        plan = _parse_response(query, raw)
-        code = None
-        return plan
+            ]
+            for attempt in range(2):
+                code = "intent_call_failed"
+                raw = llm.call(messages)
+                code = "intent_response_invalid"
+                try:
+                    plan = _parse_response(query, raw)
+                    code = None
+                    return plan
+                except ValueError as exc:
+                    if attempt == 0 and (query or "").strip():
+                        logger.warning(
+                            "intent_parser: malformed JSON response on attempt 1; retrying once: %s",
+                            exc,
+                        )
+                        continue
+                    raise
     finally:
         callback = _intent_observer.get()
         if callback is not None:
@@ -501,18 +513,48 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
                 logger.warning("intent observation unavailable")
 
 
+_PLAN_KEYS = frozenset({
+    "search_terms",
+    "kg_concepts",
+    "limit_suggested",
+    "limit",
+    "ranking_hint",
+    "reasoning",
+    "named_entities",
+})
+
+
+def _extract_json_object(raw: str) -> dict:
+    """Scan ``raw`` with ``json.JSONDecoder.raw_decode`` for a top-level plan JSON object."""
+    text = (raw or "").strip()
+    if not text:
+        raise ValueError("intent_parser: no JSON in LLM response: ")
+    decoder = json.JSONDecoder()
+    pos = 0
+    last_err: json.JSONDecodeError | None = None
+    saw_unrelated_dict = False
+    while True:
+        idx = text.find("{", pos)
+        if idx == -1:
+            break
+        try:
+            obj, _ = decoder.raw_decode(text, idx)
+            if isinstance(obj, dict):
+                if _PLAN_KEYS.intersection(obj):
+                    return obj
+                saw_unrelated_dict = True
+        except json.JSONDecodeError as e:
+            last_err = e
+        pos = idx + 1
+    if last_err is not None:
+        raise ValueError(f"intent_parser: malformed JSON: {last_err}; raw={text[:200]}") from last_err
+    if saw_unrelated_dict:
+        raise ValueError(f"intent_parser: JSON object missing top-level plan keys: {text[:200]}")
+    raise ValueError(f"intent_parser: no JSON in LLM response: {text[:200]}")
+
+
 def _parse_response(query: str, raw: str) -> SearchPlan:
-
-    # Extract JSON object from response (handles wrapping prose if LLM
-    # ignores the "ONLY JSON" instruction)
-    m = re.search(r"\{.*\}", raw or "", re.S)
-    if not m:
-        raise ValueError(f"intent_parser: no JSON in LLM response: {(raw or '')[:200]}")
-
-    try:
-        parsed = json.loads(m.group(0))
-    except json.JSONDecodeError as e:
-        raise ValueError(f"intent_parser: malformed JSON: {e}; raw={m.group(0)[:200]}")
+    parsed = _extract_json_object(raw)
 
     # Normalize + validate. The raw-query fallback (LLM returned no/empty
     # search_terms) re-injects the query as a single literal anchor term — but
@@ -522,20 +564,26 @@ def _parse_response(query: str, raw: str) -> SearchPlan:
     search_terms = parsed.get("search_terms") or [_query_anchor]
     if not isinstance(search_terms, list) or not search_terms:
         search_terms = [_query_anchor]
-    # Strip/filter-empty -> split merged experiments -> noun siblings -> DEDUP -> cap LAST.
-    # Dedup BEFORE the cap so a duplicate term never spends a fair-share slot
-    # and so the cap never loses a genuine distinct sub-topic to an early dup.
+    # Strip/filter-empty -> split merged experiments -> primary terms first,
+    # measurement noun siblings appended AFTER all primaries -> DEDUP -> cap LAST.
+    # Keeping all primary facets ahead of sibling expansions ensures later query
+    # facets are never evicted by earlier siblings at [:MAX_SEARCH_TERMS].
     _stripped = [str(t).strip() for t in search_terms if str(t).strip()]  # NO cap yet
     if not _stripped:
         if not _query_anchor:
             raise ValueError("intent_parser: empty query yields no search terms")
         _stripped = [_query_anchor]
-    _expanded = [
-        variant
+    _primaries = [
+        part
         for term in _stripped
         for part in _split_experiment_term(term)
-        for variant in _measurement_sibling_terms(part)
     ]
+    _siblings = [
+        variant
+        for part in _primaries
+        for variant in _measurement_sibling_terms(part)[1:]
+    ]
+    _expanded = _primaries + _siblings
     _seen: set = set()
     _distinct = [t for t in _expanded if not (t in _seen or _seen.add(t))]  # order-preserving dedup
     search_terms = _distinct[:MAX_SEARCH_TERMS]  # cap LAST — up to 8 DISTINCT terms
@@ -590,15 +638,24 @@ def _parse_response(query: str, raw: str) -> SearchPlan:
         ranking_hint = "by_relevance"
 
     if filters.get("year_min") is not None and filters.get("year_max") is None:
-        canonical = re.search(r"\b(?:canonical|foundational|classical|classic|seminal|historical)\b", query, re.I)
+        canonical = re.search(
+            r"\b(?:canonical|foundational|classical|classic|seminal|historical)\b|"
+            r"经典|奠基|开创|里程碑|原始文献|原始论文",
+            query, re.I,
+        )
         survey = re.search(
             r"\b(?:current\s+(?:understanding|observational\s+picture|picture|state)|"
-            r"state\s+of\s+the\s+art|related[\s-]work|overview|introduction|survey)\b", query, re.I)
+            r"state\s+of\s+the\s+art|related[\s-]work|overview|introduction|survey)\b|"
+            r"综述|回顾|现状|概览",
+            query, re.I,
+        )
         recency = re.search(
-            r"\b(?:19|20)\d{2}\b|\b(?:recent|recently|latest|lately|newest|this\s+year|"
+            r"(?<!\d)(?:19|20)\d{2}(?!\d)|\b(?:recent|recently|latest|lately|newest|this\s+year|"
             r"last\s+(?:\d+|one|two|three|five|ten|few)\s+years?|"
-            r"past\s+(?:\d+|one|two|three|five|ten|few)\s+years?|last\s+decade|past\s+decade)\b",
-            query, re.I)
+            r"past\s+(?:\d+|one|two|three|five|ten|few)\s+years?|last\s+decade|past\s+decade)\b|"
+            r"近[几一二两三五十]年|近\d+年|最新|近期|最近",
+            query, re.I,
+        )
         if canonical or (survey and not recency):
             filters["year_min"] = None
             if ranking_hint == "by_recency":

@@ -410,6 +410,35 @@ async def _reconcile_sections(rag, ingest_source: str, sections: list[DocSection
     return counts
 
 
+async def assert_not_already_ingested(kind: str, key: str) -> None:
+    """Pre-check push-once eligibility before expensive preprocessing (e.g. MinerU PDF OCR).
+
+    Validates ``(kind, key)`` and raises ``AlreadyIngestedError`` when the key already exists
+    in the active authority store (legacy ledger or catalog active generation).
+    """
+    ingest_source, base_sid = validate_key(kind, key)
+    if knowledge_runtime.knowledge_jobs_mode() == "postgres":
+        from uuid import NAMESPACE_URL, uuid5
+
+        def _catalog_has_document() -> bool:
+            from papervault.knowledge.scheduler.catalog_service import get_catalog_service
+
+            repo = get_catalog_service().repository
+            generation = repo.get_active_generation()
+            if generation is None:
+                return False
+            parent_id = "operator_document:" + str(uuid5(NAMESPACE_URL, "papervault:operator-document:" + key))
+            return repo.get_current_inventory(parent_id, generation["generation_id"]) is not None
+
+        if await asyncio.to_thread(_catalog_has_document):
+            raise AlreadyIngestedError(
+                f"{key} is already ingested in the active catalog generation — "
+                "re-ingesting an existing key without force is refused."
+            )
+        return
+    await _assert_not_already_ingested(ingest_source, base_sid, key)
+
+
 async def _assert_not_already_ingested(ingest_source: str, base_sid: str, key: str) -> None:
     """v1 push-once (#47): REFUSE if this provenance key already has ANY ledger section.
 
@@ -517,7 +546,8 @@ async def ingest_document(
     purged = await _purge_sections(rag, ingest_source, base_sid, key) if force else None
     await _assert_not_already_ingested(ingest_source, base_sid, key)  # v1 push-once (#3)
     p = Path(path)
-    text = (read_text or _read_text)(p)
+    # Offload file read as well as build_sections so a large textbook never blocks the event loop.
+    text = await asyncio.to_thread(read_text or _read_text, p)
     is_md = p.suffix.lower() in _MARKDOWN_SUFFIXES
     # build_sections tiktoken-encodes the WHOLE document synchronously — for a 1000-page book
     # that's a ~1s CPU-bound loop that would stall the event loop serving live queries (#81).

@@ -1,6 +1,6 @@
 # 0013 — Effort-tiered role routing, Gateway v0.7.3 modifier grammar, and omitted default max_tokens
 
-Status: Accepted (2026-10-30), Amends 0012 (2026-10-30)
+Status: Accepted (2026-10-30), Amends 0012 (2026-10-30), Amended by [0014](0014-three-tier-glm-relay-codex-routing-and-gpt62.md) (2026-11-18)
 
 ## Context
 

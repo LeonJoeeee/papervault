@@ -126,3 +126,29 @@ def test_default_off_keeps_models_resident(monkeypatch, idle_models):
     assert models._BGE_MODEL is not None
     assert models._BGE_RERANKER is not None
     assert loads == {"embed": 1, "rerank": 1}
+
+
+def test_idle_unload_runs_gc_before_cuda_empty_cache_and_malloc_trim_after(idle_models, monkeypatch):
+    events: list[str] = []
+    done = threading.Event()
+    real_gc_collect = models.gc.collect
+
+    def tracked_gc():
+        events.append("gc")
+        return real_gc_collect()
+
+    def tracked_empty_cache():
+        events.append("empty_cache")
+
+    def tracked_trim():
+        events.append("malloc_trim")
+        done.set()
+
+    monkeypatch.setattr(models.gc, "collect", tracked_gc)
+    monkeypatch.setattr(torch.cuda, "empty_cache", tracked_empty_cache)
+    monkeypatch.setattr(models, "_trim_malloc", tracked_trim)
+    models._bge_encode_sync(["one"])
+    assert done.wait(2), "idle unload did not complete"
+    assert events == ["gc", "empty_cache", "malloc_trim"]
+    assert models._BGE_MODEL is None
+    assert models._BGE_RERANKER is None

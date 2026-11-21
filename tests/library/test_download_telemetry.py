@@ -105,18 +105,23 @@ def test_queue_admission_wait_and_actual_executor(tmp_path, monkeypatch):
     assert dequeue["enqueued_at"] == enqueue["at"]
 
 
-def test_group_winner_and_losing_thread_drain_are_distinct(tmp_path, monkeypatch):
+def test_group_winner_returns_without_blocking_on_slow_losing_thread(tmp_path, monkeypatch):
+    import time
     from papervault.library import download_telemetry as telemetry
 
     lib, paper = setup_paper(tmp_path)
     loser_started = threading.Event()
-    selected = threading.Event()
+    release_loser = threading.Event()
+    loser_exited = threading.Event()
+    slow_logged = threading.Event()
+    seen_cancel = []
     original_log = lib.log
 
     def record(event):
         original_log(event)
-        if event.get("phase") == "winner":
-            selected.set()
+        if (event.get("phase") == "member" and event.get("mark") == "end"
+                and event.get("member") == "slow"):
+            slow_logged.set()
 
     monkeypatch.setattr(lib, "log", record)
 
@@ -126,18 +131,34 @@ def test_group_winner_and_losing_thread_drain_are_distinct(tmp_path, monkeypatch
 
     def loser(_):
         loser_started.set()
-        assert selected.wait(2)
+        cancel = download._CONCURRENT_CANCEL.get()
+        assert cancel is not None
+        seen_cancel.append(cancel.wait(2))
+        release_loser.wait(2)
+        loser_exited.set()
         return None
 
-    with telemetry.observation(lib, paper.key):
-        result = download._try_concurrent_first_hit(paper, [("win", winner), ("slow", loser)])
-    assert result == b"%PDF-winner"
+    try:
+        with telemetry.observation(lib, paper.key):
+            started = time.monotonic()
+            result = download._try_concurrent_first_hit(paper, [("win", winner), ("slow", loser)])
+            elapsed = time.monotonic() - started
+        assert result == b"%PDF-winner"
+        # Winner must return immediately rather than blocking on the slow losing thread.
+        assert elapsed < 1.0
+        assert not loser_exited.is_set()
+    finally:
+        release_loser.set()
+        assert loser_exited.wait(2)
+        assert slow_logged.wait(2)
+
+    assert seen_cancel == [True]
     members = completed_spans(lib, "member")
     assert {e["member"] for e in members} == {"win", "slow"}
     selected = next(e for e in events(lib) if e.get("phase") == "winner")
-    drained, = completed_spans(lib, "group")
+    group_span, = completed_spans(lib, "group")
     slow = next(e for e in members if e["member"] == "slow")
-    assert selected["at"] < slow["ended_at"] <= drained["ended_at"]
+    assert selected["at"] <= group_span["ended_at"] < slow["ended_at"]
     assert len({e["run_id"] for e in members}) == 1
 
 
@@ -402,3 +423,61 @@ def test_confirmed_withdrawal_with_existing_pdf_still_records_terminal(tmp_path)
     outcome = next(e for e in events(lib) if e["event"] == "download_failed")
     assert outcome["timing"]["run_id"] == terminal["run_id"]
     assert lib.pdf_path(paper.key).read_bytes() == b"%PDF-existing"
+
+
+def test_concurrent_domain_members_receive_isolated_copies_and_merge_on_coordinator(tmp_path):
+    from papervault.library.models import ADSAvailability
+
+    lib, paper = setup_paper(tmp_path)
+    coordinator_tid = threading.get_ident()
+    seen_objects = {}
+    ads_mutated_before_return = []
+
+    def ads_member(copy_paper):
+        assert copy_paper is not paper
+        seen_objects["ads"] = copy_paper
+        copy_paper.ads_availability = ADSAvailability(
+            availability="confirmed_abstract_only",
+            publication_kind="abstract",
+            reason="abstract_only",
+        )
+        # Live paper must remain untouched while worker thread is still running.
+        ads_mutated_before_return.append(paper.ads_availability.availability)
+        return None
+
+    def inspire_member(copy_paper):
+        assert copy_paper is not paper
+        seen_objects["inspire"] = copy_paper
+        copy_paper.inspire_record_id = "1412451"
+        copy_paper.inspire_document_urls = ["https://inspirehep.net/files/test"]
+        return None
+
+    assert threading.get_ident() == coordinator_tid
+    out = download._try_concurrent_first_hit(
+        paper, [("ads", ads_member), ("inspire", inspire_member)], library=lib,
+    )
+    assert out is None
+    assert ads_mutated_before_return == ["unknown"]
+    assert seen_objects["ads"] is not seen_objects["inspire"]
+    assert paper.ads_availability.availability == "confirmed_abstract_only"
+    assert paper.inspire_record_id == "1412451"
+    assert paper.inspire_document_urls == ["https://inspirehep.net/files/test"]
+
+
+def test_merge_member_updates_skips_ads_availability_when_live_card_identity_changed(tmp_path):
+    from papervault.library.models import ADSAvailability
+
+    lib, paper = setup_paper(tmp_path)
+    paper.doi = "10.1234/original"
+    baseline = paper.model_copy(deep=True)
+    donor = paper.model_copy(deep=True)
+    donor.ads_availability = ADSAvailability(
+        availability="confirmed_abstract_only",
+        publication_kind="abstract",
+        reason="abstract_only",
+    )
+    # Concurrent card identity correction changed the live DOI.
+    paper.doi = "10.1234/corrected"
+
+    download._merge_member_updates(paper, baseline, donor, "ads", library=lib)
+    assert paper.ads_availability.availability == "unknown"

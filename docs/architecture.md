@@ -24,7 +24,7 @@ One package, one server process, with these ownership boundaries:
 | `library/` | Search coordination, bibliographic identity, registration, acquisition and extraction. Library owns vault writes; registration is a separately admitted command. |
 | `store/` | Transactional catalog authority, revisions, audit/outbox, publication lineage, recovery and derivative lifecycle/capacity. JSON exports are projections under PostgreSQL authority. |
 | `knowledge/` | Immutable knowledge intake, distillation scheduling, LightRAG backend adapters, evidence retrieval and synthesis. Catalog commands accept verified outputs; backend computation alone grants no publication authority. |
-| `domain/` | Configured search rubric, entity ontology, extraction examples and instructions; space physics/AI4Science is the factory domain. |
+| `domain/` | Configured search rubric, entity ontology, extraction examples and instructions; space physics, space computing, and AI4Science form the factory domain. |
 | `eval/` | Gold workloads, scoring and shared response assembly; reference-machine retrieval evidence complements CI's deterministic scoring tests. |
 
 Persistence has three logical roles: **Source** retains research/input bytes;
@@ -66,8 +66,10 @@ stores or mutate derived data. Neo4j follows LightRAG's `chunk-entity-relation`
 database default and read-only home-database fallback on `DatabaseNotFound`.
 Encoding shares S2's serving-loop GPU semaphore and retains its permit until the
 synchronous worker finishes even after caller cancellation; DB reads hold no GPU
-permit. `PAPERVAULT_SEARCH_KG` defaults on only with
-`PAPERVAULT_STORAGE_BACKEND=postgres`; explicit `0` disables and `1` enables.
+permit. Explicit `PAPERVAULT_SEARCH_KG=0` disables and `1` enables this arm; when unset,
+the runtime checks only legacy `PAPERVAULT_STORAGE_BACKEND=postgres` (not
+`PAPERVAULT_CATALOG_AUTHORITY=postgres`), so PostgreSQL catalog deployments set
+`PAPERVAULT_SEARCH_KG=1` explicitly.
 Missing configuration or PG/Neo4j/BGE failure returns an empty KG list, preserving
 BM25/external serving. This is candidate discovery, not S2 evidence publication.
 
@@ -123,31 +125,35 @@ retrieved-paper citation fallback, not a synthesis-quality measurement.
 All text LLM stages resolve through these nine roles via `PAPERVAULT_LLM_<ROLE>`
 as ordered `primary[,fallback...]` chains of concrete `ModelTarget` specs
 (`<model>[@<effort>|@thinking|@nothinking]`), validated per model family against
-the transparent LLM Gateway `v0.7.3` catalog and omitting `max_tokens` on the
-wire unless explicitly configured; see
-[ADR-0012](adr/0012-direct-role-model-routing-and-glm-fallback.md) and
-[ADR-0013](adr/0013-effort-tiered-role-routing-and-omitted-max-tokens.md).
-Multi-target GLM-primary production routes (`verify`, `gate`, `build`) fail over
-immediately on transient upstream errors (`429`, `408`, `5xx`, timeout,
-`StreamTruncated`) with a process-local primary cooldown
-(`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`, default `120`s), while single-target GPT
-roles use bounded same-model retries without cross-model fallback. `eval_judge`
-defaults to single-target `glm-5.3@max` so evaluation runs preserve a
-single-family ruler invariant unless an explicit multi-target
-`PAPERVAULT_LLM_EVAL_JUDGE` chain is configured. Search intent selects its own
-handle; the ingest and return gates share the judge handle.
+the transparent LLM Gateway catalog and omitting `max_tokens` on the wire unless
+explicitly configured; see
+[ADR-0012](adr/0012-direct-role-model-routing-and-glm-fallback.md),
+[ADR-0013](adr/0013-effort-tiered-role-routing-and-omitted-max-tokens.md), and
+[ADR-0014](adr/0014-three-tier-glm-relay-codex-routing-and-gpt62.md).
+Three-tier production routes (`build`, `gate`, `verify`, `keyword`, `judge`,
+`decompose`) drain official GLM subscription quota first, step to `relay-glm-*`
+balance, and fall back to Codex `gpt-6.1-terra` — failing over immediately on
+transient upstream errors (`429`, `408`, `5xx`, timeout, `StreamTruncated`) and
+quota/balance exhaustion (`402`, or quota-indicated `400/403/429`) with a
+process-local per-model cooldown (`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`, default
+`120`s), while single-target Codex roles (`intent`, `synth`) use bounded
+same-model retries without cross-model fallback. `eval_judge` defaults to
+two-tier same-family `glm-5.3@max,relay-glm-5.3@max` (without Tier 3 GPT
+fallback) so evaluation runs preserve a single-family ruler invariant. Search
+intent selects its own handle; the ingest and return gates share the judge
+handle.
 
 | Plane / LLM stage | Role | Default |
 | --- | --- | --- |
 | S1 intent parsing (API terms, local KG concepts, filters and ranking hints) | `intent` | `gpt-6.1-terra@high` |
-| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `gpt-6.1-terra@medium` |
-| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,gpt-6.1-terra@low` |
-| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.3@max,gpt-6.1-terra@high` |
-| S2 query high/low-level keyword extraction when needed | `keyword` | `gpt-6.1-terra@low` |
-| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `gpt-6.1-terra@high` |
-| S2 evidence-grounded synthesis (production/eval) | `synth` | `gpt-6-astra@xhigh` |
-| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.3@max` |
+| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
+| S2 query high/low-level keyword extraction when needed | `keyword` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` |
+| S2 evidence-grounded synthesis (production/eval) | `synth` | `gpt-6.2-astra@xhigh` |
+| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.3@max,relay-glm-5.3@max` |
 
 Planner, gate, verification and decomposition prompts include concrete calibration
 examples. Local embedding/reranking and the MinerU OCR service remain outside text

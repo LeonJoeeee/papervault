@@ -13,13 +13,13 @@ NASA ADS requires ADS_API_TOKEN; silently skipped otherwise.
 from __future__ import annotations
 
 import concurrent.futures
-from functools import partial
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 import json
 import logging
 import os
 import re
 import sys as _sys
+import threading
 import time as time
 from dataclasses import dataclass as dataclass
 from html import unescape as unescape
@@ -325,25 +325,123 @@ class _SourcePDF(bytes):
     """Retain a plain-byte group winner's source without changing tier labels."""
 
 
+_CONCURRENT_CANCEL: ContextVar[Optional[threading.Event]] = ContextVar(
+    "download_concurrent_cancel", default=None,
+)
+
+_CARD_IDENTITY_FIELDS = ("title", "authors", "year", "doi", "arxiv_id", "inspire_record_id")
+
+
+class _IsolatedLiveCardProxy:
+    """Isolated per-worker wrapper around a deep-copied ``Paper``.
+
+    All attribute writes land strictly on the worker's private copy (never
+    mutating the live ``Paper`` or ``Library`` from a background thread), while
+    ``model_dump()`` overlays current read-only bibliographic fields from the
+    live card if they changed mid-flight so stale document fetches abort early.
+    """
+
+    def __init__(self, copy: Paper, live: Paper, baseline: Paper) -> None:
+        object.__setattr__(self, "_copy", copy)
+        object.__setattr__(self, "_live", live)
+        object.__setattr__(self, "_baseline", baseline)
+
+    def __getattr__(self, name: str):
+        return getattr(object.__getattribute__(self, "_copy"), name)
+
+    def __setattr__(self, name: str, value) -> None:
+        setattr(object.__getattribute__(self, "_copy"), name, value)
+
+    def model_dump(self, *args, **kwargs):
+        copy_obj = object.__getattribute__(self, "_copy")
+        live_obj = object.__getattribute__(self, "_live")
+        base_obj = object.__getattribute__(self, "_baseline")
+        data = copy_obj.model_dump(*args, **kwargs)
+        for field in _CARD_IDENTITY_FIELDS:
+            live_val = getattr(live_obj, field)
+            if live_val != getattr(base_obj, field):
+                data[field] = list(live_val) if isinstance(live_val, list) else live_val
+        return data
+
+
+def _merge_member_updates(
+    target: Paper,
+    baseline: Paper,
+    donor: Paper,
+    member: str,
+    *,
+    library: Optional[Library] = None,
+) -> bool:
+    """Merge isolated worker updates back onto live ``target`` on the coordinator thread.
+
+    Returns False if an INSPIRE identity adoption became stale or conflicted with
+    changes on the live ``target`` card.
+    """
+    ids_unchanged = target.doi == baseline.doi and target.arxiv_id == baseline.arxiv_id
+    ids_compatible = (
+        ids_unchanged
+        and (not donor.doi or not target.doi or donor.doi == target.doi)
+        and (not donor.arxiv_id or not target.arxiv_id or donor.arxiv_id == target.arxiv_id)
+    )
+    if member == "ads" and donor.ads_availability != baseline.ads_availability:
+        if ids_compatible:
+            target.ads_availability = donor.ads_availability
+    if donor.arxiv_id != baseline.arxiv_id and not target.arxiv_id and target.doi == baseline.doi:
+        target.arxiv_id = donor.arxiv_id
+    if donor.arxiv_withdrawal != baseline.arxiv_withdrawal and ids_compatible:
+        target.arxiv_withdrawal = donor.arxiv_withdrawal
+    inspire_changed = (
+        donor.inspire_record_id != baseline.inspire_record_id
+        or donor.inspire_document_urls != baseline.inspire_document_urls
+    )
+    if inspire_changed:
+        for field in ("title", "authors", "year", "doi", "arxiv_id"):
+            if getattr(target, field) != getattr(baseline, field):
+                return False
+        if baseline.inspire_record_id and target.inspire_record_id != baseline.inspire_record_id:
+            return False
+        if donor.inspire_record_id:
+            if not _adopt_source_identifiers(target, library,
+                                             inspire_record_id=donor.inspire_record_id):
+                return False
+        target.inspire_document_urls = list(donor.inspire_document_urls)
+    return True
+
+
 def _try_concurrent_first_hit(
     paper: Paper,
     members: list[tuple[str, Callable[[Paper], Optional[bytes]]]],
     timeout: int = 60,
     *,
     on_reject: Optional[Callable[[str, bytes, str], None]] = None,
+    library: Optional[Library] = None,
 ) -> Optional[bytes]:
     """Return the first identity-accepted PDF, retaining its verification.
 
-    Rejecting one member must leave completed and pending siblings eligible.
-    The coordinator reuses the winning verdict before saving its bytes.
+    Each member runs against an isolated deep copy of ``paper``; metadata and
+    availability updates merge back onto the live ``paper`` strictly on the
+    coordinator thread. Once a winner is verified, a shared cancel event is
+    signalled and the pool shuts down non-blockingly so slow losing threads
+    cannot stall returning the winning PDF.
     """
-    with span("group"), concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(2, len(members))) as pool:
+    cancel = threading.Event()
+    baseline = paper.model_copy(deep=True)
+    member_copies = [paper.model_copy(deep=True) for _ in members]
+    token = _CONCURRENT_CANCEL.set(cancel)
+    with span("group"):
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=max(2, len(members)))
         deadline = time.monotonic() + timeout
         completed_at = {}
 
         def fetch_member(index, name, fn):
-            data = _timed_member(name, fn, paper)
+            if cancel.is_set():
+                completed_at[index] = time.monotonic()
+                return None
+            worker_paper = (
+                _IsolatedLiveCardProxy(member_copies[index], paper, baseline)
+                if name == "inspire" else member_copies[index]
+            )
+            data = _timed_member(name, fn, worker_paper)
             completed_at[index] = time.monotonic()
             return data
 
@@ -366,6 +464,11 @@ def _try_concurrent_first_hit(
             for fut in completed_candidates():
                 data = fut.result()
                 member, index = futures[fut]
+                merged_ok = _merge_member_updates(
+                    paper, baseline, member_copies[index], member, library=library,
+                )
+                if not merged_ok:
+                    continue
                 # Verification latency cannot extend the original fetch budget.
                 if data and completed_at[index] <= deadline:
                     deferred_scan = member == "ads" and _trusted_ads_scan(paper, data)
@@ -379,6 +482,7 @@ def _try_concurrent_first_hit(
                             on_reject(member, data, reason)
                         emit("candidate_rejected", member=member)
                         continue
+                    cancel.set()
                     if type(data) is bytes:
                         data = _SourcePDF(data)
                     data._group_verification = (ok, reason)
@@ -388,11 +492,13 @@ def _try_concurrent_first_hit(
         except concurrent.futures.TimeoutError:
             pass
         finally:
+            cancel.set()
+            _CONCURRENT_CANCEL.reset(token)
             if stoprules_v2_enabled():
-                # Observe the same executor shutdown the context manager owns.
-                # Winner selection is not evidence that losing threads drained.
                 with span("group_drain"):
-                    pool.shutdown(wait=True)
+                    pool.shutdown(wait=False, cancel_futures=True)
+            else:
+                pool.shutdown(wait=False, cancel_futures=True)
     return None
 
 
@@ -423,11 +529,11 @@ def _try_domain_aggregators(
     paper at most one will have content; running them serially wastes
     ~6-8s on the misses."""
     return _try_concurrent_first_hit(paper, [
-        ("inspire", partial(_try_inspire, library=library) if library is not None else _try_inspire),
+        ("inspire", _try_inspire),
         ("ads", _try_ads if ads_member is None else ads_member),
         ("europepmc", _try_europepmc),
         ("zenodo", _try_zenodo),
-    ], on_reject=on_reject)
+    ], on_reject=on_reject, library=library)
 
 
 # Ordered cascade. Sorted by Round 1 hit-rate (high first), with

@@ -6,7 +6,7 @@ DOI-first (normalized), title-fallback (normalized containment / high token
 overlap). Sequential real calls — the caller-shaped measurement.
 
 Usage:  .venv/bin/python scripts/mustfind_recall.py --tag mfr_$(date +%m%d)
-Writes  src/papervault/eval/results/<tag>.jsonl + prints the summary card.
+Writes  $PAPERVAULT_EVAL_DIR/<tag>.jsonl + prints the summary card.
 """
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import argparse
 import asyncio
 import json
 import re
+import sys
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -22,6 +23,13 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT / "src") not in sys.path:
+    sys.path.insert(0, str(ROOT / "src"))
+from papervault.eval._paths import eval_path  # noqa: E402
+
+
+def _output_path(tag: str) -> Path:
+    return eval_path(f"{tag}.jsonl")
 
 
 def _norm_doi(d: str | None) -> str | None:
@@ -122,7 +130,8 @@ async def main() -> None:
 
     pools = {json.loads(l)["qid"]: json.loads(l) for l in open(args.pools) if l.strip()}
     intents = {json.loads(l)["qid"]: json.loads(l)["intent"] for l in open(args.intents) if l.strip()}
-    out_path = ROOT / "src/papervault/eval/results" / f"{args.tag}.jsonl"
+    out_path = _output_path(args.tag)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
     recalls = []
     with out_path.open("w") as fh:

@@ -18,6 +18,8 @@ FastMCP lifespan once per client session, not once at boot).
 from __future__ import annotations
 
 import logging
+import os
+from collections import OrderedDict
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from uuid import uuid4
@@ -42,6 +44,7 @@ from papervault import config
 from papervault.knowledge.mcp.server import query as _knowledge_query
 from papervault.knowledge.mcp.server import start_background as _start_knowledge_bg
 from papervault.library.mcp.server import build_server as _build_library
+from papervault.library.services.concurrency import trim_process_memory as trim_process_memory
 from papervault.mcp.access_log import install_access_log
 from papervault.mcp.admission import install_admission
 
@@ -50,6 +53,30 @@ logger = logging.getLogger(__name__)
 # FastMCP's default loopback lists; the SDK does not export these constants.
 LOOPBACK_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
 LOOPBACK_ORIGINS = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+_DEFAULT_SESSION_IDLE_TIMEOUT_S = 1800.0
+_DEFAULT_MAX_TOMBSTONES = 256
+_DEFAULT_MAX_PRINCIPALS = 1024
+
+
+def _env_float(name: str, default: float) -> float | None:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = float(raw)
+    except ValueError:
+        return default
+    return val if val > 0 else None
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(1, int(raw))
+    except ValueError:
+        return default
 
 
 class ResilientHTTPSessionManager(StreamableHTTPSessionManager):
@@ -61,11 +88,81 @@ class ResilientHTTPSessionManager(StreamableHTTPSessionManager):
     This restores connectivity, not in-flight calls or missed SSE events.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self,
+        *args,
+        max_tombstones: int | None = None,
+        max_principals: int | None = None,
+        tombstone_ttl: float | None = None,
+        principal_ttl: float | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         # SDK 1.27 has no owner map; keep this lifecycle local across supported
         # SDK releases. None records anonymous ownership, including after loss.
         self._session_principals: dict[str, tuple[str, str | None, str | None] | None] = {}
+        self._principal_seen: OrderedDict[str, float] = OrderedDict()
+        self._terminated_at: OrderedDict[str, float] = OrderedDict()
+        self._max_tombstones = (
+            max_tombstones
+            if max_tombstones is not None
+            else _env_int("PAPERVAULT_MCP_MAX_TOMBSTONES", _DEFAULT_MAX_TOMBSTONES)
+        )
+        self._max_principals = (
+            max_principals
+            if max_principals is not None
+            else _env_int("PAPERVAULT_MCP_MAX_PRINCIPALS", _DEFAULT_MAX_PRINCIPALS)
+        )
+        self._tombstone_ttl = tombstone_ttl
+        self._principal_ttl = principal_ttl
+
+    def _effective_tombstone_ttl(self) -> float:
+        if self._tombstone_ttl is not None:
+            return self._tombstone_ttl
+        base = self.session_idle_timeout if self.session_idle_timeout is not None else _DEFAULT_SESSION_IDLE_TIMEOUT_S
+        return max(base, 60.0)
+
+    def _effective_principal_ttl(self) -> float:
+        if self._principal_ttl is not None:
+            return self._principal_ttl
+        base = self.session_idle_timeout if self.session_idle_timeout is not None else _DEFAULT_SESSION_IDLE_TIMEOUT_S
+        return max(base * 2.0, 3600.0)
+
+    def _prune_session_state(self, now: float) -> None:
+        """Bound DELETE tombstones and stale principal entries to prevent memory leaks."""
+        tomb_ttl = self._effective_tombstone_ttl()
+        # Evict expired or excess DELETE tombstones (LRU oldest first).
+        while self._terminated_at:
+            sid, ts = next(iter(self._terminated_at.items()))
+            if (now - ts) > tomb_ttl or len(self._terminated_at) > self._max_tombstones:
+                self._terminated_at.popitem(last=False)
+                inst = self._server_instances.get(sid)
+                if inst is not None and inst.is_terminated:
+                    del self._server_instances[sid]
+                self._session_principals.pop(sid, None)
+                self._principal_seen.pop(sid, None)
+            else:
+                break
+
+        # Evict expired or excess inactive principal entries (never active sessions).
+        princ_ttl = self._effective_principal_ttl()
+        expired_inactive = [
+            sid for sid, ts in self._principal_seen.items()
+            if (now - ts) > princ_ttl and sid not in self._server_instances
+        ]
+        for sid in expired_inactive:
+            self._principal_seen.pop(sid, None)
+            self._session_principals.pop(sid, None)
+        if len(self._session_principals) > self._max_principals:
+            excess = len(self._session_principals) - self._max_principals
+            for sid in list(self._principal_seen):
+                if excess <= 0:
+                    break
+                if sid in self._server_instances:
+                    continue
+                self._principal_seen.pop(sid, None)
+                self._session_principals.pop(sid, None)
+                excess -= 1
 
     @asynccontextmanager
     async def run(self) -> AsyncIterator[None]:
@@ -74,6 +171,8 @@ class ResilientHTTPSessionManager(StreamableHTTPSessionManager):
                 yield
             finally:
                 self._session_principals.clear()
+                self._principal_seen.clear()
+                self._terminated_at.clear()
 
     async def _handle_stateful_request(self, scope: Scope, receive: Receive, send: Send) -> None:
         request = Request(scope, receive)
@@ -100,6 +199,8 @@ class ResilientHTTPSessionManager(StreamableHTTPSessionManager):
                      getattr(token, "subject", None))
 
         async with self._session_creation_lock:
+            now = anyio.current_time()
+            self._prune_session_state(now)
             transport = self._server_instances.get(session_id) if session_id is not None else None
             if session_id in self._session_principals and self._session_principals[session_id] != owner:
                 await self._session_error(scope, receive, send, 404, "Session not found")
@@ -119,8 +220,13 @@ class ResilientHTTPSessionManager(StreamableHTTPSessionManager):
                 self._server_instances[session_id] = transport
                 # Retain owners across crashes, including anonymous ownership.
                 self._session_principals[session_id] = owner
+                self._principal_seen[session_id] = now
+                self._principal_seen.move_to_end(session_id)
                 assert self._task_group is not None
                 await self._task_group.start(self._run_session, session_id, transport)
+            elif session_id is not None:
+                self._principal_seen[session_id] = now
+                self._principal_seen.move_to_end(session_id)
 
         # Never hold the creation lock during HTTP: a recovered GET can stay
         # open indefinitely and unrelated clients must still create sessions.
@@ -157,10 +263,17 @@ class ResilientHTTPSessionManager(StreamableHTTPSessionManager):
             logger.exception("MCP session %.64s crashed", session_id)
         finally:
             # Explicit DELETE marks the transport terminated before yielding.
-            # Keep that instance as a tombstone for this manager's lifetime.
+            # Keep a bounded/TTL tombstone so immediate replays return 404 without
+            # growing _server_instances unboundedly over weeks.
             # Identity guards keep an old runner from removing its replacement.
-            if self._server_instances.get(session_id) is transport and not transport.is_terminated:
-                del self._server_instances[session_id]
+            if self._server_instances.get(session_id) is transport:
+                if transport.is_terminated:
+                    now = anyio.current_time()
+                    self._terminated_at[session_id] = now
+                    self._terminated_at.move_to_end(session_id)
+                    self._prune_session_state(now)
+                else:
+                    del self._server_instances[session_id]
 
     @staticmethod
     async def _session_error(
@@ -236,6 +349,9 @@ def build_server(library_path: str | None = None) -> FastMCP:
         retry_interval=mcp._retry_interval,
         json_response=mcp.settings.json_response,
         security_settings=mcp.settings.transport_security,
+        session_idle_timeout=_env_float(
+            "PAPERVAULT_MCP_SESSION_IDLE_TIMEOUT_S", _DEFAULT_SESSION_IDLE_TIMEOUT_S,
+        ),
     )
     # Library plane: registers search_papers + get_paper onto `mcp`, stashes Library + queues.
     _build_library(library_path=library_path, mcp=mcp)

@@ -102,7 +102,6 @@ async def test_retrieval_runs_kg_off_loop_against_the_local_snapshot(tmp_path, m
         return ["Local"]
 
     async def external(*args, **kwargs):
-        paper.title = "Changed while external fetch runs"
         return [], {}
 
     async def progress(*args):
@@ -117,6 +116,8 @@ async def test_retrieval_runs_kg_off_loop_against_the_local_snapshot(tmp_path, m
     assert result.kg_ranks == ["Local"]
     assert kg_observations == [("Find detector measurements", ["particle detector"],
                                 "Original detector measurements", True)]
+    assert result.local[0] is not paper
+    assert result.local[0].title == "Original detector measurements"
     assert result.local[0].title == "Original detector measurements"
 
 
@@ -152,7 +153,7 @@ async def test_retrieval_uses_search_permits_while_download_permits_are_saturate
             downloads.release()
 
 
-def test_local_snapshot_copies_each_paper_once_and_reuses_it_in_frozen_view(tmp_path, monkeypatch):
+def test_local_snapshot_shallow_copies_papers_once_and_isolates_live_mutations(tmp_path, monkeypatch):
     from papervault.library.services.search_pipeline import SearchPipeline
 
     lib = Library(tmp_path)
@@ -160,18 +161,24 @@ def test_local_snapshot_copies_each_paper_once_and_reuses_it_in_frozen_view(tmp_
     copy_paper, copies = Paper.model_copy, []
 
     def counted(paper, **kwargs):
-        copies.append((paper.key, kwargs))
+        copies.append((paper.key, kwargs.get("deep")))
         return copy_paper(paper, **kwargs)
 
     monkeypatch.setattr(Paper, "model_copy", counted)
     searcher = SearchPipeline(lib, None, None, None, None, None, None, None, None, None)
     local, view = searcher._local_snapshot()
-    assert copies == [("Local", {"deep": True})]
+    assert copies == [("Local", False)]
     assert view.get("Local") is local[0]
     assert local[0] is not original
     assert all(index.frozen for index in view._lookup_indexes.values())
     original.authors.append("A live edit")
+    original.title = "Mutated live title"
+    original.doi = "10.9999/mutated"
+    original.download_status = "failed"
     assert local[0].authors == ["Tester, A."]
+    assert local[0].title == "Detector measurements"
+    assert local[0].doi == "10.1234/Local"
+    assert local[0].download_status == "pending"
 
 
 @pytest.mark.asyncio
@@ -200,6 +207,7 @@ async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypat
 
     async def external(*args, **kwargs):
         paper.authors.append("Changed during retrieval")
+        paper.title = "Changed live title"
         return [], {}
 
     async def progress(*args):
@@ -207,6 +215,7 @@ async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypat
 
     def kg_search(query, plan, view, **kwargs):
         assert view.get("Local").authors == ["Tester, A."]
+        assert view.get("Local").title == "Original detector measurements"
         return ["Local"]
 
     monkeypatch.setattr(owner, stage, checked)
@@ -216,10 +225,9 @@ async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypat
     plan = pipeline.PlannedSearch({}, ["detector measurements"], {}, 10, "by_relevance")
     result = await searcher.retrieval(plan, ServingTrace(lib))
     assert calls
-    if stage == "model_copy":
-        assert all(call.get("deep") is True for call in calls)
+    assert result.local[0] is not paper
     assert result.local[0].authors == ["Tester, A."]
-    assert paper.authors == ["Tester, A.", "Changed during retrieval"]
+    assert result.local[0].title == "Original detector measurements"
     assert result.kg_ranks == ["Local"]
 
 
@@ -1209,7 +1217,9 @@ def test_local_authority_uses_age_normalized_citations(local_authority_fusion):
 
 
 @pytest.mark.parametrize("n_terms", [1, 2])
-@pytest.mark.parametrize("rank,weight,selected", [(300, 0.25, True), (799, 1.0, True), (800, 1.0, False)])
+@pytest.mark.parametrize("rank,weight,selected", [
+    (60, 0.25, True), (99, 1.0, True), (100, 1.0, False), (300, 0.25, False),
+])
 def test_local_authority_depth_and_strength(
         local_authority_fusion, monkeypatch, n_terms, rank, weight, selected):
     from dataclasses import replace
@@ -1219,7 +1229,7 @@ def test_local_authority_depth_and_strength(
     retrieved.local = [Paper(key=f"Rank{i:03d}", title=f"Detector measurements case {i}",
                              doi=f"10.1234/rank{i}", year=2025,
                              citation_count=10000 if i == rank else 0)
-                       for i in range(801)]
+                       for i in range(350)]
     # Supply a controlled BM25 rank boundary; fusion, RRF and shortlisting stay real.
     monkeypatch.setattr(pipeline, "bm25_per_term_ranklists", lambda corpus, terms: [
         sorted(corpus, key=lambda n: n["key"]) for _ in terms])
@@ -1228,6 +1238,50 @@ def test_local_authority_depth_and_strength(
     keys = [n["key"] for n in fuse_local(searcher, plan, retrieved).local]
     assert len(keys) == 45
     assert (f"Rank{rank:03d}" in keys) is selected
+    # Top BM25 hits must never be swamped out by authority bonus alone at default weight.
+    if weight == 0.25:
+        assert keys[0] == "Rank000"
+
+
+def test_authority_does_not_reorder_ahead_of_top_kg_hits(local_authority_fusion):
+    from papervault.library.services.search_pipeline import RetrievedSearch
+
+    searcher, plan, retrieved = local_authority_fusion
+    retrieved.local = [Paper(key=f"Semantic{i:03d}", title=f"Suprathermal populations {i}",
+                             doi=f"10.1234/semantic{i}", year=2025,
+                             citation_count=50000 if i == 60 else 0) for i in range(100)]
+    retrieved = RetrievedSearch([], retrieved.local, {},
+                                kg_ranks=[f"Semantic{i:03d}" for i in range(100)])
+    searcher.authority_enabled, searcher.authority_weight = True, 1.0
+    keys = [p["key"] for p in fuse_local(searcher, plan, retrieved).local]
+    # Top 15 KG hits remain strictly ahead of authority-boosted tail candidates.
+    assert keys[:15] == [f"Semantic{i:03d}" for i in range(15)]
+    assert "Semantic060" in keys
+
+
+def test_multi_axis_folding_matches_arxiv_only_external_onto_doi_plus_arxiv_library(tmp_path):
+    lib = Library(tmp_path)
+    add_record(lib, "LocalBoth", title="Parker spiral solar wind",
+               doi="10.1234/parker", arxiv_id="2401.12345v2", year=2024)
+    # 1) External arXiv-only hit (unversioned) must fold onto LocalBoth (preserves vouch, avoids dup).
+    ext_match = dict(node("ExtArxivOnly", "Parker spiral solar wind", rank=0),
+                     doi="", arxiv_id="2401.12345")
+    # 2) External hit with a CONFLICTING DOI sharing the same arXiv ID must NOT fold onto LocalBoth.
+    ext_conflict = dict(node("ExtConflictDoi", "Unrelated paper",
+                             doi="10.9999/different", rank=1), arxiv_id="2401.12345")
+    fused = fuse_library(lib, [ext_match, ext_conflict])
+    local_by_key = {n["key"]: n for n in fused.local}
+    assert local_by_key["LocalBoth"]["folded_vouch"] == 1
+    ext_keys = {n["key"] for n in fused.external}
+    assert "ExtArxivOnly" not in ext_keys
+    assert "ExtConflictDoi" in ext_keys
+
+    # 3) External hit with a CONFLICTING explicit version (v1 vs v2) must NOT fold onto LocalBoth.
+    ext_ver_conflict = dict(node("ExtV1", "Earlier version", rank=0),
+                            doi="", arxiv_id="2401.12345v1")
+    fused_ver = fuse_library(lib, [ext_ver_conflict])
+    assert all(n.get("folded_vouch", 0) == 0 for n in fused_ver.local)
+    assert [n["key"] for n in fused_ver.external] == ["ExtV1"]
 
 
 @pytest.fixture
@@ -1482,3 +1536,105 @@ def test_fusion_flushes_all_trace_loops_as_one_stage(tmp_path, monkeypatch):
     assert len(batches) == 1
     assert {event.get("reason") for event in batches[0]} >= {"serving_excluded", "pool_selection"}
     assert batches[0][-1]["local_pool"] == 1
+
+
+def test_fusion_refuses_to_fold_external_hit_bridging_two_distinct_local_records(tmp_path):
+    from papervault.library.services.registration import ServingTrace
+    from papervault.library.services.search_pipeline import PlannedSearch, RetrievedSearch, SearchPipeline
+
+    lib = Library(tmp_path)
+    rec_a = add_record(lib, "RecA", title="Detector A measurement", doi="10.1234/rec-a", arxiv_id="")
+    rec_b = add_record(lib, "RecB", title="Detector B measurement", doi="", arxiv_id="2401.99999")
+    bridging = dict(
+        node("Bridge", "Bad cross-linked record", doi="10.1234/rec-a", rank=0),
+        arxiv_id="2401.99999",
+    )
+    clean_a = dict(node("CleanA", "Detector A measurement", doi="10.1234/rec-a", rank=1), arxiv_id="")
+    clean_b = dict(node("CleanB", "Detector B measurement", rank=2), doi="", arxiv_id="2401.99999")
+
+    searcher = SearchPipeline(lib, None, None, None, None, None, None, None, None, None)
+    plan = PlannedSearch({}, ["detector measurement"], {}, 10, "by_relevance")
+    fused = searcher.fusion(
+        plan,
+        RetrievedSearch([bridging, clean_a, clean_b], [rec_a, rec_b], {}, []),
+        ServingTrace(lib),
+    )
+    by_key = {n["key"]: n for n in fused.local}
+    # Bridging hit must NOT fold onto RecA or RecB, while clean hits still fold cleanly.
+    assert by_key["RecA"].get("folded_vouch") == 1
+    assert by_key["RecB"].get("folded_vouch") == 1
+    assert all(d.get("arxiv_id") != "2401.99999" for d in by_key["RecA"].get("_folded_donors", []))
+    assert all(d.get("doi") != "10.1234/rec-a" for d in by_key["RecB"].get("_folded_donors", []))
+    assert any(n.get("key") == "Bridge" for n in fused.external)
+
+    # Even if a conflicting donor somehow reached _prepare_return_pool, projection
+    # must never copy an identifier owned by another record.
+    pool, projections, _reg = searcher._prepare_return_pool(plan, fused, {}, ServingTrace(lib))
+    if "RecA" in projections:
+        assert projections["RecA"].arxiv_id == ""
+    if "RecB" in projections:
+        assert projections["RecB"].doi == ""
+
+
+def test_prepare_return_pool_bounds_registration_to_max_candidates_and_prioritizes_new(tmp_path):
+    from papervault.library.services.registration import MAX_CANDIDATES, ServingTrace
+    from papervault.library.services.search_pipeline import PlannedSearch, RetrievedSearch, SearchPipeline
+
+    lib = Library(tmp_path)
+    locals_ = []
+    external = []
+    # 50 local papers × 4 external sources = 200 raw folded donor hits (would exceed 120!)
+    for i in range(50):
+        doi = f"10.1234/known-{i:03d}"
+        locals_.append(add_record(lib, f"Known{i:03d}", title=f"Known detector study {i}", doi=doi))
+        for src in ("openalex", "crossref", "semantic_scholar", "ads"):
+            external.append(dict(
+                node(f"Hit{i}_{src}", f"Known detector study {i}", doi=doi, rank=i),
+                source=src,
+            ))
+    # Plus 5 brand-new eligible discoveries.
+    new_dois = {f"10.1234/brand-new-{i}" for i in range(5)}
+    for i, doi in enumerate(sorted(new_dois)):
+        external.append(dict(
+            node(f"New{i}", f"Brand new detector discovery {i}", doi=doi, rank=i),
+            authors=["Discoverer, A."], abstract="New observational result.",
+            publication_types=["JournalArticle"],
+        ))
+
+    searcher = SearchPipeline(lib, None, None, None, None, None, None, None, None, None)
+    plan = PlannedSearch({}, ["detector discovery"], {}, 10, "by_relevance")
+    fused = searcher.fusion(plan, RetrievedSearch(external, locals_, {}, []), ServingTrace(lib))
+    judgments = {
+        idx: {"ingest_ok": True, "tier": "1A", "llm_is_paper": True}
+        for idx in range(len(fused.external))
+    }
+    _pool, _proj, registration = searcher._prepare_return_pool(plan, fused, judgments, ServingTrace(lib))
+    assert len(registration) <= MAX_CANDIDATES
+    # All 5 brand-new papers survive, and each known key appears at most once.
+    reg_dois = {c.get("doi") for c in registration if not c.get("_registration_known_key")}
+    assert new_dois.issubset(reg_dois)
+    known_keys = [c["_registration_known_key"] for c in registration if c.get("_registration_known_key")]
+    assert len(known_keys) == len(set(known_keys)) == 50
+
+
+def test_prepare_return_pool_rechecks_serving_excluded_after_donor_enrichment(tmp_path):
+    from papervault.library.services.registration import ServingTrace
+    from papervault.library.services.search_pipeline import PlannedSearch, RetrievedSearch, SearchPipeline
+
+    lib = Library(tmp_path)
+    # Local record has no venue yet, so it passes initial fusion serving_excluded check.
+    local = add_record(lib, "ConfStub2024", title="Solar wind abstract study",
+                       doi="", arxiv_id="2401.77777", venue="")
+    # Folded external donor reveals this is actually an AGU Fall Meeting abstract.
+    donor = dict(
+        node("ConfDonor", "Solar wind abstract study", doi="10.1234/agu-stub", rank=0),
+        arxiv_id="2401.77777",
+        venue="AGU Fall Meeting Abstracts",
+    )
+
+    searcher = SearchPipeline(lib, None, None, None, None, None, None, None, None, None)
+    plan = PlannedSearch({}, ["solar wind abstract"], {}, 10, "by_relevance")
+    fused = searcher.fusion(plan, RetrievedSearch([donor], [local], {}, []), ServingTrace(lib))
+    pool, projections, _reg = searcher._prepare_return_pool(plan, fused, {}, ServingTrace(lib))
+    assert all(item["key"] != "ConfStub2024" for item in pool)
+    assert "ConfStub2024" not in projections

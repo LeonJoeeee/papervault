@@ -11,7 +11,7 @@ Usage (live service up; sequential on purpose — one search at a time, real cal
     .venv/bin/python scripts/search_relevance_baseline.py \
         --intents src/papervault/eval/intents_v1.jsonl --n 12 --tag srb_$(date +%m%d)
 
-Writes ``src/papervault/eval/results/<tag>.jsonl`` (one line per intent: served papers,
+Writes ``$PAPERVAULT_EVAL_DIR/<tag>.jsonl`` (one line per intent: served papers,
 judge scores, latency) and prints the summary card. Latency is also independently
 visible in the MCPCALL access log; judge-side token spend is OUTSIDE the LLMTOK book
 (offline-tool scope, see papervault/llm_usage.py).
@@ -33,12 +33,36 @@ from openai import AsyncOpenAI
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from papervault import config  # noqa: E402
+from papervault.eval._paths import eval_path  # noqa: E402
 from papervault.llm_routing import (  # noqa: E402
     create_openai_chat_completion_with_fallback,
     http_status_code,
     parse_targets,
     route,
 )
+
+
+def _output_path(tag: str) -> Path:
+    return eval_path(f"{tag}.jsonl")
+
+
+def _resolve_judge_endpoint() -> tuple[str, str]:
+    if config.USE_GATEWAY:
+        url = config.GATEWAY_URL.strip()
+        if not url:
+            raise RuntimeError(
+                "PAPERVAULT_LLM_GATEWAY_URL is empty while gateway mode is enabled"
+            )
+        return url, config.GATEWAY_KEY.strip()
+    return config.LLM_BASE_URL.strip(), config.LLM_API_KEY.strip()
+
+
+def _build_judge_client() -> AsyncOpenAI:
+    base_url, api_key = _resolve_judge_endpoint()
+    kwargs: dict[str, object] = {"api_key": api_key or "sk-", "max_retries": 0}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return AsyncOpenAI(**kwargs)
 
 RELEVANT_BAR = 0.7
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.I)
@@ -155,12 +179,10 @@ async def main() -> None:
 
     intents = [json.loads(ln) for ln in Path(args.intents).read_text().splitlines() if ln.strip()]
     intents = intents[: args.n]
-    out_path = Path(__file__).resolve().parent.parent / "src/papervault/eval/results" / f"{args.tag}.jsonl"
+    out_path = _output_path(args.tag)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    judge_client = AsyncOpenAI(
-        base_url=config.GATEWAY_URL, api_key=config.GATEWAY_KEY or "sk-", max_retries=0
-    )
+    judge_client = _build_judge_client()
     cards = []
     with out_path.open("w") as fh:
         for row in intents:

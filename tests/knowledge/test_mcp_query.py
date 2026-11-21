@@ -345,3 +345,22 @@ async def test_per_session_startup_cannot_reopen_query_admission_during_shutdown
     finally:
         drain.set()
         await stopping
+
+
+async def test_active_ttl_prunes_completed_entry_without_follow_up_call(pipeline, monkeypatch):
+    monkeypatch.setenv("KS_MCP_QUERY_RETENTION_S", "0.05")
+    pipeline.release.set()
+    res = await server.query("short-lived")
+    assert res["answer"] == "short-lived"
+    assert len(server._queries_by_id) == 1
+    await asyncio.sleep(0.15)
+    assert server._queries_by_id == {}
+    assert server._queries_by_intent == {}
+
+
+@pytest.mark.parametrize("empty_intent", ["", "   ", "\n\t"])
+async def test_empty_intent_rejected_cleanly(pipeline, empty_intent):
+    res = await server.query(empty_intent)
+    assert res["status"] == "error"
+    assert pipeline.calls == []
+    assert server._queries_by_id == {}

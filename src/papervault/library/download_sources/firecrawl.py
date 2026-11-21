@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 
 import requests
 
 from ..models import DOWNLOAD_STATUS_OK, Paper
 from ..store import Library
 from ._shared import _gate_firecrawl_md, _strip_frontmatter
+
+_FIRECRAWL_REG_LOCK = threading.Lock()
 
 
 def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
@@ -56,11 +59,13 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
         return False
 
     from ..services.extraction_registration import begin_extraction, finish_extraction, recover_completions
-    recover_completions(library, key=paper.key)
+    with _FIRECRAWL_REG_LOCK:
+        recover_completions(library, key=paper.key)
 
     if library.has_extract(paper.key, "md"):
         from ..services.extraction_registration import require_selected_registration
-        require_selected_registration(library, paper)
+        with _FIRECRAWL_REG_LOCK:
+            require_selected_registration(library, paper)
         # Idempotent re-entry on an md already on disk. If it's firecrawl-
         # sourced, the paper is in text-only state — but D5 says firecrawl md
         # must PASS the completeness gate to be served as full text, with no
@@ -254,20 +259,54 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
                          "title": (paper.title or "")[:80]})
             return False
 
-    extraction_request = begin_extraction(paper, library, raw_markdown.encode(),
-        engine="firecrawl", source_role="provider_markdown", request={"url": target_url,
-            "endpoint": api_url + "/v1/scrape", "formats": ["markdown"], "timeout": 90000})
+    # Gate in memory BEFORE calling begin_extraction() so rejected scrapes
+    # never write orphaned extraction input artifacts or trigger durable saves.
     success_fields = ("download_status", "download_source", "firecrawl_pdf_hunt_exhausted")
     before = {field: getattr(paper, field) for field in success_fields}
+    identity_before = (
+        paper.doi,
+        paper.arxiv_id,
+        paper.title,
+        paper.extraction_completion_id,
+    )
     if not _gate_firecrawl_md(paper, library, md, target_url=target_url):
         return False
     # The historical gate also handles existing files. Fresh completion cannot
     # expose its optimistic status stamps until durable registration succeeds.
     for field, value in before.items():
         setattr(paper, field, value)
-    finish_extraction(paper, library, extraction_request, frontmatter + md,
-        provider_observations={"actual_model": "unknown", "engine_version": "unknown",
-                               "source_bytes": "not_disclosed", "input_boundary": "provider_markdown"})
+    with _FIRECRAWL_REG_LOCK:
+        live = library.get(paper.key) if hasattr(library, "get") else None
+        current = live if live is not None else paper
+        identity_after = (
+            current.doi,
+            current.arxiv_id,
+            current.title,
+            current.extraction_completion_id,
+        )
+        if identity_after != identity_before or (
+            paper.doi,
+            paper.arxiv_id,
+            paper.title,
+            paper.extraction_completion_id,
+        ) != identity_before:
+            library.log({
+                "event": "firecrawl_identity_changed_during_gate",
+                "key": paper.key,
+                "url": target_url,
+            })
+            return False
+        extraction_request = begin_extraction(
+            paper, library, raw_markdown.encode(),
+            engine="firecrawl", source_role="provider_markdown",
+            request={"url": target_url, "endpoint": api_url + "/v1/scrape",
+                     "formats": ["markdown"], "timeout": 90000},
+        )
+        finish_extraction(
+            paper, library, extraction_request, frontmatter + md,
+            provider_observations={"actual_model": "unknown", "engine_version": "unknown",
+                                   "source_bytes": "not_disclosed", "input_boundary": "provider_markdown"},
+        )
 
     # ✦ Phase 12.3 (#94): pre-curator quality gate (Phase 28 route B
     # reframe — the gate originally protected the 5-Q insight worker

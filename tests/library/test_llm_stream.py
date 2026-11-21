@@ -470,6 +470,72 @@ def test_multi_target_cooldown_skips_primary_and_marks_degraded_until_expiry(mon
     assert [o.degraded for o in obs] == [True, True, False]
 
 
+@pytest.mark.parametrize(
+    "relay_failure",
+    [
+        lambda: _quota_err(402, "Payment Required: insufficient balance"),
+        lambda: _quota_err(403, "预扣费额度失败, 用户剩余额度不足 (insufficient_user_quota)"),
+        lambda: _quota_err(400, "Zhipu error", body={"error": {"code": "1308", "message": "limit"}}),
+    ],
+)
+def test_three_tier_glm_to_relay_quota_to_codex_failover_and_cooldown(
+    monkeypatch, caplog, relay_failure,
+):
+    from types import SimpleNamespace
+    from papervault.llm_routing import is_model_cooled_down, parse_targets
+
+    monkeypatch.setattr(L, "_FIRST_CHUNK_S", 0.0)
+    clock = [700.0]
+    monkeypatch.setattr(L, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
+    targets = parse_targets(
+        "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"
+    )
+    calls = responses(
+        monkeypatch,
+        litellm.RateLimitError("weekly limit", model="glm-5.3-flash", llm_provider="openai"),
+        relay_failure(),
+        Stream([chunk("tier3-ok"), chunk(finish="stop")]),
+        Stream([chunk("cached-tier3-ok"), chunk(finish="stop")]),
+    )
+    client = L.LLM("openai/glm-5.3-flash", targets=targets)
+    obs = []
+    with caplog.at_level(logging.INFO, logger=L.__name__), L.observe_llm_calls(obs.append):
+        assert client.call("p1") == "tier3-ok"
+        assert is_model_cooled_down("glm-5.3-flash", now=clock[0])
+        assert is_model_cooled_down("relay-glm-5.3-flash", now=clock[0])
+        clock[0] = 750.0  # inside 120s cooldown for both Tier 1 and Tier 2
+        assert client.call("p2") == "cached-tier3-ok"
+
+    assert [c["model"] for c in calls] == [
+        "openai/glm-5.3-flash",
+        "openai/relay-glm-5.3-flash",
+        "openai/gpt-6.1-terra",
+        "openai/gpt-6.1-terra",
+    ]
+    assert [c["extra_body"] for c in calls] == [
+        {"reasoning_effort": "high"},
+        {"reasoning_effort": "high"},
+        {"reasoning_effort": "medium"},
+        {"reasoning_effort": "medium"},
+    ]
+    assert [o.degraded for o in obs] == [True, True]
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("glm-5.3-flash -> relay-glm-5.3-flash" in m for m in msgs)
+    assert any("relay-glm-5.3-flash -> gpt-6.1-terra" in m for m in msgs)
+
+
+def _quota_err(status_code: int, message: str, *, body=None):
+    err = litellm.APIError(
+        status_code=status_code,
+        message=message,
+        llm_provider="openai",
+        model="relay-glm-5.3-flash",
+    )
+    if body is not None:
+        err.body = body
+    return err
+
+
 @pytest.mark.parametrize("code", [400, 401, 403, 422])
 def test_multi_target_does_not_fail_over_on_deterministic_4xx(monkeypatch, code):
     from papervault.llm_routing import parse_targets
@@ -496,3 +562,29 @@ def test_single_target_gpt_role_never_cross_model_falls_back(monkeypatch):
     with pytest.raises(litellm.RateLimitError):
         client.call("ping")
     assert [c["model"] for c in calls] == ["openai/gpt-6.1-terra", "openai/gpt-6.1-terra"]
+
+
+@pytest.mark.parametrize("err_factory", [
+    lambda: litellm.APIConnectionError("reset by peer", llm_provider="openai", model="glm-5.3-flash"),
+    lambda: httpx.RemoteProtocolError("server disconnected"),
+    lambda: httpx.ConnectError("connection refused"),
+])
+def test_multi_target_fails_over_on_connection_and_transport_errors(monkeypatch, err_factory):
+    from papervault.llm_routing import parse_targets
+
+    err = err_factory()
+    calls = responses(monkeypatch, err, Stream([chunk("recovered"), chunk(finish="stop")]))
+    client = L.LLM(
+        "openai/glm-5.3-flash",
+        targets=parse_targets("glm-5.3-flash@high,gpt-6.1-terra@medium"),
+    )
+    assert client.call("ping") == "recovered"
+    assert [c["model"] for c in calls] == ["openai/glm-5.3-flash", "openai/gpt-6.1-terra"]
+
+
+def test_llm_call_forwards_explicit_timeout_to_provider(monkeypatch):
+    calls = responses(monkeypatch, Stream([chunk("ok"), chunk(finish="stop")]))
+    client = L.LLM("openai/gpt-6.1-terra")
+    assert client.call("ping", timeout=15.0) == "ok"
+    assert len(calls) == 1
+    assert 0 < calls[0]["timeout"] <= 15.0

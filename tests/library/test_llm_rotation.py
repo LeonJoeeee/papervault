@@ -106,6 +106,34 @@ def test_429_does_not_disable(tmp_path, no_shuffle):
     assert not next(g for g in data if g["api_key"] == "k1").get("disabled")
 
 
+def test_403_auth_disables_but_quota_403_does_not_disable(tmp_path, monkeypatch, no_shuffle):
+    f = tmp_path / "keys.json"
+    _write(f, [{"model": "m", "api_key": "k_quota", "base_url": "b"},
+               {"model": "m", "api_key": "k_auth", "base_url": "b"},
+               {"model": "m", "api_key": "k_ok", "base_url": "b"}])
+
+    class QuotaOrAuthLLM:
+        def __init__(self, **kw):
+            self.kw = kw
+
+        def call(self, *args, **kwargs):
+            k = self.kw.get("api_key")
+            if k == "k_quota":
+                err = FakeErr(403)
+                err.message = "预扣费额度失败 (insufficient_user_quota)"
+                raise err
+            if k == "k_auth":
+                raise FakeErr(403)
+            return "resp-ok"
+
+    monkeypatch.setattr(L, "LLM", QuotaOrAuthLLM)
+    p = L.KeyPool(f, 10)
+    assert p.call([{"role": "user", "content": "x"}]) == "resp-ok"
+    data = {g["api_key"]: g for g in json.loads(f.read_text())}
+    assert not data["k_quota"].get("disabled")
+    assert data["k_auth"].get("disabled") and data["k_auth"]["disabled"]["code"] == 403
+
+
 def test_hot_reload_picks_up_new_key(tmp_path):
     f = tmp_path / "keys.json"
     _write(f, [{"model": "m", "api_key": "k1", "base_url": "b"}])
@@ -172,15 +200,15 @@ def test_gateway_on_returns_proxy_llm(monkeypatch):
     monkeypatch.delenv("PAPERVAULT_LLM_JUDGE", raising=False)
     monkeypatch.setattr(L, "_DEFAULT_MAX_TOKENS", None)
     monkeypatch.setattr(L, "_gw_llms", {})
-    got = L.get_llm()                       # default library role → judge (gpt-6.1-terra@medium)
+    got = L.get_llm()                       # default library role → judge (3-tier)
     assert isinstance(got, FakeLLM)         # L.LLM is monkeypatched to FakeLLM by _reset
     assert got.kw == {
-        "model": "openai/gpt-6.1-terra",
+        "model": "openai/glm-5.3-flash",
         "base_url": "http://proxy:4000/v1",
         "api_key": "sk-test",
         "max_tokens": None,
         "num_retries": 0,
-        "targets": parse_targets("gpt-6.1-terra@medium"),
+        "targets": parse_targets("glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"),
     }
     # An explicit multi-target gate route preserves its output ceiling and parsed target chain.
     gate_spec = "glm-5.3-flash@high,gpt-6.1-terra@medium"
@@ -239,3 +267,15 @@ def test_gateway_on_default_url_and_raises_on_failure(monkeypatch):
     BEHAVIOR["sk-test"] = 500               # proxy returns an error
     with pytest.raises(FakeErr):
         got.call([{"role": "user", "content": "x"}])
+
+
+def test_keypool_client_cache_is_thread_safe(tmp_path):
+    import concurrent.futures
+
+    f = tmp_path / "keys.json"
+    groups = [{"model": "m", "api_key": f"k{i}", "base_url": "b"} for i in range(4)]
+    _write(f, groups)
+    pool = L.KeyPool(f, 10)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        clients = list(ex.map(lambda i: pool._client(groups[i % 4]), range(64)))
+    assert len({id(c) for c in clients}) == 4

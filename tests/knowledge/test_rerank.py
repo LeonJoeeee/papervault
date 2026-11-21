@@ -155,17 +155,23 @@ def test_aquery_query_param_widened(monkeypatch):
 
 # ---- V1 + V2 wiring: graph.get_graph() --------------------------------------
 
-def test_get_graph_wires_rerank_and_prompt_before_ctor(monkeypatch):
+def test_get_graph_wires_rerank_and_prompt_before_ctor(monkeypatch, tmp_path):
     """get_graph() must (V2) call apply_ks_extraction_prompt BEFORE building LightRAG, and
     (V1) pass rerank_model_func + min_rerank_score=0.0 into the ctor.
 
     Everything heavy (assert_safe_workspace, LightRAG ctor, storage init) is stubbed so this
     runs with no DB / no model. We assert ordering via a shared event log.
     """
+    from dataclasses import replace
     from papervault.knowledge.store import graph as graph_mod
 
     events = []
     monkeypatch.setattr(graph_mod, "_RAG", None)
+    monkeypatch.setattr(
+        graph_mod,
+        "CONFIG",
+        replace(graph_mod.CONFIG, lightrag=replace(graph_mod.CONFIG.lightrag, working_dir=str(tmp_path))),
+    )
     monkeypatch.setattr(graph_mod, "assert_safe_workspace", lambda: "l0_probe")
     monkeypatch.setattr(
         graph_mod, "apply_ks_extraction_prompt", lambda **kw: events.append(("prompt", kw))
@@ -180,6 +186,9 @@ def test_get_graph_wires_rerank_and_prompt_before_ctor(monkeypatch):
 
         async def initialize_storages(self):
             events.append(("init_storages", None))
+
+        async def finalize_storages(self):
+            events.append(("finalize_storages", None))
 
     monkeypatch.setattr(graph_mod, "LightRAG", _FakeRAG)
     # initialize_pipeline_status is imported inside get_graph from shared_storage
@@ -203,7 +212,8 @@ def test_get_graph_wires_rerank_and_prompt_before_ctor(monkeypatch):
     assert captured_ctor["rerank_model_func"] is graph_mod._bge_rerank
     assert captured_ctor["min_rerank_score"] == 0.0
 
-    # cleanup the module singleton we just populated
+    # cleanup the module singleton + lease we just populated
+    _run(rag.finalize_storages())
     monkeypatch.setattr(graph_mod, "_RAG", None)
 
 
@@ -211,17 +221,14 @@ def test_get_graph_wires_rerank_and_prompt_before_ctor(monkeypatch):
 
 def test_extraction_prompt_real_mutation_is_format_safe():
     """SDD §6.9.2 line 492 declares '.format-safe (only LightRAG placeholders, no bare {}/})'
-    a HARD constraint. The wiring test above monkeypatches apply_ks_extraction_prompt to a
-    lambda (it checks CALL ORDERING only, never the real mutation) — so nothing else exercises
-    the actual content. This replicates operate.py's exact two-stage .format() (operate.py
-    2909-2926, 2951-2960, lightrag 1.4.16) against the REAL mutated PROMPTS and asserts it does
-    not raise: a future edit that introduces a stray '{' in an example or the exclusions block
-    would crash the next BUILD with KeyError/ValueError — this catches it cheaply (no DB/model).
+    a HARD constraint. Replicates LightRAG 1.5.7's two-stage .format() against the REAL mutated
+    PROMPTS and asserts it does not raise.
     """
     import copy
 
     from lightrag import prompt as lr_prompt
 
+    from papervault.domain import get_domain
     from papervault.knowledge.store.extraction_prompt import apply_ks_extraction_prompt
     from papervault.knowledge.store.graph import ENTITY_TYPES
 
@@ -231,7 +238,7 @@ def test_extraction_prompt_real_mutation_is_format_safe():
     try:
         apply_ks_extraction_prompt(examples=True, exclusions=True)
 
-        # --- Stage 1: examples joined then .format()'d (operate.py:2909-2918) ---
+        # --- Stage 1: examples joined then .format()'d ---
         examples = "\n".join(lr_prompt.PROMPTS["entity_extraction_examples"])
         example_context_base = dict(
             tuple_delimiter=lr_prompt.PROMPTS["DEFAULT_TUPLE_DELIMITER"],
@@ -241,11 +248,15 @@ def test_extraction_prompt_real_mutation_is_format_safe():
         )
         examples = examples.format(**example_context_base)  # raises KeyError/ValueError on a stray brace
 
-        # --- Stage 2: system + user + continue prompts .format()'d (operate.py:2920-2960) ---
+        # --- Stage 2: system + user + continue prompts .format()'d (LightRAG 1.5.7 keys) ---
         context_base = dict(
             tuple_delimiter=lr_prompt.PROMPTS["DEFAULT_TUPLE_DELIMITER"],
             completion_delimiter=lr_prompt.PROMPTS["DEFAULT_COMPLETION_DELIMITER"],
             entity_types=",".join(ENTITY_TYPES),
+            entity_types_guidance=get_domain().entity_types_guidance,
+            max_entity_records=30,
+            max_total_records=50,
+            heading_context_block="",
             examples=examples,
             language="English",
         )
@@ -271,7 +282,7 @@ def test_extraction_prompt_real_mutation_is_format_safe():
             assert stock not in examples
         for ours in ("Solar Energetic Particles", "Physics-Informed Neural Network", "Galactic Cosmic Rays"):
             assert ours in examples
-        # V3 exclusions block reached the system prompt.
+        # V3 exclusions block reached the system prompt via entity_types_guidance.
         assert "Exclusions (do NOT extract" in sysp
     finally:
         lr_prompt.PROMPTS["entity_extraction_examples"] = saved_examples
@@ -280,23 +291,26 @@ def test_extraction_prompt_real_mutation_is_format_safe():
 
 def test_extraction_prompt_idempotent():
     """SDD §6.9.2: apply is idempotent (own sentinel). get_graph() builds the singleton once,
-    but a repeated call must not stack a 2nd exclusions block or a 4th example.
+    but a repeated call must not stack a 2nd patch or duplicate examples.
     """
     import copy
 
     from lightrag import prompt as lr_prompt
 
-    from papervault.knowledge.store.extraction_prompt import apply_ks_extraction_prompt
+    from papervault.domain import get_domain
+    from papervault.knowledge.store import extraction_prompt as ep
 
     saved_examples = copy.deepcopy(lr_prompt.PROMPTS["entity_extraction_examples"])
     saved_sysp = lr_prompt.PROMPTS["entity_extraction_system_prompt"]
     try:
-        apply_ks_extraction_prompt(examples=True, exclusions=True)
-        apply_ks_extraction_prompt(examples=True, exclusions=True)
-        apply_ks_extraction_prompt(examples=True, exclusions=True)
+        ep.apply_ks_extraction_prompt(examples=True, exclusions=True)
+        ep.apply_ks_extraction_prompt(examples=True, exclusions=True)
+        ep.apply_ks_extraction_prompt(examples=True, exclusions=True)
         sysp = lr_prompt.PROMPTS["entity_extraction_system_prompt"]
-        assert sysp.count("Exclusions (do NOT extract") == 1
-        assert sysp.count("Acronym canonicalization") == 1
+        guidance = get_domain().entity_types_guidance
+        assert sysp.count(ep._CLOSED_ONTOLOGY_15) == 1
+        assert guidance.count("Exclusions (do NOT extract") == 1
+        assert guidance.count("Acronym canonicalization") == 1
         assert len(lr_prompt.PROMPTS["entity_extraction_examples"]) == 4
     finally:
         lr_prompt.PROMPTS["entity_extraction_examples"] = saved_examples
@@ -388,3 +402,44 @@ def test_construct_graph_aligns_gpu_worker_settings(tmp_path, monkeypatch, setti
     assert tuple(rag.options[name] for name in (
         "embedding_func_max_async", "embedding_batch_num",
         "default_embedding_timeout", "rerank_model_max_async")) == expected
+
+
+@pytest.mark.parametrize("configured,expected_ladder", [
+    (4, [4, 2, 1]),
+    (16, [16, 8, 4, 2, 1]),
+    (32, [32, 16, 8, 4, 2, 1]),
+    (6, [6, 4, 2, 1]),
+    (1, [1]),
+    (0, [1]),
+])
+def test_predict_with_oom_retry_starts_at_configured_batch_size(monkeypatch, configured, expected_ladder):
+    """KS_RERANK_BATCH_SIZE=4 must run at 4 (not silently drop to 2) and step down on OOM."""
+    import torch
+
+    seen_bs: list[int] = []
+
+    class _OomModel:
+        def predict(self, pairs, batch_size=32, **kwargs):
+            seen_bs.append(batch_size)
+            if batch_size > 1:
+                raise torch.cuda.OutOfMemoryError("simulated OOM")
+            return np.array([0.5] * len(pairs), dtype=np.float32)
+
+    monkeypatch.setattr(lightrag_init, "_RERANK_BATCH_SIZE", configured)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: None)
+    scores = lightrag_init._predict_with_oom_retry(_OomModel(), [("q", "d0"), ("q", "d1")])
+    assert seen_bs == expected_ladder
+    assert len(scores) == 2
+
+
+def test_predict_with_oom_retry_uses_configured_batch_size_on_happy_path(monkeypatch):
+    seen_bs: list[int] = []
+
+    class _HappyModel:
+        def predict(self, pairs, batch_size=32, **kwargs):
+            seen_bs.append(batch_size)
+            return np.array([0.7] * len(pairs), dtype=np.float32)
+
+    monkeypatch.setattr(lightrag_init, "_RERANK_BATCH_SIZE", 4)
+    lightrag_init._predict_with_oom_retry(_HappyModel(), [("q", "d0")])
+    assert seen_bs == [4]

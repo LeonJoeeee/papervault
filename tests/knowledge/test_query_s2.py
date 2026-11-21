@@ -239,6 +239,102 @@ async def test_live_receipt_records_rerank_degradation_and_synthesis_timing(monk
             return {"status": "success", "data": evidence(), "metadata": META}
     out = await aq.query("question", rag=Rag())
     assert out["query_receipt"]["rerank_degraded"] is True
-    assert out["query_receipt"]["synthesis_model"] == "gpt-6-astra@xhigh"
+    assert out["query_receipt"]["synthesis_model"] == "gpt-6.2-astra@xhigh"
     assert out["query_receipt"]["synthesis_latency_s"] >= 0
     assert out["cited_papers"] == ["Alpha"]
+
+
+def test_multi_key_and_locator_citations_and_slash_operator_paths():
+    data = evidence()
+    data["chunks"].extend([
+        {"file_path": "textbook/SlashBook#s1", "content": "Slash textbook"},
+        {"file_path": "notebook/idea-23", "content": "Slash notebook"},
+        {"file_path": "web/nasa-srag", "content": "Slash web"},
+    ])
+    answer = (
+        "Consensus [Alpha, Zeta] and [Alpha; Beta] plus [FakeKey2025] "
+        "with [textbook:Book, Ch. 5], [textbook/SlashBook, Sec. 3.2], "
+        "[Zeta, pp. 12-15], [Zeta, Eq. (4)], [ Alpha ], [notebook:idea-23], [web:nasa-srag]."
+    )
+    out = aq.build_outfeed(data, META, answer)
+    assert set(out["cited_papers"]) == {"Alpha", "Zeta", "Beta"}
+    assert "textbook:Book" in out["cited_sources"]
+    assert "textbook:SlashBook" in out["retrieved_sources"]
+    assert "textbook:SlashBook" in out["cited_sources"]
+    assert "notebook:idea-23" in out["cited_sources"]
+    assert "web:nasa-srag" in out["cited_sources"]
+    assert "FakeKey2025" in out["query_receipt"]["unverified_citations"]
+
+
+def test_hallucinated_citations_recorded_and_logged_without_flagging_numeric_brackets(caplog):
+    answer = (
+        "Valid [Alpha], hallucinated [FakeAuthor2025] and [textbook:Unknown2020] and [Smith et al. 2024], "
+        "non-citations [1] [0, 1] [km/s] and markdown [link](https://example.com)."
+    )
+    with caplog.at_level(logging.WARNING, logger="ks.query.aquery"):
+        out = aq.build_outfeed(evidence(), META, answer)
+    unverified = out["query_receipt"]["unverified_citations"]
+    assert unverified == ["FakeAuthor2025", "textbook:Unknown2020", "Smith et al. 2024"]
+    assert any("unverified inline citations" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_mcp_and_aquery_log_query_receipt_once(monkeypatch, caplog):
+    from papervault.knowledge.mcp import server
+
+    monkeypatch.setattr(server, "_queries_by_id", {})
+    monkeypatch.setattr(server, "_queries_by_intent", {})
+    monkeypatch.setattr(server, "_query_stopping", False)
+    monkeypatch.setattr(aq, "_QUERY_VARIANT", "single")
+
+    async def ready():
+        pass
+
+    class Rag:
+        async def aquery_data(self, intent, param):
+            return {"status": "success", "data": evidence(), "metadata": META}
+
+    async def fake_synth(data, intent, **kw):
+        return "Verified finding [Alpha]."
+
+    async def fake_get_graph():
+        return Rag()
+
+    monkeypatch.setattr(server, "_ensure_knowledge_authority", ready)
+    monkeypatch.setattr("papervault.knowledge.store.graph.get_graph", fake_get_graph)
+    monkeypatch.setattr(aq, "synth_answer", fake_synth)
+
+    with caplog.at_level(logging.INFO):
+        result = await server.query("unique-dedup-receipt-check")
+    receipt_logs = [r for r in caplog.records if getattr(r, "query_receipt", None) is not None]
+    assert result["cited_papers"] == ["Alpha"]
+    assert len(receipt_logs) == 1
+
+
+@pytest.mark.asyncio
+async def test_trimmed_prompt_chunks_excluded_from_verified_citations(monkeypatch, caplog):
+    """A paper retrieved in data but trimmed out by KS_SYNTH_MAX_PROMPT_TOKENS must NOT pass as
+    a verified cited_paper — citing it must trigger unverified_citations instead."""
+    monkeypatch.setattr(synth, "_SYNTH_MAX_PROMPT_TOKENS", 220)
+
+    async def fake_complete(prompt, **kwargs):
+        assert "KeepPaper2023" in prompt
+        assert "DropPaper2024" not in prompt
+        return "Findings supported by [KeepPaper2023] and hallucinated [DropPaper2024]."
+
+    monkeypatch.setattr(synth, "mimo_complete", fake_complete)
+    data = {
+        "chunks": [
+            {"file_path": "paper/KeepPaper2023", "content": "Concise finding about SEP onset."},
+            {"file_path": "paper/DropPaper2024", "content": " ".join(["overflow"] * 300)},
+        ],
+        "references": [{"file_path": "paper/KeepPaper2023"}, {"file_path": "paper/DropPaper2024"}],
+        "entities": [],
+        "relationships": [],
+    }
+    with caplog.at_level(logging.WARNING, logger="ks.query.aquery"):
+        out = await aq.synthesize_outfeed(data, META, "Summarize SEP onset.")
+    assert out["retrieved_papers"] == ["KeepPaper2023", "DropPaper2024"]
+    assert out["cited_papers"] == ["KeepPaper2023"]
+    assert out["query_receipt"]["unverified_citations"] == ["DropPaper2024"]
+    assert any("unverified inline citations" in r.getMessage() for r in caplog.records)

@@ -43,7 +43,12 @@ from lightrag.utils import sanitize_text_for_encoding
 from lightrag.utils_pipeline import compute_text_content_hash, strip_lightrag_doc_prefix
 
 from papervault.knowledge.ingest.abstract_doc import build_abstract_doc
-from papervault.knowledge.ingest.distill import clean, doc_status_of, record_duplicate
+from papervault.knowledge.ingest.distill import (
+    clean,
+    doc_status_of,
+    find_doc_by_file_basename,
+    record_duplicate,
+)
 from papervault.knowledge.ingest.fingerprint import META, fingerprint
 from papervault.knowledge.ingest.vault import read_extract_raw
 from papervault.knowledge.ledger import store as ledger
@@ -83,11 +88,15 @@ def diff(
         led = {k: v for k, v in led.items() if k in ks}
     d = Diff()
     for key, rec in idx.items():
-        fp = fp_of(rec)
         existing = led.get(key)
         if existing is None:
+            if getattr(rec, "is_deterministic_garbage", False):
+                continue  # Never distill new deterministic garbage into the graph
+            fp = fp_of(rec)
             d.to_distill.append((key, fp))
-        elif fp != existing.fingerprint:
+            continue
+        fp = fp_of(rec)
+        if fp != existing.fingerprint:
             d.to_redistill.append((key, fp))
         elif existing.status == "error":            # F9: 指纹未变也重投(否则永卡 error,§6.1.e)
             d.to_redistill.append((key, fp))
@@ -164,46 +173,55 @@ async def reconcile_library(rag, idx: Mapping, *, only_keys=None) -> dict:
             # This source is no longer represented. Do not re-adopt a changed twin merely
             # because the old raw fingerprints match; schedule the available source below.
         twin_id = None
-        if own is None and not r.duplicate_of:
-            for twin in twins.get(r.fingerprint, []):
-                if (twin.ingest_source, twin.source_id) == (r.ingest_source, r.source_id):
+        # Plain metadata-only rows (done_meta with META fingerprint and no duplicate_of) were
+        # never inserted into LightRAG — skip per-row twin & basename SQL lookups to avoid N+1
+        # wasted queries every scheduler round, while still falling through to reopen if content
+        # became available in the vault index below.
+        plain_meta = r.status == "done_meta" and r.fingerprint == META and r.duplicate_of is None
+        if not plain_meta:
+            if own is None and not r.duplicate_of:
+                for twin in twins.get(r.fingerprint, []):
+                    if (twin.ingest_source, twin.source_id) == (r.ingest_source, r.source_id):
+                        continue
+                    if doc_status_of(await status(twin.doc_id)) == DocStatus.PROCESSED:
+                        twin_id = twin.doc_id
+                        break
+            # LightRAG's post-parse rejection can leave a FAILED own row. Enqueue rejection
+            # instead leaves a dup-* marker on the source filename (is_duplicate=true), with the
+            # same metadata. Use find_doc_by_file_basename so PG doesn't hide is_duplicate=true rows.
+            marker = own
+            if marker is None and not r.duplicate_of:
+                basename = r.source_id if r.ingest_source == "paper" else r.doc_id
+                match = await find_doc_by_file_basename(rag, basename, prefer_duplicates=True)
+                marker = match[1] if match else None
+            meta = marker.get("metadata", {}) if isinstance(marker, dict) else {}
+            original = meta.get("original_doc_id") if meta.get("duplicate_kind") == "content_hash" else None
+            if not r.duplicate_of and original and original != r.doc_id and doc_status_of(await status(original)) == DocStatus.PROCESSED:
+                # Post-parse rejection records the rejected content's hash. A historical
+                # rejection is no longer proof of representation after that twin is rebuilt.
+                rejected_hash = marker.get("content_hash")
+                if not rejected_hash and r.ingest_source == "paper" and r.source_id in idx:
+                    rejected_hash = await asyncio.to_thread(_source_content_hash, idx[r.source_id])
+                same_fingerprint = any(t.doc_id == original for t in twins.get(r.fingerprint, []))
+                if ((rejected_hash and rejected_hash == await twin_hash(original)) or
+                        (not rejected_hash and same_fingerprint)):
+                    twin_id = original
+                else:
+                    twin_id = None
+                    own = await clear_rejection(r, own)
+            if twin_id:
+                content_hash = await twin_hash(twin_id)
+                if content_hash:
+                    await clear_rejection(r, own)
+                    await record_duplicate(r.ingest_source, r.source_id, r.doc_id,
+                                           twin_id, content_hash, r.fingerprint)
+                    counters["duplicates"] += 1
                     continue
-                if doc_status_of(await status(twin.doc_id)) == DocStatus.PROCESSED:
-                    twin_id = twin.doc_id
-                    break
-        # LightRAG's post-parse rejection can leave a FAILED own row. Enqueue rejection
-        # instead leaves a dup-* marker on the source filename, with the same metadata.
-        marker = own
-        if marker is None and not r.duplicate_of:
-            basename = r.source_id if r.ingest_source == "paper" else r.doc_id
-            match = await rag.doc_status.get_doc_by_file_basename(basename)
-            marker = match[1] if match else None
-        meta = marker.get("metadata", {}) if isinstance(marker, dict) else {}
-        original = meta.get("original_doc_id") if meta.get("duplicate_kind") == "content_hash" else None
-        if not r.duplicate_of and original and original != r.doc_id and doc_status_of(await status(original)) == DocStatus.PROCESSED:
-            # Post-parse rejection records the rejected content's hash. A historical
-            # rejection is no longer proof of representation after that twin is rebuilt.
-            rejected_hash = marker.get("content_hash")
-            if not rejected_hash and r.ingest_source == "paper" and r.source_id in idx:
-                rejected_hash = await asyncio.to_thread(_source_content_hash, idx[r.source_id])
-            same_fingerprint = any(t.doc_id == original for t in twins.get(r.fingerprint, []))
-            if ((rejected_hash and rejected_hash == await twin_hash(original)) or
-                    (not rejected_hash and same_fingerprint)):
-                twin_id = original
-            else:
-                twin_id = None
-                own = await clear_rejection(r, own)
-        if twin_id:
-            content_hash = await twin_hash(twin_id)
-            if content_hash:
-                await clear_rejection(r, own)
-                await record_duplicate(r.ingest_source, r.source_id, r.doc_id,
-                                       twin_id, content_hash, r.fingerprint)
-                counters["duplicates"] += 1
-                continue
         if own is not None or r.ingest_source != "paper" or r.source_id not in idx:
             continue
         if r.status not in ("done", "done_meta", "done_abstract", "error_parked") or r.attempts != 0:
+            continue
+        if getattr(idx[r.source_id], "is_deterministic_garbage", False):
             continue
         fp = await asyncio.to_thread(fingerprint, idx[r.source_id])
         if fp != META:

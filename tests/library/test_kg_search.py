@@ -384,3 +384,137 @@ def test_dangling_and_cyclic_aliases_cannot_be_returned(backends):
     backends.rows[("chunks", 0)] = [{"file_path": "Dangling<SEP>A<SEP>B<SEP>P"}]
     assert search(Library(alias("Dangling", "Missing"), alias("A", "B"),
                           alias("B", "A"), paper("P")), ["concept"]) == ["P"]
+
+
+def test_catalog_authority_postgres_enables_kg_without_legacy_env(backends, monkeypatch):
+    monkeypatch.delenv("PAPERVAULT_STORAGE_BACKEND", raising=False)
+    monkeypatch.delenv("PAPERVAULT_SEARCH_KG", raising=False)
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "postgres")
+    backends.rows[("chunks", 0)] = [{"file_path": "P"}]
+    assert search(Library(paper("P")), ["concept"]) == ["P"]
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "json")
+    assert search(Library(paper("P")), ["concept"]) == []
+
+
+def test_default_timeout_raised_and_env_tunable_with_warning_on_failure(backends, monkeypatch, caplog):
+    import logging
+    from papervault.library.services import kg_search
+
+    monkeypatch.delenv("PAPERVAULT_SEARCH_KG_TIMEOUT_S", raising=False)
+    assert kg_search._search_timeout() == 25.0
+    monkeypatch.setenv("PAPERVAULT_SEARCH_KG_TIMEOUT_S", "40")
+    assert kg_search._search_timeout() == 40.0
+
+    before = kg_search.kg_search_stats()
+    backends.fail = "pg"
+    with caplog.at_level(logging.WARNING, logger="papervault.library.services.kg_search"):
+        assert search(Library(paper("P")), ["concept"]) == []
+    assert any(rec.levelno == logging.WARNING and "unavailable" in rec.message for rec in caplog.records)
+    after = kg_search.kg_search_stats()
+    assert after["errors"] == before["errors"] + 1
+
+
+def test_neo4j_query_orders_by_weight_desc_before_limit(backends):
+    backends.rows[("entity", 1)] = [{"entity_name": "E", "file_path": "P"}]
+    search(Library(paper("P")), ["concept"])
+    assert "ORDER BY r.weight DESC LIMIT $limit" in backends.graph_query.text
+
+
+def test_specificity_weighting_prevents_hub_entity_from_flooding_specific_entity(backends):
+    hub_papers = [paper(f"Hub{i:03d}") for i in range(200)]
+    specific = paper("Specific")
+    library = Library(*hub_papers, specific)
+    hub_path = "<SEP>".join(f"Hub{i:03d}" for i in range(200))
+    backends.rows[("entity", 0)] = [
+        {"entity_name": "broad hub", "file_path": hub_path},
+        {"entity_name": "specific mechanism", "file_path": "Specific"},
+    ]
+    ranked = search(library, ["concept"])
+    assert ranked[0] == "Specific"
+
+
+def test_pooled_pg_and_neo4j_connections_reuse_and_reconnect_on_stale_error(backends, monkeypatch):
+    from contextlib import contextmanager
+    import neo4j
+    import psycopg
+    from papervault.library.services import kg_search
+
+    kg_search.close_pools()
+    pg_opens, neo_opens = 0, 0
+    pg_closed, neo_closed = [], []
+    fail_next_pg = [False]
+    fail_next_neo = [False]
+
+    class PooledConn:
+        def __init__(self, cid):
+            self.cid = cid
+            self.closed = False
+
+        @contextmanager
+        def transaction(self):
+            yield
+
+        def execute(self, sql, params=None):
+            if fail_next_pg[0]:
+                fail_next_pg[0] = False
+                raise RuntimeError("stale PG connection")
+            self._rows = [{"entity_name": "E", "file_path": "P"}] if "lightrag_vdb_entity" in sql else []
+            return self
+
+        def fetchall(self):
+            return self._rows
+
+        def close(self):
+            self.closed = True
+            pg_closed.append(self.cid)
+
+    class PooledSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def run(self, query, **params):
+            if fail_next_neo[0]:
+                fail_next_neo[0] = False
+                raise RuntimeError("stale Neo4j session")
+            return [{"source": "E", "target": "E", "weight": 2.0, "file_path": "P"}]
+
+    class PooledDriver:
+        def __init__(self, did):
+            self.did = did
+
+        def session(self, **kwargs):
+            return PooledSession()
+
+        def close(self):
+            neo_closed.append(self.did)
+
+    def connect(**kwargs):
+        nonlocal pg_opens
+        pg_opens += 1
+        return PooledConn(pg_opens)
+
+    def driver(uri, **kwargs):
+        nonlocal neo_opens
+        neo_opens += 1
+        return PooledDriver(neo_opens)
+
+    monkeypatch.setattr(psycopg, "connect", connect)
+    monkeypatch.setattr(neo4j.GraphDatabase, "driver", driver)
+    try:
+        lib = Library(paper("P"))
+        assert search(lib, ["concept"]) == ["P"]
+        assert search(lib, ["concept"]) == ["P"]
+        assert pg_opens == 1 and neo_opens == 1
+
+        # Simulate stale connections on both PG and Neo4j -> evict & reconnect once.
+        fail_next_pg[0] = True
+        fail_next_neo[0] = True
+        assert search(lib, ["concept"]) == ["P"]
+        assert pg_opens == 2 and neo_opens == 2
+        assert 1 in pg_closed and 1 in neo_closed
+    finally:
+        kg_search.close_pools()
+        assert 2 in pg_closed and 2 in neo_closed

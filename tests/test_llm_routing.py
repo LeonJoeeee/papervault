@@ -992,3 +992,56 @@ def test_is_quota_exhaustion_error_matrix(status_code, message, body, code_attr,
     if code_attr is not None:
         err.code = code_attr
     assert is_quota_exhaustion_error(err) is want
+
+
+def test_quota_cooldown_lifecycle_and_env_override(monkeypatch):
+    monkeypatch.delenv("PAPERVAULT_LLM_QUOTA_COOLDOWN_S", raising=False)
+    monkeypatch.delenv("PAPERVAULT_LLM_FALLBACK_COOLDOWN_S", raising=False)
+    assert llm_routing.quota_cooldown_seconds() == 600.0
+
+    record_model_cooldown("glm-5.3", now=100.0, quota=True)
+    assert is_model_cooled_down("glm-5.3", now=699.9)
+    assert not is_model_cooled_down("glm-5.3", now=700.0)
+
+    monkeypatch.setenv("PAPERVAULT_LLM_QUOTA_COOLDOWN_S", "900")
+    assert llm_routing.quota_cooldown_seconds() == 900.0
+
+    # Inherit disable when fallback cooldown is <= 0 and quota cooldown is unset.
+    monkeypatch.delenv("PAPERVAULT_LLM_QUOTA_COOLDOWN_S", raising=False)
+    monkeypatch.setenv("PAPERVAULT_LLM_FALLBACK_COOLDOWN_S", "0")
+    assert llm_routing.quota_cooldown_seconds() == 0.0
+    record_model_cooldown("glm-5.3", now=1000.0, quota=True)
+    assert not is_model_cooled_down("glm-5.3", now=1000.0)
+
+
+@pytest.mark.asyncio
+async def test_openai_fallback_helper_fails_over_on_connection_error_and_merges_extra_body():
+    from types import SimpleNamespace
+    import httpx
+    import openai
+
+    calls: list[dict] = []
+    conn_err = openai.APIConnectionError(
+        request=httpx.Request("POST", "http://gw.example/v1/chat/completions")
+    )
+
+    async def create(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            raise conn_err
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    caller_extra = {"foo": "bar", "thinking": {"type": "enabled"}}
+    resp = await llm_routing.create_openai_chat_completion_with_fallback(
+        client,
+        parse_targets("deepseek-v4@nothinking,mimo-v2.6-pro@thinking"),
+        messages=[{"role": "user", "content": "hi"}],
+        extra_body=caller_extra,
+    )
+    assert resp.choices[0].message.content == "ok"
+    assert [c["model"] for c in calls] == ["deepseek-v4", "mimo-v2.6-pro"]
+    assert calls[0]["extra_body"] == {"foo": "bar", "thinking": {"type": "disabled"}}
+    assert calls[1]["extra_body"] == {"foo": "bar", "thinking": {"type": "enabled"}}
+    assert caller_extra == {"foo": "bar", "thinking": {"type": "enabled"}}
+    assert is_model_cooled_down("deepseek-v4")

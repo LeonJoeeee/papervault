@@ -205,7 +205,12 @@ def test_from_env_defaults_and_overrides():
 
 
 @pytest.mark.parametrize("exc", [
-    _status_error(400), _status_error(429), _status_error(503),
+    openai.APIStatusError(
+        "credit balance too low",
+        response=httpx.Response(400, request=_REQ),
+        body={"error": {"code": "1308", "message": "limit"}},
+    ),
+    _status_error(402), _status_error(429), _status_error(503),
     openai.APIConnectionError(request=_REQ), openai.APITimeoutError(request=_REQ),
     StreamTruncated("cut"),
 ])
@@ -224,6 +229,7 @@ def test_direct_pool_exhaustion_counts_through_its_cause():
 
 
 @pytest.mark.parametrize("exc", [
+    _status_error(400), _status_error(422),
     ValueError("caller bug"), RuntimeError("No active LLM keys"),
     BuildPausedError("paused"), asyncio.CancelledError(),
 ])
@@ -484,7 +490,7 @@ def test_schedule_default_windows_and_boundaries(value, allowed):
     if allowed:
         b.before_call()
     else:
-        with pytest.raises(BuildPausedError, match="DeepSeek peak window"):
+        with pytest.raises(BuildPausedError, match="configured peak window"):
             b.before_call()
 
 
@@ -605,7 +611,7 @@ def test_schedule_pause_preserves_failure_state_and_counters(failure_state):
     snapshot = (b._state, tuple(b._failures), b._open_until)
     for _ in range(5):
         assert not b.allows()
-        with pytest.raises(BuildPausedError, match="DeepSeek peak window") as exc:
+        with pytest.raises(BuildPausedError, match="configured peak window") as exc:
             b.before_call()
         assert not is_upstream_failure(exc.value)
     assert (b._state, tuple(b._failures), b._open_until) == snapshot
@@ -668,7 +674,7 @@ async def test_schedule_blocks_build_calls_but_allows_query_routes(monkeypatch):
     monkeypatch.setattr(graph, "mimo_complete", fake)
     assert await graph.build_llm("first chunk") == "ok"
     wall.set("2026-10-12T09:00:00+08:00")
-    with pytest.raises(BuildPausedError, match="DeepSeek peak window"):
+    with pytest.raises(BuildPausedError, match="configured peak window"):
         await graph.build_llm("next chunk")
     assert len(fake.calls) == 1
     assert b._state == "closed" and not b._failures

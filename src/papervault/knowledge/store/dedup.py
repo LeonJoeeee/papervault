@@ -207,7 +207,6 @@ async def sweep(rag, *, min_key_len: int = MIN_KEY_LEN, backup_path: str | None 
 
     merged = {}
     for (_k, members, types) in single:
-        target = max(members, key=lambda m: 0)  # placeholder; replaced below by degree
         # choose highest-degree member as canonical target
         degs = {m: await _node_degree(rag, m) for m in members}
         target = max(members, key=lambda m: degs[m])

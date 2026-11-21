@@ -524,13 +524,15 @@ async def test_stream_cut_before_finish_is_an_error_not_an_empty_answer(tmp_path
     assert any("attempt-fail" in r.getMessage() for r in caplog.records)
 
 
-async def test_stream_that_finishes_with_empty_content_is_a_legit_empty_answer(tmp_path, monkeypatch):
-    """finish_reason present + no content = the model genuinely answered nothing (same as the plain
-    call's `content: None` → ""); NOT a truncation."""
+async def test_stream_that_finishes_with_empty_content_raises_stream_truncated(tmp_path, monkeypatch):
+    """finish_reason present + empty content (e.g. after thinking) raises StreamTruncated so
+    callers fail over / retry instead of returning '' and poisoning caches."""
     _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_GW_TRANSIENT_RETRIES", 0)
     _install_fake_stream_client(monkeypatch, lambda key: [_chunk(reasoning="hmm"), _chunk(content=None, finish="stop")])
     pool = KeyPool(tmp_path / "unused.json")
-    assert await pool.complete("ping") == ""
+    with pytest.raises(llm_mod.StreamTruncated, match="empty content"):
+        await pool.complete("ping")
 
 
 async def test_stream_collects_only_choice_index_0_when_n_gt_1(tmp_path, monkeypatch):
@@ -1283,3 +1285,150 @@ async def test_slow_first_chunk_succeeds_when_first_chunk_cutoff_disabled(
 
     monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
     assert await KeyPool(f).complete("ping") == "Hello"
+
+
+@pytest.mark.parametrize("stream_on", [True, False])
+async def test_length_truncated_non_empty_returns_lightrag_truncated_response(
+    tmp_path, monkeypatch, stream_on,
+):
+    """finish_reason='length' with non-empty content returns lightrag.utils.TruncatedResponse
+    (a str subclass) so callers see str AND LightRAG 1.5.7 skips caching truncated outputs."""
+    from lightrag.utils import TruncatedResponse, is_truncated_response
+
+    _gateway_mode(monkeypatch)
+    monkeypatch.setattr(llm_mod, "_STREAM", stream_on)
+    if stream_on:
+        _install_fake_stream_client(
+            monkeypatch,
+            lambda key: [_chunk(content="partial "), _chunk(content="body", finish="length")],
+        )
+    else:
+        class _LenResp:
+            choices = [type("C", (), {
+                "message": type("M", (), {"content": "partial body"})(),
+                "finish_reason": "length",
+            })()]
+
+        class _Completions:
+            async def create(self, **kw):
+                return _LenResp()
+
+        class _Fake:
+            def __init__(self, **kw):
+                self.chat = type("Chat", (), {"completions": _Completions()})()
+
+        monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
+
+    out = await KeyPool(tmp_path / "unused.json").complete("ping")
+    assert isinstance(out, str)
+    assert isinstance(out, TruncatedResponse)
+    assert is_truncated_response(out) is True
+    assert out == "partial body"
+
+
+async def test_empty_content_after_thinking_fails_over_in_multi_target_chain(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(
+        monkeypatch,
+        [
+            [_chunk(reasoning="exhausted budget"), _chunk(content="", finish="length")],
+            list(_HELLO_STREAM),
+        ],
+    )
+    out = await KeyPool(tmp_path / "unused.json").complete(
+        "ping", model="glm-5.3@max,gpt-6.1-terra@high",
+    )
+    assert out == "Hello"
+    assert [c["model"] for c in created] == ["glm-5.3", "gpt-6.1-terra"]
+
+
+async def test_hung_tier1_respects_caller_timeout_and_fails_over_to_tier2(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    from papervault.llm_routing import is_model_cooled_down
+
+    _gateway_mode(monkeypatch)
+    seen_models: list[str] = []
+
+    class _Completions:
+        async def create(self, *, model, messages, **kw):
+            seen_models.append(model)
+            if model == "glm-5.3":
+                await asyncio.sleep(5.0)
+            async def _gen():
+                for c in _HELLO_STREAM:
+                    yield c
+            return _gen()
+
+    class _Fake:
+        def __init__(self, **kw):
+            self.chat = type("Chat", (), {"completions": _Completions()})()
+
+    monkeypatch.setattr(llm_mod, "AsyncOpenAI", _Fake)
+    t0 = time.monotonic()
+    out = await KeyPool(tmp_path / "unused.json").complete(
+        "ping", model="glm-5.3@max,gpt-6.1-terra@high", timeout=0.4,
+    )
+    elapsed = time.monotonic() - t0
+    assert out == "Hello"
+    assert seen_models == ["glm-5.3", "gpt-6.1-terra"]
+    assert elapsed < 1.0
+    assert is_model_cooled_down("glm-5.3")
+
+
+async def test_quota_429_uses_quota_cooldown_and_skips_final_target_retries(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    from papervault.llm_routing import is_model_cooled_down
+
+    _gateway_mode(monkeypatch)
+    clock = [5000.0]
+    monkeypatch.setattr(llm_mod.time, "monotonic", lambda: clock[0])
+
+    class _Quota429(Exception):
+        status_code = 429
+
+    # 1. Quota-429 on Tier 1 cools down for 600s (not 120s).
+    created = _install_sequenced_stream_client(
+        monkeypatch, [_Quota429("Weekly usage limit reached"), list(_HELLO_STREAM)],
+    )
+    pool = KeyPool(tmp_path / "unused.json")
+    assert await pool.complete("c1", model="glm-5.3@max,gpt-6.1-terra@high") == "Hello"
+    assert is_model_cooled_down("glm-5.3", now=5300.0)
+    assert not is_model_cooled_down("glm-5.3", now=5601.0)
+    assert [c["model"] for c in created] == ["glm-5.3", "gpt-6.1-terra"]
+
+    # 2. Final target hitting quota-429 is NOT retried by _gateway_retry.
+    created_final = _install_sequenced_stream_client(
+        monkeypatch, [_Quota429("Weekly usage limit reached"), list(_HELLO_STREAM)],
+    )
+    pool_final = KeyPool(tmp_path / "unused.json")
+    with pytest.raises(_Quota429):
+        await pool_final.complete("c2", model="gpt-6-astra@xhigh")
+    assert len(created_final) == 1
+
+
+async def test_retries_zero_disables_inner_gateway_retries(
+    tmp_path, monkeypatch, _instant_gateway_backoff,
+):
+    _gateway_mode(monkeypatch)
+    created = _install_sequenced_stream_client(monkeypatch, [_FakeError(503), list(_HELLO_STREAM)])
+    with pytest.raises(_FakeError):
+        await KeyPool(tmp_path / "unused.json").complete("ping", retries=0)
+    assert len(created) == 1
+
+
+async def test_direct_multi_target_fails_over_on_connection_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "USE_GATEWAY", False)
+    monkeypatch.setattr(llm_mod, "_BASE_BACKOFF", 0.0)
+    f = tmp_path / "keys.json"
+    _write(f, [_group("k1")])
+    conn_err = openai.APIConnectionError(
+        request=httpx.Request("POST", "https://sgp.example/v1/chat/completions")
+    )
+    created = _install_sequenced_stream_client(monkeypatch, [conn_err, list(_HELLO_STREAM)])
+    out = await KeyPool(f).complete("ping", model="glm-5.3-flash@high,gpt-6.1-terra@medium")
+    assert out == "Hello"
+    assert [c["model"] for c in created] == ["glm-5.3-flash", "gpt-6.1-terra"]

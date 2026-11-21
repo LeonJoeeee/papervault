@@ -49,6 +49,7 @@ _DEFAULT_ROUTES: dict[str, str] = {
 ROLES = tuple(_DEFAULT_ROUTES)
 
 _DEFAULT_COOLDOWN_S = 120.0
+_DEFAULT_QUOTA_COOLDOWN_S = 600.0
 _FALLBACK_LOCK = threading.Lock()
 _FALLBACK_COOLDOWNS: dict[str, float] = {}
 
@@ -270,9 +271,20 @@ def fallback_cooldown_seconds() -> float:
     return val if val > 0 else 0.0
 
 
+def quota_cooldown_seconds() -> float:
+    """Active quota/balance-exhaustion cooldown window in seconds (``<= 0`` disables cooldown)."""
+    raw = os.getenv("PAPERVAULT_LLM_QUOTA_COOLDOWN_S", "").strip()
+    if not raw:
+        if fallback_cooldown_seconds() <= 0:
+            return 0.0
+        return _DEFAULT_QUOTA_COOLDOWN_S
+    val = float(raw)
+    return val if val > 0 else 0.0
+
+
 def is_model_cooled_down(model: str, *, now: float | None = None) -> bool:
     """Return True iff ``model`` is currently inside an active fallback cooldown window."""
-    if fallback_cooldown_seconds() <= 0:
+    if fallback_cooldown_seconds() <= 0 and quota_cooldown_seconds() <= 0:
         return False
     key = model.strip()
     ts = time.monotonic() if now is None else now
@@ -286,17 +298,18 @@ def is_model_cooled_down(model: str, *, now: float | None = None) -> bool:
         return True
 
 
-def record_model_cooldown(model: str, *, now: float | None = None) -> float:
+def record_model_cooldown(model: str, *, now: float | None = None, quota: bool = False) -> float:
     """Record a cooldown window for ``model`` and return the applied duration in seconds."""
     key = model.strip()
-    ttl = fallback_cooldown_seconds()
+    ttl = quota_cooldown_seconds() if quota else fallback_cooldown_seconds()
     if ttl <= 0:
-        with _FALLBACK_LOCK:
-            _FALLBACK_COOLDOWNS.pop(key, None)
+        if fallback_cooldown_seconds() <= 0 and quota_cooldown_seconds() <= 0:
+            with _FALLBACK_LOCK:
+                _FALLBACK_COOLDOWNS.pop(key, None)
         return 0.0
     ts = time.monotonic() if now is None else now
     with _FALLBACK_LOCK:
-        _FALLBACK_COOLDOWNS[key] = ts + ttl
+        _FALLBACK_COOLDOWNS[key] = max(_FALLBACK_COOLDOWNS.get(key, 0.0), ts + ttl)
     return ttl
 
 
@@ -402,11 +415,11 @@ def _is_openai_failover_eligible(exc: Exception, code: int | None) -> bool:
     if isinstance(exc, TimeoutError):
         return True
     try:
-        from openai import APITimeoutError
+        from openai import APIConnectionError, APITimeoutError
 
-        return isinstance(exc, APITimeoutError)
+        return isinstance(exc, (APITimeoutError, APIConnectionError))
     except Exception:  # noqa: BLE001
-        return type(exc).__name__ == "APITimeoutError"
+        return type(exc).__name__ in {"APITimeoutError", "APIConnectionError"}
 
 
 async def create_openai_chat_completion_with_fallback(
@@ -421,9 +434,9 @@ async def create_openai_chat_completion_with_fallback(
 
     Used by async OpenAI-SDK callers (``judge_mimo``, ``_ab_u1_judge``,
     ``scripts/search_relevance_baseline.py``). Non-final targets in active cooldown are
-    skipped; transient upstream errors (``429``, ``408``, ``500..599``, timeouts) and
-    quota/balance exhaustion responses (``402`` or quota-indicated ``400/403/429``) on a
-    non-final target record cooldown, log a warning, and fail over immediately in the
+    skipped; transient upstream errors (``429``, ``408``, ``500..599``, timeouts, connection
+    errors) and quota/balance exhaustion responses (``402`` or quota-indicated ``400/403/429``)
+    on a non-final target record cooldown, log a warning, and fail over immediately in the
     same call without burning same-target retries. ``CancelledError`` and genuine non-quota
     ``4xx`` errors always re-raise immediately.
     """
@@ -435,9 +448,18 @@ async def create_openai_chat_completion_with_fallback(
         is_final = target_idx == len(targets) - 1
         if not is_final and is_model_cooled_down(target.model):
             continue
+        call_kwargs = dict(kwargs)
         wire = openai_wire_kwargs(target)
+        wire_extra = wire.pop("extra_body", None)
+        if wire_extra is not None:
+            caller_extra = call_kwargs.get("extra_body")
+            if isinstance(caller_extra, dict):
+                call_kwargs["extra_body"] = {**caller_extra, **wire_extra}
+            else:
+                call_kwargs["extra_body"] = dict(wire_extra)
+        call_kwargs.update(wire)
         try:
-            return await client.chat.completions.create(**kwargs, **wire)
+            return await client.chat.completions.create(**call_kwargs)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -446,7 +468,10 @@ async def create_openai_chat_completion_with_fallback(
             code = http_status_code(exc)
             if not _is_openai_failover_eligible(exc, code):
                 raise
-            ttl = record_model_cooldown(target.model)
+            ttl = record_model_cooldown(
+                target.model,
+                quota=is_quota_exhaustion_error(exc, code),
+            )
             fallback_model = targets[target_idx + 1].model
             if deadline is not None and deadline - time.monotonic() <= 0.0:
                 active_log.warning(

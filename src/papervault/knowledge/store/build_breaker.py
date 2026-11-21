@@ -58,6 +58,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from openai import APIConnectionError
 
 from papervault.knowledge.store.llm import StreamTruncated, _error_code
+from papervault.llm_routing import is_quota_exhaustion_error
 
 log = logging.getLogger("ks.store.build_breaker")
 
@@ -184,20 +185,21 @@ class BuildSchedule:
             if paused != self._paused:
                 self._paused = paused
                 if paused:
-                    log.info("build schedule entered DeepSeek peak window; %s", self.message(resume))
+                    log.info("build schedule entered configured peak window; %s", self.message(resume))
                 else:
                     log.info("build schedule off-peak resumed; background build schedule allows work")
             return resume
 
     @staticmethod
     def message(resume: datetime) -> str:
-        return "build paused: DeepSeek peak window (off-peak resumes " + resume.strftime("%H:%M %Z") + ")"
+        return "build paused: configured peak window (off-peak resumes " + resume.strftime("%H:%M %Z") + ")"
 
 
 def is_upstream_failure(exc: BaseException) -> bool:
     """True when ``exc`` (or an exception in its ``__cause__`` chain) is an upstream/gateway failure:
-    an HTTP 4xx/5xx status, a transport error, or a stream cut short. Cancellations and every other
-    error are the caller's, not the upstream's."""
+    an upstream/quota HTTP status (401/402/403/408/429/5xx, or quota-indicated 400), a transport
+    error, or a stream cut short. Deterministic non-quota 400/422 validation errors, cancellations,
+    and every other error are the caller's, not the upstream's."""
     seen: set[int] = set()
     e: Optional[BaseException] = exc
     while e is not None and id(e) not in seen:
@@ -208,7 +210,9 @@ def is_upstream_failure(exc: BaseException) -> bool:
             return True
         if isinstance(e, Exception):
             code = _error_code(e)
-            if code is not None and 400 <= code <= 599:
+            if is_quota_exhaustion_error(e, code):
+                return True
+            if code is not None and (code in {401, 402, 403, 408, 429} or 500 <= code <= 599):
                 return True
         e = e.__cause__
     return False

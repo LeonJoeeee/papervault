@@ -271,6 +271,18 @@ def cmd_correction_adjudicate(args) -> int:
     return 0
 
 
+def _refuse_if_service_running(action: str) -> bool:
+    """Refuse offline mutating CLI commands while papervault.service is active."""
+    from papervault.ops_guards import active_service_units
+    running = active_service_units(("papervault.service",), states=_SERVICE_RUNNING_STATES)
+    if running:
+        _err(f"{', '.join(running)} is running — it saves its in-memory index "
+             f"and would overwrite or conflict with `{action}`. Stop it first "
+             "(systemctl --user stop papervault.service), then re-run.")
+        return True
+    return False
+
+
 def cmd_add(args) -> int:
     """`python -m papervault.library.cli add <ident>` — enqueue one paper for background ingest.
 
@@ -280,6 +292,8 @@ def cmd_add(args) -> int:
     """
     from .services.add_service import AddService
 
+    if _refuse_if_service_running("add"):
+        return 2
     lib = Library()
     result = AddService(lib).add(args.identifier, force_refresh=args.force_refresh)
 
@@ -313,6 +327,8 @@ def cmd_add_batch(args) -> int:
         _err("no identifiers provided")
         return 1
 
+    if _refuse_if_service_running("add-batch"):
+        return 2
     lib = Library()
     svc = BatchAddService(lib, max_workers=args.workers)
 
@@ -330,7 +346,7 @@ def cmd_add_batch(args) -> int:
 
 def cmd_list(args) -> int:
     """`python -m papervault.library.cli list [filters]` — tabular library view."""
-    lib = Library()
+    lib = Library(read_only=True)
 
     def keep(p) -> bool:
         if args.review and not p.is_review:
@@ -367,7 +383,7 @@ def cmd_search(args) -> int:
     """`python -m papervault.library.cli search <query>` — in-library search with optional LLM rerank."""
     from .services.search_service import SearchService
 
-    lib = Library()
+    lib = Library(read_only=True)
     out = SearchService(lib).search(
         args.query, limit=args.limit, rerank=not args.no_rerank,
     )
@@ -386,7 +402,7 @@ def cmd_search(args) -> int:
 
 def cmd_show(args) -> int:
     """`python -m papervault.library.cli show <key>` — full metadata for one paper."""
-    lib = Library()
+    lib = Library(read_only=True)
     p = lib.get(args.key)
     if p is None:
         _err(f"no paper with key {args.key!r}")
@@ -402,7 +418,7 @@ def cmd_show(args) -> int:
 
 def cmd_read(args) -> int:
     """`python -m papervault.library.cli read <key>` — print extracted text."""
-    lib = Library()
+    lib = Library(read_only=True)
     if lib.get(args.key) is None:
         _err(f"no paper with key {args.key!r}")
         return 1
@@ -423,7 +439,7 @@ def cmd_read(args) -> int:
 
 def cmd_bibtex(args) -> int:
     """`python -m papervault.library.cli bibtex` — export BibTeX (full library or subset)."""
-    lib = Library()
+    lib = Library(read_only=True)
     keys = None
     if args.keys:
         keys = [k.strip() for k in args.keys.split(",") if k.strip()]
@@ -453,7 +469,7 @@ def cmd_cite_check(args) -> int:
     if args.allowed_keys:
         allowed = [k.strip() for k in args.allowed_keys.split(",") if k.strip()]
 
-    lib = Library()
+    lib = Library(read_only=True)
     report = cite_check.check(tex_path.read_text(), lib, allowed=allowed)
 
     if args.json:
@@ -756,22 +772,24 @@ def cmd_audit(args) -> int:
         except OSError as exc:
             _err(f"cannot read --retry-extract-keys file {args.retry_extract_keys}: {exc}")
             return 2
-        if not args.dry_run:
-            from papervault.ops_guards import active_service_units
-            running = active_service_units(("papervault.service",),
-                                           states=_SERVICE_RUNNING_STATES)
-            if running:
-                _err(f"{', '.join(running)} is running — it saves its whole in-memory "
-                     "index and would overwrite this reset. Stop it first "
-                     "(systemctl --user stop papervault.service), then re-run.")
-                return 2
+
+    is_mutating = bool(
+        args.fix
+        or args.retry_failed
+        or args.retry_low_quality
+        or args.retry_metadata_only
+        or (args.retry_extract_keys and not args.dry_run)
+        or (args.resolve_stub_dois and not args.dry_run)
+    )
+    if is_mutating and _refuse_if_service_running("audit"):
+        return 2
 
     from .services.operator_actions import reopen_records
     actor = args.actor
     def reopen(papers, action, *, extraction=False):
         reopen_records(lib, papers, extraction=extraction,
                        reason=args.reason or f"audit: {action}", actor=actor)
-    lib = Library()
+    lib = Library(read_only=not is_mutating)
     payload: dict = {}
     do_drift_scan = args.fix or not (
         args.queue or args.retry_failed or args.retry_low_quality
@@ -987,7 +1005,7 @@ def cmd_status(args) -> int:
     healthy, and what just happened" rather than the full state-machine
     breakdown. Designed for ``watch -n 60 python -m papervault.library.cli status`` style use.
     """
-    lib = Library()
+    lib = Library(read_only=True)
     papers = lib.all_papers()
 
     from .models import (
@@ -1103,7 +1121,7 @@ def cmd_status(args) -> int:
 
 def cmd_topics(args) -> int:
     """`python -m papervault.library.cli topics list|show <slug>` — topic membership inspection."""
-    lib = Library()
+    lib = Library(read_only=True)
     if args.topic_command == "list":
         slugs = sorted(p.stem for p in lib.topics_dir.glob("*.json"))
         for s in slugs:
@@ -1121,11 +1139,22 @@ def cmd_topics(args) -> int:
 
 def cmd_config(args) -> int:
     """`python -m papervault.library.cli config` — print effective config."""
-    lib = Library()
+    from papervault import config
+    try:
+        lib = Library(read_only=True)
+        root_str = str(lib.root)
+        paper_count = len(lib.all_papers())
+    except ValueError:
+        root_str = str(Path(os.path.expanduser(
+            os.environ.get("PAPER_LIBRARY_PATH")
+            or os.environ.get("PAPERVAULT_VAULT")
+            or str(config.VAULT_PATH)
+        )))
+        paper_count = 0
     info = {
-        "library_root": str(lib.root),
-        "library_root_env": "$PAPER_LIBRARY_PATH" if "PAPER_LIBRARY_PATH" in __import__("os").environ else "(default)",
-        "papers_in_library": len(lib.all_papers()),
+        "library_root": root_str,
+        "library_root_env": "$PAPER_LIBRARY_PATH" if "PAPER_LIBRARY_PATH" in os.environ else "(default)",
+        "papers_in_library": paper_count,
         "version": _version(),
     }
     if args.json:
@@ -1156,7 +1185,9 @@ def cmd_zotero_sync(args) -> int:
         _err(f"ZOTERO_USER_ID must be integer, got {user_id_raw!r}")
         return 2
 
-    lib = Library()
+    if not args.dry_run and _refuse_if_service_running("zotero-sync"):
+        return 2
+    lib = Library(read_only=bool(args.dry_run))
     sync = ZoteroSync(lib, api_key=api_key, user_id=user_id)
 
     def _progress(stage: str, done: int, total: int) -> None:
@@ -1177,11 +1208,15 @@ def cmd_zotero_sync(args) -> int:
 
 
 def _version() -> str:
-    try:
-        from importlib.metadata import version
-        return version("paper-library")
-    except Exception:
-        return "unknown"
+    from importlib.metadata import PackageNotFoundError, version
+    for dist in ("papervault", "paper-library"):
+        try:
+            return version(dist)
+        except PackageNotFoundError:
+            continue
+        except Exception:
+            return "unknown"
+    return "unknown"
 
 
 # -------------------------------- argparse ---------------------------------

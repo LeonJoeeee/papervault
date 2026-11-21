@@ -1223,3 +1223,83 @@ def test_extraction_starts_failover_at_selected_round_robin_endpoint(tmp_path, m
                         lambda **kw: real_client(transport=httpx.MockTransport(handle), **kw))
     assert asyncio.run(extract.extract_md(paper, lib, llm=object())) == body
     assert hosts == want
+
+
+def test_review_and_completeness_gate_sample_oversized_text_and_log_errors(monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setenv("PAPERVAULT_EXTRACT_GATE_MAX_CHARS", "3000")
+    head_marker = "HEAD_ANCHOR_BEGIN "
+    mid_marker = " INTERIOR_ANCHOR_MIDDLE "
+    tail_marker = " TAIL_ANCHOR_END."
+    huge = head_marker + ("A" * 5000) + mid_marker + ("B" * 5000) + tail_marker
+    assert len(huge) > 10000
+
+    seen_review: list[str] = []
+    seen_gate: list[str] = []
+
+    class CaptureReview:
+        def call(self, msgs):
+            seen_review.append(msgs[-1]["content"])
+            return '{"ok": true, "issues": [], "confidence": 0.9}'
+
+    class CaptureGate:
+        def call(self, msgs):
+            seen_gate.append(msgs[-1]["content"])
+            return '{"complete": true, "reason": "complete"}'
+
+    with caplog.at_level(logging.INFO, logger=extract.__name__):
+        assert extract.review_extract(huge, llm=CaptureReview())["ok"] is True
+        assert extract.completeness_gate(huge, llm=CaptureGate())["complete"] is True
+
+    for payload in (seen_review[0], seen_gate[0]):
+        assert len(payload) < 4000
+        assert head_marker in payload
+        assert mid_marker in payload
+        assert tail_marker in payload
+        assert "SAMPLED DOCUMENT REVIEW" in payload
+        assert "chars omitted" in payload
+    assert any("sampled oversized extract" in r.message for r in caplog.records)
+
+    class BoomLLM:
+        def call(self, msgs):
+            raise RuntimeError("upstream boom")
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=extract.__name__):
+        assert extract.review_extract("X" * 1000, llm=BoomLLM())["ok"] is True
+        assert extract.completeness_gate("X" * 1000, llm=BoomLLM())["complete"] is True
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("review_extract: LLM call failed" in m for m in warnings)
+    assert any("completeness_gate: LLM call failed" in m for m in warnings)
+
+
+@pytest.mark.asyncio
+async def test_extract_md_offloads_blocking_io_and_holds_lib_write_lock(tmp_path, monkeypatch):
+    import threading
+    from papervault.library.services import concurrency, extraction_registration as er
+
+    lib, paper = _pdf_paper(tmp_path)
+    _stub_good_probe(monkeypatch)
+    _stub_mineru(monkeypatch, returns="Readable body text. " * 30)
+    _stub_judges_pass(monkeypatch)
+
+    loop_thread = threading.get_ident()
+    observed = []
+    orig_begin = er.begin_extraction
+    orig_finish = er.finish_extraction
+
+    def wrapped_begin(*args, **kwargs):
+        observed.append(("begin", threading.get_ident() != loop_thread, concurrency.lib_write_lock.locked()))
+        return orig_begin(*args, **kwargs)
+
+    def wrapped_finish(*args, **kwargs):
+        observed.append(("finish", threading.get_ident() != loop_thread, concurrency.lib_write_lock.locked()))
+        return orig_finish(*args, **kwargs)
+
+    monkeypatch.setattr(er, "begin_extraction", wrapped_begin)
+    monkeypatch.setattr(er, "finish_extraction", wrapped_finish)
+
+    out = await extract.extract_md(paper, lib, llm=object())
+    assert out is not None
+    assert observed == [("begin", True, True), ("finish", True, True)]

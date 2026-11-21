@@ -787,3 +787,27 @@ def test_firecrawl_matching_abstract_passes_identity(
     result = download._try_firecrawl_text_fallback(paper, lib)
     assert result is True
     assert lib.has_extract(paper.key, "md")
+
+
+@responses.activate
+def test_firecrawl_rejected_scrape_never_calls_begin_extraction_or_writes_orphan_inputs(
+    lib, paper, firecrawl_env, monkeypatch
+):
+    from papervault.library.services import extraction_registration as er
+
+    responses.add(
+        responses.POST, "https://api.firecrawl.dev/v1/scrape",
+        json={"success": True, "data": {"markdown": PAYWALL_STUB_MD}},
+        status=200,
+    )
+    paper.abstract = "A citable abstract."
+    _patch_gate(monkeypatch, complete=False, reason="paywall stub")
+
+    called = []
+    monkeypatch.setattr(er, "begin_extraction", lambda *a, **k: called.append(True))
+
+    result = download._try_firecrawl_text_fallback(paper, lib)
+    assert result is False
+    assert called == []
+    inputs_dir = lib.root / "extracts" / "inputs"
+    assert not inputs_dir.exists() or list(inputs_dir.iterdir()) == []

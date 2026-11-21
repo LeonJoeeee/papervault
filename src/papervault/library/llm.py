@@ -257,7 +257,15 @@ def _is_failover_eligible(exc: Exception) -> bool:
         return code in {408, 429} or 500 <= code <= 599
     return isinstance(
         exc,
-        (StreamTruncated, TimeoutError, APITimeoutError, litellm.Timeout, httpx.TimeoutException),
+        (
+            StreamTruncated,
+            TimeoutError,
+            APITimeoutError,
+            litellm.Timeout,
+            litellm.APIConnectionError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+        ),
     )
 
 
@@ -501,26 +509,27 @@ class KeyPool:
         return active
 
     def _client(self, g: dict) -> LLM:
-        if self._targets is not None:
-            wire_model = litellm_wire_kwargs(self._targets[0])["model"]
-            key = (wire_model, g["base_url"], g["api_key"], self._targets)
+        with self._lock:
+            if self._targets is not None:
+                wire_model = litellm_wire_kwargs(self._targets[0])["model"]
+                key = (wire_model, g["base_url"], g["api_key"], self._targets)
+                c = self._clients.get(key)
+                if c is None:
+                    c = LLM(
+                        model=wire_model,
+                        base_url=g["base_url"],
+                        api_key=g["api_key"],
+                        max_tokens=self._max_tokens,
+                        targets=self._targets,
+                    )
+                    self._clients[key] = c
+                return c
+            key = (g.get("model") or _DEFAULT_MODEL, g["base_url"], g["api_key"])
             c = self._clients.get(key)
             if c is None:
-                c = LLM(
-                    model=wire_model,
-                    base_url=g["base_url"],
-                    api_key=g["api_key"],
-                    max_tokens=self._max_tokens,
-                    targets=self._targets,
-                )
+                c = LLM(model=key[0], base_url=key[1], api_key=key[2], max_tokens=self._max_tokens)
                 self._clients[key] = c
             return c
-        key = (g.get("model") or _DEFAULT_MODEL, g["base_url"], g["api_key"])
-        c = self._clients.get(key)
-        if c is None:
-            c = LLM(model=key[0], base_url=key[1], api_key=key[2], max_tokens=self._max_tokens)
-            self._clients[key] = c
-        return c
 
     # ---- the call: random failover, stateless ----
     def call(self, *args, **kwargs):

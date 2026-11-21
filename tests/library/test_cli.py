@@ -728,3 +728,66 @@ def test_retry_extract_keys_missing_file_is_an_error(tmp_lib_env, tmp_path, caps
     rc = cli.main(["audit", "--retry-extract-keys", str(tmp_path / "absent.txt")])
     assert rc == 2
     assert "absent.txt" in capsys.readouterr().err
+
+
+def test_version_resolves_papervault_distribution():
+    ver = cli._version()
+    assert ver != "unknown"
+    assert "." in ver
+
+
+@pytest.mark.parametrize("argv", [
+    ["list"],
+    ["search", "cosmic ray", "--no-rerank"],
+    ["show", "Potgieter2013"],
+    ["read", "Potgieter2013", "--md"],
+    ["bibtex", "--keys", "Potgieter2013"],
+    ["status"],
+    ["topics", "list"],
+    ["config"],
+    ["audit", "--queue"],
+])
+def test_readonly_subcommands_open_library_read_only(tmp_lib_env, monkeypatch, argv):
+    seen_flags = []
+    real_lib = cli.Library
+
+    def spy_lib(*args, **kwargs):
+        seen_flags.append(kwargs.get("read_only", False))
+        return real_lib(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "Library", spy_lib)
+    cli.main(argv)
+    assert seen_flags == [True]
+
+
+@pytest.mark.parametrize("argv", [
+    ["add", "10.1/x"],
+    ["audit", "--fix"],
+    ["audit", "--retry-failed"],
+    ["audit", "--retry-low-quality"],
+    ["audit", "--retry-metadata-only", "--all"],
+    ["audit", "--resolve-stub-dois", "--no-dry-run"],
+])
+def test_mutating_subcommands_refuse_while_service_active(tmp_lib_env, capsys, monkeypatch, argv):
+    from papervault import ops_guards
+
+    monkeypatch.setattr(ops_guards.subprocess, "run", _FakeSystemctl("active"))
+    rc = cli.main(argv)
+    err = capsys.readouterr().err
+    assert rc == 2
+    assert "papervault.service" in err
+
+
+def test_add_batch_and_zotero_sync_refuse_while_service_active(tmp_lib_env, tmp_path, capsys, monkeypatch):
+    from papervault import ops_guards
+
+    monkeypatch.setattr(ops_guards.subprocess, "run", _FakeSystemctl("active"))
+    batch_file = tmp_path / "idents.txt"
+    batch_file.write_text("10.1/a\n")
+    assert cli.main(["add-batch", str(batch_file)]) == 2
+    assert "papervault.service" in capsys.readouterr().err
+
+    monkeypatch.setenv("ZOTERO_API_KEY", "k")
+    monkeypatch.setenv("ZOTERO_USER_ID", "12345")
+    assert cli.main(["zotero-sync"]) == 2
+    assert "papervault.service" in capsys.readouterr().err

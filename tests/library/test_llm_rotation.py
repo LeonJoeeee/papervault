@@ -267,3 +267,15 @@ def test_gateway_on_default_url_and_raises_on_failure(monkeypatch):
     BEHAVIOR["sk-test"] = 500               # proxy returns an error
     with pytest.raises(FakeErr):
         got.call([{"role": "user", "content": "x"}])
+
+
+def test_keypool_client_cache_is_thread_safe(tmp_path):
+    import concurrent.futures
+
+    f = tmp_path / "keys.json"
+    groups = [{"model": "m", "api_key": f"k{i}", "base_url": "b"} for i in range(4)]
+    _write(f, groups)
+    pool = L.KeyPool(f, 10)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        clients = list(ex.map(lambda i: pool._client(groups[i % 4]), range(64)))
+    assert len({id(c) for c in clients}) == 4

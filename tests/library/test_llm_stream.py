@@ -562,3 +562,21 @@ def test_single_target_gpt_role_never_cross_model_falls_back(monkeypatch):
     with pytest.raises(litellm.RateLimitError):
         client.call("ping")
     assert [c["model"] for c in calls] == ["openai/gpt-6.1-terra", "openai/gpt-6.1-terra"]
+
+
+@pytest.mark.parametrize("err_factory", [
+    lambda: litellm.APIConnectionError("reset by peer", llm_provider="openai", model="glm-5.3-flash"),
+    lambda: httpx.RemoteProtocolError("server disconnected"),
+    lambda: httpx.ConnectError("connection refused"),
+])
+def test_multi_target_fails_over_on_connection_and_transport_errors(monkeypatch, err_factory):
+    from papervault.llm_routing import parse_targets
+
+    err = err_factory()
+    calls = responses(monkeypatch, err, Stream([chunk("recovered"), chunk(finish="stop")]))
+    client = L.LLM(
+        "openai/glm-5.3-flash",
+        targets=parse_targets("glm-5.3-flash@high,gpt-6.1-terra@medium"),
+    )
+    assert client.call("ping") == "recovered"
+    assert [c["model"] for c in calls] == ["openai/glm-5.3-flash", "openai/gpt-6.1-terra"]

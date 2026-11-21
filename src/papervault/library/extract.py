@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -42,6 +43,59 @@ from dataclasses import dataclass
 from typing import Optional
 
 from papervault.llm_routing import route
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_GATE_MAX_CHARS = 120_000
+
+
+def _gate_max_chars() -> int:
+    raw = os.environ.get("PAPERVAULT_EXTRACT_GATE_MAX_CHARS", "").strip()
+    if not raw:
+        return _DEFAULT_GATE_MAX_CHARS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid PAPERVAULT_EXTRACT_GATE_MAX_CHARS=%r; using %d",
+            raw, _DEFAULT_GATE_MAX_CHARS,
+        )
+        return _DEFAULT_GATE_MAX_CHARS
+    return value if value >= 3000 else _DEFAULT_GATE_MAX_CHARS
+
+
+def _sample_for_gate(text: str, *, max_chars: int | None = None, gate: str = "extract_gate") -> tuple[str, bool]:
+    """Bound reviewer LLM input size without losing head, interior, or tail evidence.
+
+    Normal documents (``len(text) <= limit``) pass through byte-for-byte unchanged.
+    Oversized documents are sampled into clearly annotated head, interior, and tail
+    windows so reviewers do not hit upstream context-length HTTP 400 errors and
+    silently fail open.
+    """
+    limit = _gate_max_chars() if max_chars is None else max_chars
+    if len(text) <= limit:
+        return text, False
+    head_n = int(limit * 0.4)
+    tail_n = int(limit * 0.4)
+    mid_n = max(1, limit - head_n - tail_n)
+    mid_start = max(head_n, (len(text) - mid_n) // 2)
+    mid_end = min(len(text) - tail_n, mid_start + mid_n)
+    omitted_1 = max(0, mid_start - head_n)
+    omitted_2 = max(0, (len(text) - tail_n) - mid_end)
+    sampled = (
+        f"[SAMPLED DOCUMENT REVIEW: {len(text):,} total chars; showing head, interior, "
+        f"and tail windows — intentional sampling markers below are NOT truncation.]\n\n"
+        f"{text[:head_n]}\n\n"
+        f"[... {omitted_1:,} chars omitted between head and interior window ...]\n\n"
+        f"{text[mid_start:mid_end]}\n\n"
+        f"[... {omitted_2:,} chars omitted between interior and tail window ...]\n\n"
+        f"{text[-tail_n:]}"
+    )
+    logger.info(
+        "%s: sampled oversized extract (%d chars -> %d chars, windows=%d/%d/%d)",
+        gate, len(text), len(sampled), head_n, mid_end - mid_start, tail_n,
+    )
+    return sampled, True
 
 from .mineru_client import (
     MineruExtractionError,
@@ -215,14 +269,15 @@ def pdf_probe(pdf_path: str, *,
 # ``broken_pdf_suspected`` axis (that was completeness leakage, now fully owned
 # by completeness_gate, D3/D4).
 _REVIEW_PROMPT = (
-    "You are checking ONE chunk of a PDF→Markdown extraction of an academic "
-    "paper for READABILITY. Below is the text of a single chunk (not the whole "
-    "paper). Return ONLY a JSON object on a single line, no prose:\n"
+    "You are checking a PDF→Markdown or scraped text extraction of an academic "
+    "paper for READABILITY. Below is either the whole extracted document or "
+    "clearly annotated head, interior, and tail sampled windows of a long "
+    "document. Return ONLY a JSON object on a single line, no prose:\n"
     '{"ok": true|false, "issues": ["..."], "confidence": 0.0-1.0}\n\n'
     # === THE ONE QUESTION (clarity only) ===
-    "Your single test: **can a human read this chunk?** If the text is "
+    "Your single test: **can a human read this extracted text?** If the text is "
     "legible prose / equations / tables a reader can follow → ok=true. Flag "
-    "ok=false ONLY when the extraction itself is broken so the chunk is "
+    "ok=false ONLY when the extraction itself is broken so the text is "
     "UNREADABLE:\n"
     "  - Garbled / looping text: e.g., 'Hull, Hull, Hulf, Hull, Hulf, ...', "
     "'Galathe' for 'Galactic', or μ rendered as 'TO GUO GUILLOS'\n"
@@ -232,20 +287,18 @@ _REVIEW_PROMPT = (
     "symbols should be; random replacement chars (U+FFFD ⊙) throughout\n"
     "  - Engine-refusal text replacing real content: 'I cannot…', "
     "'As an AI model…'\n"
-    "  - Essentially blank: almost no actual text came out of this chunk\n\n"
+    "  - Essentially blank: almost no actual text came out of this extraction\n\n"
     # === DO NOT FLAG (clarity false-positive traps) ===
-    "**Do NOT flag the following — these do NOT make a chunk unreadable:**\n"
-    "  - The chunk being SHORT. Length is NOT a clarity problem. A short "
-    "chunk (a 2-page letter, a references-only tail, an appendix) is fine.\n"
-    "  - The chunk lacking an Introduction / Conclusion / some section. This "
-    "is ONE chunk of a larger paper; it is NOT supposed to be self-contained. "
-    "Missing sections are NEVER your concern (that is the whole-paper gate's "
-    "job, not yours).\n"
-    "  - The chunk ending mid-sentence or mid-paragraph. Chunks are cut by "
-    "page count, so they routinely start and end mid-flow — that is normal "
-    "chunking, NOT a truncated paper. Do NOT report 'truncated'.\n"
-    "  - Whether the paper looks like a paywall page / landing page / is "
-    "complete overall — NONE of that is your job. Judge ONLY readability.\n"
+    "**Do NOT flag the following — these do NOT make an extraction unreadable:**\n"
+    "  - The text being SHORT. Length is NOT a clarity problem. A short "
+    "paper (a 2-page letter, a references-only tail, an appendix) is fine.\n"
+    "  - Intentional sampling markers (`[SAMPLED DOCUMENT REVIEW: ...]`, "
+    "`[... N chars omitted ...]`) injected for long documents, or text around "
+    "those sampling boundaries starting/ending mid-sentence — that is normal "
+    "window sampling, NOT garble or truncation.\n"
+    "  - Missing sections or whether the paper looks like a paywall page / "
+    "landing page / is complete overall — NONE of that is your job (that is "
+    "the completeness gate's job). Judge ONLY readability.\n"
     "  - HTML residue (`<sup>`, `<span>`, `<br>`, `<table>`) from VLM "
     "output — cosmetic only, readability fine\n"
     "  - Equations rendered as LaTeX (`$...$`, `\\frac{}{}`) — that's the "
@@ -258,52 +311,38 @@ _REVIEW_PROMPT = (
     "Issues list must be concrete (quote the specific garbled chars or "
     "phrases). Empty if ok."
     "\n\nWorked examples:\n"
-    "Chunk: The inferred diffusion coefficient decreases with increasing magnetic "
+    "Extract: The inferred diffusion coefficient decreases with increasing magnetic "
     "turbulence, and the measured particle flux therefore\n"
     'Output: {"ok": true, "issues": [], "confidence": 0.98}\n'
-    "This is clean prose ending mid-sentence at a normal chunk boundary.\n\n"
-    "Chunk: Hull Hull Hulf Hull Hulf TO GUO GUILLOS a n d t h a t Hull Hulf Hull\n"
+    "This is clean prose at a normal window boundary.\n\n"
+    "Extract: Hull Hull Hulf Hull Hulf TO GUO GUILLOS a n d t h a t Hull Hulf Hull\n"
     'Output: {"ok": false, "issues": ["Looping Hull Hulf and corrupt TO GUO GUILLOS; per-character spacing a n d t h a t"], "confidence": 0.99}\n\n'
-    "Chunk: The fit gives $D = D_0 E^\\alpha$. <span>Density</span> is "
+    "Extract: The fit gives $D = D_0 E^\\alpha$. <span>Density</span> is "
     "$n=3$ cm<sup>-3</sup>.<br><table><tr><td>Energy</td><td>1 GeV</td></tr></table>\n"
     'Output: {"ok": true, "issues": [], "confidence": 0.97}\n'
 )
 
 
 def review_extract(extract_text: str, *, llm=None) -> dict:
-    """Clarity reviewer (D4) — now used by the firecrawl pre-curator check.
+    """Clarity reviewer (D4) — whole-document / sampled-window readability judge.
 
-    The per-chunk OCR caller is gone (single whole-PDF MinerU call). The live
-    consumer is the firecrawl post-download pre-curator check (``download.py``),
-    which runs this on a web-scraped rendering before treating it as real full
-    text. It answers ONE question — **can a human read this text?** (garble /
-    loop / engine-refusal / blank). It is deliberately narrow:
+    Used by both the MinerU extraction spine and the firecrawl pre-curator check.
+    It answers ONE question — **can a human read this text?** (garble / loop /
+    engine-refusal / blank). Oversized extracts above ``PAPERVAULT_EXTRACT_GATE_MAX_CHARS``
+    (default 120,000 chars) are sampled into annotated head + interior + tail windows
+    so long monographs never hit HTTP 400 context errors and silently fail open.
 
-    - It does NOT judge completeness (truncation / paywall stub / a missing
-      interior section). That is ``completeness_gate``'s job (D3).
-    - It NEVER judges by length (D4). The ONE length rule is the
-      <_BLANK_CHUNK_FLOOR-char floor below, which catches a blank / refused
-      rendering (essentially no text came out), not "this is short". A
-      legitimately short-but-clean text (100-499 chars) is ABOVE the floor and
-      is judged by the LLM clarity reviewer.
-
-    Returns ``{"ok": bool, "issues": [str], "confidence": float}`` — there is
-    no ``broken_pdf_suspected`` axis (that completeness/PDF-source judgment now
-    lives entirely in ``completeness_gate``). Network or parse failure →
-    ``ok=True`` (fail-open) so a flaky API never discards a readable text.
+    Returns ``{"ok": bool, "issues": [str], "confidence": float}``. Network or
+    parse failure logs a warning and returns ``ok=True`` (fail-open).
     """
     if not extract_text or len(extract_text) < _BLANK_CHUNK_FLOOR:
-        # Blank / near-blank chunk: the engine produced essentially nothing,
-        # which is a CLARITY failure (nothing readable came out), not a
-        # "shortness" judgment. The floor matches the engine-layer thin-output
-        # guard, so a legitimately short-but-clean tail (100-499 chars) is NOT
-        # condemned here — it goes to the LLM clarity judge below (D4: short is not an error).
         return {
             "ok": False,
             "issues": ["extract_too_short"],
             "confidence": 1.0,
         }
 
+    review_input, _sampled = _sample_for_gate(extract_text, gate="review_extract")
     try:
         if llm is None:
             from .llm import get_llm
@@ -312,19 +351,23 @@ def review_extract(extract_text: str, *, llm=None) -> dict:
             llm = get_llm(model=route("gate"))
         raw = llm.call([
             {"role": "system", "content": _REVIEW_PROMPT},
-            {"role": "user", "content": extract_text},
+            {"role": "user", "content": review_input},
         ])
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "review_extract: LLM call failed (failing open, input_chars=%d): %s",
+            len(review_input), exc,
+        )
         return {
             "ok": True,
             "issues": ["review_llm_unavailable"],
             "confidence": 0.0,
         }
 
-    import json
     import re
     m = re.search(r"\{.*\}", raw or "", re.S)
     if not m:
+        logger.warning("review_extract: no JSON in LLM reply (failing open): %r", (raw or "")[:160])
         return {
             "ok": True,
             "issues": ["review_parse_failed"],
@@ -332,16 +375,13 @@ def review_extract(extract_text: str, *, llm=None) -> dict:
         }
     try:
         verdict = json.loads(m.group(0))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning("review_extract: malformed JSON in LLM reply (failing open): %s", exc)
         return {
             "ok": True,
             "issues": ["review_parse_failed"],
             "confidence": 0.0,
         }
-    # Coerce ``ok``: LLMs sometimes emit the JSON string "false" instead of a
-    # boolean, and ``bool("false")`` is True — which would pass a genuinely
-    # unreadable chunk. Read truthiness words explicitly (matches the same
-    # guard in completeness_gate).
     ov = verdict.get("ok", True)
     if isinstance(ov, bool):
         ok = ov
@@ -407,7 +447,10 @@ _GATE_PROMPT = (
     "  - A chunk that is ONLY a references list or ONLY an appendix — that is a "
     "legitimate tail of a longer whole, not a truncation.\n"
     "  - Prose that ends a paragraph mid-thought but at a real sentence "
-    "boundary (academic writing is not always tidy) → COMPLETE.\n\n"
+    "boundary (academic writing is not always tidy) → COMPLETE.\n"
+    "  - Intentional sampling markers (`[SAMPLED DOCUMENT REVIEW: ...]`, "
+    "`[... N chars omitted ...]`) inserted for very long documents → NOT "
+    "missing sections or truncation; judge truncation from the real document tail.\n\n"
     # === ANTI-HALLUCINATION ===
     "**Do NOT claim 'truncated' unless you can prove it from the LAST "
     "characters of the text.** Before flagging truncation: does the text end at "
@@ -458,6 +501,7 @@ def completeness_gate(full_text: str, *, llm=None) -> dict:
     if not full_text or not full_text.strip():
         return {"complete": False, "reason": "empty_text"}
 
+    gate_input, _sampled = _sample_for_gate(full_text, gate="completeness_gate")
     try:
         if llm is None:
             from .llm import get_llm
@@ -466,20 +510,25 @@ def completeness_gate(full_text: str, *, llm=None) -> dict:
             llm = get_llm(model=route("gate"))
         raw = llm.call([
             {"role": "system", "content": _GATE_PROMPT},
-            {"role": "user", "content": full_text},
+            {"role": "user", "content": gate_input},
         ])
-    except Exception:
+    except Exception as exc:
         # Fail-open: don't lose review-passed text over a flaky API.
+        logger.warning(
+            "completeness_gate: LLM call failed (failing open, input_chars=%d): %s",
+            len(gate_input), exc,
+        )
         return {"complete": True, "reason": "gate_llm_unavailable"}
 
-    import json
     import re
     m = re.search(r"\{.*\}", raw or "", re.S)
     if not m:
+        logger.warning("completeness_gate: no JSON in LLM reply (failing open): %r", (raw or "")[:160])
         return {"complete": True, "reason": "gate_parse_failed"}
     try:
         verdict = json.loads(m.group(0))
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        logger.warning("completeness_gate: malformed JSON in LLM reply (failing open): %s", exc)
         return {"complete": True, "reason": "gate_parse_failed"}
 
     # Coerce ``complete``. LLMs commonly emit the JSON string "false" instead
@@ -593,11 +642,12 @@ async def extract_md(paper: Paper, library: Library, *,
     deferred_identity = pending_ocr_identity(paper, library)
     if not force and not deferred_identity:
         from .services.extraction_registration import recover_completions
-        recover_completions(library, key=paper.key)
+        async with concurrency.lib_write_lock:
+            await asyncio.to_thread(recover_completions, library, key=paper.key)
     if not force and not deferred_identity and library.has_extract(paper.key, "md"):
         from .services.extraction_registration import require_selected_registration
-        require_selected_registration(library, paper)
-        return library.md_path(paper.key).read_text()
+        await asyncio.to_thread(require_selected_registration, library, paper)
+        return await asyncio.to_thread(library.md_path(paper.key).read_text)
     if not library.has_pdf(paper.key):
         return None
 
@@ -641,10 +691,13 @@ async def extract_md(paper: Paper, library: Library, *,
     # ---- 2. Capture source + configured endpoint set -----------------------
     endpoints = endpoints_from_env()
 
-    pdf_bytes = pdf_path.read_bytes()
+    pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
     from .services.extraction_registration import begin_extraction, finish_extraction
-    extraction_request = begin_extraction(paper, library, pdf_bytes,
-        request={"endpoints": [e.url for e in endpoints]}, llm=llm)
+    async with concurrency.lib_write_lock:
+        extraction_request = await asyncio.to_thread(
+            begin_extraction, paper, library, pdf_bytes,
+            request={"endpoints": [e.url for e in endpoints]}, llm=llm,
+        )
 
     # ---- 3. ONE whole-PDF MinerU call (no chunking, no page cap) ----
     library.log({"event": "extract_md_start", "key": paper.key,
@@ -742,18 +795,23 @@ async def extract_md(paper: Paper, library: Library, *,
             output_hash = hashlib.sha256(mineru_md.encode()).hexdigest()
             retained = library.root / "extracts" / "rejected" / f"{extraction_request['completion_id']}.md"
             from papervault.store.extraction import write_once
-            write_once(retained, mineru_md.encode())
-            write_once(retained.with_suffix(".json"), json.dumps({
-                "request": extraction_request, "reason": identity_reason,
-                "output_sha256": output_hash, "disposition": "identity_unverified",
-            }, sort_keys=True).encode())
-            library.set_domain_status(paper.key, "identity_mismatch")
-            paper.domain_status = "identity_mismatch"
-            paper.download_status = DOWNLOAD_STATUS_EXTRACT_FAILED
-            library.log({"event": "extract_md_identity_reject", "key": paper.key,
-                         "reason": identity_reason, "source_sha256": digest,
-                         "output_sha256": output_hash, "retained_output": str(retained.relative_to(library.root))})
-            library.save(force=True, durable=True)
+
+            def _persist_identity_reject() -> None:
+                write_once(retained, mineru_md.encode())
+                write_once(retained.with_suffix(".json"), json.dumps({
+                    "request": extraction_request, "reason": identity_reason,
+                    "output_sha256": output_hash, "disposition": "identity_unverified",
+                }, sort_keys=True).encode())
+                library.set_domain_status(paper.key, "identity_mismatch")
+                paper.domain_status = "identity_mismatch"
+                paper.download_status = DOWNLOAD_STATUS_EXTRACT_FAILED
+                library.log({"event": "extract_md_identity_reject", "key": paper.key,
+                             "reason": identity_reason, "source_sha256": digest,
+                             "output_sha256": output_hash, "retained_output": str(retained.relative_to(library.root))})
+                library.save(force=True, durable=True)
+
+            async with concurrency.lib_write_lock:
+                await asyncio.to_thread(_persist_identity_reject)
             _p("extract: OCR identity unverified — quarantined")
             return None
 
@@ -798,14 +856,19 @@ async def extract_md(paper: Paper, library: Library, *,
     observations = ({"actual_model": "unknown", "identity_verification": {
         "match": True, "reason": identity_reason, "source_sha256": digest,
     }} if deferred_identity else None)
-    finish_extraction(paper, library, extraction_request, mineru_md,
-                      provider_observations=observations)
-    paper.download_status = DOWNLOAD_STATUS_OK
-    if deferred_identity:
-        paper.verification_deferred_to_ocr = False
-        library.log({"event": "extract_md_identity_verified", "key": paper.key,
-                     "source_sha256": digest, "reason": identity_reason})
-        library.save(force=True, durable=True)
+
+    def _persist_completion() -> None:
+        finish_extraction(paper, library, extraction_request, mineru_md,
+                          provider_observations=observations)
+        paper.download_status = DOWNLOAD_STATUS_OK
+        if deferred_identity:
+            paper.verification_deferred_to_ocr = False
+            library.log({"event": "extract_md_identity_verified", "key": paper.key,
+                         "source_sha256": digest, "reason": identity_reason})
+            library.save(force=True, durable=True)
+
+    async with concurrency.lib_write_lock:
+        await asyncio.to_thread(_persist_completion)
     # Issue #43: a successful extraction proves the backend is producing output —
     # advance the process-global success epoch so any papers deferred during the
     # outage go stale next reconcile sweep and are re-enqueued (auto-recovery).

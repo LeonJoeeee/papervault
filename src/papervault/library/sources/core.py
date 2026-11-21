@@ -28,6 +28,7 @@ API_URL = "https://api.core.ac.uk/v3/search/works/"
 TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_DELAY = 5.0
+RETRY_BUDGET_S = 25.0
 
 
 @source_errors
@@ -54,21 +55,38 @@ def search_core(query: str, max_results: int = 30) -> list[dict[str, Any]]:
     # transient failure must NOT masquerade as an authoritative 0-hit). A genuine
     # empty result set is an EMPTY ``data["results"]`` → returns [].
     failure = BackendDegraded("CORE no response")
-    for _attempt in range(MAX_RETRIES):
+    deadline = time.monotonic() + RETRY_BUDGET_S
+    resp = None
+    for attempt in range(MAX_RETRIES):
+        remaining = deadline - time.monotonic()
+        if attempt > 0 and remaining <= 0:
+            break
+        req_timeout = min(TIMEOUT, 25.0, max(1.0, remaining))
         try:
             resp = requests.get(API_URL, params=params, headers=headers,
-                                timeout=TIMEOUT, allow_redirects=True)
+                                timeout=req_timeout, allow_redirects=True)
             if resp.status_code == 429:
                 failure = backend_degraded(response=resp)
-                time.sleep(RETRY_DELAY)
+                if attempt < MAX_RETRIES - 1:
+                    remaining_now = deadline - time.monotonic()
+                    if remaining_now <= RETRY_DELAY:
+                        break
+                    time.sleep(RETRY_DELAY)
                 continue
             if not resp.ok:
                 raise backend_degraded(response=resp)
             break
         except (requests.ConnectionError, requests.Timeout) as error:
             failure = backend_degraded(error)
-            time.sleep(RETRY_DELAY)
+            resp = None
+            if attempt < MAX_RETRIES - 1:
+                remaining_now = deadline - time.monotonic()
+                if remaining_now <= RETRY_DELAY:
+                    break
+                time.sleep(RETRY_DELAY)
     else:
+        raise failure
+    if resp is None or not resp.ok:
         raise failure
 
     data = resp.json()

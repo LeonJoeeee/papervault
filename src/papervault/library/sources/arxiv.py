@@ -1,5 +1,6 @@
 """arXiv API search tool."""
 
+import logging
 import random
 import time
 import xml.etree.ElementTree as ET
@@ -12,6 +13,8 @@ from ..polite_http import PolitenessDenied, polite_get
 
 from .exceptions import BackendDegraded, backend_degraded, source_errors
 from .identity import source_identity
+
+logger = logging.getLogger(__name__)
 
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
 NS = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
@@ -66,13 +69,15 @@ def search_arxiv(query: str, max_results: int = 30, *,
             raise (failure if attempt else backend_degraded(error)) from error
         except (requests.ConnectionError, requests.Timeout) as error:
             failure = backend_degraded(error)
-            time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)
             continue
         if resp.status_code == 429 or resp.status_code >= 500:
             failure = backend_degraded(response=resp)
             if polite_v2_enabled() and resp.status_code == 429:
                 raise failure
-            time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)
+            if attempt < _MAX_RETRIES - 1:
+                time.sleep(min(_BACKOFF_CAP, 1.0 * (attempt + 1)) + random.random() * 0.5)
             continue
         if not resp.ok:
             raise backend_degraded(response=resp)
@@ -89,36 +94,44 @@ def search_arxiv(query: str, max_results: int = 30, *,
     papers = []
 
     for entry in root.findall("atom:entry", NS):
-        title_elem = entry.find("atom:title", NS)
-        published_elem = entry.find("atom:published", NS)
-        if title_elem is None or published_elem is None:
+        try:
+            title_raw = entry.findtext("atom:title", None, NS)
+            published = (entry.findtext("atom:published", None, NS) or "").strip()
+            if not title_raw or not published:
+                continue
+            title = title_raw.strip().replace("\n", " ")
+            if not title:
+                continue
+            abstract = (entry.findtext("atom:summary", "", NS) or "").strip().replace("\n", " ")
+            year = published[:4]
+            url = (entry.findtext("atom:id", "", NS) or "").strip()
+            if not url:
+                continue
+            arxiv_id = url.split("/abs/")[-1]
+            doi = normalize_doi(entry.findtext("arxiv:doi", "", NS) or "")
+            identity = source_identity(
+                "arxiv", source_ids={"arxiv:paper": arxiv_id}, dois=doi, arxiv_ids=arxiv_id,
+                urls=[url, *(link.get("href") for link in entry.findall("atom:link", NS))],
+            )
+
+            authors = []
+            for author_elem in entry.findall("atom:author", NS):
+                name = (author_elem.findtext("atom:name", "", NS) or "").strip()
+                if name:
+                    authors.append(name)
+
+            papers.append({
+                "title": title,
+                "authors": authors,
+                "abstract": abstract,
+                "year": year,
+                "url": url,
+                "arxiv_id": arxiv_id,
+                "doi": doi,
+                "source_identities": [identity],
+            })
+        except Exception as exc:
+            logger.warning("arXiv: skipping malformed Atom entry: %s", exc)
             continue
-        title = title_elem.text.strip().replace("\n", " ")
-        abstract = entry.find("atom:summary", NS).text.strip().replace("\n", " ")
-        published = published_elem.text
-        year = published[:4]
-        url = entry.find("atom:id", NS).text.strip()
-        arxiv_id = url.split("/abs/")[-1]
-        doi = normalize_doi(entry.findtext("arxiv:doi", "", NS) or "")
-        identity = source_identity(
-            "arxiv", source_ids={"arxiv:paper": arxiv_id}, dois=doi, arxiv_ids=arxiv_id,
-            urls=[url, *(link.get("href") for link in entry.findall("atom:link", NS))],
-        )
-
-        authors = []
-        for author_elem in entry.findall("atom:author", NS):
-            name = author_elem.find("atom:name", NS).text.strip()
-            authors.append(name)
-
-        papers.append({
-            "title": title,
-            "authors": authors,
-            "abstract": abstract,
-            "year": year,
-            "url": url,
-            "arxiv_id": arxiv_id,
-            "doi": doi,
-            "source_identities": [identity],
-        })
 
     return papers

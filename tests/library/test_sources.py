@@ -796,6 +796,125 @@ def test_arxiv_normalizes_wrapped_multitoken_doi():
 
 
 @responses.activate
+def test_arxiv_isolates_malformed_atom_entry_and_preserves_valid_entries():
+    malformed = (
+        "<entry>"
+        "<title>Broken Entry Missing Summary And Id</title>"
+        "<published>2024-03-01T00:00:00Z</published>"
+        "<author><name/></author>"
+        "</entry>"
+        "<entry>"
+        "<id>http://arxiv.org/abs/2403.0003v1</id>"
+        "<title>Missing Summary Only</title>"
+        "<published>2024-03-01T00:00:00Z</published>"
+        "<author><name/></author>"
+        "</entry>"
+    )
+    body = _ATOM_RESPONSE.replace("<entry>", malformed + "<entry>", 1)
+    responses.get("http://export.arxiv.org/api/query", body=body)
+    papers = search_arxiv("test query")
+    assert [p["title"] for p in papers] == [
+        "Missing Summary Only", "A Test Paper Title", "Second Paper",
+    ]
+    assert papers[0]["abstract"] == ""
+    assert papers[0]["authors"] == []
+
+
+@pytest.mark.parametrize("source", ["ads", "inspire", "core"])
+def test_source_adapters_retry_timeout_skip_final_sleep_and_cap_wall_budget(monkeypatch, source):
+    import requests as _requests
+    from papervault.library.sources import ads as _ads, core as _core, inspire as _inspire
+
+    mod, fn, max_retries = {
+        "ads": (_ads, search_ads, _ads.MAX_RETRIES),
+        "inspire": (_inspire, search_inspire, _inspire.MAX_RETRIES),
+        "core": (_core, search_core, _core.MAX_RETRIES),
+    }[source]
+    monkeypatch.setenv("ADS_API_TOKEN", "tok")
+    monkeypatch.setenv("CORE_API_KEY", "key")
+
+    sleeps: list[float] = []
+    clock = [100.0]
+
+    def fake_monotonic():
+        return clock[0]
+
+    def fake_sleep(delay: float):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    attempts = 0
+
+    def always_timeout(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert kwargs["timeout"] <= 25.0
+        clock[0] += 8.0
+        raise _requests.Timeout("slow upstream")
+
+    monkeypatch.setattr(mod.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(mod.time, "sleep", fake_sleep)
+    monkeypatch.setattr(mod.requests, "get", always_timeout)
+
+    with pytest.raises(BackendDegraded):
+        fn("cosmic rays")
+    # Must retry Timeout, respect <=25s wall-clock budget, and never sleep after final attempt.
+    assert 2 <= attempts <= max_retries
+    assert len(sleeps) < attempts
+    assert clock[0] - 100.0 <= 25.0 + 8.0
+
+
+@responses.activate
+def test_scihub_winner_returns_immediately_and_cancels_losing_mirror(monkeypatch):
+    import threading
+    import time
+    from papervault.library.download_sources import scihub
+    from papervault.library.models import Paper
+
+    monkeypatch.setenv("PAPER_PIPELINE_USE_SCIHUB", "1")
+    monkeypatch.setattr(scihub, "_discover_scihub_mirrors",
+                        lambda: ["https://fast.example", "https://slow.example"])
+    slow_calls = 0
+    slow_started = threading.Event()
+    slow_exited = threading.Event()
+    pdf_bytes = b"%PDF-1.4\n" + b"x" * 2048
+
+    def fake_get(url, **kwargs):
+        nonlocal slow_calls
+        if "fast.example" in url:
+            slow_started.wait(1.0)
+            if url.endswith(".pdf"):
+                return type("R", (), {"ok": True, "content": pdf_bytes})()
+            return type("R", (), {
+                "ok": True,
+                "text": '<meta name="citation_pdf_url" content="https://fast.example/ok.pdf">',
+            })()
+        slow_calls += 1
+        slow_started.set()
+        # Simulate slow mirror that fails attempt 1 and enters retry wait (which cancel wakes immediately).
+        return type("R", (), {"ok": False, "text": ""})()
+
+    monkeypatch.setattr(scihub.requests, "get", fake_get)
+    real_one = scihub._scihub_one_mirror
+
+    def wrapped_one(mirror, target, max_attempts=3):
+        try:
+            return real_one(mirror, target, max_attempts=max_attempts)
+        finally:
+            if "slow.example" in mirror:
+                slow_exited.set()
+
+    monkeypatch.setattr(scihub, "_scihub_one_mirror", wrapped_one)
+    started = time.monotonic()
+    out = scihub._try_scihub(Paper(key="P", title="T", doi="10.1234/x"))
+    elapsed = time.monotonic() - started
+    assert out == pdf_bytes
+    assert elapsed < 0.8
+    assert slow_exited.wait(1.0)
+    assert slow_calls <= 1
+
+
+@responses.activate
 def test_semantic_scholar_normalizes_wrapped_multitoken_doi():
     responses.get("https://api.semanticscholar.org/graph/v1/paper/search",
                   json={"data": [{"title": "SS identifiers", "externalIds": {

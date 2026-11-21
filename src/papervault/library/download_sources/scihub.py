@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import concurrent.futures
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 import os
 import re
+import threading
 import time
 from typing import Optional
+
+_SCIHUB_CANCEL: ContextVar[Optional[threading.Event]] = ContextVar("scihub_cancel", default=None)
 
 import requests
 
@@ -111,7 +114,21 @@ _SCIHUB_PDF_PATTERNS = (
 )
 
 
-def _scihub_one_mirror(mirror: str, target: str, max_attempts: int = 3) -> Optional[bytes]:
+def _scihub_sleep(delay: float, cancel: Optional[threading.Event]) -> bool:
+    """Sleep for retry backoff; return True immediately if ``cancel`` was signalled."""
+    if cancel is not None:
+        return cancel.wait(delay)
+    time.sleep(delay)
+    return False
+
+
+def _scihub_one_mirror(
+    mirror: str,
+    target: str,
+    max_attempts: int = 3,
+    *,
+    cancel: Optional[threading.Event] = None,
+) -> Optional[bytes]:
     """Probe ONE scihub mirror; return PDF bytes or None. Extracted from
     _try_scihub so the mirror loop can race in parallel rather than
     iterate serially (40+s under racing-cascade concurrency, well past
@@ -123,18 +140,22 @@ def _scihub_one_mirror(mirror: str, target: str, max_attempts: int = 3) -> Optio
     (each requests.get opens a new TCP socket → new mihomo round-robin
     exit) when the response fails or lacks the PDF link.
     """
+    if cancel is None:
+        cancel = _SCIHUB_CANCEL.get()
     landing_url = f"{mirror}/{target}"
     for attempt in range(max_attempts):
+        if cancel is not None and cancel.is_set():
+            return None
         try:
             r = requests.get(landing_url, timeout=TIMEOUT,
                              headers=BROWSER_HEADERS, allow_redirects=True)
         except Exception:
-            if attempt < max_attempts - 1:
-                time.sleep(2 ** attempt)
+            if attempt < max_attempts - 1 and _scihub_sleep(2 ** attempt, cancel):
+                return None
             continue
         if not r.ok:
-            if attempt < max_attempts - 1:
-                time.sleep(2 ** attempt)
+            if attempt < max_attempts - 1 and _scihub_sleep(2 ** attempt, cancel):
+                return None
             continue
         pdf_url: Optional[str] = None
         for pat in _SCIHUB_PDF_PATTERNS:
@@ -143,9 +164,11 @@ def _scihub_one_mirror(mirror: str, target: str, max_attempts: int = 3) -> Optio
                 pdf_url = m.group(1)
                 break
         if not pdf_url:
-            if attempt < max_attempts - 1:
-                time.sleep(2 ** attempt)
+            if attempt < max_attempts - 1 and _scihub_sleep(2 ** attempt, cancel):
+                return None
             continue
+        if cancel is not None and cancel.is_set():
+            return None
         pdf_url = pdf_url.split("#", 1)[0]
         if pdf_url.startswith("//"):
             pdf_url = "https:" + pdf_url
@@ -161,13 +184,16 @@ def _scihub_one_mirror(mirror: str, target: str, max_attempts: int = 3) -> Optio
                 return pdf_resp.content
         except Exception:
             pass
-        if attempt < max_attempts - 1:
-            time.sleep(2 ** attempt)
+        if attempt < max_attempts - 1 and _scihub_sleep(2 ** attempt, cancel):
+            return None
     return None
 
 
 def _timed_mirror(index, mirror, target):
     # Indices correlate race members without publishing upstream URLs or targets.
+    cancel = _SCIHUB_CANCEL.get()
+    if cancel is not None and cancel.is_set():
+        return None
     with span("member", member=f"mirror_{index}") as fields:
         result = _scihub_one_mirror(mirror, target)
         fields["pdf_candidate"] = bool(result)
@@ -179,9 +205,9 @@ def _try_scihub(paper: Paper) -> Optional[bytes]:
     PAPER_PIPELINE_USE_SCIHUB=1. Be aware this may not be legal in your
     jurisdiction.
 
-    Mirrors race in parallel; first valid PDF wins. Serial iteration was
-    the dominant bottleneck under racing-cascade concurrency — 8 mirrors
-    × per-mirror timeout = 40+s, exceeding the per-paper deadline.
+    Mirrors race in parallel; first valid PDF wins and returns immediately
+    without waiting for slower mirrors to drain. A shared cancel event stops
+    losing mirrors before or between HTTP requests.
     """
     if os.environ.get("PAPER_PIPELINE_USE_SCIHUB", "").strip() not in {"1", "true", "yes"}:
         return None
@@ -191,18 +217,27 @@ def _try_scihub(paper: Paper) -> Optional[bytes]:
     mirrors = _discover_scihub_mirrors()
     if not mirrors:
         return None
-    with span("group"), concurrent.futures.ThreadPoolExecutor(max_workers=len(mirrors)) as ex:
-        futures = [ex.submit(copy_context().run, _timed_mirror, i, m, target)
-                   for i, m in enumerate(mirrors)]
+    cancel = threading.Event()
+    token = _SCIHUB_CANCEL.set(cancel)
+    with span("group"):
+        ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(mirrors))
         try:
-            for fut in concurrent.futures.as_completed(futures, timeout=TIMEOUT * 2):
-                data = fut.result()
-                if data:
-                    emit("winner", member=f"mirror_{futures.index(fut)}")
-                    for f in futures:
-                        if not f.done():
-                            f.cancel()
-                    return data
-        except concurrent.futures.TimeoutError:
-            pass
+            futures = [ex.submit(copy_context().run, _timed_mirror, i, m, target)
+                       for i, m in enumerate(mirrors)]
+            try:
+                for fut in concurrent.futures.as_completed(futures, timeout=TIMEOUT * 2):
+                    data = fut.result()
+                    if data:
+                        emit("winner", member=f"mirror_{futures.index(fut)}")
+                        cancel.set()
+                        for f in futures:
+                            if not f.done():
+                                f.cancel()
+                        return data
+            except concurrent.futures.TimeoutError:
+                pass
+        finally:
+            cancel.set()
+            _SCIHUB_CANCEL.reset(token)
+            ex.shutdown(wait=False, cancel_futures=True)
     return None

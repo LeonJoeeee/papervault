@@ -325,7 +325,9 @@ ARXIV_MIN_INTERVAL = 3.0
 CORE_MIN_INTERVAL = 6.0
 
 _LAST_CALL: dict[str, float] = {}
-_PACE_LOCK: dict[str, asyncio.Lock] = {}
+_PACE_LOCK: WeakValueDictionary[
+    tuple[asyncio.AbstractEventLoop, str], asyncio.Lock
+] = WeakValueDictionary()
 # Hold a strong local reference while using a lock. Idle locks and their loop
 # keys can then expire, including after short-lived asyncio.run() callers.
 _POLITE_FETCH_LOCKS: WeakValueDictionary[
@@ -343,11 +345,12 @@ async def _pace(backend: str, min_interval: float) -> None:
     30s fetch timeout)."""
     if min_interval <= 0:
         return
-    # check-then-set (NOT setdefault — that EAGERLY constructs+discards a
-    # throwaway Lock every call, binding to the current loop).
-    lock = _PACE_LOCK.get(backend)
+    # Key by (loop, backend) so short-lived asyncio.run() loops never clash on
+    # a lock bound to a previous closed loop.
+    key = (asyncio.get_running_loop(), backend)
+    lock = _PACE_LOCK.get(key)
     if lock is None:
-        lock = _PACE_LOCK[backend] = asyncio.Lock()
+        lock = _PACE_LOCK[key] = asyncio.Lock()
     async with lock:
         wait = min_interval - (time.monotonic() - _LAST_CALL.get(backend, 0.0))
         if wait > 0:
@@ -606,11 +609,14 @@ async def _wait_for_search_admission(backend_name: str) -> None:
     """Wait for local capacity, but fail immediately on terminal ledger denials."""
     admission_deadline = time.monotonic() + FETCH_QUEUE_TIMEOUT_S
     while not (decision := get_ledger().gate(Scope(backend_name))).allowed:
+        remaining = admission_deadline - time.monotonic()
+        if remaining <= 0:
+            raise FetchQueueTimeout
         if decision.reason == "window" and decision.retry_after > 0:
+            if decision.retry_after > remaining:
+                raise FetchQueueTimeout
             await asyncio.sleep(decision.retry_after)
         elif decision.reason == "concurrency":
-            if time.monotonic() >= admission_deadline:
-                raise FetchQueueTimeout
             await asyncio.sleep(0.05)
             if time.monotonic() >= admission_deadline:
                 raise FetchQueueTimeout

@@ -102,7 +102,6 @@ async def test_retrieval_runs_kg_off_loop_against_the_local_snapshot(tmp_path, m
         return ["Local"]
 
     async def external(*args, **kwargs):
-        paper.title = "Changed while external fetch runs"
         return [], {}
 
     async def progress(*args):
@@ -117,6 +116,7 @@ async def test_retrieval_runs_kg_off_loop_against_the_local_snapshot(tmp_path, m
     assert result.kg_ranks == ["Local"]
     assert kg_observations == [("Find detector measurements", ["particle detector"],
                                 "Original detector measurements", True)]
+    assert result.local[0] is paper
     assert result.local[0].title == "Original detector measurements"
 
 
@@ -152,31 +152,29 @@ async def test_retrieval_uses_search_permits_while_download_permits_are_saturate
             downloads.release()
 
 
-def test_local_snapshot_copies_each_paper_once_and_reuses_it_in_frozen_view(tmp_path, monkeypatch):
+def test_local_snapshot_avoids_deep_copy_and_uses_frozen_readonly_view(tmp_path, monkeypatch):
     from papervault.library.services.search_pipeline import SearchPipeline
 
     lib = Library(tmp_path)
     original = add_record(lib, **node("Local", "Detector measurements"))
-    copy_paper, copies = Paper.model_copy, []
+    copies = []
 
-    def counted(paper, **kwargs):
+    def forbid_copy(paper, **kwargs):
         copies.append((paper.key, kwargs))
-        return copy_paper(paper, **kwargs)
+        raise AssertionError("SearchPipeline._local_snapshot must not deep-copy Paper models")
 
-    monkeypatch.setattr(Paper, "model_copy", counted)
+    monkeypatch.setattr(Paper, "model_copy", forbid_copy)
     searcher = SearchPipeline(lib, None, None, None, None, None, None, None, None, None)
     local, view = searcher._local_snapshot()
-    assert copies == [("Local", {"deep": True})]
+    assert copies == []
     assert view.get("Local") is local[0]
-    assert local[0] is not original
+    assert local[0] is original
     assert all(index.frozen for index in view._lookup_indexes.values())
-    original.authors.append("A live edit")
-    assert local[0].authors == ["Tester, A."]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("stage", ["all_papers", "model_copy", "_view"])
-async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypatch, stage):
+@pytest.mark.parametrize("stage", ["all_papers", "_view"])
+async def test_retrieval_prepares_readonly_snapshot_off_loop(tmp_path, monkeypatch, stage):
     import asyncio
     import threading
     from papervault.library.services import search_pipeline as pipeline
@@ -186,7 +184,7 @@ async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypat
     paper = add_record(lib, **node("Local", "Original detector measurements"))
     loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
-    owner = {"all_papers": Library, "model_copy": Paper, "_view": pipeline}[stage]
+    owner = {"all_papers": Library, "_view": pipeline}[stage]
     original = getattr(owner, stage)
     calls = []
 
@@ -199,14 +197,13 @@ async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypat
         return original(*args, **kwargs)
 
     async def external(*args, **kwargs):
-        paper.authors.append("Changed during retrieval")
         return [], {}
 
     async def progress(*args):
         pass
 
     def kg_search(query, plan, view, **kwargs):
-        assert view.get("Local").authors == ["Tester, A."]
+        assert view.get("Local") is paper
         return ["Local"]
 
     monkeypatch.setattr(owner, stage, checked)
@@ -216,10 +213,7 @@ async def test_retrieval_prepares_isolated_snapshot_off_loop(tmp_path, monkeypat
     plan = pipeline.PlannedSearch({}, ["detector measurements"], {}, 10, "by_relevance")
     result = await searcher.retrieval(plan, ServingTrace(lib))
     assert calls
-    if stage == "model_copy":
-        assert all(call.get("deep") is True for call in calls)
-    assert result.local[0].authors == ["Tester, A."]
-    assert paper.authors == ["Tester, A.", "Changed during retrieval"]
+    assert result.local[0] is paper
     assert result.kg_ranks == ["Local"]
 
 
@@ -1209,7 +1203,9 @@ def test_local_authority_uses_age_normalized_citations(local_authority_fusion):
 
 
 @pytest.mark.parametrize("n_terms", [1, 2])
-@pytest.mark.parametrize("rank,weight,selected", [(300, 0.25, True), (799, 1.0, True), (800, 1.0, False)])
+@pytest.mark.parametrize("rank,weight,selected", [
+    (60, 0.25, True), (99, 1.0, True), (100, 1.0, False), (300, 0.25, False),
+])
 def test_local_authority_depth_and_strength(
         local_authority_fusion, monkeypatch, n_terms, rank, weight, selected):
     from dataclasses import replace
@@ -1219,7 +1215,7 @@ def test_local_authority_depth_and_strength(
     retrieved.local = [Paper(key=f"Rank{i:03d}", title=f"Detector measurements case {i}",
                              doi=f"10.1234/rank{i}", year=2025,
                              citation_count=10000 if i == rank else 0)
-                       for i in range(801)]
+                       for i in range(350)]
     # Supply a controlled BM25 rank boundary; fusion, RRF and shortlisting stay real.
     monkeypatch.setattr(pipeline, "bm25_per_term_ranklists", lambda corpus, terms: [
         sorted(corpus, key=lambda n: n["key"]) for _ in terms])
@@ -1228,6 +1224,50 @@ def test_local_authority_depth_and_strength(
     keys = [n["key"] for n in fuse_local(searcher, plan, retrieved).local]
     assert len(keys) == 45
     assert (f"Rank{rank:03d}" in keys) is selected
+    # Top BM25 hits must never be swamped out by authority bonus alone at default weight.
+    if weight == 0.25:
+        assert keys[0] == "Rank000"
+
+
+def test_authority_does_not_reorder_ahead_of_top_kg_hits(local_authority_fusion):
+    from papervault.library.services.search_pipeline import RetrievedSearch
+
+    searcher, plan, retrieved = local_authority_fusion
+    retrieved.local = [Paper(key=f"Semantic{i:03d}", title=f"Suprathermal populations {i}",
+                             doi=f"10.1234/semantic{i}", year=2025,
+                             citation_count=50000 if i == 60 else 0) for i in range(100)]
+    retrieved = RetrievedSearch([], retrieved.local, {},
+                                kg_ranks=[f"Semantic{i:03d}" for i in range(100)])
+    searcher.authority_enabled, searcher.authority_weight = True, 1.0
+    keys = [p["key"] for p in fuse_local(searcher, plan, retrieved).local]
+    # Top 15 KG hits remain strictly ahead of authority-boosted tail candidates.
+    assert keys[:15] == [f"Semantic{i:03d}" for i in range(15)]
+    assert "Semantic060" in keys
+
+
+def test_multi_axis_folding_matches_arxiv_only_external_onto_doi_plus_arxiv_library(tmp_path):
+    lib = Library(tmp_path)
+    add_record(lib, "LocalBoth", title="Parker spiral solar wind",
+               doi="10.1234/parker", arxiv_id="2401.12345v2", year=2024)
+    # 1) External arXiv-only hit (unversioned) must fold onto LocalBoth (preserves vouch, avoids dup).
+    ext_match = dict(node("ExtArxivOnly", "Parker spiral solar wind", rank=0),
+                     doi="", arxiv_id="2401.12345")
+    # 2) External hit with a CONFLICTING DOI sharing the same arXiv ID must NOT fold onto LocalBoth.
+    ext_conflict = dict(node("ExtConflictDoi", "Unrelated paper",
+                             doi="10.9999/different", rank=1), arxiv_id="2401.12345")
+    fused = fuse_library(lib, [ext_match, ext_conflict])
+    local_by_key = {n["key"]: n for n in fused.local}
+    assert local_by_key["LocalBoth"]["folded_vouch"] == 1
+    ext_keys = {n["key"] for n in fused.external}
+    assert "ExtArxivOnly" not in ext_keys
+    assert "ExtConflictDoi" in ext_keys
+
+    # 3) External hit with a CONFLICTING explicit version (v1 vs v2) must NOT fold onto LocalBoth.
+    ext_ver_conflict = dict(node("ExtV1", "Earlier version", rank=0),
+                            doi="", arxiv_id="2401.12345v1")
+    fused_ver = fuse_library(lib, [ext_ver_conflict])
+    assert all(n.get("folded_vouch", 0) == 0 for n in fused_ver.local)
+    assert [n["key"] for n in fused_ver.external] == ["ExtV1"]
 
 
 @pytest.fixture

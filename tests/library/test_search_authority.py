@@ -94,11 +94,20 @@ def test_age_normalization_favors_rising_work_over_raw_count():
 # ----------- missing-year fallback ------------------------------------------
 
 
-def test_missing_year_falls_back_to_raw_count():
-    """No year → the authority value is the RAW citation count (rank fallback)."""
-    assert _authority_value(_cand("NoYear", year=None, citation_count=800), 2026) == 800.0
-    # non-int / zero year also routes to the fallback
-    assert _authority_value({"citation_count": 12}, 2026) == 12.0
+def test_missing_year_uses_conservative_age_denominator():
+    """No year → conservative 10-year denominator so undated records don't inflate velocity."""
+    assert _authority_value(_cand("NoYear", year=None, citation_count=800), 2026) == 80.0
+    # non-int / zero year also routes to the conservative fallback
+    assert _authority_value({"citation_count": 120}, 2026) == 12.0
+
+
+def test_age_denominator_is_capped_for_classics():
+    """Foundational 1958–1980 classics cap age at 30 so 1-year-old papers don't crush them 50x."""
+    parker_1958 = _cand("Parker1958", year=1958, citation_count=3000)
+    # Age 68 capped at 30 -> 100.0/yr instead of 3000/68 = 44.1/yr
+    assert _authority_value(parker_1958, 2026) == 100.0
+    recent = _cand("Recent2025", year=2025, citation_count=80)
+    assert _authority_value(parker_1958, 2026) > _authority_value(recent, 2026)
 
 
 def test_missing_year_paper_ranks_by_raw_count_in_blend():
@@ -294,9 +303,11 @@ def test_tier_defaults_and_identifier_exemptions(cand, multiplier):
     assert _venue_tier_multiplier(cand) == multiplier
 
 
-@pytest.mark.parametrize("year", [None, 0, "2016", 2026, 2027])
-def test_venue_multiplier_preserves_missing_or_future_year_fallback(year):
-    assert _authority_value(dict(venue="PRL", citation_count=40, year=year), 2026) == 60.0
+@pytest.mark.parametrize("year,expected", [
+    (None, 6.0), (0, 6.0), ("2016", 6.0), (2026, 60.0), (2027, 60.0),
+])
+def test_venue_multiplier_preserves_missing_or_future_year_fallback(year, expected):
+    assert _authority_value(dict(venue="PRL", citation_count=40, year=year), 2026) == expected
 
 
 @pytest.mark.parametrize("venue,doi,multiplier", [

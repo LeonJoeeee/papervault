@@ -32,7 +32,7 @@ from .bm25_search import (
 from .intent_parser import named_entity_groups, observe_intent
 from .kg_search import kg_local_search
 from .registration import (
-    ServingTrace, _find, _view, preview_candidates, registration_rejection, serving_excluded,
+    ServingTrace, _fill, _find, _view, preview_candidates, registration_rejection, serving_excluded,
 )
 
 logger = logging.getLogger(__name__)
@@ -166,10 +166,19 @@ def _venue_tier_multiplier(cand: dict) -> float:
     return 1.0
 
 
+_AUTHORITY_UNDATED_AGE = 10
+_AUTHORITY_MAX_AGE = 30
+_AUTHORITY_POOL_DEPTH = 100
+_KG_TOP_PROTECT = 15
+
+
 def _authority_value(cand: dict, now_year: int) -> float:
     cites, year = cand.get("citation_count") or 0, cand.get("year")
-    rate = cites / max(1, now_year - year) if isinstance(year, int) and year > 0 else float(cites)
-    return rate * _venue_tier_multiplier(cand)
+    if isinstance(year, int) and not isinstance(year, bool) and year > 0:
+        age = min(_AUTHORITY_MAX_AGE, max(1, now_year - year))
+    else:
+        age = _AUTHORITY_UNDATED_AGE
+    return (cites / age) * _venue_tier_multiplier(cand)
 
 
 def _authority_reorder(scored, *, now_year=None, enabled=None, lam=None, k=60):
@@ -248,6 +257,44 @@ class ReturnSelection:
     registration: list[dict]
     ingest_dropped: int
     return_dropped: int
+
+
+def _normalized_ids(node: dict) -> tuple[str, str, str]:
+    """Return ``(norm_doi, base_arxiv, version_suffix)`` for exact identity matching."""
+    from ..store import _normalize_arxiv, _normalize_doi
+    doi = _normalize_doi(node.get("doi") or "")
+    raw_arxiv = (node.get("arxiv_id") or "").strip()
+    base_arxiv = _normalize_arxiv(raw_arxiv)
+    ver_match = re.search(r"v\d+$", raw_arxiv, re.I) if base_arxiv else None
+    version = ver_match.group().lower() if ver_match else ""
+    return doi, base_arxiv, version
+
+
+def _exact_identity_axes(node: dict) -> list[str]:
+    """Return all normalized exact identifier axes (DOI, versioned/base arXiv)."""
+    doi, base_arxiv, version = _normalized_ids(node)
+    axes: list[str] = []
+    if doi:
+        axes.append("doi:" + doi)
+    if base_arxiv:
+        if version:
+            axes.append("arxiv:" + base_arxiv + version)
+        axes.append("arxiv:" + base_arxiv)
+    return axes
+
+
+def _nodes_compatible(existing: dict, incoming: dict) -> bool:
+    """True iff no populated exact identifier conflicts between the two records."""
+    e_doi, e_arxiv, e_ver = _normalized_ids(existing)
+    i_doi, i_arxiv, i_ver = _normalized_ids(incoming)
+    if e_doi and i_doi and e_doi != i_doi:
+        return False
+    if e_arxiv and i_arxiv:
+        if e_arxiv != i_arxiv:
+            return False
+        if e_ver and i_ver and e_ver != i_ver:
+            return False
+    return True
 
 
 def _identity_key(node):
@@ -379,9 +426,17 @@ class SearchPipeline:
         return plan
 
     def _local_snapshot(self):
-        local = self.library.all_papers(include_quarantined=True)
-        local = [p.model_copy(deep=True) for p in local]
-        return local, _view(self.library, {p.key: p for p in local}, deep_copy=False, frozen=True)
+        # Shallow read-only snapshot view: search serving projects Paper models
+        # into fresh dicts via paper_to_dict() and never mutates snapshot Papers.
+        lock = getattr(self.library, "_merge_execution_lock", None)
+        if lock is not None:
+            with lock:
+                local = list(self.library.all_papers(include_quarantined=True))
+                view = _view(self.library, {p.key: p for p in local}, deep_copy=False, frozen=True)
+        else:
+            local = list(self.library.all_papers(include_quarantined=True))
+            view = _view(self.library, {p.key: p for p in local}, deep_copy=False, frozen=True)
+        return local, view
 
     async def retrieval(self, plan, trace):
         await self.progress(2, "searching external sources")
@@ -399,12 +454,36 @@ class SearchPipeline:
 
     def fusion(self, plan, retrieved, trace):
         seen, local_by_key, canonical_keys = {}, {}, {}
+        seen_axes = collections.defaultdict(list)
         excluded_identities = {}
         bibliography = collections.defaultdict(list)
         snapshot = {p.key: p for p in retrieved.local}
         query_tokens = {token for term in plan.terms for token in _tokenize(term)}
         kg_trace_keys = set(retrieved.kg_ranks)
         local_trace_counts = collections.Counter()
+
+        def register_seen(hit, witness=None):
+            w = witness if witness is not None else hit
+            seen[_identity_key(w)] = hit
+            for axis in _exact_identity_axes(w):
+                bucket = seen_axes[axis]
+                if not any(existing_hit is hit and existing_w is w for existing_hit, existing_w in bucket):
+                    bucket.append((hit, w))
+
+        def lookup_seen(node):
+            axes = _exact_identity_axes(node)
+            if axes:
+                for axis in axes:
+                    matches = {}
+                    for hit, witness in seen_axes.get(axis, ()):
+                        if _nodes_compatible(witness, node):
+                            matches[id(hit)] = hit
+                    if len(matches) == 1:
+                        return next(iter(matches.values()))
+                    if len(matches) > 1:
+                        return None
+                return None
+            return seen.get(_identity_key(node))
 
         def trace_local(paper, canonical, reason, **fields):
             # Trace relevance only: all catalog identity/exclusion state below
@@ -437,23 +516,24 @@ class SearchPipeline:
                     trace_local(paper, canonical, "serving_excluded", decision="dropped")
                     continue
                 node = paper_to_dict(canonical)
-                identity = _identity_key(node)
+                existing = lookup_seen(node)
                 bib_key = serving_bibliographic_key(node)
                 matches = bibliography.get(bib_key, [])
-                if (identity not in seen and not (node.get("doi") or node.get("arxiv_id"))
+                if (existing is None and not (node.get("doi") or node.get("arxiv_id"))
                         and len(matches) == 1):
-                    seen[identity] = matches[0]
-                if identity in seen:
-                    canonical_keys[paper.key] = seen[identity]["key"]
+                    existing = matches[0]
+                    register_seen(existing, node)
+                if existing is not None:
+                    canonical_keys[paper.key] = existing["key"]
                     if paper.key != canonical.key:
-                        seen[_identity_key(paper_to_dict(paper))] = seen[identity]
-                    trace_local(paper, snapshot[seen[identity]["key"]], "local_duplicate", candidate=paper_to_dict(paper),
-                                decision="folded", canonical_key=seen[identity]["key"])
+                        register_seen(existing, paper_to_dict(paper))
+                    trace_local(paper, snapshot[existing["key"]], "local_duplicate", candidate=paper_to_dict(paper),
+                                decision="folded", canonical_key=existing["key"])
                     continue
-                seen[identity] = node
+                register_seen(node)
                 canonical_keys[paper.key] = node["key"]
                 if paper.key != canonical.key:
-                    seen[_identity_key(paper_to_dict(paper))] = node
+                    register_seen(node, paper_to_dict(paper))
                 local_by_key[node["key"]] = node
                 if bib_key is not None and (node.get("doi") or node.get("arxiv_id")):
                     bibliography[bib_key].append(node)
@@ -480,18 +560,21 @@ class SearchPipeline:
                     trace.record("fusion", candidate=node, key=excluded_key, arm="external",
                                  decision="dropped", reason="serving_excluded")
                     continue
-                hit = seen.get(identity)
+                hit = lookup_seen(node)
                 if hit is None:
-                    seen[identity] = hit = node
+                    hit = node
                     hit["term_ranks"] = {}
+                    register_seen(hit)
                 else:
                     _merge_observations(hit, node)
+                    register_seen(hit)
                     trace.record("fusion", candidate=node, decision="folded", canonical_key=hit.get("key"))
                 hit["best_external_rank"] = min(hit.get("best_external_rank", rank), rank)
                 hit["external_rrf_score"] = hit.get("external_rrf_score", 0) + 1 / (RRF_K + rank)
                 hit["_external_hit_count"] = hit.get("_external_hit_count", 0) + 1
                 if hit.get("_source_origin") == "library":
                     hit["folded_vouch"] = hit.get("folded_vouch", 0) + 1
+                    hit.setdefault("_folded_donors", []).append(node)
                     continue
                 votes = hit.setdefault("term_ranks", {})
                 if term not in votes:
@@ -504,21 +587,38 @@ class SearchPipeline:
             lib_key = lambda node: node["key"]
             ranked_lists = [("local", ranks) for ranks in local_ranks] + [("kg", kg_ranks)]
             pool_ranks = [ranks for _, ranks in ranked_lists]
-            lib_rrf = rrf_fuse(pool_ranks, lib_key)
+            base_rrf = rrf_fuse(pool_ranks, lib_key)
+            lib_rrf = dict(base_rrf)
             authority_active = (self.authority_enabled and self.authority_weight > 0
                                 and plan.ranking_hint not in ("by_recency", "by_importance"))
             now_year = datetime.now(timezone.utc).year
+            authority_applied = False
             if authority_active:
-                top_cands = {node["key"] for rl in pool_ranks for node in rl[:800]}
-                if any(_authority_value(local_by_key[k], now_year) > 0 for k in top_cands):
-                    auth_order = sorted(top_cands, key=lambda k: (
-                        -_authority_value(local_by_key[k], now_year), -lib_rrf.get(k, 0.0), k))
+                top_cands = {node["key"] for rl in pool_ranks for node in rl[:_AUTHORITY_POOL_DEPTH]}
+                scored_cands = [k for k in top_cands if _authority_value(local_by_key[k], now_year) > 0]
+                if scored_cands:
+                    authority_applied = True
+                    auth_order = sorted(scored_cands, key=lambda k: (
+                        -_authority_value(local_by_key[k], now_year), -base_rrf.get(k, 0.0), k))
                     auth_rank = {k: i for i, k in enumerate(auth_order)}
-                    n_lists = max(1, sum(1 for rl in pool_ranks if rl))
                     for k in auth_order:
                         lib_rrf[k] = lib_rrf.get(k, 0.0) + (
-                            4.0 * self.authority_weight * n_lists / (RRF_K + auth_rank[k]))
-            pool_ranks = reorder_ranklists_by_rrf(pool_ranks, lib_rrf, lib_key)
+                            1.5 * self.authority_weight / (RRF_K + auth_rank[k]))
+            if authority_applied:
+                reordered_local = reorder_ranklists_by_rrf(local_ranks, lib_rrf, lib_key)
+                if kg_ranks:
+                    kg_base = reorder_ranklists_by_rrf([kg_ranks], base_rrf, lib_key)[0]
+                    kg_head = kg_base[:_KG_TOP_PROTECT]
+                    kg_tail = (
+                        reorder_ranklists_by_rrf([kg_base[_KG_TOP_PROTECT:]], lib_rrf, lib_key)[0]
+                        if len(kg_base) > _KG_TOP_PROTECT else []
+                    )
+                    reordered_kg = kg_head + kg_tail
+                else:
+                    reordered_kg = []
+                pool_ranks = reordered_local + [reordered_kg]
+            else:
+                pool_ranks = reorder_ranklists_by_rrf(pool_ranks, lib_rrf, lib_key)
             for ranklist in external_ranks:
                 for node in ranklist:
                     node["_rrf"] = ext_rrf.get(_identity_key(node), 0)
@@ -571,7 +671,12 @@ class SearchPipeline:
                 trace.record("gate", candidate=candidate, decision="skipped" if rejection else "eligible", reason=rejection)
                 if not rejection:
                     eligible.append(candidate)
-        registration = eligible + [dict(n, _registration_known_key=n["key"]) for n in fused.vouched]
+        vouched_registration = []
+        for n in fused.vouched:
+            donors = n.get("_folded_donors") or [n]
+            for donor in donors:
+                vouched_registration.append(dict(donor, _registration_known_key=n["key"]))
+        registration = eligible + vouched_registration
         external, projections = preview_candidates(live_view, eligible, canonical_keys=fused.canonical_keys)
         # Preview may resolve a new identity to a local row suppressed by fusion.
         # Its canonical snapshot already carries the preview hits' rank evidence;
@@ -588,7 +693,30 @@ class SearchPipeline:
                 if "best_external_rank" in donor:
                     node["best_external_rank"] = min(node["best_external_rank"], donor["best_external_rank"])
         external_keys = set(projections)
-        pool = [n for n in fused.local if n["key"] not in external_keys] + external
+        local_pool = []
+        for node in fused.local:
+            key = node["key"]
+            if key in external_keys:
+                continue
+            donors = node.get("_folded_donors")
+            if donors:
+                base = live_view.get(key)
+                if base is not None:
+                    projected = base.model_copy(deep=True)
+                    for donor in donors:
+                        _fill(projected, donor)
+                    projections[key] = projected
+                    enriched = paper_to_dict(projected)
+                    for meta_field in (
+                        "folded_vouch", "external_rrf_score",
+                        "best_external_rank", "_external_hit_count",
+                    ):
+                        if meta_field in node:
+                            enriched[meta_field] = node[meta_field]
+                    local_pool.append(enriched)
+                    continue
+            local_pool.append(node)
+        pool = local_pool + external
         pool = [n for n in pool if plan.year_eligible(n)]
         return pool, projections, registration
 

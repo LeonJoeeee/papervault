@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS catalog.records (
         AND payload ? 'key' AND payload ->> 'key' = key)
 );
 CREATE INDEX IF NOT EXISTS records_status_idx ON catalog.records (download_status);
+CREATE INDEX IF NOT EXISTS records_alias_idx ON catalog.records (key) WHERE merge = 'alias';
 ALTER TABLE catalog.records ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
 
 CREATE TABLE IF NOT EXISTS catalog.aliases (
@@ -49,6 +50,9 @@ CREATE TABLE IF NOT EXISTS catalog.audit (
     key TEXT,
     detail JSONB NOT NULL
 );
+CREATE INDEX IF NOT EXISTS audit_event_actor_cmd_idx
+    ON catalog.audit (event, actor, (detail->>'command_id'))
+    WHERE event = 'registration';
 
 CREATE TABLE IF NOT EXISTS catalog.rulings (
     id BIGSERIAL PRIMARY KEY,

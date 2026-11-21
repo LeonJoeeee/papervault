@@ -176,6 +176,9 @@ class PostgresCatalogRepository:
     checks and imports. Revision predicates still reject stale observations.
     """
 
+    _write_depth: int = 0
+    _defer_alias_validation: bool = False
+
     def __init__(self, connection, *, schema: str = "catalog", read_only: bool = False):
         if not re.fullmatch(r"catalog(?:_[a-z0-9_]+)?", schema):
             raise ValueError("shadow namespace must be catalog or catalog_<suffix>")
@@ -186,9 +189,38 @@ class PostgresCatalogRepository:
         self.schema = schema
         self.read_only = read_only
         self.fence_id = None
+        self._regclass_cache: dict[str, bool] = {}
+        self._write_depth = 0
+        self._defer_alias_validation = False
 
     def _table(self, name: str):
         return sql.Identifier(self.schema, name)
+
+    def _table_exists(self, name: str) -> bool:
+        cache = getattr(self, "_regclass_cache", None)
+        if cache is None:
+            cache = self._regclass_cache = {}
+        cached = cache.get(name)
+        if cached is not None:
+            return cached
+        row = self.connection.execute(
+            "SELECT to_regclass(%s) AS name", (self.schema + "." + name,)
+        ).fetchone()
+        present = bool(row and row["name"])
+        cache[name] = present
+        return present
+
+    @contextmanager
+    def defer_alias_validation(self):
+        """Validate alias ownership once at batch exit instead of per-upsert."""
+        prev = self._defer_alias_validation
+        self._defer_alias_validation = True
+        try:
+            yield
+            if not prev:
+                self._validate_alias_ownership()
+        finally:
+            self._defer_alias_validation = prev
 
     @contextmanager
     def _write(self, audit: AuditEvent):
@@ -197,17 +229,21 @@ class PostgresCatalogRepository:
         if self.read_only:
             raise PermissionError("shadow comparator repository is read-only")
         with self.connection.transaction():
-            self.connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                                    ("papervault:" + self.schema,))
-            exists = self.connection.execute("SELECT to_regclass(%s) AS name",
-                                             (self.schema + ".writer_fence",)).fetchone()
-            if exists and exists["name"]:
-                row = self.connection.execute(sql.SQL("SELECT fence_id FROM {}").format(
-                    self._table("writer_fence"))).fetchone()
-                if row and row["fence_id"] and row["fence_id"] != self.fence_id:
-                    from .fencing import WriterFenced
-                    raise WriterFenced("catalog writers durably fenced for handoff")
-            yield
+            is_outer = self._write_depth == 0
+            self._write_depth += 1
+            try:
+                if is_outer:
+                    self.connection.execute("SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                                            ("papervault:" + self.schema,))
+                    if self._table_exists("writer_fence"):
+                        row = self.connection.execute(sql.SQL("SELECT fence_id FROM {}").format(
+                            self._table("writer_fence"))).fetchone()
+                        if row and row["fence_id"] and row["fence_id"] != self.fence_id:
+                            from .fencing import WriterFenced
+                            raise WriterFenced("catalog writers durably fenced for handoff")
+                yield
+            finally:
+                self._write_depth -= 1
 
     def set_fence(self, fence_id: str | None, *, audit: AuditEvent):
         with self._write(audit):
@@ -225,55 +261,61 @@ class PostgresCatalogRepository:
             self._write_job(job)
 
     def ensure_schema(self, *, audit: AuditEvent) -> None:
-        with self._write(audit):
-            ddl = files("papervault.store").joinpath("schema.sql").read_text()
-            ddl = render_catalog_ddl(ddl, self.schema)
-            self.connection.execute(ddl)
-            row = self.connection.execute(sql.SQL(
-                "INSERT INTO {} (version, name) VALUES (1, 'P1 shadow catalog') "
-                "ON CONFLICT (version) DO NOTHING RETURNING version"
-            ).format(self._table("schema_version"))).fetchone()
-            if row:
-                self._finish(None, audit)
-            row = self.connection.execute(sql.SQL(
-                "INSERT INTO {} (version, name) VALUES (2, 'P2 guarded catalog persistence') "
-                "ON CONFLICT (version) DO NOTHING RETURNING version"
-            ).format(self._table("schema_version"))).fetchone()
-            if row:
-                self._finish(None, audit)
+        try:
+            with self._write(audit):
+                ddl = files("papervault.store").joinpath("schema.sql").read_text()
+                ddl = render_catalog_ddl(ddl, self.schema)
+                self.connection.execute(ddl)
+                self._regclass_cache.clear()
+                row = self.connection.execute(sql.SQL(
+                    "INSERT INTO {} (version, name) VALUES (1, 'P1 shadow catalog') "
+                    "ON CONFLICT (version) DO NOTHING RETURNING version"
+                ).format(self._table("schema_version"))).fetchone()
+                if row:
+                    self._finish(None, audit)
+                row = self.connection.execute(sql.SQL(
+                    "INSERT INTO {} (version, name) VALUES (2, 'P2 guarded catalog persistence') "
+                    "ON CONFLICT (version) DO NOTHING RETURNING version"
+                ).format(self._table("schema_version"))).fetchone()
+                if row:
+                    self._finish(None, audit)
+        finally:
+            self._regclass_cache.clear()
 
     def ensure_knowledge_schema(self, *, audit: AuditEvent) -> None:
         """Explicit administrative P4 migration; ordinary startup never calls it."""
-        with self._write(audit):
-            ddl = files("papervault.store").joinpath("knowledge_schema.sql").read_text()
-            ddl = render_catalog_ddl(ddl, self.schema)
-            self.connection.execute(ddl)
-            # Existing registrations predate transactional P4 capture. Seed
-            # unknown pending requirements at this explicit migration boundary.
-            records = list(self.connection.execute(sql.SQL("SELECT key,revision,payload FROM {}").format(
-                self._table("records"))))
-            with self.connection.cursor() as cursor:
-                cursor.executemany(sql.SQL("INSERT INTO {}(record_key,record_revision,payload_digest) "
-                    "VALUES(%s,%s,%s) ON CONFLICT DO NOTHING").format(self._table("knowledge_pending_inputs")),
-                    [(r["key"], r["revision"], payload_hash(r["payload"])) for r in records])
-                if cursor.rowcount > 0:
-                    self.connection.execute(sql.SQL("UPDATE {} SET requirements_revision=requirements_revision+1").format(
-                        self._table("knowledge_runtime")))
-            changed = self.connection.execute(sql.SQL(
-                "INSERT INTO {}(version,name) VALUES(4,'P4 catalog knowledge commands'),"
-                "(5,'P5a extraction derivation registration'),"
-                "(6,'P5b isolated recovery generations'),"
-                "(7,'P5c disposable extract lifecycle') "
-                "ON CONFLICT(version) DO NOTHING RETURNING version"
-            ).format(self._table("schema_version"))).fetchone()
-            if changed:
-                self._finish(None, audit)
+        try:
+            with self._write(audit):
+                ddl = files("papervault.store").joinpath("knowledge_schema.sql").read_text()
+                ddl = render_catalog_ddl(ddl, self.schema)
+                self.connection.execute(ddl)
+                self._regclass_cache.clear()
+                # Existing registrations predate transactional P4 capture. Seed
+                # unknown pending requirements at this explicit migration boundary.
+                records = list(self.connection.execute(sql.SQL("SELECT key,revision,payload FROM {}").format(
+                    self._table("records"))))
+                with self.connection.cursor() as cursor:
+                    cursor.executemany(sql.SQL("INSERT INTO {}(record_key,record_revision,payload_digest) "
+                        "VALUES(%s,%s,%s) ON CONFLICT DO NOTHING").format(self._table("knowledge_pending_inputs")),
+                        [(r["key"], r["revision"], payload_hash(r["payload"])) for r in records])
+                    if cursor.rowcount > 0:
+                        self.connection.execute(sql.SQL("UPDATE {} SET requirements_revision=requirements_revision+1").format(
+                            self._table("knowledge_runtime")))
+                changed = self.connection.execute(sql.SQL(
+                    "INSERT INTO {}(version,name) VALUES(4,'P4 catalog knowledge commands'),"
+                    "(5,'P5a extraction derivation registration'),"
+                    "(6,'P5b isolated recovery generations'),"
+                    "(7,'P5c disposable extract lifecycle') "
+                    "ON CONFLICT(version) DO NOTHING RETURNING version"
+                ).format(self._table("schema_version"))).fetchone()
+                if changed:
+                    self._finish(None, audit)
+        finally:
+            self._regclass_cache.clear()
 
     def _track_knowledge_requirement_change(self, record: Record, revision: int):
         """Capture and invalidate in the Library writer transaction, when installed."""
-        exists = self.connection.execute("SELECT to_regclass(%s) AS name",
-            (self.schema + ".knowledge_pending_inputs",)).fetchone()
-        if not exists or not exists["name"]:
+        if not self._table_exists("knowledge_pending_inputs"):
             return
         self.connection.execute(sql.SQL(
             "INSERT INTO {}(record_key,record_revision,payload_digest) VALUES(%s,%s,%s) "
@@ -324,9 +366,7 @@ class PostgresCatalogRepository:
         lifecycle = None
         if any(payload.get(field) for payload in (record.payload, current.payload if current else {})
                for field in ("extraction_completion_id", "pdf_path", "md_path", "txt_path")):
-            exists = self.connection.execute("SELECT to_regclass(%s) AS name",
-                (self.schema + ".extract_deletions",)).fetchone()
-            if exists["name"]:
+            if self._table_exists("extract_deletions"):
                 from . import extract_lifecycle
                 from .knowledge import KnowledgeRepository
                 lifecycle = KnowledgeRepository(self)
@@ -363,7 +403,7 @@ class PostgresCatalogRepository:
                 self._sync_aliases([record])
                 if not changed and before != self.all_aliases().get(record.key):
                     self._finish(record.key, audit)
-            else:
+            elif not self._defer_alias_validation:
                 self._validate_alias_ownership()
             return changed
 
@@ -396,7 +436,8 @@ class PostgresCatalogRepository:
                 self.connection.execute(sql.SQL(
                     "INSERT INTO {} (alias_key, canonical_key) VALUES (%s, %s)"
                 ).format(self._table("aliases")), (record.key, target))
-        self._validate_alias_ownership()
+        if not self._defer_alias_validation:
+            self._validate_alias_ownership()
 
     def _validate_alias_ownership(self):
         # Imports and metadata edits also pass here. Never release an older

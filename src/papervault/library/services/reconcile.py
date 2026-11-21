@@ -50,6 +50,7 @@ import datetime as _dt
 import logging
 import os
 import re
+import time
 from typing import Optional
 
 from .. import fetch
@@ -62,6 +63,41 @@ log = logging.getLogger("papervault.library.reconcile")
 
 # Papers scanned per batch before yielding control back to the event loop.
 _BATCH_SIZE = 200
+# Rotating cursor across transport-deferred extracts so a few corrupt PDFs at
+# the head of the list cannot starve healthy deferred papers from canary probes.
+_defer_canary_cursor = 0
+# Maximum wall-clock time spent politely pacing a single metadata sweep.
+_POLITE_SWEEP_BUDGET_S = 120.0
+
+
+async def _wait_polite_gate(service: str, *, max_wait: float = 15.0) -> bool:
+    """Wait for politeness-v2 headroom before issuing a background sweep call.
+
+    Returns True when permitted (or when politeness-v2 is disabled), False when
+    the scope is disabled or cooling down longer than ``max_wait``.
+    """
+    from papervault.config import polite_v2_enabled
+    if not polite_v2_enabled():
+        return True
+    from ..polite_http import get_ledger
+    from ..politeness_v2 import Scope
+
+    scope = Scope(service)
+    deadline = time.monotonic() + max_wait
+    while True:
+        try:
+            decision = get_ledger().gate(scope)
+        except Exception:
+            return False
+        if decision.allowed:
+            return True
+        if decision.reason == "disabled":
+            return False
+        wait = decision.retry_after if decision.retry_after > 0 else 0.25
+        remaining = deadline - time.monotonic()
+        if remaining <= 0 or (decision.reason == "cooldown" and wait > remaining):
+            return False
+        await asyncio.sleep(min(wait, remaining, 5.0))
 
 
 async def _prio_by_pages(library: Library, key: str) -> int:
@@ -182,6 +218,7 @@ async def _resolve_doi_sweep(library: Library, *, cap: int) -> int:
         _resolve_one(p.title, list(p.authors or []), p.year) for p in cands))
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     resolved = 0
+    mutated = 0
     async with concurrency.lib_write_lock:
         for key, (status, doi) in zip(keys, results):
             if status == "transient":
@@ -194,12 +231,16 @@ async def _resolve_doi_sweep(library: Library, *, cap: int) -> int:
                     key, doi, provenance="doi_resolved", resolved_at=now)
                 if outcome in ("set", "collision"):
                     resolved += 1
+                    mutated += 1
                 # On "collision" the stub was merged+purged (no row to stamp).
                 if outcome in ("set", "has_doi"):
                     p.resolve_attempted_at = now
+                    mutated += 1
             else:  # clean miss / abstain -> stamp so it isn't re-probed
                 p.resolve_attempted_at = now
-        library.save()
+                mutated += 1
+        if mutated:
+            await asyncio.to_thread(library.save)
     log.info("reconcile: doi-resolve probed %d -> resolved %d", len(cands), resolved)
     return resolved
 
@@ -213,22 +254,45 @@ async def _enrich_sweep(library: Library, *, cap: int) -> int:
     drains the existing no-venue backlog over sweeps AND completes new
     DOI-bearing search-ingest rows — the single root-cause + backfill mechanism.
     """
+    from papervault.config import polite_v2_enabled
+
     cands = [p for p in library.all_papers() if _needs_enrich(p)][:cap]
     if not cands:
         return 0
     targets = [(p.key, (p.doi or "").strip()) for p in cands]
-    results = await asyncio.gather(*(_enrich_one(doi) for _, doi in targets))
+    processed_targets: list[tuple[str, str]] = []
+    results: list[tuple[str, dict]] = []
+    if polite_v2_enabled():
+        # Respect politeness-v2 concurrency=1 & window pacing instead of bursting
+        # all candidates concurrently and dropping 119/120 with PolitenessDenied.
+        deadline = time.monotonic() + _POLITE_SWEEP_BUDGET_S
+        for key, doi in targets:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            if not await _wait_polite_gate("crossref", max_wait=min(15.0, remaining)):
+                break
+            processed_targets.append((key, doi))
+            results.append(await _enrich_one(doi))
+    else:
+        processed_targets = targets
+        results = await asyncio.gather(*(_enrich_one(doi) for _, doi in targets))
     now = _dt.datetime.now(_dt.timezone.utc).isoformat()
     filled = 0
+    mutated = 0
     async with concurrency.lib_write_lock:
-        for (key, doi), (status, fields) in zip(targets, results):
+        for (key, doi), (status, fields) in zip(processed_targets, results):
             if status == "transient":
                 continue                          # fail-open: do NOT stamp, retry later
+            if library.get(key) is None:
+                continue
+            mutated += 1
             if library.enrich(key, fields, enriched_at=now, provenance={"incoming_source": "crossref",
                     "lookup_doi": doi, "checked_at": now}):
                 filled += 1
-        library.save()
-    log.info("reconcile: enrich probed %d -> filled %d", len(cands), filled)
+        if mutated:
+            await asyncio.to_thread(library.save)
+    log.info("reconcile: enrich probed %d -> filled %d", len(processed_targets), filled)
     return filled
 
 
@@ -238,10 +302,51 @@ async def _enrich_sweep(library: Library, *, cap: int) -> int:
 _ABSTRACT_CAP = 100
 _abstract_sem = asyncio.Semaphore(3)
 _ABSTRACT_FLOOR = 40
+_ABSTRACT_RETRY_DAYS = 30
 
 
-def _needs_abstract(p) -> bool:
-    return len((p.abstract or "").strip()) < _ABSTRACT_FLOOR
+def _parse_iso_utc(stamp: Optional[str]) -> Optional[_dt.datetime]:
+    if not stamp:
+        return None
+    try:
+        dt = _dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        return dt if dt.tzinfo is not None else dt.replace(tzinfo=_dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def _has_newer_extract(library: Library, p, attempted_dt: _dt.datetime) -> bool:
+    """True iff an on-disk extract for ``p`` is newer than ``attempted_dt``."""
+    cutoff = attempted_dt.timestamp()
+    checked = []
+    for rel in (p.md_path, p.txt_path):
+        if rel:
+            checked.append(library.root / rel)
+    if not checked:
+        checked.extend((library.md_path(p.key), library.txt_path(p.key)))
+    for path in checked:
+        try:
+            if path.stat().st_mtime > cutoff:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _needs_abstract(p, library: Optional[Library] = None, *,
+                    now: Optional[_dt.datetime] = None) -> bool:
+    if len((p.abstract or "").strip()) >= _ABSTRACT_FLOOR:
+        return False
+    attempted = getattr(p, "abstract_attempted_at", None)
+    if not attempted:
+        return True
+    attempted_dt = _parse_iso_utc(attempted)
+    if attempted_dt is None:
+        return True
+    if library is not None and _has_newer_extract(library, p, attempted_dt):
+        return True
+    current = now or _dt.datetime.now(_dt.timezone.utc)
+    return (current - attempted_dt) >= _dt.timedelta(days=_ABSTRACT_RETRY_DAYS)
 
 
 def _clean_extract_text(s: str) -> str:
@@ -306,45 +411,93 @@ def _opening_paragraph(library: Library, p) -> str:
     return ""
 
 
-async def _abstract_one(library: Library, p) -> str:
+async def _abstract_probe(library: Library, p, *, polite_deadline: Optional[float] = None) -> tuple[str, str]:
+    """3-state abstract backfill probe: ("ok", ab) | ("miss", "") | ("transient", "")."""
+    from papervault.config import polite_v2_enabled
+
     # Priority: the paper's OWN labelled Abstract section (verbatim, safest) ->
     # an authoritative source by DOI (OpenAlex/SS) -> the opening prose paragraph
     # (riskiest, so it runs ONLY after the others miss).
     section = await asyncio.to_thread(_abstract_section, library, p)
     if len(section) >= 60:
-        return section
+        return ("ok", section)
     doi = (p.doi or "").strip()
+    doi_transient = False
     if doi:
-        from ..fetch import fetch_abstract_by_doi
-        async with _abstract_sem:
-            got = await asyncio.to_thread(fetch_abstract_by_doi, doi)
-        if len((got or "").strip()) >= 60:
-            return got.strip()
-    return await asyncio.to_thread(_opening_paragraph, library, p)
+        can_probe_doi = True
+        if polite_v2_enabled():
+            max_wait = 15.0 if polite_deadline is None else max(0.0, min(15.0, polite_deadline - time.monotonic()))
+            oa_ok = await _wait_polite_gate("openalex", max_wait=max_wait)
+            if not oa_ok:
+                ss_wait = 15.0 if polite_deadline is None else max(0.0, min(15.0, polite_deadline - time.monotonic()))
+                ss_ok = await _wait_polite_gate("semantic_scholar", max_wait=ss_wait)
+                if not ss_ok:
+                    can_probe_doi = False
+                    doi_transient = True
+        if can_probe_doi:
+            from ..fetch import _fetch_abstract_by_doi_3state
+            async with _abstract_sem:
+                status, got = await asyncio.to_thread(_fetch_abstract_by_doi_3state, doi)
+            if status == "ok" and len((got or "").strip()) >= 60:
+                return ("ok", got.strip())
+            if status == "transient":
+                doi_transient = True
+    opening = await asyncio.to_thread(_opening_paragraph, library, p)
+    if len(opening) >= 60:
+        return ("ok", opening)
+    return ("transient", "") if doi_transient else ("miss", "")
+
+
+async def _abstract_one(library: Library, p) -> str:
+    status, ab = await _abstract_probe(library, p)
+    return ab if status == "ok" else ""
 
 
 async def _abstract_sweep(library: Library, *, cap: int) -> int:
     """Backfill an abstract on up to ``cap`` no-abstract rows: verbatim from the
     row's own extract, else OpenAlex/SS by DOI. Fetch OFF the loop; fill-blanks
-    (never overwrite) + save ONCE under the write lock."""
-    cands = [p for p in library.all_papers() if _needs_abstract(p)][:cap]
+    (never overwrite) + save ONCE under the write lock. Non-transient misses
+    stamp ``abstract_attempted_at`` so unfillable rows do not re-probe forever."""
+    from papervault.config import polite_v2_enabled
+
+    now_dt = _dt.datetime.now(_dt.timezone.utc)
+    cands = [p for p in library.all_papers() if _needs_abstract(p, library, now=now_dt)][:cap]
     if not cands:
         return 0
-    keys = [p.key for p in cands]
-    results = await asyncio.gather(*(_abstract_one(library, p) for p in cands))
+    processed_keys: list[str] = []
+    results: list[tuple[str, str]] = []
+    if polite_v2_enabled():
+        deadline = time.monotonic() + _POLITE_SWEEP_BUDGET_S
+        for p in cands:
+            if time.monotonic() >= deadline and (p.doi or "").strip():
+                break
+            processed_keys.append(p.key)
+            results.append(await _abstract_probe(library, p, polite_deadline=deadline))
+    else:
+        processed_keys = [p.key for p in cands]
+        results = await asyncio.gather(*(_abstract_probe(library, p) for p in cands))
+    now_iso = _dt.datetime.now(_dt.timezone.utc).isoformat()
     filled = 0
+    mutated = 0
     async with concurrency.lib_write_lock:
-        for key, ab in zip(keys, results):
-            ab = (ab or "").strip()
-            if len(ab) < 60:
+        for key, (status, ab) in zip(processed_keys, results):
+            if status == "transient":
                 continue
             row = library.get(key)
-            if row is not None and _needs_abstract(row):
+            if row is None or len((row.abstract or "").strip()) >= _ABSTRACT_FLOOR:
+                continue
+            ab = (ab or "").strip()
+            if status == "ok" and len(ab) >= 60:
                 row.abstract = ab
+                row.abstract_attempted_at = None
                 filled += 1
-        if filled:
-            library.save()
-    log.info("reconcile: abstract sweep probed %d -> filled %d", len(cands), filled)
+                mutated += 1
+            else:
+                row.abstract_attempted_at = now_iso
+                mutated += 1
+        if mutated:
+            await asyncio.to_thread(library.save)
+    log.info("reconcile: abstract sweep probed %d -> filled %d", len(processed_keys), filled)
     return filled
 
 
@@ -379,7 +532,7 @@ async def _path_backfill_sweep(library: Library) -> int:
             setattr(row, field, str(path.relative_to(library.root)))
             n += 1
         if n:
-            library.save()
+            await asyncio.to_thread(library.save)
     log.info("reconcile: path-backfill set %d md/txt path fields", n)
     return n
 
@@ -465,7 +618,18 @@ async def reconcile_once(
     # is re-enqueued next sweep. During a stable outage this costs O(DEFER_CANARY)
     # attempts/sweep instead of O(pending-set) — the busy-loop is bounded, not
     # perpetual.
-    for key in deferred_extract[:extract_defer.DEFER_CANARY]:
+    global _defer_canary_cursor
+    canary_count = min(extract_defer.DEFER_CANARY, len(deferred_extract))
+    if canary_count > 0:
+        start_idx = _defer_canary_cursor % len(deferred_extract)
+        canary_keys = [
+            deferred_extract[(start_idx + offset) % len(deferred_extract)]
+            for offset in range(canary_count)
+        ]
+        _defer_canary_cursor = (start_idx + canary_count) % len(deferred_extract)
+    else:
+        canary_keys = []
+    for key in canary_keys:
         try:
             prio = await _prio_by_pages(library, key)
             extract_queue.add(key, prio)
@@ -524,6 +688,7 @@ async def reconcile_once(
         counts["extract_deferred"], counts["extract_canary"],
         counts["terminal"], counts["errors"],
     )
+    await asyncio.to_thread(concurrency.trim_process_memory)
     return counts
 
 

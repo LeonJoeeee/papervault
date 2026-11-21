@@ -42,6 +42,8 @@ from papervault.store import knowledge_runtime
 
 import asyncio
 import logging
+import os
+import time
 from collections import defaultdict
 from typing import Iterable, Optional
 
@@ -50,21 +52,118 @@ from lightrag.base import DocStatus
 from papervault.knowledge.ingest.abstract_doc import done_status_for
 from papervault.knowledge.ingest.distill import distill_batch, doc_status_of, docs_by_ids, remove_one
 from papervault.knowledge.ingest.fingerprint import fingerprint
+from papervault.knowledge.ingest.paper_library_client import catalog_state_token
 from papervault.knowledge.ingest.vault import load_clean_index
 from papervault.knowledge.ledger import store as ledger
 from papervault.knowledge.ledger.store import _max_attempts
 from papervault.knowledge.scheduler.opdoc_pickup import drain_pending
 from papervault.knowledge.scheduler.reconcile import Diff, diff, reconcile_library
 from papervault.knowledge.store.build_breaker import BuildPausedError, get_breaker
+from papervault.library.services.concurrency import trim_process_memory
 
 log = logging.getLogger("ks.scheduler.round")
 
 PAPER = "paper"
 DEFAULT_STUCK_LIMIT = 3        # processing 行连续 N 轮不前进 → error(§6.6 永卡兜底)
 DEFAULT_ROUND_INTERVAL = 60.0  # main_loop sleep 秒
+DEFAULT_FULL_RECONCILE_INTERVAL_S = 1800.0  # periodic safety full-reconcile during idle
+_ACTIVE_LEDGER_STATUSES = frozenset({"processing", "error", "pending_remove"})
 
 # 进程内 stuck 计数(重启从 0 重数 —— 重启本身触发 LightRAG 自愈,见 §6.6)。
 _stuck: dict[str, int] = defaultdict(int)
+
+
+def _full_reconcile_interval() -> float:
+    try:
+        return max(0.0, float(os.getenv("KS_FULL_RECONCILE_INTERVAL_S", str(DEFAULT_FULL_RECONCILE_INTERVAL_S))))
+    except ValueError:
+        return DEFAULT_FULL_RECONCILE_INTERVAL_S
+
+
+async def _ledger_idle_token():
+    """Return a cheap ledger state token when no active rows exist, else None."""
+    if hasattr(ledger, "_conn") and hasattr(ledger, "_workspace"):
+        ws = ledger._workspace()
+        async with ledger._conn() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT status, count(*), max(last_processed_at) "
+                    "FROM ks_ledger WHERE workspace=%s GROUP BY status ORDER BY status",
+                    (ws,),
+                )
+                rows = await cur.fetchall()
+        token = []
+        for status, count, max_ts in rows:
+            if status in _ACTIVE_LEDGER_STATUSES and int(count) > 0:
+                return None
+            token.append((status, int(count), max_ts.isoformat() if max_ts is not None else ""))
+        return tuple(token)
+    # Test/fake ledger fallback (in-memory FakeLedger).
+    if hasattr(ledger, "rows"):
+        active = await ledger.load_by_status(tuple(_ACTIVE_LEDGER_STATUSES))
+        if active:
+            return None
+        return tuple(sorted(
+            (r.ingest_source, r.source_id, r.status, r.fingerprint, r.doc_id)
+            for r in ledger.rows.values()
+        ))
+    return None
+
+
+async def _doc_status_idle_token(rag):
+    """Return a cheap LightRAG doc_status token when zero non-processed docs exist, else None."""
+    doc_status = getattr(rag, "doc_status", None)
+    if doc_status is not None and hasattr(doc_status, "get_status_counts"):
+        counts = await doc_status.get_status_counts()
+        non_processed = sum(int(v) for k, v in counts.items() if str(k).lower() != "processed")
+        if non_processed > 0:
+            return None
+        return tuple(sorted((str(k).lower(), int(v)) for k, v in counts.items()))
+    if hasattr(rag, "rows") and isinstance(rag.rows, dict):
+        counts: dict[str, int] = defaultdict(int)
+        for row in rag.rows.values():
+            st = str(row.get("status", "")).lower()
+            if st != "processed":
+                return None
+            counts[st] += 1
+        return tuple(sorted(counts.items()))
+    return None
+
+
+async def _idle_state_token(rag):
+    """Cheap combined state token for skipping redundant 46k-row idle rounds.
+
+    Returns None whenever active work is in flight or any probe cannot confirm
+    an idle state (fail-open to full round).
+    """
+    try:
+        cat_token = await asyncio.to_thread(catalog_state_token)
+        led_token = await _ledger_idle_token()
+        if led_token is None:
+            return None
+        doc_token = await _doc_status_idle_token(rag)
+        if doc_token is None:
+            return None
+        return (cat_token, led_token, doc_token)
+    except Exception:
+        log.debug("idle state probe unavailable; running full round", exc_info=True)
+        return None
+
+
+def _is_clean_idle_summary(summary: dict) -> bool:
+    if summary.get("paused") or summary.get("skipped_idle"):
+        return False
+    if summary.get("to_distill") or summary.get("to_redistill") or summary.get("to_remove"):
+        return False
+    term = summary.get("terminal") or {}
+    if any(term.get(k, 0) for k in ("done", "error", "pending", "stuck_error")):
+        return False
+    if (summary.get("healed") or {}).get("healed", 0):
+        return False
+    lib = summary.get("library") or {}
+    if lib.get("reopened", 0) or lib.get("duplicates", 0):
+        return False
+    return True
 
 
 async def reconcile_terminal(
@@ -83,8 +182,10 @@ async def reconcile_terminal(
     OUTSIDE the subset — defeating the "一小撮固定 keys" intent and racing other rounds.
     """
     knowledge_runtime.assert_knowledge_authority("legacy")
-    led = await ledger.load(PAPER)
-    proc = [r for r in led.values() if r.status == "processing"]
+    if hasattr(ledger, "load_by_status"):
+        proc = [r for r in await ledger.load_by_status(("processing",)) if r.ingest_source == PAPER]
+    else:
+        proc = [r for r in (await ledger.load(PAPER)).values() if r.status == "processing"]
     if only_keys is not None:
         ks = set(only_keys)
         proc = [r for r in proc if r.source_id in ks]
@@ -196,6 +297,7 @@ async def run_round(
     *,
     stuck_limit: int = DEFAULT_STUCK_LIMIT,
     only_keys: Optional[Iterable[str]] = None,
+    _idle_state: Optional[dict] = None,
 ) -> dict:
     """一个增量同步 round(SDD §6.1/§6.6)。进程内串行,删插互斥。
 
@@ -213,6 +315,16 @@ async def run_round(
     knowledge_runtime.assert_knowledge_authority("legacy")
     only = set(only_keys) if only_keys is not None else None
 
+    if _idle_state is not None and only is None and get_breaker().allows():
+        full_interval = _full_reconcile_interval()
+        prev_token = _idle_state.get("token")
+        last_full_at = _idle_state.get("last_full_at", 0.0)
+        if prev_token is not None and full_interval > 0 and (time.monotonic() - last_full_at) < full_interval:
+            current_token = await _idle_state_token(rag)
+            if current_token is not None and current_token == prev_token:
+                log.debug("run_round: idle fast-path (catalog/ledger/doc_status unchanged)")
+                return {"skipped_idle": True}
+
     idx = await asyncio.to_thread(load_clean_index)
     library = await reconcile_library(rag, idx, only_keys=only)
 
@@ -226,6 +338,8 @@ async def run_round(
     # #143/#209: upstream failure or peak window → start no build work this round (the gate
     # already logged the transition; the reconcile writes above needed no LLM).
     if not get_breaker().allows():
+        if _idle_state is not None and only is None:
+            _idle_state["token"] = None
         summary = {"terminal": term, "healed": healed, "paused": True}
         log.debug("run_round: build paused by the build-path breaker: %s", summary)
         return summary
@@ -299,6 +413,13 @@ async def run_round(
             "(status=error_parked, no longer re-distilled). Check the embedding/LLM/graph backend NOW (#84).",
             build_errored, _max_attempts(),
         )
+    if _idle_state is not None and only is None:
+        _idle_state["last_full_at"] = time.monotonic()
+        if _is_clean_idle_summary(summary):
+            _idle_state["token"] = await _idle_state_token(rag)
+        else:
+            _idle_state["token"] = None
+            await asyncio.to_thread(trim_process_memory)
     return summary
 
 
@@ -315,13 +436,16 @@ async def main_loop(rag, *, interval: float = DEFAULT_ROUND_INTERVAL,
     knowledge_runtime.assert_knowledge_authority("legacy")
     await ledger.ensure_schema()
     log.info("scheduler main_loop started (interval=%ss, stuck_limit=%s)", interval, stuck_limit)
+    idle_state: dict = {"token": None, "last_full_at": 0.0}
     try:
         while True:
             try:
-                await run_round(rag, stuck_limit=stuck_limit)
+                await run_round(rag, stuck_limit=stuck_limit, _idle_state=idle_state)
             except BuildPausedError:
+                idle_state["token"] = None
                 log.debug("run_round: deferred paused build")
             except Exception:  # noqa: BLE001 — 单轮异常不杀循环;下轮重试(distill 批级已自兜底,这里是兜底之兜底)
+                idle_state["token"] = None
                 log.exception("run_round failed; retrying next interval")
             # #81 windowless operator-doc pickup: scan the pending dir and ingest dropped
             # textbook/notebook md against the SAME singleton rag. Runs HERE, after run_round,
@@ -333,8 +457,11 @@ async def main_loop(rag, *, interval: float = DEFAULT_ROUND_INTERVAL,
             # fast and route a good file to failed/; it stays in pending/ for a later round.
             try:
                 if get_breaker().allows():
-                    await drain_pending(rag)
+                    picked = await drain_pending(rag)
+                    if picked:
+                        idle_state["token"] = None
             except Exception:  # noqa: BLE001 — 兜底之兜底:pickup 异常不杀循环、不影响 paper sync
+                idle_state["token"] = None
                 log.exception("drain_pending failed; retrying next interval")
             await asyncio.sleep(interval)
     except asyncio.CancelledError:

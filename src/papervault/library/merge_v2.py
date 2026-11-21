@@ -8,6 +8,7 @@ never an automatic repeat. Checkpoints release the write lock while work drains.
 from __future__ import annotations
 
 import asyncio
+import copy
 import math
 import inspect
 import threading
@@ -138,7 +139,7 @@ def guard_execution(work):
                                         row.terminal_state = replace(row.acquisition_state, quarantine=True)
                                         if row.merge_intent:
                                             row.merge_intent = row.merge_intent.model_copy(update={"status": "uncertain"})
-                                library.save(force=True, durable=True)
+                                await asyncio.to_thread(library.save, force=True, durable=True)
                     publication = asyncio.create_task(persist_uncertainty())
                     while not publication.done():
                         try:
@@ -203,10 +204,27 @@ class MergeStore:
                        reason=self.reason + ": " + action, actor=self.actor, event=action)
         self.library.save(force=True, durable=True)
 
-    def _require_writer(self):
+    @staticmethod
+    async def _run_off_loop(fn, *args, **kwargs):
+        """Run blocking merge/save work off the event loop without releasing the lock early."""
+        task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if task.cancelled():
+            raise asyncio.CancelledError
+        result = task.result()
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
+    def _require_writer(self, *, _writer_verified: bool = False):
         if not merge_v2_enabled():
             raise ValueError("PAPERVAULT_MERGE_V2 is disabled")
-        if not self.lock.owned():
+        if not _writer_verified and not self.lock.owned():
             raise RuntimeError("merge writer does not own the library write-lock")
         check_index_readable(self.library.root)
 
@@ -249,8 +267,10 @@ class MergeStore:
         return intent.model_copy(update={"metadata": pending,
                                         "canonical_quarantine": intent.canonical_quarantine or extra_quarantine})
 
-    def _quiesce(self, canonical_key, absorbed_key, *, wait_seconds=60, metadata=None):
-        self._require_writer()
+    def _quiesce(self, canonical_key, absorbed_key, *, wait_seconds=60, metadata=None,
+                 _writer_verified: bool = False):
+        from .models import Paper
+        self._require_writer(_writer_verified=_writer_verified)
         if not math.isfinite(wait_seconds) or wait_seconds <= 0:
             raise ValueError("merge wait must be positive and finite")
         if canonical_key == absorbed_key:
@@ -284,17 +304,50 @@ class MergeStore:
                              canonical_quarantine=left.acquisition_state.quarantine,
                              absorbed_quarantine=right.acquisition_state.quarantine)
         with self.library._merge_execution_lock:
-            intent = self._observe(left, intent, metadata)
-            for paper in (left, right):
-                # The intent projects an admission quarantine; do not mark
-                # existing dispatched execution as uncertain before it settles.
-                paper.merge_intent = intent
-            self._save("merge_quiesce", (left, right))
+            left_snap = left.model_copy(deep=True)
+            right_snap = right.model_copy(deep=True)
+            try:
+                intent = self._observe(left, intent, metadata)
+                for paper in (left, right):
+                    # The intent projects an admission quarantine; do not mark
+                    # existing dispatched execution as uncertain before it settles.
+                    paper.merge_intent = intent
+                self._save("merge_quiesce", (left, right))
+            except Exception:
+                for paper, snap in ((left, left_snap), (right, right_snap)):
+                    for field_name in Paper.model_fields:
+                        object.__setattr__(paper, field_name, copy.deepcopy(getattr(snap, field_name)))
+                raise
         return intent
 
     async def quiesce(self, canonical_key, absorbed_key, *, wait_seconds=60):
         async with self.lock:
-            return self._quiesce(canonical_key, absorbed_key, wait_seconds=wait_seconds)
+            self._require_writer()
+            return await self._run_off_loop(
+                self._quiesce, canonical_key, absorbed_key,
+                wait_seconds=wait_seconds, _writer_verified=True,
+            )
+
+    def _restart_sync(self, intent: MergeIntent, *, wait_seconds=60):
+        self._require_writer(_writer_verified=True)
+        if not math.isfinite(wait_seconds) or wait_seconds <= 0:
+            raise ValueError("merge wait must be positive and finite")
+        with self.library._merge_execution_lock:
+            papers = self._pair(intent)
+            if (papers is None or intent.status != "expired"
+                    or any(paper.merge_intent != intent or paper.unquiesced_state.quarantine
+                           or self._can_quiesce(paper.key) is None for paper in papers)):
+                return None
+            now = float(self.clock())
+            fresh = intent.model_copy(update={"merge_id": uuid.uuid4().hex, "status": "waiting",
+                                              "started_at": now, "deadline": now + wait_seconds})
+            for paper in papers:
+                paper.merge_intent = fresh
+            self._save("merge_restart", papers)
+            self.library.log({"event": "merge_intent_restarted", "previous_merge_id": intent.merge_id,
+                              "merge_id": fresh.merge_id, "canonical_key": fresh.canonical_key,
+                              "absorbed_key": fresh.absorbed_key})
+            return fresh
 
     async def restart(self, intent: MergeIntent, *, wait_seconds=60):
         """Explicitly replace an expired wait, keeping both admission fences.
@@ -304,27 +357,10 @@ class MergeStore:
         """
         async with self.lock:
             self._require_writer()
-            if not math.isfinite(wait_seconds) or wait_seconds <= 0:
-                raise ValueError("merge wait must be positive and finite")
-            with self.library._merge_execution_lock:
-                papers = self._pair(intent)
-                if (papers is None or intent.status != "expired"
-                        or any(paper.merge_intent != intent or paper.unquiesced_state.quarantine
-                               or self._can_quiesce(paper.key) is None for paper in papers)):
-                    return None
-                now = float(self.clock())
-                fresh = intent.model_copy(update={"merge_id": uuid.uuid4().hex, "status": "waiting",
-                                                  "started_at": now, "deadline": now + wait_seconds})
-                for paper in papers:
-                    paper.merge_intent = fresh
-                self._save("merge_restart", papers)
-                self.library.log({"event": "merge_intent_restarted", "previous_merge_id": intent.merge_id,
-                                  "merge_id": fresh.merge_id, "canonical_key": fresh.canonical_key,
-                                  "absorbed_key": fresh.absorbed_key})
-                return fresh
+            return await self._run_off_loop(self._restart_sync, intent, wait_seconds=wait_seconds)
 
-    def _drain_ready(self, intent):
-        self._require_writer()
+    def _drain_ready(self, intent, *, _writer_verified: bool = False):
+        self._require_writer(_writer_verified=_writer_verified)
         papers = self._pair(intent)
         if papers is None:
             return False
@@ -355,14 +391,20 @@ class MergeStore:
 
     async def drain_ready(self, intent):
         async with self.lock:
-            with self.library._merge_execution_lock:
-                return self._drain_ready(intent)
+            self._require_writer()
+            def _check():
+                with self.library._merge_execution_lock:
+                    return self._drain_ready(intent, _writer_verified=True)
+            return await self._run_off_loop(_check)
 
-    def _merge_records(self, canonical_key, absorbed_key, *, wait_seconds=60, metadata=None):
-        self._require_writer()
-        intent = self._quiesce(canonical_key, absorbed_key, wait_seconds=wait_seconds, metadata=metadata)
+    def _merge_records(self, canonical_key, absorbed_key, *, wait_seconds=60, metadata=None,
+                       _writer_verified: bool = False):
+        from .models import Paper
+        self._require_writer(_writer_verified=_writer_verified)
+        intent = self._quiesce(canonical_key, absorbed_key, wait_seconds=wait_seconds,
+                               metadata=metadata, _writer_verified=_writer_verified)
         with self.library._merge_execution_lock:
-            if not self._drain_ready(intent):
+            if not self._drain_ready(intent, _writer_verified=_writer_verified):
                 return None
             left, right = self._pair(intent)
             md_fields = ("md_path", "extraction_completion_id", "md_engine", "md_engine_version")
@@ -380,6 +422,10 @@ class MergeStore:
             event = self.ledger.append_merge(canonical_key, absorbed_key, merge_id=intent.merge_id)
             budget = MergeBudget(merge_id=intent.merge_id, generation=event["generation_after"],
                                  spent=event["spent"], budget=event["budget"])
+            # Snapshot both records before in-place mutations so a failed _save()
+            # does not leave uncommitted merged fields or alias state in memory.
+            left_snap = left.model_copy(deep=True)
+            right_snap = right.model_copy(deep=True)
             # Work is settled before the existing in-place blank-fill writer runs.
             self.library._merge(left, right.model_dump())
             if intent.metadata:
@@ -409,9 +455,12 @@ class MergeStore:
                 self._save("identity_merge", (left, right))
             except Exception:
                 uncertain = intent.model_copy(update={"status": "uncertain"})
-                for paper in (left, right):
+                for paper, snap in ((left, left_snap), (right, right_snap)):
+                    for field_name in Paper.model_fields:
+                        object.__setattr__(paper, field_name, copy.deepcopy(getattr(snap, field_name)))
                     paper.merge_intent = uncertain
                     paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
+                self.library._reindex_keys((left.key, right.key))
                 raise
             return left
 
@@ -422,4 +471,8 @@ class MergeStore:
         under the library lock or mistakes deadline expiry for drain evidence.
         """
         async with self.lock:
-            return self._merge_records(canonical_key, absorbed_key, wait_seconds=wait_seconds)
+            self._require_writer()
+            return await self._run_off_loop(
+                self._merge_records, canonical_key, absorbed_key,
+                wait_seconds=wait_seconds, _writer_verified=True,
+            )

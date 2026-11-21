@@ -11,6 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 from functools import lru_cache
+import os
 from os import fstat
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -43,13 +44,18 @@ def _index_header(reader, root: Path, primary_stamp, backup_stamp):
     return data.get("version", INDEX_FORMAT_VERSION), data.get("acquisition_versions", {})
 
 
-def check_index_readable(root) -> None:
+def check_index_readable(root, *, authority: str | None = None) -> None:
     """Fence v2 entry points using the raw primary/last-good index headers.
 
     This does not change the legacy index reader or rewrite any fields. Checking
     before typed records are used also prevents an unsupported v2 field from
     being treated as a corrupt row and silently omitted by the legacy loader.
+    Under PostgreSQL catalog authority, index.json is only an optional export
+    snapshot, so skip opening/parsing it on hot read/write paths.
     """
+    effective = authority or os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json")
+    if effective == "postgres":
+        return
     from .store import Library
     root = Path(root)
     header = _index_header(Library._read_index_file, root,

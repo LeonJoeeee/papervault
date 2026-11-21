@@ -345,6 +345,7 @@ class Library:
         self._by_doi: dict[str, str] = {}
         self._by_arxiv: dict[str, str] = {}
         self._by_title: dict[str, str] = {}
+        self._key_index_entries: dict[str, tuple[str, str, str, str]] = {}
         self._lookup_indexes: dict[str, _FieldLookup] = {}
         self._identity_reservations: set[tuple[str, str, str, object]] = set()
         # Save-cost controls (issue #34 root cause: per-item full-index writes starved
@@ -356,6 +357,7 @@ class Library:
         self._index_dirty = False
         self._bib_min_interval = float(os.environ.get("PAPERVAULT_BIB_MIN_INTERVAL_S", "60"))
         self._last_bib_save = 0.0
+        self._bib_dirty = False
         from .services.correction_ledger import CorrectionLedger
         self.corrections = CorrectionLedger(self.root)
         self.correction_run_lock = asyncio.Lock()
@@ -364,6 +366,8 @@ class Library:
 
     def close(self) -> None:
         """Release the writer fence when an embedded Library's lifetime ends."""
+        if self._catalog_backend is not None and hasattr(self._catalog_backend, "close"):
+            self._catalog_backend.close()
         if self._writer_finalizer:
             self._writer_finalizer()
         self._writer_closed = True
@@ -381,12 +385,11 @@ class Library:
         if self._catalog_backend is not None:
             self._papers = self._catalog_backend.load()
             for paper in self._papers.values():
-                self._state_v2_fingerprints[paper.key] = hash(paper.model_dump_json())
                 self._reindex(paper)
             return
         if self.read_only:
             from .state_v2 import check_index_readable
-            check_index_readable(self.root)
+            check_index_readable(self.root, authority="json")
             data = self._read_index_file(self.index_path) or self._read_index_file(self.index_bak_path)
             if data is None or not isinstance(data.get("papers"), dict):
                 raise ValueError(f"no readable library index at {self.root}")
@@ -471,13 +474,18 @@ class Library:
 
     def _reindex(self, p: Paper) -> None:
         key = (p.acquisition_state.alias_key or p.key) if merge_v2_enabled() or p.merge_budget else p.key
-        if p.doi:
-            self._by_doi[_normalize_doi(p.doi)] = key
-        if p.arxiv_id:
-            self._by_arxiv[_normalize_arxiv(p.arxiv_id)] = key
+        doi_norm = _normalize_doi(p.doi) if p.doi else ""
+        arxiv_norm = _normalize_arxiv(p.arxiv_id) if p.arxiv_id else ""
         nt = normalize_title(p.title)
+        if doi_norm:
+            self._by_doi[doi_norm] = key
+        if arxiv_norm:
+            self._by_arxiv[arxiv_norm] = key
         if nt:
             self._by_title[nt] = key
+        entries = getattr(self, "_key_index_entries", None)
+        if entries is not None:
+            entries[p.key] = (key, doi_norm, arxiv_norm, nt)
         aliases = getattr(self, "_frozen_aliases", None)
         if aliases is not None:
             # Frozen views predeclare their field indexes. Live registries can
@@ -490,15 +498,32 @@ class Library:
             else:
                 aliases.pop(p.key, None)
 
-    def _save_index(self, *, durable: bool = False) -> None:
+    def _reindex_keys(self, keys) -> None:
+        """Incrementally update lookup indexes for a changed key subset."""
+        entries = getattr(self, "_key_index_entries", None)
+        for key in keys:
+            if entries is not None:
+                prev = entries.pop(key, None)
+                if prev is not None:
+                    prev_target, prev_doi, prev_arxiv, prev_title = prev
+                    if prev_doi and self._by_doi.get(prev_doi) == prev_target:
+                        self._by_doi.pop(prev_doi, None)
+                    if prev_arxiv and self._by_arxiv.get(prev_arxiv) == prev_target:
+                        self._by_arxiv.pop(prev_arxiv, None)
+                    if prev_title and self._by_title.get(prev_title) == prev_target:
+                        self._by_title.pop(prev_title, None)
+            paper = self._papers.get(key)
+            if paper is not None:
+                self._reindex(paper)
+
+    def _save_index(self, *, durable: bool = False) -> bool:
         self._check_writer()
         if self._catalog_backend is not None:
-            self._save_catalog()
-            return
+            return self._save_catalog()
         # Metadata/queue saves must not strip an unsupported format header,
         # even with v2 flags off. Refuse before rotating the last-good index.
         from .state_v2 import check_index_readable
-        check_index_readable(self.root)
+        check_index_readable(self.root, authority="json")
         # D14: rotate the current on-disk index into ``.bak`` BEFORE overwriting
         # it, so a known-good copy survives a crash mid-write of the new index.
         # We only rotate a copy that actually parses — never overwrite a good
@@ -541,8 +566,9 @@ class Library:
         data = {"version": 1, "papers": records}
         _atomic_write(self.index_path, json.dumps(data, ensure_ascii=False, indent=2), durable=durable)
         self._state_v2_fingerprints = fingerprints
+        return True
 
-    def _save_catalog(self) -> None:
+    def _save_catalog(self) -> bool:
         from papervault.store.persistence import CatalogConflict
         # The PG delta preserves raw legacy payloads. Metadata edits must not
         # materialize read-derived state; ingress/status writers record actual
@@ -550,16 +576,27 @@ class Library:
         try:
             rulings = self._catalog_backend.save(self._papers)
         except CatalogConflict as exc:
+            accepted_keys = getattr(self._catalog_backend, "last_changed_keys", None)
+            if accepted_keys:
+                self._reindex_keys(accepted_keys)
             self._index_dirty = True
             self.log({"event": "catalog_conflict", "keys": list(exc.keys)})
             raise
         from .services.operator_actions import mirror_events
         mirror_events(self, rulings)
-        self._by_doi.clear()
-        self._by_arxiv.clear()
-        self._by_title.clear()
-        for paper in self._papers.values():
-            self._reindex(paper)
+        changed_keys = getattr(self._catalog_backend, "last_changed_keys", None)
+        if changed_keys is None:
+            # Custom/stub backends without change tracking retain full reindex behavior.
+            self._by_doi.clear()
+            self._by_arxiv.clear()
+            self._by_title.clear()
+            self._key_index_entries.clear()
+            for paper in self._papers.values():
+                self._reindex(paper)
+            return True
+        if changed_keys:
+            self._reindex_keys(changed_keys)
+        return bool(changed_keys or rulings)
 
     def catalog_completion(self, token):
         from contextlib import contextmanager, nullcontext
@@ -639,12 +676,18 @@ class Library:
         try:
             write_lock = self._catalog_save_lock or FileLock(str(lock_path), timeout=lock_timeout)
             with write_lock.acquire(timeout=lock_timeout):
-                self._save_index(durable=durable)
+                changed = self._save_index(durable=durable)
                 self._last_index_save = time.monotonic()
-                self._index_dirty = self._catalog_backend.dirty(self._papers) if self._catalog_backend else False
-                if force_bib or (now - self._last_bib_save) >= self._bib_min_interval:
+                if self._catalog_backend:
+                    self._index_dirty = bool(getattr(self._catalog_backend, "_last_save_left_dirty", False))
+                else:
+                    self._index_dirty = False
+                if changed:
+                    self._bib_dirty = True
+                if force_bib or (self._bib_dirty and (now - self._last_bib_save) >= self._bib_min_interval):
                     self._save_bib()
                     self._last_bib_save = time.monotonic()
+                    self._bib_dirty = False
         except Timeout as exc:
             raise RuntimeError(f"library write lock timed out after {lock_timeout}s") from exc
 
@@ -895,6 +938,7 @@ class Library:
                 self._merge(existing, incoming)
                 self._reindex(existing)
                 return existing
+            created_twin_key = None
             if twin is None:
                 # Persist the second observation before quiescing, so deferred
                 # promotions survive restart and have two auditable source keys.
@@ -907,7 +951,23 @@ class Library:
                 twin = Paper(key=key, **payload)
                 self._papers[key] = twin
                 self._reindex(twin)
-            return merger._merge_records(existing.key, twin.key, metadata=incoming) or existing
+                created_twin_key = key
+            try:
+                return merger._merge_records(existing.key, twin.key, metadata=incoming) or existing
+            except Exception:
+                if (created_twin_key is not None
+                        and self._papers.get(created_twin_key) is twin
+                        and twin.merge_intent is None
+                        and (self._catalog_backend is None
+                             or created_twin_key not in self._catalog_backend.persisted)):
+                    self._papers.pop(created_twin_key, None)
+                    self._key_index_entries.pop(created_twin_key, None)
+                    for index in (self._by_doi, self._by_arxiv, self._by_title):
+                        for val, k in list(index.items()):
+                            if k == created_twin_key:
+                                del index[val]
+                    self._reindex(existing)
+                raise
         return write_locked(consolidate)
 
     def purge(self, key: str, reason: str = "") -> dict:
@@ -1243,7 +1303,8 @@ class Library:
             existing.terminal_state = retain_observed_restrictions(current_state, observed)
         for field, value in incoming.items():
             if field in {"inspire_record_id", "inspire_document_urls", "source_identities", "terminal_state",
-                         "reopen_claim", "merge_intent", "merge_budget", "extraction_completion_id"}:
+                         "reopen_claim", "merge_intent", "merge_budget", "extraction_completion_id",
+                         "abstract_attempted_at"}:
                 continue  # source identity and links are merged together above
             if field == "key" or field not in Paper.model_fields:
                 continue                       # never reassign the cite key
@@ -1348,6 +1409,28 @@ class Library:
         """
         self.log_many([event])
 
+    def _maybe_rotate_manifest(self) -> None:
+        """Keep manifest.log bounded via single-generation size rotation (.1)."""
+        if not isinstance(self.manifest_path, Path):
+            return
+        raw = os.environ.get("PAPERVAULT_MANIFEST_MAX_BYTES", str(50 * 1024 * 1024))
+        try:
+            max_bytes = int(raw)
+        except ValueError:
+            max_bytes = 50 * 1024 * 1024
+        if max_bytes <= 0:
+            return
+        try:
+            size = self.manifest_path.stat().st_size
+        except OSError:
+            return
+        if size >= max_bytes:
+            rotated = self.manifest_path.with_name(self.manifest_path.name + ".1")
+            try:
+                os.replace(self.manifest_path, rotated)
+            except OSError:
+                pass
+
     def log_many(self, events: Sequence[dict]) -> None:
         """Append a batch of manifest events with one lock and file open."""
         self._check_writer()
@@ -1360,8 +1443,10 @@ class Library:
             self._telemetry_live.log_many([{**enrich(event, self), "staged": True} for event in events])
             return
         lines = [json.dumps(enrich(event, self), ensure_ascii=False) + "\n" for event in events]
-        with manifest_lock, self.manifest_path.open("a") as f:
-            f.writelines(lines)
+        with manifest_lock:
+            self._maybe_rotate_manifest()
+            with self.manifest_path.open("a") as f:
+                f.writelines(lines)
         from .telemetry_v2 import observe_publication
         for event in events:
             observe_publication(event, self)

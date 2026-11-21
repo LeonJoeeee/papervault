@@ -185,6 +185,16 @@ class LibraryWriteLock(asyncio.Lock):
     """Track ownership so synchronous consolidation cannot borrow another task's lock."""
 
     async def acquire(self):
+        loop = asyncio.get_running_loop()
+        bound = getattr(self, "_loop", None)
+        if bound is not None and bound is not loop:
+            if not self._locked and not self._waiters:
+                self._loop = None
+            elif bound.is_closed():
+                self._loop = None
+                self._locked = False
+                self._waiters = None
+                self._owner = None
         result = await super().acquire()
         self._owner = asyncio.current_task()
         return result
@@ -221,10 +231,12 @@ async def with_dedup(key: str, work: Callable[[], Awaitable[Any]]) -> Any:
     """
     existing = _in_flight.get(key)
     if existing is not None:
-        return await existing
+        return await asyncio.shield(existing)
 
     loop = asyncio.get_running_loop()
     fut = loop.create_future()
+    # Mark exceptions retrieved if no subscribers await this shared Future.
+    fut.add_done_callback(lambda f: None if f.cancelled() else f.exception())
     _in_flight[key] = fut
 
     try:
@@ -232,12 +244,17 @@ async def with_dedup(key: str, work: Callable[[], Awaitable[Any]]) -> Any:
         if not fut.done():
             fut.set_result(result)
         return result
-    except Exception as exc:
+    except asyncio.CancelledError:
+        if not fut.done():
+            fut.cancel()
+        raise
+    except BaseException as exc:
         if not fut.done():
             fut.set_exception(exc)
         raise
     finally:
-        _in_flight.pop(key, None)
+        if _in_flight.get(key) is fut:
+            _in_flight.pop(key, None)
 
 
 def in_flight_keys() -> list[str]:
@@ -247,3 +264,26 @@ def in_flight_keys() -> list[str]:
 
 def is_in_flight(key: str) -> bool:
     return key in _in_flight
+
+
+_libc = None
+
+
+def trim_process_memory() -> bool:
+    """Run Python GC and best-effort glibc malloc_trim(0) on Linux."""
+    import ctypes
+    import gc
+    import sys
+
+    gc.collect()
+    if sys.platform != "linux":
+        return False
+    global _libc
+    try:
+        if _libc is None:
+            _libc = ctypes.CDLL("libc.so.6")
+            _libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            _libc.malloc_trim.restype = ctypes.c_int
+        return bool(_libc.malloc_trim(0))
+    except Exception:
+        return False

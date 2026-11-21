@@ -402,7 +402,7 @@ class DownloadQueue:
             ok = await asyncio.to_thread(execute)
 
         async with concurrency.lib_write_lock:
-            self.library.save()
+            await asyncio.to_thread(self.library.save)
 
         # Re-read paper for the freshest status (download_paper mutates).
         paper = self.library.get(key) or paper

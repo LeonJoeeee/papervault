@@ -7,10 +7,12 @@ Compatibility markdown files are projections and are not derivation outputs.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
@@ -20,6 +22,90 @@ from .repository import canonical_json, payload_hash
 
 
 _log = logging.getLogger(__name__)
+# Linux FICLONE ioctl for zero-copy CoW reflinks on Btrfs/XFS.
+_FICLONE = 0x40049409
+_COMPLETIONS_CACHE_LOCK = threading.RLock()
+_COMPLETIONS_INDEX_CACHE: dict[
+    str, tuple[tuple[int, int], dict[str, tuple[Path, ...]], tuple[Path, ...], tuple[Path, ...]]
+] = {}
+_COMPLETIONS_CACHE_MAX = 64
+
+
+def _invalidate_completions_cache(versions_dir: Path) -> None:
+    with _COMPLETIONS_CACHE_LOCK:
+        _COMPLETIONS_INDEX_CACHE.pop(str(versions_dir), None)
+
+
+def _try_reflink(source_path: Path, dest_path: Path) -> bool:
+    """Attempt a Linux CoW reflink copy into ``dest_path`` via atomic temp+link."""
+    durable_directory(dest_path.parent)
+    temporary = dest_path.parent / ("." + dest_path.name + "." + uuid4().hex)
+    try:
+        with source_path.open("rb") as src, temporary.open("xb") as dst:
+            fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())
+            os.fsync(dst.fileno())
+        try:
+            os.link(temporary, dest_path)
+        except FileExistsError:
+            if dest_path.is_symlink():
+                raise ValueError("immutable extraction evidence differs")
+            return True
+        fsync_directory(dest_path.parent)
+        return True
+    except OSError:
+        return False
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _capture_source_bytes(vault: Path, dest: Path, source: bytes, source_hash: str,
+                          *, record_key: str, source_role: str) -> None:
+    """Persist immutable input bytes, preferring zero-copy reflink or hardlink for PDFs.
+
+    If ``dest`` already exists with matching content, skip writing completely.
+    For ``source_role == "pdf"`` when ``vault/pdfs/<record_key>.pdf`` has identical
+    bytes on the same device:
+      1. Try a CoW reflink (``FICLONE``) — zero disk duplication and fully isolated
+         even against non-atomic in-place writes.
+      2. Otherwise, for multi-block PDFs (default >= 64 KiB, configurable via
+         ``PAPERVAULT_EXTRACTION_HARDLINK_MIN_BYTES``), hardlink (``os.link``) to
+         avoid duplicating multi-MB PDFs on ext4 (production downloads always write
+         PDFs via atomic tmp+rename). Tiny synthetic inputs fall through to
+         ``write_once`` so in-place ``write_bytes`` test fixtures stay isolated.
+    """
+    if dest.exists():
+        if dest.is_symlink() or dest.read_bytes() != source:
+            raise ValueError("immutable extraction evidence differs")
+        return
+    if source_role == "pdf" and record_key:
+        candidate = vault / "pdfs" / f"{record_key}.pdf"
+        try:
+            if not candidate.is_symlink():
+                cand_st = candidate.stat()
+                if (cand_st.st_size == len(source)
+                        and hashlib.sha256(candidate.read_bytes()).hexdigest() == source_hash):
+                    if _try_reflink(candidate, dest):
+                        if dest.read_bytes() != source:
+                            raise ValueError("immutable extraction evidence differs")
+                        return
+                    try:
+                        min_bytes = int(os.environ.get("PAPERVAULT_EXTRACTION_HARDLINK_MIN_BYTES", "65536"))
+                    except ValueError:
+                        min_bytes = 65536
+                    if len(source) >= min_bytes:
+                        durable_directory(dest.parent)
+                        if cand_st.st_dev == dest.parent.stat().st_dev:
+                            try:
+                                os.link(candidate, dest)
+                                fsync_directory(dest.parent)
+                                return
+                            except FileExistsError:
+                                if dest.is_symlink() or dest.read_bytes() != source:
+                                    raise ValueError("immutable extraction evidence differs")
+                                return
+        except OSError:
+            pass
+    write_once(dest, source)
 
 
 def fsync_directory(path: Path) -> None:
@@ -84,7 +170,10 @@ class ExtractionStore:
         spec, digest = canonical_recipe(recipe)
         source_hash = hashlib.sha256(source).hexdigest()
         relative = "extracts/inputs/" + source_hash
-        write_once(self.path(relative), source)
+        _capture_source_bytes(
+            self.vault, self.path(relative), source, source_hash,
+            record_key=record_key, source_role=source_role,
+        )
         artifact = {"artifact_id": "sha256:" + source_hash, "sha256": source_hash,
                     "byte_length": len(source), "path": relative, "role": source_role}
         manifest = {"schema_version": 1, "metadata": metadata,
@@ -127,6 +216,7 @@ class ExtractionStore:
         # Library may have created an ancestor without syncing its entry.
         fsync_directory(self.versions.parent)
         fsync_directory(self.vault)
+        _invalidate_completions_cache(self.versions)
         return completion
 
     @staticmethod
@@ -180,10 +270,61 @@ class ExtractionStore:
         if json.loads(retained.read_bytes()) != completion:
             raise ValueError("extraction receipt differs from retained completion")
 
+    def _completions_index(self) -> tuple[dict[str, tuple[Path, ...]], tuple[Path, ...], tuple[Path, ...]]:
+        try:
+            st = self.versions.stat()
+        except OSError:
+            return {}, (), ()
+        cache_key = str(self.versions)
+        stamp = (st.st_mtime_ns, st.st_nlink)
+        with _COMPLETIONS_CACHE_LOCK:
+            cached = _COMPLETIONS_INDEX_CACHE.get(cache_key)
+            if cached is not None and cached[0] == stamp:
+                return cached[1], cached[2], cached[3]
+        by_key_lists: dict[str, list[Path]] = {}
+        all_paths: list[Path] = []
+        malformed_paths: list[Path] = []
+        cacheable = True
+        try:
+            entries = sorted(p for p in self.versions.iterdir() if not p.name.startswith(".") and p.is_dir())
+        except OSError:
+            return {}, (), ()
+        for entry in entries:
+            path = entry / "completion.json"
+            if not path.is_file():
+                cacheable = False
+                continue
+            all_paths.append(path)
+            try:
+                raw = json.loads(path.read_bytes())
+                rk = raw.get("record_key") if isinstance(raw, dict) else None
+                if isinstance(rk, str) and rk:
+                    by_key_lists.setdefault(rk, []).append(path)
+                else:
+                    malformed_paths.append(path)
+            except (OSError, ValueError, KeyError, TypeError):
+                malformed_paths.append(path)
+        by_key = {k: tuple(v) for k, v in by_key_lists.items()}
+        all_tuple = tuple(all_paths)
+        malformed_tuple = tuple(malformed_paths)
+        if cacheable:
+            with _COMPLETIONS_CACHE_LOCK:
+                if len(_COMPLETIONS_INDEX_CACHE) >= _COMPLETIONS_CACHE_MAX and cache_key not in _COMPLETIONS_INDEX_CACHE:
+                    _COMPLETIONS_INDEX_CACHE.pop(next(iter(_COMPLETIONS_INDEX_CACHE)))
+                _COMPLETIONS_INDEX_CACHE[cache_key] = (stamp, by_key, all_tuple, malformed_tuple)
+        return by_key, all_tuple, malformed_tuple
+
     def completions(self, *, key=None):
         if not self.versions.exists():
             return
-        for path in sorted(self.versions.glob("[!.]*/completion.json")):
+        by_key, all_paths, malformed_paths = self._completions_index()
+        if key is not None:
+            for bad_path in malformed_paths:
+                _log.warning("Skipping malformed extraction completion: %s", bad_path)
+            candidates = by_key.get(key, ())
+        else:
+            candidates = all_paths
+        for path in candidates:
             try:
                 completion = json.loads(path.read_bytes())
                 if (not isinstance(completion, dict)
@@ -218,6 +359,7 @@ class ExtractionStore:
         fsync_directory(self.versions)
         fsync_directory(self.versions.parent)
         fsync_directory(self.vault)
+        _invalidate_completions_cache(self.versions)
 
 
 def register_completion(repository, vault, completion):

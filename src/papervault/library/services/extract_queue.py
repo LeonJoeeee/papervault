@@ -144,7 +144,8 @@ class ExtractQueue:
         recovered = await asyncio.to_thread(
             recover_completions, self.library, exclude_keys=pending_identity or None)
         if recovered["recovered"]:
-            self.library.save(force=True, durable=True)
+            async with concurrency.lib_write_lock:
+                await asyncio.to_thread(self.library.save, force=True, durable=True)
         self._started = True
 
         from ..extract import pdf_probe
@@ -330,7 +331,8 @@ class ExtractQueue:
         if not needs_identity:
             recovered = await asyncio.to_thread(recover_completions, self.library, key=key)
             if recovered["recovered"]:
-                self.library.save(force=True, durable=True)
+                async with concurrency.lib_write_lock:
+                    await asyncio.to_thread(self.library.save, force=True, durable=True)
         if not self.library.has_pdf(key):
             log.warning(
                 "extract queue: %s has no PDF, dropping (download chain bug?)",
@@ -342,7 +344,7 @@ class ExtractQueue:
         # to on_success if present (no-op in post-route-B production).
         if not needs_identity and self.library.has_extract(key, "md"):
             from .extraction_registration import require_selected_registration
-            require_selected_registration(self.library, paper)
+            await asyncio.to_thread(require_selected_registration, self.library, paper)
             log.debug(
                 "extract queue: %s already has md, skipping extract", key
             )
@@ -375,7 +377,7 @@ class ExtractQueue:
         async with concurrency.lib_write_lock:
             # Drain-flush (issue #34): mid-burst saves ride the debounce; the item
             # that empties the queue forces the flush so nothing stays dirty.
-            self.library.save(force=self._queue.qsize() == 0)
+            await asyncio.to_thread(self.library.save, force=self._queue.qsize() == 0)
 
         # 3. Optional on_success chain. Pre-route-B this fed the
         # insight queue; post-route-B production wiring sets on_success

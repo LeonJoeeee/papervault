@@ -209,6 +209,7 @@ def _view(library, papers, *, deep_copy: bool = True, frozen: bool = False):
     view._papers = {key: paper.model_copy(deep=True) if deep_copy else paper
                     for key, paper in papers.items()}
     view._by_doi, view._by_arxiv, view._by_title = {}, {}, {}
+    view._key_index_entries = {}
     view._lookup_indexes = {}
     if frozen:
         view._lookup_indexes = {field: _FieldLookup(frozen=True)
@@ -615,6 +616,8 @@ class RegistrationService:
                 backend._accept(accepted, revisions, lib._papers, captured)
                 for record in accepted:
                     lib._reindex(lib.get(record.key))
+                if accepted:
+                    lib._bib_dirty = True
             for key, conflicts in publication_conflicts:
                 try:
                     lib.log({"event": "registration_identity_conflict", "key": key,

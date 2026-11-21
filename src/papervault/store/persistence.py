@@ -220,6 +220,27 @@ class PostgresPersistence:
                     detail={"campaign_id": claim["campaign_id"]}))
         return tuple(jobs)
 
+    def _has_remaining_dirty(self, papers, persisted, digests, working_norm, *, exclude: set[str]) -> bool:
+        """Check whether any non-excluded key in ``papers`` differs from ``persisted``."""
+        if persisted.keys() != papers.keys():
+            return True
+        if working_norm is not None:
+            return any(
+                key not in exclude and working_norm.get(key) != paper.model_dump(mode="json")
+                for key, paper in papers.items()
+            )
+        for key, paper in papers.items():
+            if key in exclude:
+                continue
+            digest = _paper_digest(paper)
+            if digests.get(key) == digest:
+                continue
+            before = Paper.model_validate(persisted[key].payload).model_dump(mode="json")
+            if before != paper.model_dump(mode="json"):
+                return True
+            digests[key] = digest
+        return False
+
     def _accept(self, records, revisions, papers, captured):
         left_dirty = False
         changed_keys: set[str] = set()
@@ -247,7 +268,11 @@ class PostgresPersistence:
                 if final_dump != saved:
                     left_dirty = True
         self.last_changed_keys = changed_keys
-        self._last_save_left_dirty = left_dirty or (self.persisted.keys() != papers.keys())
+        if not left_dirty:
+            left_dirty = self._has_remaining_dirty(
+                papers, self.persisted, self._digests, self._normalized_override, exclude=changed_keys
+            )
+        self._last_save_left_dirty = left_dirty
 
     def _flush_in_tx(self, repository, records, revisions, persisted, rulings):
         operator = rulings[-1] if rulings else None
@@ -329,6 +354,10 @@ class PostgresPersistence:
                     break
                 except StaleWrite as exc:
                     if retry or self._completion is not None or rulings:
+                        if rulings:
+                            # Stale rulings cannot commit without a fresh operator
+                            # decision; drop them so they cannot wedge unrelated saves.
+                            del self.operator_rulings[:len(rulings)]
                         self._last_save_left_dirty = True
                         raise CatalogConflict([exc.key]) from exc
                     merged, conflicts = [], []
@@ -370,7 +399,9 @@ class PostgresPersistence:
                     working_norm[record.key] = saved_paper.model_dump(mode="json")
                 changed_keys.add(record.key)
             self.last_changed_keys = changed_keys
-            self._last_save_left_dirty = persisted.keys() != papers.keys()
+            self._last_save_left_dirty = self._has_remaining_dirty(
+                papers, persisted, digests, working_norm, exclude=changed_keys
+            )
             deferred = {r.key: r for r in self._deferred[0]} if self._deferred else {}
             deferred.update({r.key: r for r in records})
             previous_capture = self._deferred[3] if self._deferred else {}

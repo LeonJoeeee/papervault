@@ -227,17 +227,23 @@ class PaperRecord:
 
 
 def _use_pg_catalog(vault_path: Path) -> tuple[str, str] | None:
-    """Return (dsn, schema) when reading the default vault under PG authority."""
+    """Return (dsn, schema) when reading the default vault under PG authority.
+
+    Fails closed when PG authority is enabled for ``DEFAULT_VAULT`` without
+    ``PAPERVAULT_CATALOG_DSN`` (never silently falls back to stale index.json).
+    Explicit non-default vault paths (e.g. isolated test vaults) continue to
+    read ``{vault_path}/index.json``.
+    """
     if os.environ.get("PAPERVAULT_CATALOG_AUTHORITY", "json") != "postgres":
-        return None
-    dsn = os.environ.get("PAPERVAULT_CATALOG_DSN", "").strip()
-    if not dsn:
         return None
     try:
         if Path(vault_path).resolve() != Path(DEFAULT_VAULT).resolve():
             return None
     except OSError:
         return None
+    dsn = os.environ.get("PAPERVAULT_CATALOG_DSN", "").strip()
+    if not dsn:
+        raise ValueError("postgres authority requires PAPERVAULT_CATALOG_DSN")
     schema = os.environ.get("PAPERVAULT_CATALOG_SCHEMA", "catalog").strip() or "catalog"
     if not re.fullmatch(r"catalog(?:_[a-z0-9_]+)?", schema):
         raise ValueError("catalog schema must be catalog or catalog_<suffix>")

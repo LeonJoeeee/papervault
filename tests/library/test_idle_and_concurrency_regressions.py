@@ -19,10 +19,11 @@ from papervault.library.state_v2 import Merge, Policy, Retrieval, TerminalState,
 
 
 class _Resp:
-    def __init__(self, status: int, payload=None, *, bad_json: bool = False):
+    def __init__(self, status: int, payload=None, *, bad_json: bool = False, headers: dict | None = None):
         self.status_code = status
         self._payload = payload
         self._bad_json = bad_json
+        self.headers = headers or {}
         self.ok = 200 <= status < 300
 
     def json(self):
@@ -82,12 +83,23 @@ async def test_with_dedup_subscriber_cancellation_preserves_leader_and_peers():
 @pytest.mark.parametrize("resp", [
     _Resp(400),
     _Resp(410),
-    _Resp(200, bad_json=True),
+    _Resp(200, bad_json=True, headers={"Content-Type": "application/xml"}),
+    _Resp(200, bad_json=True, headers={"Content-Type": "text/xml; charset=utf-8"}),
     _Resp(200, payload="not-a-dict"),
-], ids=["400", "410", "xml-200", "non-dict-200"])
+], ids=["400", "410", "app-xml-200", "text-xml-200", "non-dict-200"])
 def test_crossref_enrich_poison_pill_is_miss_not_transient(monkeypatch, resp):
     monkeypatch.setattr(fetch.requests, "get", lambda *a, **k: resp)
     assert fetch.crossref_enrich_lookup("10.5194/angeo-44-263-2026.xml") == ("miss", {})
+
+
+@pytest.mark.parametrize("resp", [
+    _Resp(200, bad_json=True, headers={"Content-Type": "text/html; charset=utf-8"}),
+    _Resp(200, bad_json=True, headers={"Content-Type": "application/json"}),
+    _Resp(200, bad_json=True),
+], ids=["html-gateway-200", "truncated-json-200", "unknown-content-type-200"])
+def test_crossref_enrich_html_or_truncated_200_stays_transient(monkeypatch, resp):
+    monkeypatch.setattr(fetch.requests, "get", lambda *a, **k: resp)
+    assert fetch.crossref_enrich_lookup("10.3847/1538-4357/good") == ("transient", {})
 
 
 @pytest.mark.asyncio
@@ -264,14 +276,25 @@ def test_manifest_rotation_and_serving_trace_gating(tmp_path, monkeypatch):
         events = [json.loads(line) for line in lib.manifest_path.read_text().splitlines()]
         assert [e["stage"] for e in events] == ["intent", "registration_summary"]
 
-        # Size-based manifest rotation keeps one .1 rotated copy.
-        monkeypatch.setenv("PAPERVAULT_MANIFEST_MAX_BYTES", "200")
+        # Size-based in-place tail compaction keeps manifest.log bounded without creating
+        # extra vault files (such as manifest.log.1) that would pin coordinated recovery backups.
+        monkeypatch.setenv("PAPERVAULT_MANIFEST_MAX_BYTES", "300")
         for i in range(10):
             lib.log({"event": "rotation_test", "seq": i, "pad": "x" * 60})
-        rotated = lib.manifest_path.with_name("manifest.log.1")
-        assert rotated.exists()
+        assert not lib.manifest_path.with_name("manifest.log.1").exists()
         assert lib.manifest_path.exists()
-        assert lib.manifest_path.stat().st_size < 400
+        assert lib.manifest_path.stat().st_size < 450
+        lines = lib.manifest_path.read_text(encoding="utf-8").splitlines()
+        parsed = [json.loads(line) for line in lines]
+        assert parsed[-1]["seq"] == 9
+
+        from papervault.store.recovery_source import _MUTABLE_VAULT_STATE, _files
+        unlisted = [
+            p.relative_to(tmp_path).as_posix()
+            for p in _files(tmp_path)
+            if p.relative_to(tmp_path).as_posix() not in _MUTABLE_VAULT_STATE
+        ]
+        assert unlisted == []
     finally:
         lib.close()
 
@@ -351,3 +374,220 @@ async def test_merge_records_restores_fields_and_indexes_when_save_fails(tmp_pat
 def test_trim_process_memory_runs_cleanly():
     result = concurrency.trim_process_memory()
     assert isinstance(result, bool)
+
+
+def test_budget_ledger_events_returns_defensive_copies(tmp_path):
+    """Mutating rows returned by BudgetLedger.events() must never corrupt cached ledger state."""
+    lib = Library(tmp_path)
+    try:
+        p, _ = lib.upsert({"title": "Defensive copy ledger fixture paper",
+                           "authors": ["Author"], "year": 2024, "doi": "10.1/defcopy"})
+        lib.save()
+        ledger = BudgetLedger(tmp_path, clock=lambda: 100.0)
+        ledger.start_campaign(cap=2, keys=[p.key])
+
+        ev1 = ledger.events()
+        ev1[0]["event"] = "corrupted"
+        ev1[0]["keys"].append("INJECTED")
+
+        ev2 = ledger.events()
+        assert ev2[0]["event"] == "campaign_start"
+        assert ev2[0]["keys"] == [p.key]
+    finally:
+        lib.close()
+
+
+def test_budget_ledger_pg_absent_cache_invalidates_on_catalog_revision_bump(tmp_path, monkeypatch):
+    """PG absent-ledger cache skips JSONB scan when (max_rev, cnt) is unchanged and rechecks on bump."""
+    from contextlib import contextmanager
+    from papervault.library import claims_v2
+    from papervault.library.claims_v2 import LedgerError
+    from papervault.store.persistence import PostgresPersistence
+
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "postgres")
+    monkeypatch.setenv("PAPERVAULT_CATALOG_DSN", "postgresql://unused/absent-cache")
+    monkeypatch.setenv("PAPERVAULT_CATALOG_SCHEMA", "catalog")
+
+    state = {"max_rev": 5, "cnt": 10, "has_claim": False, "claim_scans": 0, "stamp_queries": 0}
+
+    class FakeResult:
+        def __init__(self, row):
+            self._row = row
+
+        def fetchone(self):
+            return self._row
+
+    class FakeConn:
+        def execute(self, stmt, params=None):
+            text = str(stmt)
+            if "MAX(revision)" in text:
+                state["stamp_queries"] += 1
+                return FakeResult((state["max_rev"], state["cnt"]))
+            state["claim_scans"] += 1
+            return FakeResult((1,) if state["has_claim"] else None)
+
+    @contextmanager
+    def fake_pg_conn(dsn):
+        yield FakeConn()
+
+    monkeypatch.setattr(claims_v2, "_pg_absent_connection", fake_pg_conn)
+    monkeypatch.setattr(PostgresPersistence, "from_environment", lambda: PostgresPersistence("postgresql://unused/absent-cache"))
+
+    ledger = BudgetLedger(tmp_path, clock=lambda: 100.0)
+    assert ledger.events() == ()
+    assert state["claim_scans"] == 1
+    # Unchanged (max_rev, cnt) skips the JSONB claim scan completely!
+    assert ledger.events() == ()
+    assert state["claim_scans"] == 1
+    assert state["stamp_queries"] == 2
+
+    # External writer commits a claim (bumping max_rev): cache invalidates and fails closed!
+    state["max_rev"] = 6
+    state["has_claim"] = True
+    with pytest.raises(LedgerError, match="persisted claims"):
+        ledger.events()
+    assert state["claim_scans"] == 2
+
+
+@pytest.mark.asyncio
+async def test_bibtex_failure_does_not_revert_committed_quarantine_or_merge_quiesce(tmp_path, monkeypatch):
+    """A BibTeX projection OSError must not revert committed quarantine or merge_intent fences."""
+    from papervault.library.claims_v2 import ClaimStore
+
+    monkeypatch.setenv("PAPERVAULT_REOPEN_V2", "1")
+    monkeypatch.setenv("PAPERVAULT_MERGE_V2", "1")
+    lib = Library(tmp_path)
+    try:
+        p1, _ = lib.upsert({"title": "Paper one for bibtex fault isolation test",
+                            "authors": ["Curie"], "year": 2024, "doi": "10.1/bib1"})
+        p2, _ = lib.upsert({"title": "Paper two for bibtex fault isolation test",
+                            "authors": ["Einstein"], "year": 2024, "arxiv_id": "2401.11111"})
+        for p in (p1, p2):
+            p.download_status = "failed"
+            p.terminal_state = TerminalState(retrieval=Retrieval.EXHAUSTED, policy=Policy.CLEAR)
+        lib.save()
+
+        ledger = BudgetLedger(tmp_path, clock=lambda: 100.0)
+        claims = ClaimStore(lib, ledger=ledger, clock=lambda: 100.0)
+        campaign = ledger.start_campaign(cap=1, keys=[p1.key])
+        token = await claims.claim(
+            p1.key, expected_state=p1.acquisition_state, expected_generation=0, campaign_id=campaign, ttl=60.0
+        )
+
+        # Inject BibTeX failure while making bib interval look elapsed.
+        def failing_bib():
+            raise OSError("simulated disk full on library.bib")
+
+        monkeypatch.setattr(lib, "_save_bib", failing_bib)
+        lib._last_bib_save = 0.0
+
+        await claims.quarantine(token, reason="test quarantine with broken bib")
+        assert p1.acquisition_state.quarantine is True
+        assert lib._bib_dirty is True
+
+        p3, _ = lib.upsert({"title": "Paper three for merge quiesce bib isolation",
+                            "authors": ["Bohr"], "year": 2024, "doi": "10.1/bib3"})
+        p3.download_status = "failed"
+        p3.terminal_state = TerminalState(retrieval=Retrieval.EXHAUSTED, policy=Policy.CLEAR)
+        lib.save(force=True, force_bib=False)
+
+        merge = MergeStore(lib, ledger=ledger, clock=lambda: 100.0)
+        intent = await merge.quiesce(p2.key, p3.key)
+        assert intent is not None
+        assert p2.merge_intent == intent and p3.merge_intent == intent
+        assert lib._bib_dirty is True
+    finally:
+        lib.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelling_not_sent_waits_for_thread_before_releasing_lock(tmp_path, monkeypatch):
+    """Cancelling ClaimStore.not_sent() must keep lib_write_lock held until _not_sent thread drains."""
+    from papervault.library.claims_v2 import ClaimStore
+
+    monkeypatch.setenv("PAPERVAULT_REOPEN_V2", "1")
+    lib = Library(tmp_path)
+    try:
+        p, _ = lib.upsert({"title": "Paper for not_sent cancellation lock shielding",
+                           "authors": ["Fermi"], "year": 2024, "doi": "10.1/shield"})
+        p.download_status = "failed"
+        p.terminal_state = TerminalState(retrieval=Retrieval.EXHAUSTED, policy=Policy.CLEAR)
+        lib.save()
+
+        ledger = BudgetLedger(tmp_path, clock=lambda: 100.0)
+        claims = ClaimStore(lib, ledger=ledger, clock=lambda: 100.0)
+        campaign = ledger.start_campaign(cap=1, keys=[p.key])
+        token = await claims.claim(
+            p.key, expected_state=p.acquisition_state, expected_generation=0, campaign_id=campaign, ttl=60.0
+        )
+
+        entered = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        orig_not_sent = claims._not_sent
+
+        def slow_not_sent(paper, tok):
+            entered.set()
+            assert release.wait(5.0)
+            res = orig_not_sent(paper, tok)
+            finished.set()
+            return res
+
+        monkeypatch.setattr(claims, "_not_sent", slow_not_sent)
+        task = asyncio.create_task(claims.not_sent(token))
+        assert await asyncio.to_thread(entered.wait, 5.0)
+
+        task.cancel()
+        await asyncio.sleep(0.02)
+        # Lock MUST stay held while the _not_sent worker thread is still running!
+        assert concurrency.lib_write_lock.locked() is True
+        assert not task.done()
+
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5.0)
+        assert finished.is_set()
+        assert concurrency.lib_write_lock.locked() is False
+    finally:
+        lib.close()
+
+
+@pytest.mark.asyncio
+async def test_abstract_sweep_candidate_selection_off_loop_and_stops_at_cap(tmp_path, monkeypatch):
+    """_abstract_sweep selects candidates off the event loop and stops scanning once cap is reached."""
+    lib = Library(tmp_path)
+    try:
+        old_stamp = (_dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=1)).isoformat()
+        for i in range(15):
+            p, _ = lib.upsert({"title": f"Abstract sweep off-loop selection paper {i:02d}",
+                               "authors": [f"Author{i}"], "year": 2024, "doi": f"10.1/sel{i}"})
+            p.abstract = ""
+            # First 5 have no attempt stamp (immediately eligible); rest have recent stamp triggering stat().
+            if i < 2:
+                p.abstract_attempted_at = old_stamp
+                md = lib.md_path(p.key)
+                md.write_text("# Title\n\nBody without abstract.")
+                future_ts = _dt.datetime.now(_dt.timezone.utc).timestamp() + 60
+                os.utime(md, (future_ts, future_ts))
+                p.md_path = str(md.relative_to(lib.root))
+            else:
+                p.abstract_attempted_at = old_stamp
+        lib.save()
+
+        loop_tid = threading.get_ident()
+        stat_threads = []
+        orig_has_newer = reconcile._has_newer_extract
+
+        def spy_has_newer(library, paper, attempted_dt):
+            stat_threads.append(threading.get_ident())
+            return orig_has_newer(library, paper, attempted_dt)
+
+        monkeypatch.setattr(reconcile, "_has_newer_extract", spy_has_newer)
+        monkeypatch.setattr(fetch, "_fetch_abstract_by_doi_3state", lambda doi: ("transient", ""))
+
+        await reconcile._abstract_sweep(lib, cap=2)
+        # Candidate stat() ran off the event loop and stopped immediately at cap=2 (never scanned all 15)!
+        assert len(stat_threads) == 2
+        assert all(tid != loop_tid for tid in stat_threads)
+    finally:
+        lib.close()

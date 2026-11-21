@@ -139,7 +139,7 @@ def guard_execution(work):
                                         row.terminal_state = replace(row.acquisition_state, quarantine=True)
                                         if row.merge_intent:
                                             row.merge_intent = row.merge_intent.model_copy(update={"status": "uncertain"})
-                                await asyncio.to_thread(library.save, force=True, durable=True)
+                                await asyncio.to_thread(library.save, force=True, force_bib=False, durable=True)
                     publication = asyncio.create_task(persist_uncertainty())
                     while not publication.done():
                         try:
@@ -202,7 +202,7 @@ class MergeStore:
         from .services.operator_actions import stage_operator
         stage_operator(self.library, action=action, keys=[p.key for p in papers],
                        reason=self.reason + ": " + action, actor=self.actor, event=action)
-        self.library.save(force=True, durable=True)
+        self.library.save(force=True, force_bib=False, durable=True)
 
     @staticmethod
     async def _run_off_loop(fn, *args, **kwargs):
@@ -461,6 +461,7 @@ class MergeStore:
                     paper.merge_intent = uncertain
                     paper.terminal_state = replace(paper.acquisition_state, quarantine=True)
                 self.library._reindex_keys((left.key, right.key))
+                self.library._reindex(right)
                 raise
             return left
 

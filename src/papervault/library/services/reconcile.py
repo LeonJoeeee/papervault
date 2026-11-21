@@ -453,6 +453,20 @@ async def _abstract_one(library: Library, p) -> str:
     return ab if status == "ok" else ""
 
 
+def _select_abstract_candidates(papers, library: Library, *, cap: int,
+                                now: _dt.datetime) -> list:
+    """Select up to ``cap`` papers needing abstract backfill (off-loop stat safe)."""
+    if cap <= 0:
+        return []
+    selected = []
+    for p in papers:
+        if _needs_abstract(p, library, now=now):
+            selected.append(p)
+            if len(selected) >= cap:
+                break
+    return selected
+
+
 async def _abstract_sweep(library: Library, *, cap: int) -> int:
     """Backfill an abstract on up to ``cap`` no-abstract rows: verbatim from the
     row's own extract, else OpenAlex/SS by DOI. Fetch OFF the loop; fill-blanks
@@ -461,7 +475,8 @@ async def _abstract_sweep(library: Library, *, cap: int) -> int:
     from papervault.config import polite_v2_enabled
 
     now_dt = _dt.datetime.now(_dt.timezone.utc)
-    cands = [p for p in library.all_papers() if _needs_abstract(p, library, now=now_dt)][:cap]
+    papers_snapshot = library.all_papers()
+    cands = await asyncio.to_thread(_select_abstract_candidates, papers_snapshot, library, cap=cap, now=now_dt)
     if not cands:
         return 0
     processed_keys: list[str] = []

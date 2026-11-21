@@ -423,6 +423,15 @@ async def run_round(
     return summary
 
 
+def _drain_did_work(picked) -> bool:
+    """True iff drain_pending() actually processed or deferred at least one file."""
+    if not picked:
+        return False
+    if isinstance(picked, dict):
+        return any(bool(v) for v in picked.values())
+    return bool(picked)
+
+
 async def main_loop(rag, *, interval: float = DEFAULT_ROUND_INTERVAL,
                     stuck_limit: int = DEFAULT_STUCK_LIMIT) -> None:
     """进程内增量主循环(SDD §6.6):启动 ensure_schema,然后 sleep→run_round→repeat。
@@ -458,7 +467,7 @@ async def main_loop(rag, *, interval: float = DEFAULT_ROUND_INTERVAL,
             try:
                 if get_breaker().allows():
                     picked = await drain_pending(rag)
-                    if picked:
+                    if _drain_did_work(picked):
                         idle_state["token"] = None
             except Exception:  # noqa: BLE001 — 兜底之兜底:pickup 异常不杀循环、不影响 paper sync
                 idle_state["token"] = None

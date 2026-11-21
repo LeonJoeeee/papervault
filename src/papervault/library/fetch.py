@@ -205,8 +205,12 @@ def crossref_enrich_lookup(doi: str) -> tuple[str, dict]:
         return ("transient", {})
     try:
         data = r.json()
-    except (ValueError, TypeError):   # Non-JSON / XML redirect (e.g. *.xml DOI) -> definitive miss
-        return ("miss", {})
+    except (ValueError, TypeError):
+        headers = getattr(r, "headers", None) or {}
+        content_type = str(headers.get("Content-Type") or headers.get("content-type") or "").lower()
+        if "xml" in content_type:     # Crossref XML transform redirect (e.g. *.xml DOI) -> definitive miss
+            return ("miss", {})
+        return ("transient", {})      # HTML gateway/WAF error page or truncated JSON -> retry next sweep
     if not isinstance(data, dict) or not isinstance(data.get("message"), dict):
         return ("miss", {})
     msg = data["message"]

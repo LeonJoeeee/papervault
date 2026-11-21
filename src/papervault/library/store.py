@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as _dt
 import asyncio
 import json
+import logging
 import os
 import re
 import stat
@@ -15,6 +16,8 @@ from pathlib import Path
 from typing import Optional
 
 from papervault.config import merge_v2_enabled, reopen_v2_enabled, terminal_v2_enabled
+
+logger = logging.getLogger(__name__)
 
 from .download_telemetry import enrich, manifest_lock
 from .models import DOWNLOAD_STATUS_PENDING, IdentityRecovery, Paper, base_key, normalize_title
@@ -499,11 +502,19 @@ class Library:
                 aliases.pop(p.key, None)
 
     def _reindex_keys(self, keys) -> None:
-        """Incrementally update lookup indexes for a changed key subset."""
+        """Incrementally update lookup indexes for a changed key subset.
+
+        Only touches lookup axes whose normalized value or alias target actually
+        changed on that paper, so non-index edits (e.g. venue/abstract) never
+        flip ``_by_title`` ownership between same-titled papers.
+        """
         entries = getattr(self, "_key_index_entries", None)
         for key in keys:
-            if entries is not None:
-                prev = entries.pop(key, None)
+            paper = self._papers.get(key)
+            prev = entries.get(key) if entries is not None else None
+            if paper is None:
+                if entries is not None:
+                    entries.pop(key, None)
                 if prev is not None:
                     prev_target, prev_doi, prev_arxiv, prev_title = prev
                     if prev_doi and self._by_doi.get(prev_doi) == prev_target:
@@ -512,9 +523,39 @@ class Library:
                         self._by_arxiv.pop(prev_arxiv, None)
                     if prev_title and self._by_title.get(prev_title) == prev_target:
                         self._by_title.pop(prev_title, None)
-            paper = self._papers.get(key)
-            if paper is not None:
+                continue
+            if prev is None:
                 self._reindex(paper)
+                continue
+            prev_target, prev_doi, prev_arxiv, prev_title = prev
+            new_target = (paper.acquisition_state.alias_key or paper.key) if merge_v2_enabled() or paper.merge_budget else paper.key
+            new_doi = _normalize_doi(paper.doi) if paper.doi else ""
+            new_arxiv = _normalize_arxiv(paper.arxiv_id) if paper.arxiv_id else ""
+            new_title = normalize_title(paper.title)
+            for idx, old_val, new_val in (
+                (self._by_doi, prev_doi, new_doi),
+                (self._by_arxiv, prev_arxiv, new_arxiv),
+                (self._by_title, prev_title, new_title),
+            ):
+                if (prev_target, old_val) == (new_target, new_val):
+                    if new_val and new_val not in idx:
+                        idx[new_val] = new_target
+                    continue
+                if old_val and idx.get(old_val) == prev_target:
+                    idx.pop(old_val, None)
+                if new_val:
+                    idx[new_val] = new_target
+            if entries is not None:
+                entries[paper.key] = (new_target, new_doi, new_arxiv, new_title)
+            aliases = getattr(self, "_frozen_aliases", None)
+            if aliases is not None:
+                for field, index in self._lookup_indexes.items():
+                    index.reindex(paper, field)
+                self._frozen_order.setdefault(paper.key, len(self._frozen_order))
+                if paper.acquisition_state.alias_key:
+                    aliases[paper.key] = paper
+                else:
+                    aliases.pop(paper.key, None)
 
     def _save_index(self, *, durable: bool = False) -> bool:
         self._check_writer()
@@ -685,9 +726,20 @@ class Library:
                 if changed:
                     self._bib_dirty = True
                 if force_bib or (self._bib_dirty and (now - self._last_bib_save) >= self._bib_min_interval):
-                    self._save_bib()
-                    self._last_bib_save = time.monotonic()
-                    self._bib_dirty = False
+                    try:
+                        self._save_bib()
+                    except OSError:
+                        # BibTeX is a convenience projection; once the authoritative
+                        # index/catalog commit has succeeded, a projection write error
+                        # must not revert committed state fences unless the caller
+                        # explicitly demanded a BibTeX write (force_bib=True).
+                        self._bib_dirty = True
+                        if force_bib:
+                            raise
+                        logger.warning("BibTeX projection write failed; will retry on next save", exc_info=True)
+                    else:
+                        self._last_bib_save = time.monotonic()
+                        self._bib_dirty = False
         except Timeout as exc:
             raise RuntimeError(f"library write lock timed out after {lock_timeout}s") from exc
 
@@ -1410,7 +1462,14 @@ class Library:
         self.log_many([event])
 
     def _maybe_rotate_manifest(self) -> None:
-        """Keep manifest.log bounded via single-generation size rotation (.1)."""
+        """Keep manifest.log bounded via atomic in-place tail compaction.
+
+        Compacts ``manifest.log`` in place (keeping the newest complete JSONL
+        lines up to ``min(max_bytes // 2, 10 MiB)``) rather than creating a
+        sibling ``manifest.log.1`` inside the vault, because coordinated
+        recovery treats unlisted vault files as protected source paths that
+        would pin older backup snapshots.
+        """
         if not isinstance(self.manifest_path, Path):
             return
         raw = os.environ.get("PAPERVAULT_MANIFEST_MAX_BYTES", str(50 * 1024 * 1024))
@@ -1424,10 +1483,29 @@ class Library:
             size = self.manifest_path.stat().st_size
         except OSError:
             return
-        if size >= max_bytes:
-            rotated = self.manifest_path.with_name(self.manifest_path.name + ".1")
+        if size < max_bytes:
+            return
+        keep_bytes = min(max_bytes // 2, 10 * 1024 * 1024)
+        tmp = self.manifest_path.with_name(f".{self.manifest_path.name}.compact.tmp")
+        try:
+            tail = b""
+            if keep_bytes > 0:
+                with self.manifest_path.open("rb") as src:
+                    if size > keep_bytes:
+                        src.seek(size - keep_bytes)
+                        raw_tail = src.read()
+                        nl = raw_tail.find(b"\n")
+                        tail = raw_tail[nl + 1:] if nl >= 0 else b""
+                    else:
+                        tail = src.read()
+            with tmp.open("wb") as dst:
+                if tail:
+                    dst.write(tail)
+                dst.flush()
+            os.replace(tmp, self.manifest_path)
+        except OSError:
             try:
-                os.replace(self.manifest_path, rotated)
+                tmp.unlink(missing_ok=True)
             except OSError:
                 pass
 

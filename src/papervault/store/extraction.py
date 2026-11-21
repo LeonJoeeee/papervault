@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,13 +37,13 @@ def _invalidate_completions_cache(versions_dir: Path) -> None:
         _COMPLETIONS_INDEX_CACHE.pop(str(versions_dir), None)
 
 
-def _try_reflink(source_path: Path, dest_path: Path) -> bool:
-    """Attempt a Linux CoW reflink copy into ``dest_path`` via atomic temp+link."""
+def _try_reflink_fd(src_fd: int, dest_path: Path) -> bool:
+    """Attempt a Linux CoW reflink copy from open ``src_fd`` into ``dest_path``."""
     durable_directory(dest_path.parent)
     temporary = dest_path.parent / ("." + dest_path.name + "." + uuid4().hex)
     try:
-        with source_path.open("rb") as src, temporary.open("xb") as dst:
-            fcntl.ioctl(dst.fileno(), _FICLONE, src.fileno())
+        with temporary.open("xb") as dst:
+            fcntl.ioctl(dst.fileno(), _FICLONE, src_fd)
             os.fsync(dst.fileno())
         try:
             os.link(temporary, dest_path)
@@ -58,6 +59,25 @@ def _try_reflink(source_path: Path, dest_path: Path) -> bool:
         temporary.unlink(missing_ok=True)
 
 
+def _try_reflink(source_path: Path, dest_path: Path) -> bool:
+    """Attempt a Linux CoW reflink copy into ``dest_path`` via atomic temp+link."""
+    try:
+        with source_path.open("rb") as src:
+            return _try_reflink_fd(src.fileno(), dest_path)
+    except OSError:
+        return False
+
+
+def _read_all_fd(fd: int) -> bytes:
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _capture_source_bytes(vault: Path, dest: Path, source: bytes, source_hash: str,
                           *, record_key: str, source_role: str) -> None:
     """Persist immutable input bytes, preferring zero-copy reflink or hardlink for PDFs.
@@ -65,13 +85,15 @@ def _capture_source_bytes(vault: Path, dest: Path, source: bytes, source_hash: s
     If ``dest`` already exists with matching content, skip writing completely.
     For ``source_role == "pdf"`` when ``vault/pdfs/<record_key>.pdf`` has identical
     bytes on the same device:
-      1. Try a CoW reflink (``FICLONE``) — zero disk duplication and fully isolated
-         even against non-atomic in-place writes.
-      2. Otherwise, for multi-block PDFs (default >= 64 KiB, configurable via
-         ``PAPERVAULT_EXTRACTION_HARDLINK_MIN_BYTES``), hardlink (``os.link``) to
-         avoid duplicating multi-MB PDFs on ext4 (production downloads always write
-         PDFs via atomic tmp+rename). Tiny synthetic inputs fall through to
-         ``write_once`` so in-place ``write_bytes`` test fixtures stay isolated.
+      1. Open the source with ``O_NOFOLLOW``, verify regular file + size + SHA-256
+         from the open file descriptor (keeping it open so the inode cannot be
+         recycled).
+      2. Try a CoW reflink (``FICLONE``) directly from that verified FD.
+      3. Otherwise, for multi-block PDFs (default >= 64 KiB, configurable via
+         ``PAPERVAULT_EXTRACTION_HARDLINK_MIN_BYTES``), create a temporary hardlink,
+         verify its ``(st_dev, st_ino)`` matches the verified FD (eliminating any
+         atomic-rename TOCTOU race), and link into ``dest``. Any mismatch or small
+         fixture falls through to ``write_once``.
     """
     if dest.exists():
         if dest.is_symlink() or dest.read_bytes() != source:
@@ -79,12 +101,15 @@ def _capture_source_bytes(vault: Path, dest: Path, source: bytes, source_hash: s
         return
     if source_role == "pdf" and record_key:
         candidate = vault / "pdfs" / f"{record_key}.pdf"
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        src_fd = None
         try:
-            if not candidate.is_symlink():
-                cand_st = candidate.stat()
-                if (cand_st.st_size == len(source)
-                        and hashlib.sha256(candidate.read_bytes()).hexdigest() == source_hash):
-                    if _try_reflink(candidate, dest):
+            src_fd = os.open(candidate, flags)
+            cand_st = os.fstat(src_fd)
+            if stat.S_ISREG(cand_st.st_mode) and cand_st.st_size == len(source):
+                data = _read_all_fd(src_fd)
+                if len(data) == len(source) and hashlib.sha256(data).hexdigest() == source_hash:
+                    if _try_reflink_fd(src_fd, dest):
                         if dest.read_bytes() != source:
                             raise ValueError("immutable extraction evidence differs")
                         return
@@ -95,16 +120,26 @@ def _capture_source_bytes(vault: Path, dest: Path, source: bytes, source_hash: s
                     if len(source) >= min_bytes:
                         durable_directory(dest.parent)
                         if cand_st.st_dev == dest.parent.stat().st_dev:
+                            tmp_link = dest.parent / ("." + dest.name + "." + uuid4().hex)
                             try:
-                                os.link(candidate, dest)
-                                fsync_directory(dest.parent)
-                                return
-                            except FileExistsError:
-                                if dest.is_symlink() or dest.read_bytes() != source:
-                                    raise ValueError("immutable extraction evidence differs")
-                                return
+                                os.link(candidate, tmp_link)
+                                tmp_st = os.lstat(tmp_link)
+                                if (tmp_st.st_dev, tmp_st.st_ino) == (cand_st.st_dev, cand_st.st_ino):
+                                    try:
+                                        os.link(tmp_link, dest)
+                                    except FileExistsError:
+                                        if dest.is_symlink() or dest.read_bytes() != source:
+                                            raise ValueError("immutable extraction evidence differs")
+                                        return
+                                    fsync_directory(dest.parent)
+                                    return
+                            finally:
+                                tmp_link.unlink(missing_ok=True)
         except OSError:
             pass
+        finally:
+            if src_fd is not None:
+                os.close(src_fd)
     write_once(dest, source)
 
 

@@ -166,19 +166,19 @@ def test_pg_library_skips_state_v2_fingerprints_double_dirty_full_reindex_and_no
         assert bib_calls == []
 
         # Edit only A: incremental reindex touches ONLY A (not B), dirty() still not called.
-        reindexed = []
-        orig_reindex = lib._reindex
+        reindexed_batches = []
+        orig_reindex_keys = lib._reindex_keys
 
-        def spy_reindex(paper):
-            reindexed.append(paper.key)
-            return orig_reindex(paper)
+        def spy_reindex_keys(keys):
+            reindexed_batches.append(set(keys))
+            return orig_reindex_keys(keys)
 
-        monkeypatch.setattr(lib, "_reindex", spy_reindex)
+        monkeypatch.setattr(lib, "_reindex_keys", spy_reindex_keys)
         lib.get("A").doi = "10.1/a-new"
         lib.save(force=False, force_bib=False)
 
         assert dirty_calls == []
-        assert reindexed == ["A"]
+        assert reindexed_batches == [{"A"}]
         assert lib._by_doi == {"10.1/a-new": "A", "10.1/b": "B"}
         assert len(bib_calls) == 1
 
@@ -349,3 +349,222 @@ def test_extraction_store_hardlinks_large_pdf_and_caches_completions_index(tmp_p
     reads.clear()
     assert list(store.completions(key="NoSuchPaper")) == []
     assert reads == []
+
+
+def test_registration_view_does_not_leak_preview_keys_into_live_index_entries(tmp_path):
+    """_view() isolates _key_index_entries so previewing external candidates never mutates live state."""
+    from papervault.library.services.registration import _view, preview_candidates
+
+    lib = Library(tmp_path)
+    try:
+        p, _ = lib.upsert({"title": "Live paper in library", "authors": ["Smith"], "year": 2024, "doi": "10.1/live"})
+        lib.save()
+        before_entries = dict(lib._key_index_entries)
+
+        view = _view(lib, lib._papers, deep_copy=True, frozen=True)
+        assert view._key_index_entries is not lib._key_index_entries
+        view._reindex(Paper(key="GhostPreview2026", title="Temporary preview candidate", doi="10.1/ghost"))
+        assert "GhostPreview2026" not in lib._key_index_entries
+        assert lib._key_index_entries == before_entries
+
+        snapshots, _ = preview_candidates(lib, [{
+            "title": "External candidate that should not leak into live index entries",
+            "authors": ["Doe, J."],
+            "year": 2025,
+            "doi": "10.1/ext-preview",
+            "abstract": "Detailed measurement of heliospheric plasma waves.",
+            "_registration": {"ingest_ok": True, "tier": "1A", "llm_is_paper": True},
+        }])
+        assert len(snapshots) == 1
+        assert lib._key_index_entries == before_entries
+    finally:
+        lib.close()
+
+
+def test_reindex_keys_preserves_title_ownership_on_venue_edit(tmp_path, monkeypatch):
+    """Editing a non-index field (venue) must not flip _by_title ownership between same-titled papers."""
+    from papervault.library.models import normalize_title
+
+    title = "Identical plasma wave title shared by two papers"
+    rec_a = replace(Record.from_payload("A", {"key": "A", "title": title, "doi": "10.1/a"}), revision=1)
+    rec_b = replace(Record.from_payload("B", {"key": "B", "title": title, "doi": "10.1/b"}), revision=1)
+    repo = _MemoryRepo({"A": rec_a, "B": rec_b})
+    backend = _backend_for(repo)
+    monkeypatch.setattr(PostgresPersistence, "from_environment", lambda: backend)
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "postgres")
+
+    lib = Library(tmp_path)
+    try:
+        nt = normalize_title(title)
+        assert lib._by_title[nt] == "B"  # B was indexed after A and owns the title bucket
+        lib.get("A").venue = "ApJ"
+        lib.save(force=False, force_bib=False)
+        # Venue edit did NOT change A's title, so B retains _by_title ownership!
+        assert lib._by_title[nt] == "B"
+
+        # Changing A's DOI still updates _by_doi cleanly without touching _by_title.
+        lib.get("A").doi = "10.1/a-v2"
+        lib.save(force=False, force_bib=False)
+        assert lib._by_doi.get("10.1/a") is None
+        assert lib._by_doi["10.1/a-v2"] == "A"
+        assert lib._by_title[nt] == "B"
+    finally:
+        lib.close()
+
+
+def test_register_postgres_marks_bib_dirty_for_next_bib_refresh(tmp_path, monkeypatch):
+    """RegistrationService._register_postgres() sets _bib_dirty so library.bib refreshes on next interval."""
+    from papervault.library.services.registration import RegistrationService
+
+    class _RegRepo(_MemoryRepo):
+        def upsert(self, record, *, audit, expected_revision):
+            cur = self.records.get(record.key)
+            if cur is not None and cur.revision != expected_revision:
+                raise StaleWrite(record.key, expected_revision, cur.revision)
+            self.records[record.key] = replace(record, revision=expected_revision + 1)
+            return True
+
+    repo = _RegRepo()
+    backend = _backend_for(repo)
+    monkeypatch.setattr(PostgresPersistence, "from_environment", lambda: backend)
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "postgres")
+
+    lib = Library(tmp_path)
+    try:
+        lib._bib_dirty = False
+        lib._last_bib_save = 0.0
+        svc = RegistrationService(lib, SimpleNamespace(add=lambda *a, **k: None))
+        outcomes = svc._register_postgres(
+            [{
+                "title": "Newly registered space physics paper for bibtex refresh",
+                "authors": ["Parker, E."],
+                "year": 2025,
+                "doi": "10.1/reg-bib",
+                "abstract": "Measurements of Alfven waves in the inner heliosphere.",
+                "_registration": {"ingest_ok": True, "tier": "1A", "llm_is_paper": True},
+            }],
+            actor="search",
+            reason="bib-refresh-test",
+        )
+        assert any(o["status"] == "registered" for o in outcomes)
+        assert lib._bib_dirty is True
+
+        # Next non-forced save after bib interval writes library.bib even with zero new PG changes!
+        lib.save(force=False, force_bib=False)
+        assert lib._bib_dirty is False
+        assert "10.1/reg-bib" in lib.bib_path.read_text(encoding="utf-8")
+    finally:
+        lib.close()
+
+
+def test_concurrent_edit_to_unrelated_paper_during_save_keeps_index_dirty(tmp_path, monkeypatch):
+    """Mutating unrelated paper B while A is flushing to PG must keep lib._index_dirty=True."""
+    rec_a = replace(Record.from_payload("A", {"key": "A", "title": "Paper A"}), revision=1)
+    rec_b = replace(Record.from_payload("B", {"key": "B", "title": "Paper B"}), revision=1)
+    repo = _MemoryRepo({"A": rec_a, "B": rec_b})
+    backend = _backend_for(repo)
+    monkeypatch.setattr(PostgresPersistence, "from_environment", lambda: backend)
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "postgres")
+
+    lib = Library(tmp_path)
+    try:
+        mutated_once = [False]
+        orig_flush = repo.flush
+
+        def flush_with_concurrent_edit(records, *, expected_revisions, audit):
+            result = orig_flush(records, expected_revisions=expected_revisions, audit=audit)
+            if not mutated_once[0]:
+                mutated_once[0] = True
+                # Simulate another worker mutating unrelated paper B during A's PG round-trip.
+                lib.get("B").venue = "JGR Space Physics"
+            return result
+
+        monkeypatch.setattr(repo, "flush", flush_with_concurrent_edit)
+        lib.get("A").venue = "ApJ"
+        lib.save(force=True, force_bib=False)
+
+        assert repo.get("A").payload["venue"] == "ApJ"
+        assert repo.get("B").payload.get("venue", "") == ""
+        assert lib._index_dirty is True  # concurrent edit to B was NOT lost!
+
+        assert lib.flush_if_dirty() is True
+        assert repo.get("B").payload["venue"] == "JGR Space Physics"
+        assert lib._index_dirty is False
+    finally:
+        lib.close()
+
+
+def test_stale_operator_ruling_conflict_does_not_wedge_subsequent_unrelated_saves():
+    """A StaleWrite rejecting a queued operator ruling must clear it so unrelated saves succeed."""
+    rec_a = replace(Record.from_payload("A", {"key": "A", "title": "Paper A"}), revision=1)
+    rec_b = replace(Record.from_payload("B", {"key": "B", "title": "Paper B"}), revision=1)
+    repo = _MemoryRepo({"A": rec_a, "B": rec_b})
+    repo.import_ruling = lambda ruling, *, audit: None
+    backend = _backend_for(repo)
+    papers = backend.load()
+
+    # Remote advances A -> rev 2 while local queues an operator ruling against rev 1.
+    repo.records["A"] = replace(Record.from_payload("A", {"key": "A", "title": "Paper A remote"}), revision=2)
+    backend.operator_rulings.append({
+        "timestamp": "2026-10-22T00:00:00+00:00",
+        "action": "reopen_download",
+        "event": "operator_reopen",
+        "scope": "acquire",
+        "reason": "stale operator retry",
+        "actor": "owner",
+        "keys": ["A"],
+        "revision": 1,
+    })
+    papers["B"].venue = "Solar Physics"
+
+    with pytest.raises(CatalogConflict) as exc_info:
+        backend.save(papers)
+    assert exc_info.value.keys == ("A",)
+    assert backend.operator_rulings == []
+
+    # Subsequent save of unrelated B must succeed cleanly instead of staying wedged forever!
+    assert backend.save(papers) == []
+    assert repo.get("B").payload["venue"] == "Solar Physics"
+    assert repo.get("B").revision == 2
+
+
+def test_extraction_store_hardlink_toctou_mismatch_falls_back_to_write_once(tmp_path, monkeypatch):
+    """If pdfs/<key>.pdf is replaced atomically before os.link, capture detects inode mismatch and writes exact source."""
+    import papervault.store.extraction as ext_mod
+
+    store = ExtractionStore(tmp_path)
+    orig_bytes = b"%PDF-1.4\n" + (b"A123456789abcdef" * 5000)
+    replaced_bytes = b"%PDF-1.4\n" + (b"B123456789abcdef" * 5000)
+    pdf_path = tmp_path / "pdfs" / "Race2024.pdf"
+    pdf_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf_path.write_bytes(orig_bytes)
+
+    # Disable reflink so we exercise the hardlink path deterministically on any filesystem.
+    monkeypatch.setattr(ext_mod, "_try_reflink_fd", lambda fd, dest: False)
+
+    real_link = os.link
+    raced = [False]
+
+    def racing_link(src, dst, *args, **kwargs):
+        if not raced[0] and str(src) == str(pdf_path):
+            raced[0] = True
+            # Atomically swap candidate to a brand-new inode with different content right before os.link!
+            tmp_swap = pdf_path.with_suffix(".pdf.swap")
+            tmp_swap.write_bytes(replaced_bytes)
+            os.replace(tmp_swap, pdf_path)
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(ext_mod.os, "link", racing_link)
+
+    recipe = {"schema_version": 1, "engine": "mineru2.5-pro", "configured_model": "test",
+              "output_contract": {"fulltext": {"required": ["markdown"], "not_applicable": []}}}
+    req = store.capture(
+        record_key="Race2024", metadata={"key": "Race2024"}, source=orig_bytes, source_role="pdf",
+        recipe=recipe, guard={"previous_completion_id": None, "identity": {"key": "Race2024"}},
+        unit_evidence={"kind": "paper", "record_key": "Race2024"},
+    )
+    assert raced[0] is True
+    input_path = tmp_path / req["input_manifest"]["artifacts"][0]["path"]
+    # Captured bytes MUST match orig_bytes (never replaced_bytes) and MUST NOT share inode with replaced pdf_path!
+    assert input_path.read_bytes() == orig_bytes
+    assert input_path.stat().st_ino != pdf_path.stat().st_ino

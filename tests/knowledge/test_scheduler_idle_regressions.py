@@ -229,3 +229,112 @@ async def test_run_round_idle_fast_path_skips_heavy_work_and_wakes_on_change(mon
     r5 = await rnd.run_round(rag)
     assert not r5.get("skipped_idle")
     assert len(load_calls) == 4
+
+
+def test_paper_library_client_pg_missing_dsn_fails_closed_on_default_vault_only(tmp_path, monkeypatch):
+    """PG authority with missing DSN must fail closed on DEFAULT_VAULT, while allowing custom test vaults."""
+    default_dir = tmp_path / "default_vault"
+    custom_dir = tmp_path / "custom_vault"
+    default_dir.mkdir()
+    custom_dir.mkdir()
+    payload = json.dumps({
+        "version": 1,
+        "papers": {"P1": {"key": "P1", "title": "Paper", "authors": ["Smith"]}},
+    })
+    (default_dir / "index.json").write_text(payload)
+    (custom_dir / "index.json").write_text(payload)
+
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "postgres")
+    monkeypatch.delenv("PAPERVAULT_CATALOG_DSN", raising=False)
+    monkeypatch.setattr(client, "DEFAULT_VAULT", default_dir)
+
+    with pytest.raises(ValueError, match="PAPERVAULT_CATALOG_DSN"):
+        client.load_vault_index(default_dir)
+    with pytest.raises(ValueError, match="PAPERVAULT_CATALOG_DSN"):
+        client.catalog_state_token(default_dir)
+
+    # Custom isolated vault still reads its own index.json cleanly.
+    recs = client.load_vault_index(custom_dir)
+    assert set(recs) == {"P1"}
+
+
+@pytest.mark.asyncio
+async def test_main_loop_stays_idle_when_drain_pending_returns_zero_counts(monkeypatch):
+    """main_loop must NOT reset idle_state['token'] when drain_pending returns an all-zero count dict."""
+    import asyncio
+    from papervault.knowledge.ingest.paper_library_client import PaperRecord
+
+    rows = {"A": LedgerRecord("l0_probe", "paper", "A", "fpA", "paper:A", "done")}
+    rag_rows = {"paper:A": {"status": "processed", "file_path": "A", "metadata": {}}}
+    load_calls = []
+    drain_returns = [
+        {"ingested": 0, "partial": 0, "already": 0, "disabled": 0, "deferred": 0, "failed": 0},
+        {"ingested": 1, "partial": 0, "already": 0, "disabled": 0, "deferred": 0, "failed": 0},
+        {"ingested": 0, "partial": 0, "already": 0, "disabled": 0, "deferred": 0, "failed": 0},
+    ]
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = rows
+
+        async def ensure_schema(self):
+            return None
+
+        async def load(self, source):
+            return {k: v for k, v in self.rows.items() if v.ingest_source == source}
+
+        async def load_by_status(self, statuses):
+            ss = set(statuses)
+            return [r for r in self.rows.values() if r.status in ss]
+
+    class FakeDocStatus:
+        async def get_by_ids(self, ids):
+            return [rag_rows.get(i) for i in ids]
+
+        async def get_by_id(self, i):
+            return rag_rows.get(i)
+
+        async def get_status_counts(self):
+            return {"processed": 1}
+
+    class FakeRag:
+        rows = rag_rows
+        doc_status = FakeDocStatus()
+
+        async def apipeline_process_enqueue_documents(self):
+            return None
+
+    fl = FakeLedger()
+    monkeypatch.setattr(rnd, "ledger", fl)
+    from papervault.knowledge.scheduler import reconcile as rec_mod
+    monkeypatch.setattr(rec_mod, "ledger", fl)
+    monkeypatch.setattr(rnd, "catalog_state_token", lambda: ("json", "/vault/index.json", 100, 500, 10))
+    monkeypatch.setattr(rnd, "fingerprint", lambda rec: "fpA")
+
+    def fake_load_index():
+        load_calls.append(True)
+        return {"A": PaperRecord(key="A", md_path="extracts/md/A.md")}
+
+    monkeypatch.setattr(rnd, "load_clean_index", fake_load_index)
+
+    tick = [0]
+
+    async def fake_drain(rag):
+        res = drain_returns[tick[0]]
+        tick[0] += 1
+        return res
+
+    async def fake_sleep(_interval):
+        if tick[0] >= 3:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(rnd, "drain_pending", fake_drain)
+    monkeypatch.setattr(rnd.asyncio, "sleep", fake_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await rnd.main_loop(FakeRag(), interval=0.01)
+
+    # Tick 1 ran full round (load_calls=1); drain_pending returned all zeros ->
+    # Tick 2 stayed IDLE (load_calls still 1!); then drain_pending returned ingested=1 ->
+    # Tick 3 woke up and ran full round (load_calls=2)!
+    assert len(load_calls) == 2

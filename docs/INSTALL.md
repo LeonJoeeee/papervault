@@ -180,6 +180,7 @@ are useful for diagnosis or capacity tuning; defaults come from the current runt
 | `KS_EMBED_MAX_ASYNC` / `KS_EMBED_GPU_MAX_ASYNC` | `16` / `1` | LightRAG embedding-call queue concurrency versus actual GPU forward-pass concurrency. |
 | `KS_EMBED_BATCH_NUM` / `KS_EMBED_TIMEOUT` | `32` / `120` | LightRAG embedding batch size and per-call embedding timeout in seconds. |
 | `KS_EMBED_OFFLOAD` | `1` | Offload embedding to a worker thread; `0` restores blocking inference on the server loop. |
+| `KS_BGE_WORKER_MODE` | `subprocess` | `subprocess` runs local BGE-M3 embedding and reranking in an on-demand worker subprocess so the MCP server never imports PyTorch or holds a CUDA context; `inprocess` restores legacy in-process loading. |
 | `KS_BUILD_OFFPEAK_ONLY` | `false` | `true`, `1`, or `yes` pauses background graph builds during configured peak windows; interactive queries are never paused. |
 | `KS_BUILD_PEAK_WINDOWS` / `KS_BUILD_PEAK_DAYS` | `09:00-12:00,14:00-18:00` / `Mon-Fri` | Same-day peak `HH:MM-HH:MM` windows (start inclusive, end exclusive) and weekday names/ranges for off-peak build gating. |
 | `KS_BUILD_PEAK_TZ` / `KS_BUILD_PEAK_HOLIDAYS` | `Asia/Shanghai` / empty | IANA timezone (`zoneinfo`) and comma-separated `YYYY-MM-DD` holiday dates excluded from peak windows. |
@@ -266,15 +267,23 @@ through the same `:30000` endpoint after idle GPU unload, including any
 service-owned backend wakeup. Host measurements and service deployment remain
 outside the lane's unit-test evidence.
 
-## BGE idle release
+## BGE worker mode and idle release
 
-The in-process BGE embedder and reranker have a separate opt-in idle release:
-`KS_BGE_IDLE_UNLOAD=1` and `KS_BGE_IDLE_TIMEOUT=600`. After both unload, a
-normal `query` or `search_papers` reloads the model it needs. Measure GPU memory
-and the `bge embedder loaded in ...s` / `bge reranker loaded in ...s` log entries
-on the target GPU. To roll back BGE idle release, set `KS_BGE_IDLE_UNLOAD=0`
-and restart papervault under the operator's deployment procedure; connected
-MCP clients must reconnect. These BGE settings do not control MinerU.
+By default (`KS_BGE_WORKER_MODE=subprocess`), the local BGE-M3 embedder and
+reranker run inside an on-demand worker subprocess so the long-lived
+`papervault-mcp` server process never imports PyTorch or initializes a CUDA
+context. Set `KS_BGE_WORKER_MODE=inprocess` to restore legacy in-process
+loading.
+
+Both modes support opt-in idle release via `KS_BGE_IDLE_UNLOAD=1` and
+`KS_BGE_IDLE_TIMEOUT=600`. In `subprocess` mode, idle release terminates the
+worker subprocess cleanly—returning 100% of its PyTorch RAM and CUDA context
+(0 MiB idle VRAM) to the OS—and the next `query` or `search_papers` respawns
+it on demand. Measure GPU memory and the `bge embedder loaded in ...s` /
+`bge reranker loaded in ...s` log entries on the target GPU. To roll back BGE
+idle release, set `KS_BGE_IDLE_UNLOAD=0` and restart papervault under the
+operator's deployment procedure; connected MCP clients must reconnect. These
+BGE settings do not control MinerU.
 
 ## Acquisition-v2 format deploys: drain barrier
 

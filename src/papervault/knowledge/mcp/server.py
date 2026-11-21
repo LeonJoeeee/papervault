@@ -336,9 +336,13 @@ async def stop_background() -> None:
         _bg_task = None
     from papervault.knowledge.store.graph import close_graph
     from papervault.knowledge.ledger.store import close_pool
+    from papervault.knowledge.store.lightrag_init import shutdown_bge_worker
 
-    await close_graph()
-    await close_pool()
+    try:
+        await close_graph()
+        await close_pool()
+    finally:
+        await asyncio.to_thread(shutdown_bge_worker)
 
 
 @asynccontextmanager

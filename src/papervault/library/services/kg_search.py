@@ -237,9 +237,17 @@ def _checkin_pg(pool_key: tuple, conn) -> None:
     _safe_close(conn)
 
 
+def _callable_identity(fn) -> tuple:
+    """Stable pool key for a callable, including bound methods / classmethods."""
+    func = getattr(fn, "__func__", None)
+    if func is not None:
+        return (id(getattr(fn, "__self__", None)), id(func))
+    return (id(fn),)
+
+
 def _run_vectors_pooled(psycopg, dict_row, pg_options, workspace, vectors, canonical):
     connect_fn = psycopg.connect
-    pool_key = (tuple(sorted(pg_options.items())), id(connect_fn))
+    pool_key = (tuple(sorted(pg_options.items())), _callable_identity(connect_fn))
     pooled = _checkout_pg(pool_key)
     if pooled is not None:
         try:
@@ -298,7 +306,7 @@ def _topology(neo4j, workspace, concept_entities, canonical, *, db_timeout: floa
     user = os.environ["NEO4J_USERNAME"]
     password = os.environ["NEO4J_PASSWORD"]
     driver_fn = neo4j.GraphDatabase.driver
-    driver_key = (uri, user, password, effective_timeout, id(driver_fn))
+    driver_key = (uri, user, password, effective_timeout, _callable_identity(driver_fn))
 
     with _POOL_LOCK:
         cached_driver = _NEO_DRIVERS.get(driver_key)

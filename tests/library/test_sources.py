@@ -915,6 +915,18 @@ def test_scihub_winner_returns_immediately_and_cancels_losing_mirror(monkeypatch
 
 
 @responses.activate
+def test_arxiv_all_malformed_entries_raises_backend_degraded():
+    xml = """<?xml version="1.0" encoding="UTF-8"?>
+    <feed xmlns="http://www.w3.org/2005/Atom">
+      <entry><title>Missing published and id</title></entry>
+      <entry><published>2024-01-01T00:00:00Z</published></entry>
+    </feed>"""
+    responses.add(responses.GET, "http://export.arxiv.org/api/query", body=xml, status=200)
+    with pytest.raises(BackendDegraded):
+        search_arxiv("solar wind")
+
+
+@responses.activate
 def test_semantic_scholar_normalizes_wrapped_multitoken_doi():
     responses.get("https://api.semanticscholar.org/graph/v1/paper/search",
                   json={"data": [{"title": "SS identifiers", "externalIds": {

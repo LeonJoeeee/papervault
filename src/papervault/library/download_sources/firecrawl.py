@@ -263,6 +263,12 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
     # never write orphaned extraction input artifacts or trigger durable saves.
     success_fields = ("download_status", "download_source", "firecrawl_pdf_hunt_exhausted")
     before = {field: getattr(paper, field) for field in success_fields}
+    identity_before = (
+        paper.doi,
+        paper.arxiv_id,
+        paper.title,
+        paper.extraction_completion_id,
+    )
     if not _gate_firecrawl_md(paper, library, md, target_url=target_url):
         return False
     # The historical gate also handles existing files. Fresh completion cannot
@@ -270,6 +276,26 @@ def _try_firecrawl_text_fallback(paper: Paper, library: Library) -> bool:
     for field, value in before.items():
         setattr(paper, field, value)
     with _FIRECRAWL_REG_LOCK:
+        live = library.get(paper.key) if hasattr(library, "get") else None
+        current = live if live is not None else paper
+        identity_after = (
+            current.doi,
+            current.arxiv_id,
+            current.title,
+            current.extraction_completion_id,
+        )
+        if identity_after != identity_before or (
+            paper.doi,
+            paper.arxiv_id,
+            paper.title,
+            paper.extraction_completion_id,
+        ) != identity_before:
+            library.log({
+                "event": "firecrawl_identity_changed_during_gate",
+                "key": paper.key,
+                "url": target_url,
+            })
+            return False
         extraction_request = begin_extraction(
             paper, library, raw_markdown.encode(),
             engine="firecrawl", source_role="provider_markdown",

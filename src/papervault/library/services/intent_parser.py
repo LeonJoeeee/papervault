@@ -513,14 +513,26 @@ def parse_intent(query: str, llm=None) -> SearchPlan:
                 logger.warning("intent observation unavailable")
 
 
+_PLAN_KEYS = frozenset({
+    "search_terms",
+    "kg_concepts",
+    "limit_suggested",
+    "limit",
+    "ranking_hint",
+    "reasoning",
+    "named_entities",
+})
+
+
 def _extract_json_object(raw: str) -> dict:
-    """Scan ``raw`` with ``json.JSONDecoder.raw_decode`` for the first JSON object."""
+    """Scan ``raw`` with ``json.JSONDecoder.raw_decode`` for a top-level plan JSON object."""
     text = (raw or "").strip()
     if not text:
         raise ValueError("intent_parser: no JSON in LLM response: ")
     decoder = json.JSONDecoder()
     pos = 0
     last_err: json.JSONDecodeError | None = None
+    saw_unrelated_dict = False
     while True:
         idx = text.find("{", pos)
         if idx == -1:
@@ -528,12 +540,16 @@ def _extract_json_object(raw: str) -> dict:
         try:
             obj, _ = decoder.raw_decode(text, idx)
             if isinstance(obj, dict):
-                return obj
+                if _PLAN_KEYS.intersection(obj):
+                    return obj
+                saw_unrelated_dict = True
         except json.JSONDecodeError as e:
             last_err = e
         pos = idx + 1
     if last_err is not None:
         raise ValueError(f"intent_parser: malformed JSON: {last_err}; raw={text[:200]}") from last_err
+    if saw_unrelated_dict:
+        raise ValueError(f"intent_parser: JSON object missing top-level plan keys: {text[:200]}")
     raise ValueError(f"intent_parser: no JSON in LLM response: {text[:200]}")
 
 
@@ -624,7 +640,7 @@ def _parse_response(query: str, raw: str) -> SearchPlan:
     if filters.get("year_min") is not None and filters.get("year_max") is None:
         canonical = re.search(
             r"\b(?:canonical|foundational|classical|classic|seminal|historical)\b|"
-            r"经典|奠基|开创|里程碑|原始",
+            r"经典|奠基|开创|里程碑|原始文献|原始论文",
             query, re.I,
         )
         survey = re.search(
@@ -637,7 +653,7 @@ def _parse_response(query: str, raw: str) -> SearchPlan:
             r"(?<!\d)(?:19|20)\d{2}(?!\d)|\b(?:recent|recently|latest|lately|newest|this\s+year|"
             r"last\s+(?:\d+|one|two|three|five|ten|few)\s+years?|"
             r"past\s+(?:\d+|one|two|three|five|ten|few)\s+years?|last\s+decade|past\s+decade)\b|"
-            r"近[几一二三五十]年|近\d+年|最新|近期|最近",
+            r"近[几一二两三五十]年|近\d+年|最新|近期|最近",
             query, re.I,
         )
         if canonical or (survey and not recency):

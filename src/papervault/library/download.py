@@ -377,11 +377,18 @@ def _merge_member_updates(
     Returns False if an INSPIRE identity adoption became stale or conflicted with
     changes on the live ``target`` card.
     """
+    ids_unchanged = target.doi == baseline.doi and target.arxiv_id == baseline.arxiv_id
+    ids_compatible = (
+        ids_unchanged
+        and (not donor.doi or not target.doi or donor.doi == target.doi)
+        and (not donor.arxiv_id or not target.arxiv_id or donor.arxiv_id == target.arxiv_id)
+    )
     if member == "ads" and donor.ads_availability != baseline.ads_availability:
-        target.ads_availability = donor.ads_availability
-    if donor.arxiv_id != baseline.arxiv_id and not target.arxiv_id:
+        if ids_compatible:
+            target.ads_availability = donor.ads_availability
+    if donor.arxiv_id != baseline.arxiv_id and not target.arxiv_id and target.doi == baseline.doi:
         target.arxiv_id = donor.arxiv_id
-    if donor.arxiv_withdrawal != baseline.arxiv_withdrawal:
+    if donor.arxiv_withdrawal != baseline.arxiv_withdrawal and ids_compatible:
         target.arxiv_withdrawal = donor.arxiv_withdrawal
     inspire_changed = (
         donor.inspire_record_id != baseline.inspire_record_id

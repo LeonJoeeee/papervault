@@ -451,7 +451,8 @@ def test_kg_concepts_are_bounded_after_deduplication():
     "太阳风磁流体力学的奠基性研究",
     "行星际激波加速开创性工作",
     "日球层调制里程碑文献",
-    "Parker 太阳风原始推导",
+    "Parker 太阳风原始文献",
+    "Parker 太阳风原始论文",
     "太阳高能粒子传输综述",
     "磁重联研究回顾",
     "空间天气预报研究现状",
@@ -473,6 +474,7 @@ def test_cjk_year_min_guard_clears_false_positive_recency_cut(query):
 
 
 @pytest.mark.parametrize("query", [
+    "近两年太阳风湍流综述",
     "近三年太阳风湍流综述",
     "近几年宇宙线调制回顾",
     "近5年磁重联现状",
@@ -480,6 +482,7 @@ def test_cjk_year_min_guard_clears_false_positive_recency_cut(query):
     "近期辐射带研究概览",
     "最近日球层物理综述",
     "2024年宇宙线传输综述",
+    "2022年以来的原始观测数据分析",
 ])
 def test_cjk_year_min_guard_preserves_explicit_recency_cues(query):
     class RecencyLLM:
@@ -493,6 +496,27 @@ def test_cjk_year_min_guard_preserves_explicit_recency_cues(query):
     plan = parse_intent(query, RecencyLLM())
     assert plan["filters"]["year_min"] == 2022
     assert plan["ranking_hint"] == "by_recency"
+
+
+def test_intent_raw_decode_rejects_nested_filters_from_truncated_reply_and_retries():
+    calls = 0
+
+    class TruncatedThenValidLLM:
+        def call(self, messages):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # Truncated outer object leaves only inner filters dict decodable;
+                # must NOT accept {"year_min": 2020} as a plan and must retry once.
+                return '{"search_terms": ["Parker spiral"], "filters": {"year_min": 2020}'
+            return json.dumps({
+                "search_terms": ["Parker spiral"],
+                "filters": {"year_min": None},
+            })
+
+    plan = parse_intent("Parker spiral solar wind", TruncatedThenValidLLM())
+    assert calls == 2
+    assert plan["search_terms"] == ["Parker spiral"]
 
 
 def test_intent_raw_decode_handles_surrounding_braces_and_retries_once_on_malformed_json():

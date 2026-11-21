@@ -91,21 +91,30 @@ def search_arxiv(query: str, max_results: int = 30, *,
         raise backend_degraded(ValueError("invalid XML")) from error
     if root.tag != "{http://www.w3.org/2005/Atom}feed":
         raise backend_degraded(ValueError("invalid Atom feed"))
+    entries = root.findall("atom:entry", NS)
     papers = []
+    malformed = 0
 
-    for entry in root.findall("atom:entry", NS):
+    for entry in entries:
         try:
             title_raw = entry.findtext("atom:title", None, NS)
+            url = (entry.findtext("atom:id", "", NS) or "").strip()
+            # arXiv signals a nonexistent id: query via an official Error entry
+            # pointing at arxiv.org/api/errors with no <published> field.
+            if (title_raw or "").strip().lower() == "error" and "arxiv.org/api/errors" in url:
+                continue
             published = (entry.findtext("atom:published", None, NS) or "").strip()
             if not title_raw or not published:
+                malformed += 1
                 continue
             title = title_raw.strip().replace("\n", " ")
             if not title:
+                malformed += 1
                 continue
             abstract = (entry.findtext("atom:summary", "", NS) or "").strip().replace("\n", " ")
             year = published[:4]
-            url = (entry.findtext("atom:id", "", NS) or "").strip()
             if not url:
+                malformed += 1
                 continue
             arxiv_id = url.split("/abs/")[-1]
             doi = normalize_doi(entry.findtext("arxiv:doi", "", NS) or "")
@@ -131,7 +140,11 @@ def search_arxiv(query: str, max_results: int = 30, *,
                 "source_identities": [identity],
             })
         except Exception as exc:
+            malformed += 1
             logger.warning("arXiv: skipping malformed Atom entry: %s", exc)
             continue
+
+    if entries and malformed and not papers:
+        raise ValueError("malformed arXiv feed: all entries missing required fields")
 
     return papers

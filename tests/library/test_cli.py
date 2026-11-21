@@ -791,3 +791,63 @@ def test_add_batch_and_zotero_sync_refuse_while_service_active(tmp_lib_env, tmp_
     monkeypatch.setenv("ZOTERO_USER_ID", "12345")
     assert cli.main(["zotero-sync"]) == 2
     assert "papervault.service" in capsys.readouterr().err
+
+
+def test_mutating_guard_fails_closed_on_systemd_timeout_and_dbus_error_but_allows_missing_binary(
+    tmp_lib_env, capsys, monkeypatch
+):
+    import subprocess
+    from papervault import ops_guards
+
+    def timeout_probe(argv, **_kw):
+        raise subprocess.TimeoutExpired(argv, 10)
+
+    monkeypatch.setattr(ops_guards.subprocess, "run", timeout_probe)
+    assert cli.main(["audit", "--fix"]) == 2
+    assert "cannot verify papervault.service" in capsys.readouterr().err
+
+    def dbus_error_probe(argv, **_kw):
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Failed to connect to bus")
+
+    monkeypatch.setattr(ops_guards.subprocess, "run", dbus_error_probe)
+    assert cli.main(["audit", "--fix"]) == 2
+    assert "cannot verify papervault.service" in capsys.readouterr().err
+
+    def missing_binary_probe(argv, **_kw):
+        raise FileNotFoundError("systemctl")
+
+    monkeypatch.setattr(ops_guards.subprocess, "run", missing_binary_probe)
+    assert cli._refuse_if_service_running("audit") is False
+
+
+def test_readonly_cli_enforces_catalog_authority_fence_and_config_does_not_swallow_value_error(
+    tmp_lib_env, tmp_path, capsys, monkeypatch
+):
+    # 1) PG-cutover vault must fail closed when read-only CLI defaults to json authority.
+    (tmp_lib_env.root / ".catalog-handoff.json").write_text(json.dumps({"phase": "resumed"}))
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "json")
+    assert cli.main(["list"]) == 1
+    assert "WriterFenced" in capsys.readouterr().err
+    assert cli.main(["config"]) == 1
+    assert "WriterFenced" in capsys.readouterr().err
+    (tmp_lib_env.root / ".catalog-handoff.json").unlink()
+
+    # 2) config must NOT swallow ValueError on invalid authority or corrupt index,
+    #    while still reporting 0 papers on a nonexistent empty vault dir.
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "bogus")
+    assert cli.main(["config"]) == 1
+    assert "PAPERVAULT_CATALOG_AUTHORITY" in capsys.readouterr().err
+
+    monkeypatch.setenv("PAPERVAULT_CATALOG_AUTHORITY", "json")
+    bad_dir = tmp_path / "corrupt-vault"
+    bad_dir.mkdir()
+    (bad_dir / "index.json").write_text("{not valid json")
+    monkeypatch.setenv("PAPER_LIBRARY_PATH", str(bad_dir))
+    assert cli.main(["config"]) == 1
+    assert "no readable library index" in capsys.readouterr().err
+
+    empty_dir = tmp_path / "brand-new-empty-vault"
+    monkeypatch.setenv("PAPER_LIBRARY_PATH", str(empty_dir))
+    assert cli.main(["config", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["papers_in_library"] == 0
+    assert not empty_dir.exists()

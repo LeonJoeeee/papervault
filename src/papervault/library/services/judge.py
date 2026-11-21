@@ -25,12 +25,14 @@ See ``docs/architecture.md``.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import math
 import os
 import re
 import threading
+import time
 from typing import Any, Callable, Optional
 
 from papervault.domain import get_domain
@@ -153,24 +155,49 @@ class _ZeroMatchedError(Exception):
     """Reply parsed without exception, but matched zero expected candidate indices."""
 
 
+def _accepts_timeout(fn: Callable) -> bool:
+    """Return True if ``fn`` accepts a ``timeout`` keyword argument."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        p.name == "timeout"
+        and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        or p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in params
+    )
+
+
 async def _call_once(system_prompt: str, user_prompt: str, llm: Any) -> str:
     """Run one semaphore-bounded, timeout-bounded LLM judge attempt.
 
     Cancelling the awaiter propagates immediately while keeping ``llm_sem`` held
-    until the background thread actually finishes.
+    until the background thread actually finishes. Passes remaining timeout into
+    ``llm.call`` when supported so the underlying HTTP request cancels cleanly
+    instead of leaking zombie provider threads across retries.
     """
     sem = concurrency.llm_sem  # per-CALL cap includes cancelled callers' workers
     timeout_s = _batch_timeout_s()
+    started = time.monotonic()
     try:
         await asyncio.wait_for(sem.acquire(), timeout=timeout_s)
     except TimeoutError:
         _inc_stat("batch_timeouts")
         raise TimeoutError(f"judge batch semaphore wait timed out after {timeout_s:.1f}s") from None
-    worker = asyncio.create_task(asyncio.to_thread(
-        llm.call,
-        [{"role": "system", "content": system_prompt},
-         {"role": "user", "content": user_prompt}],
-    ))
+
+    remaining = timeout_s - (time.monotonic() - started)
+    if remaining <= 0:
+        sem.release()
+        _inc_stat("batch_timeouts")
+        raise TimeoutError(f"judge batch timed out after {timeout_s:.1f}s")
+
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    call_kwargs = {"timeout": remaining} if _accepts_timeout(llm.call) else {}
+    worker = asyncio.create_task(asyncio.to_thread(llm.call, messages, **call_kwargs))
 
     def finished(task):
         sem.release()
@@ -179,7 +206,7 @@ async def _call_once(system_prompt: str, user_prompt: str, llm: Any) -> str:
 
     worker.add_done_callback(finished)
     try:
-        return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout_s)
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=remaining)
     except TimeoutError:
         _inc_stat("batch_timeouts")
         raise TimeoutError(f"judge batch LLM call timed out after {timeout_s:.1f}s") from None

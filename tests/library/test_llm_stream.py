@@ -580,3 +580,11 @@ def test_multi_target_fails_over_on_connection_and_transport_errors(monkeypatch,
     )
     assert client.call("ping") == "recovered"
     assert [c["model"] for c in calls] == ["openai/glm-5.3-flash", "openai/gpt-6.1-terra"]
+
+
+def test_llm_call_forwards_explicit_timeout_to_provider(monkeypatch):
+    calls = responses(monkeypatch, Stream([chunk("ok"), chunk(finish="stop")]))
+    client = L.LLM("openai/gpt-6.1-terra")
+    assert client.call("ping", timeout=15.0) == "ok"
+    assert len(calls) == 1
+    assert 0 < calls[0]["timeout"] <= 15.0

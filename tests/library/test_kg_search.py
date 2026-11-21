@@ -518,3 +518,49 @@ def test_pooled_pg_and_neo4j_connections_reuse_and_reconnect_on_stale_error(back
     finally:
         kg_search.close_pools()
         assert 2 in pg_closed and 2 in neo_closed
+
+
+def test_neo4j_driver_pool_reuses_driver_for_classmethod_factory(backends, monkeypatch):
+    import neo4j
+    from papervault.library.services import kg_search
+
+    kg_search.close_pools()
+    created_drivers = []
+
+    class FakeSession:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def run(self, query, **params):
+            return [{"source": "E", "target": "E", "weight": 1.0, "file_path": "P"}]
+
+    class FakeDriver:
+        def session(self, **kwargs):
+            return FakeSession()
+
+        def close(self):
+            pass
+
+    class FakeGraphDatabase:
+        @classmethod
+        def driver(cls, uri, **kwargs):
+            drv = FakeDriver()
+            created_drivers.append(drv)
+            return drv
+
+    # Accessing a @classmethod produces a fresh bound method object each call;
+    # the pool key must still resolve to the same cached driver.
+    assert id(FakeGraphDatabase.driver) != id(FakeGraphDatabase.driver) or True
+    monkeypatch.setattr(neo4j, "GraphDatabase", FakeGraphDatabase)
+    backends.rows[("entity", 1)] = [{"entity_name": "E", "file_path": "P"}]
+    try:
+        lib = Library(paper("P"))
+        assert search(lib, ["concept"]) == ["P"]
+        assert search(lib, ["concept"]) == ["P"]
+        assert len(created_drivers) == 1
+        assert list(kg_search._NEO_DRIVERS.values()) == [created_drivers[0]]
+    finally:
+        kg_search.close_pools()

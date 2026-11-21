@@ -1303,3 +1303,42 @@ async def test_extract_md_offloads_blocking_io_and_holds_lib_write_lock(tmp_path
     out = await extract.extract_md(paper, lib, llm=object())
     assert out is not None
     assert observed == [("begin", True, True), ("finish", True, True)]
+
+
+@pytest.mark.asyncio
+async def test_run_under_write_lock_holds_lock_until_thread_finishes_on_cancellation():
+    import threading
+    from papervault.library.services import concurrency
+
+    started = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+
+    def slow_write():
+        started.set()
+        release.wait(2.0)
+        events.append("thread_done")
+
+    task = asyncio.create_task(extract._run_under_write_lock(slow_write))
+    await asyncio.to_thread(started.wait, 1.0)
+    assert concurrency.lib_write_lock.locked()
+
+    # Cancel while thread is mid-write: lock must remain held until thread finishes!
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert concurrency.lib_write_lock.locked()
+    assert not task.done()
+
+    async def waiter():
+        async with concurrency.lib_write_lock:
+            events.append("waiter_acquired")
+
+    waiter_task = asyncio.create_task(waiter())
+    await asyncio.sleep(0.02)
+    assert events == []
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(waiter_task, timeout=1.0)
+    assert events == ["thread_done", "waiter_acquired"]

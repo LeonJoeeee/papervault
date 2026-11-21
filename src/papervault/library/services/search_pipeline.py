@@ -32,7 +32,8 @@ from .bm25_search import (
 from .intent_parser import named_entity_groups, observe_intent
 from .kg_search import kg_local_search
 from .registration import (
-    ServingTrace, _fill, _find, _view, preview_candidates, registration_rejection, serving_excluded,
+    MAX_CANDIDATES, ServingTrace, _IDENTIFIERS, _METADATA, _fill, _find, _view,
+    preview_candidates, registration_rejection, serving_excluded,
 )
 
 logger = logging.getLogger(__name__)
@@ -327,6 +328,90 @@ def _merge_observations(hit, node):
             for donor in node.get("_inspire_metadata") or [node])
 
 
+def _snapshot_paper(paper):
+    """Build an isolated shallow copy of ``paper`` and its mutable list fields.
+
+    Avoids deep-copying nested Pydantic structures across ~30k catalog records
+    while completely isolating search serving from concurrent live mutations.
+    """
+    return paper.model_copy(
+        deep=False,
+        update={
+            "authors": list(paper.authors),
+            "inspire_document_urls": list(paper.inspire_document_urls),
+            "source_identities": list(paper.source_identities),
+            "publication_types": list(paper.publication_types),
+            "identity_route_rejections": list(paper.identity_route_rejections),
+        },
+    )
+
+
+def _safe_donor_for_projection(projected, donor: dict, live_view) -> dict:
+    """Return a donor copy stripped of identifiers conflicting with or owned by another record."""
+    from ..store import _normalize_arxiv, _normalize_doi
+
+    safe = dict(donor)
+    token_fn = getattr(live_view, "_identifier_token", None)
+    owner_fn = getattr(live_view, "_identifier_owner", None)
+    for field_name in _IDENTIFIERS:
+        raw = safe.get(field_name) or ""
+        if not raw:
+            continue
+        cur = getattr(projected, field_name, "") or ""
+        if field_name == "doi":
+            if cur and _normalize_doi(cur) != _normalize_doi(raw):
+                safe[field_name] = ""
+                continue
+        elif field_name == "arxiv_id":
+            if cur and _normalize_arxiv(cur) != _normalize_arxiv(raw):
+                safe[field_name] = ""
+                continue
+        elif cur and cur != raw:
+            safe[field_name] = ""
+            continue
+        if callable(token_fn) and callable(owner_fn):
+            token = token_fn(field_name, raw, safe.get("source") or "")
+            if token:
+                owner = owner_fn(field_name, token)
+                if owner is not None and owner.key != projected.key:
+                    safe[field_name] = ""
+    return safe
+
+
+def _consolidate_vouched_donor(known_node: dict, donors: list[dict]) -> dict:
+    """Merge folded external observations for one known library record into a single payload."""
+    consolidated: dict = {"_registration_known_key": known_node["key"]}
+    merged_identities = []
+    for donor in donors:
+        donor_ids = normalized_source_identities(donor, donor.get("source") or "")
+        if donor_ids:
+            merged_identities = merge_source_identities(merged_identities, donor_ids)
+        inspire_fills = merge_inspire_fields(consolidated, donor)
+        if inspire_fills:
+            consolidated.update(inspire_fills)
+            consolidated.setdefault("_inspire_metadata", []).extend(
+                {f: d.get(f) for f in ("title", "authors", "year", "doi", "arxiv_id")}
+                for d in (donor.get("_inspire_metadata") or [donor])
+            )
+        for field_name in _METADATA - {"source_identities", "inspire_record_id",
+                                       "inspire_document_urls", "_inspire_metadata"}:
+            val = donor.get(field_name)
+            if val in (None, "", [], 0):
+                continue
+            cur = consolidated.get(field_name)
+            if field_name == "citation_count":
+                consolidated["citation_count"] = max(int(cur or 0), int(val or 0))
+            elif field_name == "is_review":
+                consolidated["is_review"] = bool(cur) or bool(val)
+            elif not cur:
+                if field_name in _IDENTIFIERS and not _nodes_compatible(known_node, {field_name: val}):
+                    continue
+                consolidated[field_name] = copy.deepcopy(val)
+    if merged_identities:
+        consolidated["source_identities"] = [obs.model_dump() for obs in merged_identities]
+    return consolidated
+
+
 def _relevance_key(scored, now_year):
     score, node = scored
     year = node.get("year")
@@ -426,15 +511,16 @@ class SearchPipeline:
         return plan
 
     def _local_snapshot(self):
-        # Shallow read-only snapshot view: search serving projects Paper models
-        # into fresh dicts via paper_to_dict() and never mutates snapshot Papers.
+        # Shallow-copy each Paper + its mutable list fields so concurrent
+        # background writes never mutate the frozen serving snapshot, without
+        # paying full deep-copy cost across ~30k nested Pydantic models.
         lock = getattr(self.library, "_merge_execution_lock", None)
         if lock is not None:
             with lock:
-                local = list(self.library.all_papers(include_quarantined=True))
+                local = [_snapshot_paper(p) for p in self.library.all_papers(include_quarantined=True)]
                 view = _view(self.library, {p.key: p for p in local}, deep_copy=False, frozen=True)
         else:
-            local = list(self.library.all_papers(include_quarantined=True))
+            local = [_snapshot_paper(p) for p in self.library.all_papers(include_quarantined=True)]
             view = _view(self.library, {p.key: p for p in local}, deep_copy=False, frozen=True)
         return local, view
 
@@ -455,35 +541,75 @@ class SearchPipeline:
     def fusion(self, plan, retrieved, trace):
         seen, local_by_key, canonical_keys = {}, {}, {}
         seen_axes = collections.defaultdict(list)
-        excluded_identities = {}
+        primary_witnesses = collections.defaultdict(list)
+        alias_witnesses = collections.defaultdict(list)
+        excluded_identities = collections.defaultdict(list)
         bibliography = collections.defaultdict(list)
         snapshot = {p.key: p for p in retrieved.local}
         query_tokens = {token for term in plan.terms for token in _tokenize(term)}
         kg_trace_keys = set(retrieved.kg_ranks)
         local_trace_counts = collections.Counter()
 
-        def register_seen(hit, witness=None):
+        def register_seen(hit, witness=None, *, allow_existing_axes=True, is_alias=False):
             w = witness if witness is not None else hit
-            seen[_identity_key(w)] = hit
+            witness_list = alias_witnesses[id(hit)] if is_alias else primary_witnesses[id(hit)]
+            if not any(existing_w is w for existing_w in witness_list):
+                witness_list.append(w)
+            key_id = _identity_key(w)
+            if allow_existing_axes or key_id not in seen:
+                seen[key_id] = hit
             for axis in _exact_identity_axes(w):
                 bucket = seen_axes[axis]
+                if not allow_existing_axes and bucket:
+                    continue
                 if not any(existing_hit is hit and existing_w is w for existing_hit, existing_w in bucket):
                     bucket.append((hit, w))
 
         def lookup_seen(node):
             axes = _exact_identity_axes(node)
             if axes:
+                touched = {}
                 for axis in axes:
-                    matches = {}
-                    for hit, witness in seen_axes.get(axis, ()):
-                        if _nodes_compatible(witness, node):
-                            matches[id(hit)] = hit
-                    if len(matches) == 1:
-                        return next(iter(matches.values()))
-                    if len(matches) > 1:
-                        return None
-                return None
-            return seen.get(_identity_key(node))
+                    for hit, _witness in seen_axes.get(axis, ()):
+                        touched[id(hit)] = hit
+                if not touched:
+                    return None, False, False
+                if len(touched) > 1:
+                    # Different axes resolve to different existing records;
+                    # refuse to fold across distinct identities.
+                    return None, True, False
+                target = next(iter(touched.values()))
+                if all(_nodes_compatible(w, node) for w in primary_witnesses[id(target)]):
+                    return target, False, False
+                # An explicit Merge.ALIAS record may legitimately carry a
+                # different DOI/arXiv than its canonical target.
+                if any(
+                    _nodes_compatible(aw, node)
+                    and bool(set(axes).intersection(_exact_identity_axes(aw)))
+                    for aw in alias_witnesses[id(target)]
+                ):
+                    return target, False, True
+                return None, True, False
+            hit = seen.get(_identity_key(node))
+            if hit is None:
+                return None, False, False
+            if all(_nodes_compatible(w, node) for w in primary_witnesses[id(hit)]):
+                return hit, False, False
+            return None, True, False
+
+        def record_excluded(rec_dict, key):
+            entry = (key, rec_dict)
+            excluded_identities[_identity_key(rec_dict)].append(entry)
+            for axis in _exact_identity_axes(rec_dict):
+                excluded_identities[axis].append(entry)
+
+        def lookup_excluded(node):
+            keys_to_check = [_identity_key(node), *_exact_identity_axes(node)]
+            for idx_key in keys_to_check:
+                for canonical_key, rec_dict in excluded_identities.get(idx_key, ()):
+                    if _nodes_compatible(rec_dict, node):
+                        return canonical_key
+            return None
 
         def trace_local(paper, canonical, reason, **fields):
             # Trace relevance only: all catalog identity/exclusion state below
@@ -511,12 +637,12 @@ class SearchPipeline:
                     trace_local(paper, canonical, "unresolved_alias", decision="dropped")
                     continue
                 if serving_excluded(canonical):
-                    excluded_identities[_identity_key(paper_to_dict(paper))] = canonical.key
-                    excluded_identities[_identity_key(paper_to_dict(canonical))] = canonical.key
+                    record_excluded(paper_to_dict(paper), canonical.key)
+                    record_excluded(paper_to_dict(canonical), canonical.key)
                     trace_local(paper, canonical, "serving_excluded", decision="dropped")
                     continue
                 node = paper_to_dict(canonical)
-                existing = lookup_seen(node)
+                existing, _conflict, _via_alias = lookup_seen(node)
                 bib_key = serving_bibliographic_key(node)
                 matches = bibliography.get(bib_key, [])
                 if (existing is None and not (node.get("doi") or node.get("arxiv_id"))
@@ -526,14 +652,14 @@ class SearchPipeline:
                 if existing is not None:
                     canonical_keys[paper.key] = existing["key"]
                     if paper.key != canonical.key:
-                        register_seen(existing, paper_to_dict(paper))
+                        register_seen(existing, paper_to_dict(paper), is_alias=True)
                     trace_local(paper, snapshot[existing["key"]], "local_duplicate", candidate=paper_to_dict(paper),
                                 decision="folded", canonical_key=existing["key"])
                     continue
                 register_seen(node)
                 canonical_keys[paper.key] = node["key"]
                 if paper.key != canonical.key:
-                    register_seen(node, paper_to_dict(paper))
+                    register_seen(node, paper_to_dict(paper), is_alias=True)
                 local_by_key[node["key"]] = node
                 if bib_key is not None and (node.get("doi") or node.get("arxiv_id")):
                     bibliography[bib_key].append(node)
@@ -550,8 +676,8 @@ class SearchPipeline:
             exclusion_view = (_view(self.library, snapshot, deep_copy=False, frozen=True)
                               if excluded_identities and retrieved.external else None)
             for node in retrieved.external:
-                identity, term, rank = _identity_key(node), node.get("term_idx", 0), node.get("rank", 0)
-                excluded_key = excluded_identities.get(identity)
+                term, rank = node.get("term_idx", 0), node.get("rank", 0)
+                excluded_key = lookup_excluded(node)
                 if not excluded_key and exclusion_view is not None:
                     matched = _find(exclusion_view, node)
                     if matched is not None and serving_excluded(matched):
@@ -560,13 +686,14 @@ class SearchPipeline:
                     trace.record("fusion", candidate=node, key=excluded_key, arm="external",
                                  decision="dropped", reason="serving_excluded")
                     continue
-                hit = lookup_seen(node)
+                hit, has_conflict, via_alias = lookup_seen(node)
                 if hit is None:
                     hit = node
                     hit["term_ranks"] = {}
-                    register_seen(hit)
+                    register_seen(hit, allow_existing_axes=not has_conflict)
                 else:
                     _merge_observations(hit, node)
+                    register_seen(hit, node, is_alias=via_alias)
                     register_seen(hit)
                     trace.record("fusion", candidate=node, decision="folded", canonical_key=hit.get("key"))
                 hit["best_external_rank"] = min(hit.get("best_external_rank", rank), rank)
@@ -671,18 +798,39 @@ class SearchPipeline:
                 trace.record("gate", candidate=candidate, decision="skipped" if rejection else "eligible", reason=rejection)
                 if not rejection:
                     eligible.append(candidate)
+        # Deduplicate folded observations to one consolidated payload per known
+        # library key and bound the combined submission to MAX_CANDIDATES while
+        # prioritizing brand-new eligible discoveries so vouched observations
+        # never overflow RegistrationQueue and drop new papers.
+        vouched_ranked = sorted(
+            fused.vouched,
+            key=lambda n: (-n.get("folded_vouch", 0), -n.get("external_rrf_score", 0), n["key"]),
+        )
         vouched_registration = []
-        for n in fused.vouched:
+        seen_vouched_keys: set[str] = set()
+        for n in vouched_ranked:
+            key = n["key"]
+            if key in seen_vouched_keys:
+                continue
+            seen_vouched_keys.add(key)
             donors = n.get("_folded_donors") or [n]
-            for donor in donors:
-                vouched_registration.append(dict(donor, _registration_known_key=n["key"]))
-        registration = eligible + vouched_registration
+            vouched_registration.append(_consolidate_vouched_donor(n, donors))
+        eligible_budget = eligible[:MAX_CANDIDATES]
+        remaining_slots = max(0, MAX_CANDIDATES - len(eligible_budget))
+        registration = eligible_budget + vouched_registration[:remaining_slots]
         external, projections = preview_candidates(live_view, eligible, canonical_keys=fused.canonical_keys)
         # Preview may resolve a new identity to a local row suppressed by fusion.
         # Its canonical snapshot already carries the preview hits' rank evidence;
         # combine that with direct external folds before replacing the local row.
         local_evidence = {n["key"]: n for n in fused.local + fused.vouched}
+        filtered_external = []
         for node in external:
+            projected = projections.get(node["key"])
+            if projected is not None and serving_excluded(projected):
+                projections.pop(node["key"], None)
+                trace.record("gate", candidate=node, key=node["key"],
+                             decision="dropped", reason="serving_excluded")
+                continue
             # Later observations can fill an unknown year on the isolated
             # projection after its first scoring snapshot was captured.
             node["year"] = projections[node["key"]].year
@@ -692,6 +840,8 @@ class SearchPipeline:
                     node[field] = node.get(field, 0) + donor.get(field, 0)
                 if "best_external_rank" in donor:
                     node["best_external_rank"] = min(node["best_external_rank"], donor["best_external_rank"])
+            filtered_external.append(node)
+        external = filtered_external
         external_keys = set(projections)
         local_pool = []
         for node in fused.local:
@@ -704,7 +854,12 @@ class SearchPipeline:
                 if base is not None:
                     projected = base.model_copy(deep=True)
                     for donor in donors:
-                        _fill(projected, donor)
+                        safe_donor = _safe_donor_for_projection(projected, donor, live_view)
+                        _fill(projected, safe_donor)
+                    if serving_excluded(projected):
+                        trace.record("gate", candidate=paper_to_dict(projected), key=key,
+                                     decision="dropped", reason="serving_excluded")
+                        continue
                     projections[key] = projected
                     enriched = paper_to_dict(projected)
                     for meta_field in (

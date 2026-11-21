@@ -590,6 +590,28 @@ def confirmed_completeness_gate(full_text: str, *, llm=None) -> dict:
 # ------------------------- main entry point --------------------------------
 
 
+async def _run_under_write_lock(fn, *args, **kwargs):
+    """Run a blocking catalog write in a worker thread while holding ``lib_write_lock``.
+
+    If the caller is cancelled after the thread write has started, keep holding
+    ``lib_write_lock`` until the running thread finishes so shutdown or peer
+    writers never race ahead of an in-flight durable save.
+    """
+    async with concurrency.lib_write_lock:
+        worker = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            while not worker.done():
+                try:
+                    await asyncio.shield(worker)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    break
+            raise
+
+
 @guard_execution
 async def extract_md(paper: Paper, library: Library, *,
                      force: bool = False,
@@ -642,8 +664,7 @@ async def extract_md(paper: Paper, library: Library, *,
     deferred_identity = pending_ocr_identity(paper, library)
     if not force and not deferred_identity:
         from .services.extraction_registration import recover_completions
-        async with concurrency.lib_write_lock:
-            await asyncio.to_thread(recover_completions, library, key=paper.key)
+        await _run_under_write_lock(recover_completions, library, key=paper.key)
     if not force and not deferred_identity and library.has_extract(paper.key, "md"):
         from .services.extraction_registration import require_selected_registration
         await asyncio.to_thread(require_selected_registration, library, paper)
@@ -693,11 +714,10 @@ async def extract_md(paper: Paper, library: Library, *,
 
     pdf_bytes = await asyncio.to_thread(pdf_path.read_bytes)
     from .services.extraction_registration import begin_extraction, finish_extraction
-    async with concurrency.lib_write_lock:
-        extraction_request = await asyncio.to_thread(
-            begin_extraction, paper, library, pdf_bytes,
-            request={"endpoints": [e.url for e in endpoints]}, llm=llm,
-        )
+    extraction_request = await _run_under_write_lock(
+        begin_extraction, paper, library, pdf_bytes,
+        request={"endpoints": [e.url for e in endpoints]}, llm=llm,
+    )
 
     # ---- 3. ONE whole-PDF MinerU call (no chunking, no page cap) ----
     library.log({"event": "extract_md_start", "key": paper.key,
@@ -810,8 +830,7 @@ async def extract_md(paper: Paper, library: Library, *,
                              "output_sha256": output_hash, "retained_output": str(retained.relative_to(library.root))})
                 library.save(force=True, durable=True)
 
-            async with concurrency.lib_write_lock:
-                await asyncio.to_thread(_persist_identity_reject)
+            await _run_under_write_lock(_persist_identity_reject)
             _p("extract: OCR identity unverified — quarantined")
             return None
 
@@ -867,8 +886,7 @@ async def extract_md(paper: Paper, library: Library, *,
                          "source_sha256": digest, "reason": identity_reason})
             library.save(force=True, durable=True)
 
-    async with concurrency.lib_write_lock:
-        await asyncio.to_thread(_persist_completion)
+    await _run_under_write_lock(_persist_completion)
     # Issue #43: a successful extraction proves the backend is producing output —
     # advance the process-global success epoch so any papers deferred during the
     # outage go stale next reconcile sweep and are re-enqueued (auto-recovery).

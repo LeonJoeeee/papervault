@@ -811,3 +811,34 @@ def test_firecrawl_rejected_scrape_never_calls_begin_extraction_or_writes_orphan
     assert called == []
     inputs_dir = lib.root / "extracts" / "inputs"
     assert not inputs_dir.exists() or list(inputs_dir.iterdir()) == []
+
+
+@responses.activate
+def test_firecrawl_aborts_registration_if_paper_identity_changes_during_gate(
+    lib, paper, firecrawl_env, monkeypatch
+):
+    from papervault.library.download_sources import firecrawl as fc
+    from papervault.library.services import extraction_registration as er
+
+    responses.add(
+        responses.POST, "https://api.firecrawl.dev/v1/scrape",
+        json={"success": True, "data": {"markdown": REAL_PAPER_MD}},
+        status=200,
+    )
+    paper.abstract = _CR_ABSTRACT
+    orig_gate = fc._gate_firecrawl_md
+
+    def mutating_gate(p, library, md, *, target_url=""):
+        # Simulate a concurrent identity edit while the gate LLM was running.
+        p.doi = "10.9999/mutated-mid-gate"
+        return True
+
+    _patch_gate(monkeypatch, complete=True, reason="complete")
+    monkeypatch.setattr(fc, "_gate_firecrawl_md", mutating_gate)
+    called = []
+    monkeypatch.setattr(er, "begin_extraction", lambda *a, **k: called.append(True))
+
+    assert download._try_firecrawl_text_fallback(paper, lib) is False
+    assert called == []
+    assert not lib.has_extract(paper.key, "md")
+    assert orig_gate is not None

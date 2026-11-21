@@ -462,3 +462,22 @@ def test_concurrent_domain_members_receive_isolated_copies_and_merge_on_coordina
     assert paper.ads_availability.availability == "confirmed_abstract_only"
     assert paper.inspire_record_id == "1412451"
     assert paper.inspire_document_urls == ["https://inspirehep.net/files/test"]
+
+
+def test_merge_member_updates_skips_ads_availability_when_live_card_identity_changed(tmp_path):
+    from papervault.library.models import ADSAvailability
+
+    lib, paper = setup_paper(tmp_path)
+    paper.doi = "10.1234/original"
+    baseline = paper.model_copy(deep=True)
+    donor = paper.model_copy(deep=True)
+    donor.ads_availability = ADSAvailability(
+        availability="confirmed_abstract_only",
+        publication_kind="abstract",
+        reason="abstract_only",
+    )
+    # Concurrent card identity correction changed the live DOI.
+    paper.doi = "10.1234/corrected"
+
+    download._merge_member_updates(paper, baseline, donor, "ads", library=lib)
+    assert paper.ads_availability.availability == "unknown"

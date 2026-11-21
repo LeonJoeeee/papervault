@@ -2603,6 +2603,7 @@ async def test_get_paper_uses_classify_skipping_resting_firecrawl_and_exhausted_
     r1 = await _get_one(server, fc.key)
     r2 = await _get_one(server, ex.key)
     assert r1["status"] == "found" and r2["status"] == "found"
+    assert r2["text_status"] == "extract_failed"
     assert dq.added == []
     assert eq.added == []
 

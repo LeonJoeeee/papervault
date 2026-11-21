@@ -157,6 +157,9 @@ def _open_stream(kwargs):
                 _close_stream(stream)
 
     first_chunk_s = _FIRST_CHUNK_S
+    req_timeout = kwargs.get("timeout")
+    if isinstance(req_timeout, (int, float)) and req_timeout > 0:
+        first_chunk_s = min(first_chunk_s, req_timeout) if first_chunk_s > 0 else req_timeout
     deadline = time.monotonic() + first_chunk_s if first_chunk_s > 0 else None
     context = contextvars.copy_context()
     threading.Thread(target=context.run, args=(open_first,), daemon=True).start()
@@ -180,9 +183,20 @@ def _create_completion(**kwargs):
     """Join answer deltas and usage, rejecting an EOF without a provider finish."""
     if kwargs.get("max_tokens") is None:
         kwargs.pop("max_tokens", None)
+    req_timeout = kwargs.pop("timeout", None)
+    effective_timeout = (
+        float(req_timeout)
+        if isinstance(req_timeout, (int, float)) and req_timeout > 0
+        else _CLIENT_TIMEOUT_S
+    )
+    stream_deadline = (
+        time.monotonic() + float(req_timeout)
+        if isinstance(req_timeout, (int, float)) and req_timeout > 0
+        else None
+    )
     stream, iterator, chunk = _open_stream({
         **kwargs, "stream": True, "stream_options": {"include_usage": True},
-        "num_retries": 0, "timeout": _CLIENT_TIMEOUT_S,
+        "num_retries": 0, "timeout": effective_timeout,
     })
     parts = []
     usage = None
@@ -209,6 +223,8 @@ def _create_completion(**kwargs):
                 # proves the provider finished; raw SDK iterators use the chunk.
                 if reason and getattr(stream, "received_finish_reason", reason):
                     finish = reason
+            if stream_deadline is not None and time.monotonic() >= stream_deadline and finish is None:
+                raise TimeoutError(f"stream exceeded timeout of {effective_timeout:g}s")
             chunk = next(iterator, None)
     except Exception as exc:  # noqa: BLE001 — normalize transport/stream errors only
         code = _error_code(exc)
@@ -305,12 +321,12 @@ class LLM:
         self.num_retries = num_retries
         self.targets = tuple(targets) if targets is not None else None
 
-    def call(self, messages, **_ignored):
+    def call(self, messages, *, timeout: float | None = None, **_ignored):
         started = time.monotonic()
         response = None
         degraded = True
         try:
-            response, degraded = self._call(messages)
+            response, degraded = self._call(messages, timeout=timeout)
             return response.choices[0].message.content or ""
         finally:
             callback = _call_observer.get()
@@ -327,18 +343,37 @@ class LLM:
                 except Exception:
                     logger.warning("LLM call observation unavailable")
 
-    def _call(self, messages):
+    def _call(self, messages, *, timeout: float | None = None):
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
         t0 = time.monotonic()
-        deadline = t0 + _RETRY_BUDGET_S
+        budget_s = (
+            min(_RETRY_BUDGET_S, float(timeout))
+            if isinstance(timeout, (int, float)) and timeout > 0
+            else _RETRY_BUDGET_S
+        )
+        deadline = t0 + budget_s
+        call_deadline = (
+            t0 + float(timeout)
+            if isinstance(timeout, (int, float)) and timeout > 0
+            else None
+        )
+
+        def _timeout_kw() -> dict:
+            if call_deadline is None:
+                return {}
+            rem = call_deadline - time.monotonic()
+            if rem <= 0:
+                raise TimeoutError(f"LLM call budget of {float(timeout):g}s exhausted")
+            return {"timeout": min(_CLIENT_TIMEOUT_S, rem)}
+
         mt_kw = {"max_tokens": self.max_tokens} if self.max_tokens is not None else {}
         if self.targets is None:
             for attempt in range(2):
                 try:
                     resp = _create_completion(
                         model=self.model, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, **mt_kw,
+                        api_key=self.api_key, **mt_kw, **_timeout_kw(),
                     )
                     break
                 except Exception as exc:  # noqa: BLE001 — retain pool status handling
@@ -364,7 +399,7 @@ class LLM:
                 try:
                     resp = _create_completion(
                         **wire, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, **mt_kw,
+                        api_key=self.api_key, **mt_kw, **_timeout_kw(),
                     )
                     log_usage(logger, "pl", target.model, time.monotonic() - t0, resp)
                     return resp, target_idx > 0
@@ -394,7 +429,7 @@ class LLM:
                 try:
                     resp = _create_completion(
                         **wire, messages=messages, base_url=self.base_url,
-                        api_key=self.api_key, **mt_kw,
+                        api_key=self.api_key, **mt_kw, **_timeout_kw(),
                     )
                     log_usage(logger, "pl", target.model, time.monotonic() - t0, resp)
                     return resp, (target_idx > 0 or attempt > 0)

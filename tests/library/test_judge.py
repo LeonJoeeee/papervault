@@ -648,3 +648,20 @@ async def test_judge_batch_timeout_bounds_hung_call(monkeypatch):
         assert judge.judge_stats()["batch_timeouts"] >= before["batch_timeouts"] + 1
     finally:
         release.set()
+
+
+@pytest.mark.asyncio
+async def test_judge_passes_remaining_batch_timeout_to_llm_call(monkeypatch):
+    monkeypatch.setenv("PAPERVAULT_JUDGE_BATCH_TIMEOUT_S", "42.5")
+    seen_timeouts: list[float | None] = []
+
+    class TimeoutAwareLLM:
+        def call(self, messages, *, timeout=None):
+            seen_timeouts.append(timeout)
+            return json.dumps({"items": [{"i": 0, "reason": "ok", "score": 0.9}]})
+
+    judged, dropped = await judge_return(_many_cands(1), "q", llm=TimeoutAwareLLM())
+    assert dropped == 0
+    assert set(judged) == {0}
+    assert len(seen_timeouts) == 1
+    assert seen_timeouts[0] is not None and 0 < seen_timeouts[0] <= 42.5

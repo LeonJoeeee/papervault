@@ -1540,3 +1540,29 @@ def test_pace_lock_is_keyed_per_event_loop_and_backend(monkeypatch):
     asyncio.run(run_once())
     assert len(locks_seen) == 2
     assert locks_seen[0][0] is not locks_seen[1][0]
+
+
+def test_pace_serializes_last_call_across_concurrent_threads_and_loops(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(search, "_LAST_CALL", {})
+    barrier = threading.Barrier(2)
+    finished_at: list[float] = []
+
+    def worker():
+        async def run():
+            barrier.wait(timeout=2.0)
+            await search._pace("arxiv", 0.08)
+            finished_at.append(time.monotonic())
+
+        asyncio.run(run())
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=2.0)
+    assert len(finished_at) == 2
+    finished_at.sort()
+    assert finished_at[1] - finished_at[0] >= 0.065

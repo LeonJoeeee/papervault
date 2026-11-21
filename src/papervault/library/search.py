@@ -19,6 +19,7 @@ import collections
 import contextvars
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -325,6 +326,7 @@ ARXIV_MIN_INTERVAL = 3.0
 CORE_MIN_INTERVAL = 6.0
 
 _LAST_CALL: dict[str, float] = {}
+_LAST_CALL_LOCK = threading.Lock()
 _PACE_LOCK: WeakValueDictionary[
     tuple[asyncio.AbstractEventLoop, str], asyncio.Lock
 ] = WeakValueDictionary()
@@ -346,16 +348,21 @@ async def _pace(backend: str, min_interval: float) -> None:
     if min_interval <= 0:
         return
     # Key by (loop, backend) so short-lived asyncio.run() loops never clash on
-    # a lock bound to a previous closed loop.
+    # a lock bound to a previous closed loop, while _LAST_CALL_LOCK atomically
+    # reserves slots across separate loops/threads.
     key = (asyncio.get_running_loop(), backend)
     lock = _PACE_LOCK.get(key)
     if lock is None:
         lock = _PACE_LOCK[key] = asyncio.Lock()
     async with lock:
-        wait = min_interval - (time.monotonic() - _LAST_CALL.get(backend, 0.0))
+        with _LAST_CALL_LOCK:
+            now = time.monotonic()
+            last = _LAST_CALL.get(backend)
+            next_slot = now if last is None else max(now, last + min_interval)
+            wait = next_slot - now
+            _LAST_CALL[backend] = next_slot
         if wait > 0:
             await asyncio.sleep(wait)
-        _LAST_CALL[backend] = time.monotonic()
 
 
 # ---------------- per-backend circuit breaker (#115) ----------------

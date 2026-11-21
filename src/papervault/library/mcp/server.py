@@ -48,6 +48,7 @@ from papervault.library.models import (
     DOWNLOAD_STATUS_FAILED,
     DOWNLOAD_STATUS_METADATA_ONLY,
     DOWNLOAD_STATUS_TERMINAL,
+    MAX_EXTRACT_ATTEMPTS,
     MIN_TXT_SERVE_BYTES,
     Paper,
 )
@@ -227,6 +228,11 @@ def _attach_text_reference(rec: dict, paper: Paper, library: Library) -> None:
             rec["text_path"] = str(library.txt_path(paper.key))
             return
         # Near-empty txt — do NOT serve it as full text. Fall through.
+    if (library.has_pdf(paper.key)
+            and status not in DOWNLOAD_STATUS_TERMINAL
+            and (current.extract_attempts or 0) >= MAX_EXTRACT_ATTEMPTS):
+        rec["text_status"] = "extract_failed"
+        return
     rec["text_status"] = _TERMINAL_TEXT_STATUS.get(status, "pending")
 
 

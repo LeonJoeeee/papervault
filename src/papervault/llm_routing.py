@@ -407,8 +407,32 @@ def is_quota_exhaustion_error(exc: BaseException, code: int | None = None) -> bo
     )
 
 
+_UPSTREAM_AUTH_EXPIRED_STATUS_CODES = frozenset({400, 401})
+_UPSTREAM_AUTH_EXPIRED_SUBSTRINGS = (
+    "token_expired",
+    "your authentication token has expired",
+)
+
+
+def is_upstream_auth_expired_error(exc: BaseException, code: int | None = None) -> bool:
+    """Return True iff ``exc`` indicates an expired upstream channel OAuth token.
+
+    Targets gateway-wrapped upstream provider OAuth expiry (e.g. LiteLLM
+    ``ChatgptException`` with ``code='token_expired'`` on HTTP 400/401) so multi-target
+    routes can fail over to another gateway channel. Client/proxy key auth failures
+    (``Invalid proxy server token``, generic ``Invalid API key``) return False and fail fast.
+    """
+    resolved = http_status_code(exc) if code is None else code
+    if resolved not in _UPSTREAM_AUTH_EXPIRED_STATUS_CODES:
+        return False
+    haystack = _exception_error_text(exc)
+    if not haystack or "invalid proxy server" in haystack:
+        return False
+    return any(tok in haystack for tok in _UPSTREAM_AUTH_EXPIRED_SUBSTRINGS)
+
+
 def _is_openai_failover_eligible(exc: Exception, code: int | None) -> bool:
-    if is_quota_exhaustion_error(exc, code):
+    if is_quota_exhaustion_error(exc, code) or is_upstream_auth_expired_error(exc, code):
         return True
     if code is not None:
         return code in {408, 429} or 500 <= code <= 599
@@ -470,7 +494,10 @@ async def create_openai_chat_completion_with_fallback(
                 raise
             ttl = record_model_cooldown(
                 target.model,
-                quota=is_quota_exhaustion_error(exc, code),
+                quota=(
+                    is_quota_exhaustion_error(exc, code)
+                    or is_upstream_auth_expired_error(exc, code)
+                ),
             )
             fallback_model = targets[target_idx + 1].model
             if deadline is not None and deadline - time.monotonic() <= 0.0:

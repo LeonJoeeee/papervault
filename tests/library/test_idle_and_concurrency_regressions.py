@@ -19,11 +19,22 @@ from papervault.library.state_v2 import Merge, Policy, Retrieval, TerminalState,
 
 
 class _Resp:
-    def __init__(self, status: int, payload=None, *, bad_json: bool = False, headers: dict | None = None):
+    def __init__(
+        self,
+        status: int,
+        payload=None,
+        *,
+        bad_json: bool = False,
+        headers: dict | None = None,
+        text: str = "",
+        url: str = "",
+    ):
         self.status_code = status
         self._payload = payload
         self._bad_json = bad_json
         self.headers = headers or {}
+        self.text = text
+        self.url = url
         self.ok = 200 <= status < 300
 
     def json(self):
@@ -85,8 +96,20 @@ async def test_with_dedup_subscriber_cancellation_preserves_leader_and_peers():
     _Resp(410),
     _Resp(200, bad_json=True, headers={"Content-Type": "application/xml"}),
     _Resp(200, bad_json=True, headers={"Content-Type": "text/xml; charset=utf-8"}),
+    _Resp(
+        200,
+        bad_json=True,
+        headers={},
+        text='<?xml version="1.0" encoding="UTF-8"?>\n<crossref_result xmlns="http://www.crossref.org/qrschema/3.0">',
+    ),
+    _Resp(
+        200,
+        bad_json=True,
+        headers={},
+        url="https://api.crossref.org/works/10.5194/angeo-44-263-2026/transform/application/vnd.crossref.unixsd+xml",
+    ),
     _Resp(200, payload="not-a-dict"),
-], ids=["400", "410", "app-xml-200", "text-xml-200", "non-dict-200"])
+], ids=["400", "410", "app-xml-200", "text-xml-200", "headerless-crossref-xml-200", "unixsd-url-200", "non-dict-200"])
 def test_crossref_enrich_poison_pill_is_miss_not_transient(monkeypatch, resp):
     monkeypatch.setattr(fetch.requests, "get", lambda *a, **k: resp)
     assert fetch.crossref_enrich_lookup("10.5194/angeo-44-263-2026.xml") == ("miss", {})
@@ -96,7 +119,21 @@ def test_crossref_enrich_poison_pill_is_miss_not_transient(monkeypatch, resp):
     _Resp(200, bad_json=True, headers={"Content-Type": "text/html; charset=utf-8"}),
     _Resp(200, bad_json=True, headers={"Content-Type": "application/json"}),
     _Resp(200, bad_json=True),
-], ids=["html-gateway-200", "truncated-json-200", "unknown-content-type-200"])
+    _Resp(200, bad_json=True, headers={}, text='<?xml version="1.0"?><Error><Code>ServiceUnavailable</Code></Error>'),
+    _Resp(
+        200,
+        bad_json=True,
+        headers={"Content-Type": "text/html; charset=utf-8"},
+        text="<html><title>Temporary service outage</title></html>",
+        url="https://api.crossref.org/works/10.5194/angeo-44-263-2026/transform/application/vnd.crossref.unixsd+xml",
+    ),
+], ids=[
+    "html-gateway-200",
+    "truncated-json-200",
+    "unknown-content-type-200",
+    "generic-xml-error-200",
+    "html-outage-after-unixsd-redirect",
+])
 def test_crossref_enrich_html_or_truncated_200_stays_transient(monkeypatch, resp):
     monkeypatch.setattr(fetch.requests, "get", lambda *a, **k: resp)
     assert fetch.crossref_enrich_lookup("10.3847/1538-4357/good") == ("transient", {})

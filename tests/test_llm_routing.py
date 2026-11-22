@@ -1045,3 +1045,82 @@ async def test_openai_fallback_helper_fails_over_on_connection_error_and_merges_
     assert calls[1]["extra_body"] == {"foo": "bar", "thinking": {"type": "enabled"}}
     assert caller_extra == {"foo": "bar", "thinking": {"type": "enabled"}}
     assert is_model_cooled_down("deepseek-v4")
+
+
+@pytest.mark.parametrize(
+    "status_code,message,want",
+    [
+        (
+            401,
+            'litellm.BadRequestError: ChatgptException - {"error": {"code": "token_expired", "message": "Your authentication token has expired."}}',
+            True,
+        ),
+        (
+            400,
+            'OpenAIException - litellm.BadRequestError: ChatgptException - {"detail": {"code": "token_expired"}}',
+            True,
+        ),
+        (401, "Authentication Error, Invalid proxy server token", False),
+        (401, "Invalid API key", False),
+        (403, "Forbidden: token_expired", False),
+        (400, "Invalid parameter: messages[0].content", False),
+    ],
+)
+def test_is_upstream_auth_expired_error_matrix(status_code, message, want):
+    class _Err(Exception):
+        pass
+
+    err = _Err(message)
+    err.status_code = status_code
+    assert llm_routing.is_upstream_auth_expired_error(err) is want
+
+
+@pytest.mark.asyncio
+async def test_openai_fallback_helper_fails_over_on_upstream_token_expired_with_quota_cooldown():
+    from types import SimpleNamespace
+
+    class _AuthExpired(Exception):
+        status_code = 401
+
+    calls: list[str] = []
+
+    async def create(**kwargs):
+        calls.append(kwargs["model"])
+        if len(calls) == 1:
+            raise _AuthExpired(
+                'ChatgptException - {"error": {"code": "token_expired", "message": "Your authentication token has expired."}}'
+            )
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="fallback-ok"))])
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    resp = await llm_routing.create_openai_chat_completion_with_fallback(
+        client,
+        parse_targets("gpt-6.1-terra@high,relay-glm-5.3@high"),
+        messages=[{"role": "user", "content": "hi"}],
+    )
+    assert resp.choices[0].message.content == "fallback-ok"
+    assert calls == ["gpt-6.1-terra", "relay-glm-5.3"]
+    assert is_model_cooled_down("gpt-6.1-terra")
+
+
+@pytest.mark.asyncio
+async def test_openai_fallback_helper_does_not_failover_on_proxy_invalid_key():
+    from types import SimpleNamespace
+
+    class _BadProxyKey(Exception):
+        status_code = 401
+
+    calls: list[str] = []
+
+    async def create(**kwargs):
+        calls.append(kwargs["model"])
+        raise _BadProxyKey("Authentication Error, Invalid proxy server token")
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+    with pytest.raises(_BadProxyKey):
+        await llm_routing.create_openai_chat_completion_with_fallback(
+            client,
+            parse_targets("gpt-6.1-terra@high,relay-glm-5.3@high"),
+            messages=[{"role": "user", "content": "hi"}],
+        )
+    assert calls == ["gpt-6.1-terra"]

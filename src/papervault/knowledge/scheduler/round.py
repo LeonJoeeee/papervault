@@ -68,6 +68,7 @@ DEFAULT_STUCK_LIMIT = 3        # processing 行连续 N 轮不前进 → error(�
 DEFAULT_ROUND_INTERVAL = 60.0  # main_loop sleep 秒
 DEFAULT_FULL_RECONCILE_INTERVAL_S = 1800.0  # periodic safety full-reconcile during idle
 _ACTIVE_LEDGER_STATUSES = frozenset({"processing", "error", "pending_remove"})
+_STABLE_DOC_STATUSES = frozenset({"processed", "failed"})
 
 # 进程内 stuck 计数(重启从 0 重数 —— 重启本身触发 LightRAG 自愈,见 §6.6)。
 _stuck: dict[str, int] = defaultdict(int)
@@ -111,19 +112,33 @@ async def _ledger_idle_token():
 
 
 async def _doc_status_idle_token(rag):
-    """Return a cheap LightRAG doc_status token when zero non-processed docs exist, else None."""
+    """Return a cheap LightRAG doc_status token when zero in-flight docs exist, else None.
+
+    Terminal ``failed`` rows (e.g. historical ``dup-*`` audit rows or ``error_parked``
+    docs) remain stable across clean idle rounds and are hashed into the token so any
+    count change (new failure or external heal) still invalidates the fast-path.
+    """
     doc_status = getattr(rag, "doc_status", None)
     if doc_status is not None and hasattr(doc_status, "get_status_counts"):
         counts = await doc_status.get_status_counts()
-        non_processed = sum(int(v) for k, v in counts.items() if str(k).lower() != "processed")
-        if non_processed > 0:
-            return None
-        return tuple(sorted((str(k).lower(), int(v)) for k, v in counts.items()))
+        normalized: dict[str, int] = {}
+        for k, v in counts.items():
+            st = str(k).lower()
+            n = int(v)
+            if st == "all":
+                continue
+            if st not in _STABLE_DOC_STATUSES:
+                if n > 0:
+                    return None
+                continue
+            if n > 0:
+                normalized[st] = normalized.get(st, 0) + n
+        return tuple(sorted(normalized.items()))
     if hasattr(rag, "rows") and isinstance(rag.rows, dict):
         counts: dict[str, int] = defaultdict(int)
         for row in rag.rows.values():
             st = str(row.get("status", "")).lower()
-            if st != "processed":
+            if st not in _STABLE_DOC_STATUSES:
                 return None
             counts[st] += 1
         return tuple(sorted(counts.items()))

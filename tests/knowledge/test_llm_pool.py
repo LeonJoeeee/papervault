@@ -1460,3 +1460,34 @@ async def test_retries_zero_limits_gateway_connection_error_retries(
     with pytest.raises(openai.APIConnectionError):
         await KeyPool(tmp_path / "unused.json").complete("ping", retries=0)
     assert len(created) == 1
+
+
+async def test_direct_multi_target_fails_over_on_upstream_token_expired_without_disabling_key(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("PAPERVAULT_LLM_GATEWAY", "0")
+    monkeypatch.delenv("KS_USE_GATEWAY", raising=False)
+    keys_file = tmp_path / "llm_keys.json"
+    keys_file.write_text(json.dumps([
+        {"model": "gpt-6.1-terra", "api_key": "gw-valid-key", "base_url": "http://gw/v1"}
+    ]))
+
+    class _UpstreamExpired(Exception):
+        status_code = 401
+
+    seen = []
+
+    async def fake_create(client, model, messages, attempt_kwargs, leg_timeout):
+        seen.append(model)
+        if model == "gpt-6.1-terra":
+            raise _UpstreamExpired(
+                'ChatgptException - {"error": {"code": "token_expired", "message": "Your authentication token has expired."}}'
+            )
+        return llm_mod._Collected("fallback-ok", None, "stop")
+
+    monkeypatch.setattr(llm_mod, "_create_completion_bounded", fake_create)
+    out = await KeyPool(keys_file).complete("ping", model="gpt-6.1-terra@high,relay-glm-5.3@high")
+    assert out == "fallback-ok"
+    assert seen == ["gpt-6.1-terra", "relay-glm-5.3"]
+    saved = json.loads(keys_file.read_text())
+    assert not saved[0].get("disabled")

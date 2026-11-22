@@ -36,6 +36,7 @@ from papervault.llm_routing import (
     http_status_code,
     is_model_cooled_down,
     is_quota_exhaustion_error,
+    is_upstream_auth_expired_error,
     litellm_wire_kwargs,
     parse_targets,
     record_model_cooldown,
@@ -267,7 +268,7 @@ def _is_failover_eligible(exc: Exception) -> bool:
     from openai import APITimeoutError
 
     code = _error_code(exc)
-    if is_quota_exhaustion_error(exc, code):
+    if is_quota_exhaustion_error(exc, code) or is_upstream_auth_expired_error(exc, code):
         return True
     if code is not None:
         return code in {408, 429} or 500 <= code <= 599
@@ -407,10 +408,17 @@ class LLM:
                     if not _is_failover_eligible(exc):
                         raise
                     now = time.monotonic()
-                    ttl = record_model_cooldown(target.model, now=now)
+                    code = _error_code(exc)
+                    ttl = record_model_cooldown(
+                        target.model,
+                        now=now,
+                        quota=(
+                            is_quota_exhaustion_error(exc, code)
+                            or is_upstream_auth_expired_error(exc, code)
+                        ),
+                    )
                     remaining = deadline - now
                     fallback_model = self.targets[target_idx + 1].model
-                    code = _error_code(exc)
                     if remaining <= max(_FIRST_CHUNK_S, 0.0):
                         logger.warning(
                             "library primary failover skipped (budget exhausted: %.1fs left) "
@@ -577,10 +585,14 @@ class KeyPool:
         for g in groups:
             try:
                 return self._client(g).call(*args, **kwargs)
-            except Exception as e:  # noqa: BLE001 — fail over; auto-disable only on non-quota 401/403
+            except Exception as e:  # noqa: BLE001 — fail over; auto-disable only on genuine key 401/403
                 last_exc = e
                 code = _error_code(e)
-                if code in _PERMANENT_CODES and not is_quota_exhaustion_error(e, code):
+                if (
+                    code in _PERMANENT_CODES
+                    and not is_quota_exhaustion_error(e, code)
+                    and not is_upstream_auth_expired_error(e, code)
+                ):
                     self._disable_key(g["api_key"], code, type(e).__name__)
         raise last_exc                               # every active key failed this call
 

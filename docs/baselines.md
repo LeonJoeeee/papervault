@@ -7,7 +7,9 @@ instruments and arbitration rules at the end.
 
 > The [2026-10-24 post-v0.10.10 baseline](#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
 > records retrieval, landmark coverage, catalog hygiene and the LightRAG 1.5.7 gates
-> carried into v0.10.11. The July/F0 and October recovery/maintenance sections remain
+> carried into v0.10.11; the [2026-11-21 post-v0.11.2 record](#post-v0112-resource-envelope-and-live-verification--2026-11-21)
+> captures the single-host resource envelope and live MCP verification after the
+> `v0.11.0`–`v0.11.2` overhaul. The July/F0 and October recovery/maintenance sections remain
 > historical measurements under their original conditions; they are not remeasurements
 > of the new stack. Result tags cited below (e.g. `frozen154_*`, `srb_v1_*`, `mfr_v2_*`) name LOCAL,
 > untracked evidence files (they embed verbatim paper text — see the Evidence convention
@@ -445,6 +447,31 @@ retrieved-paper citation fallback; it does not measure synthesis quality. All 14
 candidate receipts reported `rerank_degraded=False`. ADR-0005 retains the exact
 aggregates, separate recall@12 movement, result tags and artifact provenance; its
 historical 1.5.4 measurements remain historical.
+
+## Post-v0.11.2 resource envelope and live verification — 2026-11-21
+
+Measured on lab deployment #1 (RTX 3090 24 GB, PostgreSQL-authoritative catalog,
+~29.8k papers + operator textbooks/notes, `KS_BGE_WORKER_MODE=subprocess`,
+`KS_BGE_IDLE_UNLOAD=1`, `KS_BGE_IDLE_TIMEOUT=600`, `KS_RERANK_MAX_ASYNC=1`,
+`KS_RERANK_BATCH_SIZE=8`, `MALLOC_ARENA_MAX=2`, `PAPERVAULT_SERVING_TRACE=0`) after
+deploying `v0.11.2` (`c24293e`). This records host resource-envelope and live MCP
+end-to-end smoke measurements; it is **not** a new gold-set recall arbitration run and
+does not supersede the retrieval floors above.
+
+| Metric (lab deployment #1) | Pre-overhaul (`v0.10.31`) | Post-overhaul (`v0.11.2`) | Conditions |
+| --- | --- | --- | --- |
+| Main process idle RSS (HWM / Swap) | 6.4 GiB (17.0 GiB peak / 278 MB Swap) | **1.44 GiB** (1.89 GiB HWM / **0 kB Swap**) | 5.5 h quiet steady-state window; `0` errors/tracebacks |
+| Idle GPU VRAM (`papervault-mcp`) | 432 MiB (persistent CUDA context) | **0 MiB** | `bge_worker` exited cleanly (`rc=0`) after 10 min idle ([ADR-0015](adr/0015-on-demand-bge-worker-subprocess.md)) |
+| Idle `library.bib` SSD churn | ~8.5 GB/day empty rewrites | **0 writes** (>5 h untouched) | `mutated > 0` save guard + idle fast-path with stable terminal `failed` rows |
+| `bge_worker` cold respawn after idle exit | n/a (in-process) | **3.4 s** embed + **6.4 s** rerank | First `query` after 10 min idle exit; `rerank_degraded=false` |
+
+Live `v0.11.2` MCP end-to-end smoke (`127.0.0.1:8080/mcp`, `papervault doctor` green with `0` warnings):
+
+| Tool | Observed result |
+| --- | --- |
+| `get_paper` (3 inputs: key + classic key + duplicate DOI) | `0.00 s` ok; deduplicated to 2 records with verbatim `text_path` |
+| `search_papers` (Parker cosmic-ray transport + PINN adaptive sampling, limit 6) | ~`108 s` (`90 s` bounded-wait soft-return + `18.5 s` collect); `gpt-6.1-terra@high` intent (`12.7 s`); `judge_batches_dropped={ingest:0, return:0}`; 6 landmark papers returned, all with `text_path` |
+| `query` (outer-heliosphere Parker transport + PINN failure modes) | ~`116 s` (`90 s` soft-return + `26.3 s` collect); prompt trimmed `225,597 → 158,558` tokens under `KS_SYNTH_MAX_PROMPT_TOKENS=160000`; `gpt-6.2-astra@xhigh` synth (`86.5 s`); `kb_coverage="strong"`, `74` retrieved papers, `32` cited papers + `textbook:Gombosi1998`, `unverified_citations=[]`, `rerank_degraded=false` |
 
 ## Arbitration rules (how these numbers may change)
 

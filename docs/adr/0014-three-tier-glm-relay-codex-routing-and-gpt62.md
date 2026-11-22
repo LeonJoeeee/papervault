@@ -35,3 +35,11 @@ Rejected alternatives:
 
 - Background extraction (`build`, `gate`, `verify`), search/query helpers (`judge`, `keyword`, `decompose`), and evaluation judging (`eval_judge`) drain official GLM subscription quota first, absorb overflows on `relay-glm-*`, and (for production roles) step cleanly to `gpt-6.1-terra` when relay credit is exhausted (`402` or quota-indicated `400/403/429`), cooling down each exhausted leg independently for 120 seconds.
 - Knowledge distillation and library extraction recipe digests deterministically reflect the updated `configured_models` strings for `build`, `keyword`, and `gate`.
+
+## Amendment (2026-11-21, `v0.11.0`–`v0.11.2`)
+
+Three failover refinements extend the policy above without changing default role routes or per-family modifier rules:
+
+1. **Dedicated quota/auth cooldown (`PAPERVAULT_LLM_QUOTA_COOLDOWN_S`, default `600` s).** Quota/balance exhaustion and upstream OAuth expiry use a 600-second per-model cooldown (`<= 0` disables; also disabled if unset while `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S <= 0`), keeping `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` (`120` s) scoped to transient errors (`408`, `429`, `5xx`, timeouts, transport errors, `StreamTruncated`).
+2. **Gateway-wrapped upstream OAuth `token_expired` failover (`is_upstream_auth_expired_error`, `v0.11.2`).** Multi-target routes fail over with the quota cooldown (`600` s) when a gateway-wrapped upstream channel returns HTTP `400`/`401` indicating expired upstream OAuth (`token_expired` / `your authentication token has expired`), without disabling valid keys in direct `KeyPool` mode. Genuine client/proxy auth failures (`Invalid proxy server token`, generic `Invalid API key`) remain fail-fast.
+3. **Truncation and transport-error handling.** Empty-content or thinking-only completions normalize to `StreamTruncated` (engaging retries and multi-target failover), partial `finish_reason="length"` completions return `TruncatedResponse` (a `str` subclass) so callers can inspect truncation explicitly, and library LLM calls treat transport/connection errors as failover-eligible on non-final targets with per-target timeout bounds.

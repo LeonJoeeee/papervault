@@ -358,3 +358,92 @@ async def test_main_loop_stays_idle_when_drain_pending_returns_zero_counts(monke
     # Tick 2 stayed IDLE (load_calls still 1!); then drain_pending returned ingested=1 ->
     # Tick 3 woke up and ran full round (load_calls=2)!
     assert len(load_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_run_round_idle_fast_path_tolerates_stable_failed_docs_and_wakes_on_change(monkeypatch):
+    """Historical terminal failed rows (dup-*, error_parked) must not disable the idle fast-path,
+    while any failed-count change or in-flight status must immediately wake a full round."""
+    from papervault.knowledge.ingest.paper_library_client import PaperRecord
+
+    rows = {
+        "A": LedgerRecord("l0_probe", "paper", "A", "fpA", "paper:A", "done"),
+        "P": LedgerRecord("l0_probe", "paper", "P", "fpP", "paper:P", "error_parked"),
+    }
+    doc_counts = {"processed": 1, "failed": 2}  # e.g. 1 error_parked + 1 dup-* audit row
+    rag_rows = {
+        "paper:A": {"status": "processed", "file_path": "A", "metadata": {}},
+        "paper:P": {"status": "failed", "file_path": "P", "metadata": {}},
+    }
+    load_calls = []
+
+    class FakeLedger:
+        def __init__(self):
+            self.rows = rows
+
+        async def load(self, source):
+            return {k: v for k, v in self.rows.items() if v.ingest_source == source}
+
+        async def load_by_status(self, statuses):
+            ss = set(statuses)
+            return [r for r in self.rows.values() if r.status in ss]
+
+    class FakeDocStatus:
+        async def get_by_ids(self, ids):
+            return [rag_rows.get(i) for i in ids]
+
+        async def get_by_id(self, i):
+            return rag_rows.get(i)
+
+        async def get_status_counts(self):
+            return dict(doc_counts)
+
+    class FakeRag:
+        rows = rag_rows
+        doc_status = FakeDocStatus()
+
+        async def apipeline_process_enqueue_documents(self):
+            return None
+
+    fl = FakeLedger()
+    monkeypatch.setattr(rnd, "ledger", fl)
+    from papervault.knowledge.scheduler import reconcile as rec_mod
+    monkeypatch.setattr(rec_mod, "ledger", fl)
+    monkeypatch.setattr(rnd, "catalog_state_token", lambda: ("pg", 10, 2, "2026-11-21"))
+    monkeypatch.setattr(rnd, "fingerprint", lambda rec: f"fp{rec.key}")
+
+    def fake_load_index():
+        load_calls.append(True)
+        return {
+            "A": PaperRecord(key="A", md_path="extracts/md/A.md"),
+            "P": PaperRecord(key="P", md_path="extracts/md/P.md"),
+        }
+
+    monkeypatch.setattr(rnd, "load_clean_index", fake_load_index)
+
+    idle_state = {"token": None, "last_full_at": 0.0}
+    rag = FakeRag()
+
+    # Round 1: full round finishes clean with stable failed rows -> records idle token.
+    r1 = await rnd.run_round(rag, _idle_state=idle_state)
+    assert not r1.get("skipped_idle")
+    assert idle_state["token"] is not None
+    assert len(load_calls) == 1
+
+    # Round 2: unchanged counts (including failed=2 and pending=0) -> hits idle fast-path!
+    doc_counts["pending"] = 0
+    r2 = await rnd.run_round(rag, _idle_state=idle_state)
+    assert r2 == {"skipped_idle": True}
+    assert len(load_calls) == 1
+
+    # Round 3: failed count changes (e.g. a new doc failed or one healed) -> wakes up!
+    doc_counts["failed"] = 3
+    r3 = await rnd.run_round(rag, _idle_state=idle_state)
+    assert not r3.get("skipped_idle")
+    assert len(load_calls) == 2
+
+    # Round 4: in-flight pending doc appears -> wakes up immediately!
+    doc_counts["pending"] = 1
+    r4 = await rnd.run_round(rag, _idle_state=idle_state)
+    assert not r4.get("skipped_idle")
+    assert len(load_calls) == 3

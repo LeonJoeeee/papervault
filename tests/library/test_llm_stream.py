@@ -446,7 +446,7 @@ def test_multi_target_cooldown_skips_primary_and_marks_degraded_until_expiry(mon
     targets = parse_targets("glm-5.3-flash@high,gpt-6.1-terra@medium")
     calls = responses(
         monkeypatch,
-        litellm.RateLimitError("quota", model="glm-5.3-flash", llm_provider="openai"),
+        litellm.RateLimitError("too many requests", model="glm-5.3-flash", llm_provider="openai"),
         Stream([chunk("c1"), chunk(finish="stop")]),
         Stream([chunk("c2"), chunk(finish="stop")]),
         Stream([chunk("c3"), chunk(finish="stop")]),
@@ -468,6 +468,59 @@ def test_multi_target_cooldown_skips_primary_and_marks_degraded_until_expiry(mon
     ]
     assert all("max_tokens" not in c for c in calls)
     assert [o.degraded for o in obs] == [True, True, False]
+
+
+def test_multi_target_fails_over_on_upstream_token_expired_with_quota_cooldown(monkeypatch):
+    from types import SimpleNamespace
+    from papervault.llm_routing import parse_targets
+
+    monkeypatch.setattr(L, "_FIRST_CHUNK_S", 0.0)
+    clock = [900.0]
+    monkeypatch.setattr(L, "time", SimpleNamespace(monotonic=lambda: clock[0], sleep=lambda _: None))
+    targets = parse_targets("gpt-6.1-terra@high,relay-glm-5.3@high")
+    calls = responses(
+        monkeypatch,
+        litellm.BadRequestError(
+            'ChatgptException - {"error": {"code": "token_expired", "message": "Your authentication token has expired."}}',
+            model="gpt-6.1-terra",
+            llm_provider="openai",
+        ),
+        Stream([chunk("fallback-1"), chunk(finish="stop")]),
+        Stream([chunk("fallback-2"), chunk(finish="stop")]),
+        Stream([chunk("recovered"), chunk(finish="stop")]),
+    )
+    client = L.LLM("openai/gpt-6.1-terra", targets=targets)
+    assert client.call("p1") == "fallback-1"
+    clock[0] = 1200.0  # 300s later: still inside 600s quota/auth-expiry cooldown
+    assert client.call("p2") == "fallback-2"
+    clock[0] = 1501.0  # past 600s cooldown -> probes primary again
+    assert client.call("p3") == "recovered"
+    assert [c["model"] for c in calls] == [
+        "openai/gpt-6.1-terra",
+        "openai/relay-glm-5.3",
+        "openai/relay-glm-5.3",
+        "openai/gpt-6.1-terra",
+    ]
+
+
+def test_key_pool_does_not_disable_key_on_upstream_token_expired(tmp_path, monkeypatch):
+    import json
+
+    keys_file = tmp_path / "llm_keys.json"
+    keys_file.write_text(json.dumps([
+        {"model": "openai/gpt-6.1-terra", "api_key": "gw-valid-key", "base_url": "http://gw/v1"}
+    ]))
+    pool = L.KeyPool(keys_file, model_override="gpt-6.1-terra@high")
+    err = litellm.AuthenticationError(
+        'ChatgptException - {"error": {"code": "token_expired", "message": "Your authentication token has expired."}}',
+        model="gpt-6.1-terra",
+        llm_provider="openai",
+    )
+    monkeypatch.setattr(L, "_create_completion", lambda **kwargs: (_ for _ in ()).throw(err))
+    with pytest.raises(litellm.AuthenticationError):
+        pool.call("ping")
+    saved = json.loads(keys_file.read_text())
+    assert not saved[0].get("disabled")
 
 
 @pytest.mark.parametrize(

@@ -208,7 +208,18 @@ def crossref_enrich_lookup(doi: str) -> tuple[str, dict]:
     except (ValueError, TypeError):
         headers = getattr(r, "headers", None) or {}
         content_type = str(headers.get("Content-Type") or headers.get("content-type") or "").lower()
-        if "xml" in content_type:     # Crossref XML transform redirect (e.g. *.xml DOI) -> definitive miss
+        final_url = str(getattr(r, "url", "") or "").lower()
+        raw_text = getattr(r, "text", "")
+        body_head = raw_text.lstrip()[:256].lower() if isinstance(raw_text, str) else ""
+        if "html" in content_type or body_head.startswith(("<!doctype html", "<html")):
+            return ("transient", {})  # HTML outage/WAF page (even after redirect) -> retry next sweep
+        is_crossref_xml = (
+            "xml" in content_type
+            or body_head.startswith("<crossref_result")
+            or (body_head.startswith("<?xml") and "crossref" in body_head)
+            or (not content_type and "unixsd+xml" in final_url)
+        )
+        if is_crossref_xml:           # Crossref XML transform redirect (e.g. *.xml DOI) -> definitive miss
             return ("miss", {})
         return ("transient", {})      # HTML gateway/WAF error page or truncated JSON -> retry next sweep
     if not isinstance(data, dict) or not isinstance(data.get("message"), dict):

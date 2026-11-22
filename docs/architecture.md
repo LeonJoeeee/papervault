@@ -50,28 +50,32 @@ The `intent` LLM role emits short API/BM25 `search_terms` and separate canonical
 scientific `kg_concepts` in one call; missing concepts default to normalized terms.
 Dual-track local retrieval combines **BM25 + PGVector chunks/entities/relations +
 Neo4j cross-facet topology + authority**. The full query and concepts are encoded
-with the existing BGE-M3 singleton off the event loop. Chunks use the full query;
-entities and relations use query plus concept vectors. Per-track paper ranks fuse
-with RRF, augmented by cross-facet edges between concept entity sets and
-`log(1 + weight)` hub evidence. Split `<SEP>` paths resolve to canonical library
-keys within the request snapshot. Exclusions, alias safety and year bounds apply
-before the 45-candidate local pool cut; externally vouched supplementation remains
-separate. KG ranks participate alongside local ranks in fusion without changing
-external API terms or their rank evidence.
+with the local BGE-M3 embedder (running in an on-demand worker subprocess by
+default; see [ADR-0015](adr/0015-on-demand-bge-worker-subprocess.md)) off the event
+loop. Chunks use the full query; entities and relations use query plus concept
+vectors. Per-track paper ranks fuse with specificity-weighted RRF, augmented by
+cross-facet edges between concept entity sets and `log(1 + weight)` hub evidence.
+Split `<SEP>` paths resolve to canonical library keys within the request snapshot.
+Exclusions, alias safety and year bounds apply before the 45-candidate local pool
+cut; externally vouched supplementation remains separate. KG ranks participate
+alongside local ranks in fusion without changing external API terms or their rank
+evidence.
 
-This optional S1 reader opens its own bounded read-only PostgreSQL transaction
-(`default_transaction_read_only=on`, `SET LOCAL hnsw.ef_search=120`) and Neo4j read
-session over the configured knowledge workspace; it does not initialize LightRAG
-stores or mutate derived data. Neo4j follows LightRAG's `chunk-entity-relation`
-database default and read-only home-database fallback on `DatabaseNotFound`.
-Encoding shares S2's serving-loop GPU semaphore and retains its permit until the
-synchronous worker finishes even after caller cancellation; DB reads hold no GPU
-permit. Explicit `PAPERVAULT_SEARCH_KG=0` disables and `1` enables this arm; when unset,
-the runtime checks only legacy `PAPERVAULT_STORAGE_BACKEND=postgres` (not
-`PAPERVAULT_CATALOG_AUTHORITY=postgres`), so PostgreSQL catalog deployments set
-`PAPERVAULT_SEARCH_KG=1` explicitly.
-Missing configuration or PG/Neo4j/BGE failure returns an empty KG list, preserving
-BM25/external serving. This is candidate discovery, not S2 evidence publication.
+This optional S1 reader uses pooled read-only PostgreSQL transactions
+(`default_transaction_read_only=on`, `SET LOCAL hnsw.ef_search=120`) and pooled
+Neo4j read sessions over the configured knowledge workspace under a bounded timeout
+(`PAPERVAULT_SEARCH_KG_TIMEOUT_S`, default `25`s, with DB queries capped at `5`s);
+it does not initialize LightRAG stores or mutate derived data. Neo4j follows
+LightRAG's `chunk-entity-relation` database default and read-only home-database
+fallback on `DatabaseNotFound`. Encoding shares S2's serving-loop GPU semaphore and
+retains its permit until the synchronous worker finishes even after caller
+cancellation; DB reads hold no GPU permit. Explicit `PAPERVAULT_SEARCH_KG=0`
+disables and `1` enables this arm; when unset, the runtime automatically enables it
+when `PAPERVAULT_CATALOG_AUTHORITY=postgres` (or legacy
+`PAPERVAULT_STORAGE_BACKEND=postgres`) is active and the knowledge PostgreSQL/Neo4j
+credentials are present. Missing configuration or PG/Neo4j/BGE failure returns an
+empty KG list, preserving BM25/external serving. This is candidate discovery, not
+S2 evidence publication.
 
 Fusion resolves aliases and compatible bibliographic duplicates while retaining
 external rank evidence. Local BM25/KG/RRF selection and final `by_relevance` ordering
@@ -88,20 +92,26 @@ records the decision.
 The two-way quality fence rejects new garbage through `registration_rejection`
 and excludes bad retained rows through `serving_excluded` / positive
 `deterministic_garbage_reason` evidence. Domain exclusions, policy and quarantine
-also fence serving; missing legacy metadata alone does not. Identity/alias rows
-and research assets remain retained. A `Paper`'s acquisition eligibility is enforced
-by `state_v2.admission`: eligible retrieval, canonical resolved identity, applicable
-policy, no quarantine and valid lease/budget evidence. Scoped policy rulings cannot
-silently release quarantine. Campaign claims reserve durable budgets before dispatch;
-generation/lease fences guard staged publication. Expiry and cancellation never
-prove executor termination or refund uncertain work. Merge intents stop admission
-and require drain before canonical/alias consolidation. Persisted fences survive
-flag changes. Routine purge is refused. Official ADS scans defer identity checking
-to a hash-bound post-OCR verdict before extraction publication.
+also fence serving; missing legacy metadata alone does not. In background knowledge
+distillation, `deterministic_garbage_reason` gates new distillation intake rather
+than `PaperRecord.eligible`, preventing retroactive deletion of pre-fence historical
+graph documents. Identity/alias rows and research assets remain retained. A `Paper`'s
+acquisition eligibility is enforced by `state_v2.admission`: eligible retrieval,
+canonical resolved identity, applicable policy, no quarantine and valid lease/budget
+evidence. Scoped policy rulings cannot silently release quarantine. Campaign claims
+reserve durable budgets before dispatch; generation/lease fences guard staged
+publication. Expiry and cancellation never prove executor termination or refund
+uncertain work. Merge intents stop admission and require drain before canonical/alias
+consolidation. Persisted fences survive flag changes. Routine purge is refused.
+Official ADS scans defer identity checking to a hash-bound post-OCR verdict before
+extraction publication.
 
 **S2 — knowledge and query.** The framework spine is exactly
 `lightrag-hku==1.5.7`, with Neo4j graph and PostgreSQL KV/vector/doc-status stores.
-BGE-M3 embedding and BGE reranking run in process. [ADR-0005](adr/0005-track-latest-lightrag-line-gated.md)
+Local BGE-M3 embedding and BGE reranking run in an on-demand worker subprocess by
+default (`KS_BGE_WORKER_MODE=subprocess`; [ADR-0015](adr/0015-on-demand-bge-worker-subprocess.md)),
+keeping PyTorch and CUDA out of `papervault-mcp` and releasing idle GPU VRAM to
+`0 MiB` under `KS_BGE_IDLE_UNLOAD=1`. [ADR-0005](adr/0005-track-latest-lightrag-line-gated.md)
 requires exact-patch adapter guards, a port map, prompt-content gates, queue-deferral/
 recovery tests, ontology probe and FAST recall evidence for upgrades. Adapters
 preserve LightRAG reducers, ingress/owner arguments, deferred context, retirement
@@ -113,12 +123,18 @@ traversal, caches, aggregation and synthesis. Reader pins protect that view; pol
 compatible inputs and fresh evidence are revalidated against it before return,
 without switching to a newly promoted generation. Multiquery overlaps decomposition
 with anchor retrieval, drains cancellation and gates fan-out on coverage. Evidence
-prioritizes canon, full text, then abstracts; canon comes from textbooks or explicit
-annotations. Production and eval share synthesis and the pure response builder.
+prioritizes `(canon, fulltext)` ahead of `abstract_only`, applying a bounded
+additive canon boost (`KS_MQ_CANON_BOOST`, default `0.10`) for textbooks/explicit
+canon within the primary band and diversifying chunks per paper
+(`KS_MQ_MAX_CHUNKS_PER_PAPER`, default `4`). Synthesis caps prompt input tokens
+(`KS_SYNTH_MAX_PROMPT_TOKENS`, default `160000`) by trimming tail chunks gracefully.
+Production and eval share synthesis and the pure response builder.
 `retrieved_papers` identifies candidates; `cited_papers` contains only verified inline
-`[paper_key]` citations, with operator documents separate. Empty coverage skips
-synthesis; abstract-only evidence is capped at `"weak"`. FAST `--no-synth` uses the
-retrieved-paper citation fallback, not a synthesis-quality measurement.
+`[paper_key]` citations grounded in chunks actually presented to synthesis, with
+operator documents separate and any ungrounded inline citations recorded in
+`query_receipt.unverified_citations`. Empty coverage skips synthesis; abstract-only
+evidence is capped at `"weak"`. FAST `--no-synth` uses the retrieved-paper citation
+fallback, not a synthesis-quality measurement.
 
 ### LLM stage routing
 
@@ -133,10 +149,14 @@ explicitly configured; see
 Three-tier production routes (`build`, `gate`, `verify`, `keyword`, `judge`,
 `decompose`) drain official GLM subscription quota first, step to `relay-glm-*`
 balance, and fall back to Codex `gpt-6.1-terra` — failing over immediately on
-transient upstream errors (`429`, `408`, `5xx`, timeout, `StreamTruncated`) and
-quota/balance exhaustion (`402`, or quota-indicated `400/403/429`) with a
-process-local per-model cooldown (`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`, default
-`120`s), while single-target Codex roles (`intent`, `synth`) use bounded
+transient upstream/transport errors (`429`, `408`, `5xx`, timeout, connection
+errors, `StreamTruncated` including empty/thinking-only completions) with a
+process-local cooldown (`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`, default `120`s), and
+on quota/balance exhaustion (`402`, or quota-indicated `400/403/429`) or
+gateway-wrapped upstream OAuth `token_expired` (`400/401`, excluding client/proxy
+key auth failures) with a longer cooldown (`PAPERVAULT_LLM_QUOTA_COOLDOWN_S`,
+default `600`s). Partial `finish_reason="length"` outputs return
+`TruncatedResponse`, while single-target Codex roles (`intent`, `synth`) use bounded
 same-model retries without cross-model fallback. `eval_judge` defaults to
 two-tier same-family `glm-5.3@max,relay-glm-5.3@max` (without Tier 3 GPT
 fallback) so evaluation runs preserve a single-family ruler invariant. Search

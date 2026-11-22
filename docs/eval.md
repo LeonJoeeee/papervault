@@ -48,13 +48,16 @@ are read at module import, so restart the eval or serving process after changes.
 `eval/run_eval.py` shares production's post-retrieval synthesis and response assembly
 in `knowledge/query/aquery.py` (`synthesize_outfeed` and the pure `build_outfeed`).
 Synthesized results separate `retrieved_papers` from `cited_papers`: the latter
-contains only exact inline `[paper_key]` citations verified against retrieved evidence.
+contains only exact inline `[paper_key]` citations verified against evidence chunks
+actually presented to synthesis (excluding any tail chunks trimmed under
+`KS_SYNTH_MAX_PROMPT_TOKENS`), while ungrounded inline citations are recorded in
+`query_receipt.unverified_citations`.
 In FAST `--no-synth` mode, `cited_papers` explicitly falls back to `retrieved_papers`
 for recall scoring. Raw retrieved chunks and references remain in eval output even
 when coverage is empty or the answer cites only a subset. Empty coverage skips
 synthesis; exclusively `abstract_only` evidence is capped at `"weak"`. The shared
 `query_receipt` records the generation (when catalog-pinned), variant, coverage,
-retrieved/cited counts and synthesis observations.
+retrieved/cited counts, `unverified_citations` and synthesis observations.
 
 ## Gold sets
 
@@ -124,12 +127,14 @@ the shipped values.
 | `KS_MQ_SUB_CHUNK_TOP_K` | `60` | Chunk top-k per sub-query before fusion. |
 | `KS_MQ_ENABLE_RERANK` | `true` | Rerank the fused chunk set on the GPU. |
 | `KS_RERANK_POOL_CAP` | `120` | Prefix-cap the candidate pool fed to the cross-encoder (`0` = off; never caps below the requested top_n). Arbitrated 2026-07-18: 120 is recall-neutral at 1.90× retrieval speed (issue #21). |
-| `KS_MQ_MAX_CHUNKS_PER_PAPER` | `0` | Per-paper chunk cap (`0` = no cap; raise to diversify served papers). |
+| `KS_MQ_MAX_CHUNKS_PER_PAPER` | `4` | Per-paper chunk cap in the served window so one paper or textbook cannot monopolize synthesis context (`0` = no cap). |
+| `KS_MQ_CANON_BOOST` | `0.10` | Bounded additive RRF boost (`boost / KS_MQ_RRF_K`) for canon/textbook chunks within the primary `(canon, fulltext)` band so relevant foundations surface without evicting top consensus papers. |
 | `KS_MQ_MIN_COVERAGE` | `thin` | Minimum anchor coverage required for multi-query fusion; below it, retain anchor evidence. Empty coverage always skips synthesis. |
 | `KS_MQ_CITATION_PRIOR` | `0` | Citation-count prior on fused ranking (`0` = off). |
 | `KS_MQ_CITATION_LAMBDA` | `0.5` | Weight of the citation prior when it is on. |
 | `KS_CITATION_MAP` | unset | Override the citation-map path; otherwise use `PAPERVAULT_CITATION_MAP`, default `<PAPERVAULT_DATA>/citation_map.json`. Used by the optional citation prior. |
 | `KS_MQ_FANOUT` | `1` | Adaptive fan-out on/off (`KS_MQ_FANOUT_MAX`=100, `KS_MQ_FANOUT_SLOPE`=7 shape it). |
+| `KS_SYNTH_MAX_PROMPT_TOKENS` | `160000` | Defensive input-token ceiling for the assembled synthesis prompt; trims tail chunks gracefully (`<= 0` disables). Citation verification scopes strictly to retained chunks. |
 | `KS_SYNTH_STRICT_REFUSAL` | `1` | Refuse to answer on thin/absent evidence (`0` = permissive). |
 | `KS_SYNTH_COVERAGE` | `0` | Coverage-oriented synthesis variant (`1` = on). |
 | `KS_RERANK_MAX_LENGTH` | `4096` | Per-chunk cross-encoder token limit; shortening can change ranking quality. |
@@ -153,7 +158,7 @@ held constant between arms:
 | `PAPERVAULT_EVAL_DIR` | `/data/paper-vault/eval-results` | Root for raw runs and judge artifacts; never a source directory. |
 | `KS_EVAL_ALLOW_COTENANCY` | unset | Exact `1` bypasses the stopped-service guard; workspace checks still apply. |
 | `PAPERVAULT_LLM_SYNTH` | `gpt-6.2-astra@xhigh` | Evidence-grounded synthesis route, shared by production and eval. |
-| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` / `glm-5.3@max,relay-glm-5.3@max` | Decomposition and eval-judge routes (`eval_judge` defaults to two-tier same-family `glm-5.3@max,relay-glm-5.3@max` without Tier 3 GPT fallback so benchmarks preserve the ruler invariant across Zhipu quota windows, failing over on transient or quota-exhaustion upstream errors with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S=120`). |
+| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` / `glm-5.3@max,relay-glm-5.3@max` | Decomposition and eval-judge routes (`eval_judge` defaults to two-tier same-family `glm-5.3@max,relay-glm-5.3@max` without Tier 3 GPT fallback so benchmarks preserve the ruler invariant across Zhipu quota windows, failing over on transient/transport errors with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S=120` and on quota/balance exhaustion or upstream OAuth expiry with `PAPERVAULT_LLM_QUOTA_COOLDOWN_S=600`). |
 
 The retained standalone `judge_mimo` utility honors explicit legacy `KS_GATEWAY_URL`
 and `KS_VIRTUAL_KEY` overrides when set, and otherwise falls back cleanly to

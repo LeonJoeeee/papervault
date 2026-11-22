@@ -129,15 +129,18 @@ catalog (after stripping an optional `openai/` prefix):
 
 Multi-target routes follow the three-tier GLM subscription → `relay-*` balance →
 Codex subscription hierarchy and fail over immediately from a throttled,
-timed-out, or quota-exhausted non-final target (`429`, `408`, `5xx`, timeout,
-`StreamTruncated`, `402`, or quota-indicated `400/403/429`) to the next target,
-cooling down each failed non-final leg for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`
-seconds (default `120`, `<= 0` disables) before probing it again; genuine
-non-quota `400/401/403/422` errors fail fast and single-target roles (`intent`,
-`synth`) never cross-model fallback. `eval_judge` defaults to two-tier
-same-family `glm-5.3@max,relay-glm-5.3@max` (without Tier 3 GPT fallback) to
-preserve a single-family benchmark ruler invariant across Zhipu subscription
-windows.
+timed-out, transport-failed, quota-exhausted, or OAuth-expired non-final target:
+transient errors (`429`, `408`, `5xx`, timeout, connection errors,
+`StreamTruncated`) cool down that leg for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`
+seconds (default `120`, `<= 0` disables), while upstream quota/balance exhaustion
+(`402`, or quota-indicated `400/403/429`) and gateway-wrapped upstream OAuth
+`token_expired` (`400/401`, excluding proxy/API key 401s) cool down that leg for
+`PAPERVAULT_LLM_QUOTA_COOLDOWN_S` seconds (default `600`, `<= 0` disables) before
+probing it again. Genuine non-quota `400/401/403/422` errors fail fast and
+single-target roles (`intent`, `synth`) never cross-model fallback. `eval_judge`
+defaults to two-tier same-family `glm-5.3@max,relay-glm-5.3@max` (without Tier 3
+GPT fallback) to preserve a single-family benchmark ruler invariant across Zhipu
+subscription windows.
 
 The retired symbolic level names (`flash`, `standard`, `pro`, `max`, `ultra` and
 `papervault-*`) are rejected with `ValueError` naming `PAPERVAULT_LLM_<ROLE>`.
@@ -190,10 +193,19 @@ are useful for diagnosis or capacity tuning; defaults come from the current runt
 | `KS_LLM_BACKOFF_JITTER` | `0.75` | Jitter added to direct key-pool retry backoff in seconds. |
 | `KS_GATEWAY_CONN_RETRIES` / `KS_GATEWAY_CONN_BACKOFF_CAP` | `6` / `15` | Unreachable-gateway connection retries and backoff cap in seconds, still bounded by the configured retry budget. |
 | `KS_SLOW_CALL_LOG_S` | `60` | Log successful knowledge LLM calls exceeding this duration in seconds. |
-| `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` | `120` | Process-local primary-model cooldown in seconds after multi-target failover (`<= 0` disables). |
+| `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` | `120` | Process-local primary-model cooldown in seconds after transient/transport multi-target failover (`<= 0` disables). |
+| `PAPERVAULT_LLM_QUOTA_COOLDOWN_S` | `600` | Process-local cooldown in seconds after quota/balance exhaustion or gateway-wrapped upstream OAuth `token_expired` failover (`<= 0` disables; also disabled when unset and `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S <= 0`). |
 | `PAPERVAULT_LIB_FIRST_CHUNK_S` / `PAPERVAULT_LIB_RETRY_BUDGET_S` | `0` / `480` | Library-side pre-first-chunk cutoff (`0` disables; positive seconds opt in) and total retry-admission budget in seconds; separate from the `KS_*` knowledge settings. |
 | `PAPERVAULT_SAVE_MIN_INTERVAL_S` / `PAPERVAULT_BIB_MIN_INTERVAL_S` | `0` / `60` | Non-forced library save debounce and BibTeX refresh cadence in seconds. Forced durable lifecycle saves bypass debounce. |
+| `PAPERVAULT_SERVING_TRACE` | `1` | Emit per-candidate `serving_trace` log lines (`0`/`false`/`no`/`off` suppresses high-volume candidate logs in production). |
+| `PAPERVAULT_MANIFEST_MAX_BYTES` | `52428800` (50 MiB) | In-place atomic tail compaction threshold for `manifest.log` (`<= 0` disables compaction). |
+| `KS_FULL_RECONCILE_INTERVAL_S` | `1800` | Periodic full-reconcile safety interval in seconds while the knowledge scheduler idle fast-path is active. |
+| `PAPERVAULT_SEARCH_KG_TIMEOUT_S` | `25` | End-to-end timeout in seconds for the optional S1 KG search arm (DB queries remain capped at 5 s). |
+| `PAPERVAULT_JUDGE_BATCH_TIMEOUT_S` | `120` | Per-batch timeout in seconds for search ingest/return LLM judge batches. |
+| `PAPERVAULT_EXTRACT_GATE_MAX_CHARS` | `120000` | Extract length threshold (chars, floor `3000`) above which the clarity gate samples annotated head/interior/tail windows instead of sending full text. |
 | `PAPERVAULT_EXTRACT_DEFER_CANARY` | `8` | Maximum deferred extraction recovery canaries promoted per reconcile sweep; `0` disables canaries. |
+| `PAPERVAULT_EXTRACTION_HARDLINK_MIN_BYTES` | `65536` | Minimum PDF size in bytes for TOCTOU-verified hardlink fallback when `FICLONE` reflink is unavailable in `ExtractionStore`. |
+| `PAPERVAULT_MCP_SESSION_IDLE_TIMEOUT_S` | `1800` | Idle HTTP MCP session cleanup timeout in seconds (`PAPERVAULT_MCP_MAX_PRINCIPALS=1024`, `PAPERVAULT_MCP_MAX_TOMBSTONES=256` bound session state maps). |
 | `PAPERVAULT_LOOP_LAG_MONITOR_MS` | `0` | Event-loop stall warning threshold in milliseconds; `0` disables monitoring. |
 | `PAPERVAULT_LOOP_LAG_INTERVAL_MS` / `PAPERVAULT_LOOP_LAG_ROLLUP_S` | `50` / `30` | Monitor sample interval in milliseconds and summary cadence in seconds. |
 | `NEO4J_DATABASE` | sanitized storage namespace | Catalog reader's preferred Neo4j database; it also tries the default database when unavailable. |
@@ -270,11 +282,11 @@ outside the lane's unit-test evidence.
 
 ## BGE worker mode and idle release
 
-By default (`KS_BGE_WORKER_MODE=subprocess`), the local BGE-M3 embedder and
-reranker run inside an on-demand worker subprocess so the long-lived
-`papervault-mcp` server process never imports PyTorch or initializes a CUDA
-context. Set `KS_BGE_WORKER_MODE=inprocess` to restore legacy in-process
-loading.
+By default (`KS_BGE_WORKER_MODE=subprocess`; [ADR-0015](adr/0015-on-demand-bge-worker-subprocess.md)),
+the local BGE-M3 embedder and reranker run inside an on-demand worker subprocess
+so the long-lived `papervault-mcp` server process never imports PyTorch or
+initializes a CUDA context. Set `KS_BGE_WORKER_MODE=inprocess` to restore legacy
+in-process loading.
 
 Both modes support opt-in idle release via `KS_BGE_IDLE_UNLOAD=1` and
 `KS_BGE_IDLE_TIMEOUT=600`. In `subprocess` mode, idle release terminates the

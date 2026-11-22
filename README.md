@@ -12,8 +12,8 @@ server. Claude Code, Codex CLI, Antigravity CLI/IDE and other MCP clients share 
 The factory domain pack and venue authority cover **space physics, space computing, and
 AI4Science**. Read the [PRD](docs/PRD.md) for scope and design philosophy,
 [architecture](docs/architecture.md) for boundaries, [installation guide](docs/INSTALL.md)
-for deployment, and [baselines](docs/baselines.md#post-v01010-retrieval-coverage-hygiene-and-lightrag-157-baseline--2026-10-24)
-for dated measurements. The [constitution and refactor plan](docs/adr/0007-papervault-constitution.md)
+for deployment, and [baselines](docs/baselines.md)
+for dated retrieval, recovery and resource-envelope measurements. The [constitution and refactor plan](docs/adr/0007-papervault-constitution.md)
 govern collection integrity and useful retrieval together.
 
 ## Hardware floor (not optional)
@@ -95,15 +95,17 @@ OpenAI-compatible model IDs (e.g. `gpt-4.1-mini`) accept bare, `@none..@max`, or
 an explicit ceiling env (`KS_LLM_MAX_TOKENS`, `PAPERVAULT_LIB_MAX_TOKENS`,
 `KS_SYNTH_MAX_TOKENS`, `JUDGE_MAX_TOKENS`) or caller cap is set. Multi-target
 routes follow the three-tier GLM subscription → `relay-*` balance → Codex
-subscription order and fail over immediately on transient upstream errors (`429`,
-`408`, `5xx`, timeout, `StreamTruncated`) as well as upstream quota/balance
-exhaustion (`402`, or quota-indicated `400/403/429`), cooling down each failed
-non-final leg for `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` (default `120`s) before
-re-probing; `eval_judge` defaults to two-tier same-family
-`glm-5.3@max,relay-glm-5.3@max` (no cross-family GPT fallback) so benchmarks
-preserve the ruler invariant. Retired `flash`..`ultra` and `papervault-*`
-aliases raise `ValueError`. A supplied test/client handle bypasses role
-selection for that call.
+subscription order and fail over immediately on transient upstream/transport
+errors (`429`, `408`, `5xx`, timeout, connection errors, `StreamTruncated`)
+with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` (default `120`s), as well as upstream
+quota/balance exhaustion (`402`, or quota-indicated `400/403/429`) and
+gateway-wrapped upstream OAuth `token_expired` (`400/401`, excluding client/proxy
+key auth failures) with `PAPERVAULT_LLM_QUOTA_COOLDOWN_S` (default `600`s)
+before re-probing each cooled-down non-final leg; `eval_judge` defaults to
+two-tier same-family `glm-5.3@max,relay-glm-5.3@max` (no cross-family GPT
+fallback) so benchmarks preserve the ruler invariant. Retired `flash`..`ultra`
+and `papervault-*` aliases raise `ValueError`. A supplied test/client handle
+bypasses role selection for that call.
 
 | Plane and stage | Role | Default |
 | --- | --- | --- |
@@ -169,13 +171,15 @@ path within those boundaries; they are not six separate services.
    supplement. Explicit recency/importance ordering bypasses this prior.
 
    `PAPERVAULT_SEARCH_KG=0` disables this optional arm, and `PAPERVAULT_SEARCH_KG=1`
-   explicitly enables it. When unset, the runtime currently checks only the legacy
-   `PAPERVAULT_STORAGE_BACKEND=postgres` flag (not `PAPERVAULT_CATALOG_AUTHORITY=postgres`),
-   so PostgreSQL catalog deployments (`PAPERVAULT_CATALOG_AUTHORITY=postgres`) must set
-   `PAPERVAULT_SEARCH_KG=1` explicitly to enable KG candidate discovery. Configure the knowledge database with `POSTGRES_*`
+   explicitly enables it. When unset, the runtime automatically enables it when
+   `PAPERVAULT_CATALOG_AUTHORITY=postgres` (or legacy
+   `PAPERVAULT_STORAGE_BACKEND=postgres`) is active and the knowledge database
+   credentials are configured. Configure the knowledge database with `POSTGRES_*`
    (not the catalog DSN), `POSTGRES_WORKSPACE` and `NEO4J_*`; any explicit Neo4j
-   workspace must match. Queries use PostgreSQL read-only transactions with
-   `hnsw.ef_search=120` and Neo4j read sessions, without schema initialization.
+   workspace must match. Queries use pooled PostgreSQL read-only transactions with
+   `hnsw.ef_search=120` and pooled Neo4j read sessions under a bounded timeout
+   (`PAPERVAULT_SEARCH_KG_TIMEOUT_S`, default `25`s, DB queries capped at `5`s),
+   without schema initialization.
    When `NEO4J_DATABASE` is unset, the reader tries LightRAG's
    `chunk-entity-relation` database and falls back to the home database only if
    the preferred database does not exist. Encoding shares S2's GPU admission
@@ -259,6 +263,9 @@ reads and acquisition from positively identified bad legacy rows. The latter che
 domain status, acquisition quarantine, explicitly excluded policy, and
 `deterministic_garbage_reason`: conference abstracts, positively classified non-papers
 or anonymous first authors. Missing legacy metadata alone is insufficient to exclude.
+In background knowledge distillation, `deterministic_garbage_reason` gates new
+distillation intake rather than `PaperRecord.eligible`, preventing retroactive
+deletion of pre-fence already-distilled graph documents.
 Aliases and identity rows remain durable, preventing rediscovery from allocating the
 same junk again. Routine `JANITOR_PURGE` / `Library.purge()` deletion is retired.
 
@@ -279,8 +286,11 @@ executor drain and quarantines uncertain work.
 ## Knowledge engine and query evidence
 
 The framework spine is **`lightrag-hku==1.5.7`**, with Neo4j graph storage and
-PostgreSQL KV, vector and document-status stores. BGE-M3 embedding and the BGE
-reranker run in process on the GPU. A domain pack supplies a closed entity ontology,
+PostgreSQL KV, vector and document-status stores. Local BGE-M3 embedding and the
+BGE reranker run in an on-demand worker subprocess by default
+(`KS_BGE_WORKER_MODE=subprocess`; [ADR-0015](docs/adr/0015-on-demand-bge-worker-subprocess.md)),
+keeping PyTorch and CUDA out of `papervault-mcp` and releasing idle GPU VRAM to
+`0 MiB` under `KS_BGE_IDLE_UNLOAD=1`. A domain pack supplies a closed entity ontology,
 extraction guidance and examples. The exact patch pin and fail-loud private-hook
 adapter guards follow [ADR-0005](docs/adr/0005-track-latest-lightrag-line-gated.md):
 an upgrade needs a fresh port map, prompt gates, pause/deferral and recovery tests,
@@ -298,16 +308,23 @@ generation. Reader pins protect dependencies; policy, input compatibility and fr
 evidence are rechecked against that same view before returning. Promotion cannot
 switch an in-flight query to another generation. Multiquery overlaps decomposition
 with anchor retrieval, drains cancelled decomposition and gates fan-out on coverage.
-Evidence prioritizes `canon`, then `fulltext`, then `abstract_only`; textbooks and
-explicit canon annotations establish canon status.
+Evidence prioritizes `(canon, fulltext)` ahead of `abstract_only`: textbooks and
+explicit canon annotations receive a bounded additive RRF boost
+(`KS_MQ_CANON_BOOST`, default `0.10`) within the primary band, and per-paper chunk
+diversification (`KS_MQ_MAX_CHUNKS_PER_PAPER`, default `4`) prevents one source
+from monopolizing synthesis context. Synthesis caps prompt input tokens
+(`KS_SYNTH_MAX_PROMPT_TOKENS`, default `160000`) by trimming tail chunks gracefully.
 
 Production and eval share synthesis and the pure `build_outfeed` response builder.
 `retrieved_papers` lists evidence candidates; `cited_papers` contains only exact
-inline `[paper_key]` citations verified against that pool. Operator documents are
-reported separately. Empty coverage skips synthesis; exclusively abstract evidence
-can reach at most `"weak"` coverage. `query_receipt` exposes generation, variant,
-coverage, retrieved/cited counts, reranker degradation and synthesis observations.
-FAST `--no-synth` eval explicitly uses retrieved papers as its citation fallback.
+inline `[paper_key]` citations verified against evidence chunks actually presented
+to synthesis (excluding any trimmed tail chunks), while any ungrounded inline
+citations are recorded in `query_receipt.unverified_citations`. Operator documents
+are reported separately. Empty coverage skips synthesis; exclusively abstract
+evidence can reach at most `"weak"` coverage. `query_receipt` exposes generation,
+variant, coverage, retrieved/cited counts, `unverified_citations`, reranker
+degradation and synthesis observations. FAST `--no-synth` eval explicitly uses
+retrieved papers as its citation fallback.
 
 ## Catalog authority (P2)
 

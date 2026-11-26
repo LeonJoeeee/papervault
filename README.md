@@ -84,7 +84,8 @@ or lifecycle logic.
 Every text LLM call selects one of nine roles via `PAPERVAULT_LLM_<ROLE>`
 (`<model>[@<modifier>][,<fallback>...]`; unset or blank uses the defaults below).
 Modifiers are validated per model family against the transparent LLM Gateway
-catalog: `glm-*`/`relay-glm-*` accept bare or `@low|@high|@max`
+catalog: `glm-5.4*` accepts bare or `@low|@medium|@high|@max` and other
+`glm-*`/`relay-glm-*` accept bare or `@low|@high|@max`
 (always-on thinking); `gpt-6.2-astra*`/`gpt-6.2-sol*`/`gpt-6-astra*`/`gpt-6.1-sol*`
 accept bare or `@low..@max`; `gpt-6.1-terra*`/`gpt-6-luna*` accept bare or
 `@none..@max`; `deepseek-v4*`/`deepseek-flash*`/`relay-deepseek-*` accept bare,
@@ -102,8 +103,9 @@ quota/balance exhaustion (`402`, or quota-indicated `400/403/429`) and
 gateway-wrapped upstream OAuth `token_expired` (`400/401`, excluding client/proxy
 key auth failures) with `PAPERVAULT_LLM_QUOTA_COOLDOWN_S` (default `600`s)
 before re-probing each cooled-down non-final leg; `eval_judge` defaults to
-two-tier same-family `glm-5.3@max,relay-glm-5.3@max` (no cross-family GPT
-fallback) so benchmarks preserve the ruler invariant. Retired `flash`..`ultra`
+two-tier same-family `glm-5.4@max,relay-glm-5.3@max` (no cross-family GPT
+fallback; pin `PAPERVAULT_LLM_EVAL_JUDGE=glm-5.4@max` for strict single-version
+arbitration while the relay remains on `glm-5.3`). Retired `flash`..`ultra`
 and `papervault-*` aliases raise `ValueError`. A supplied test/client handle
 bypasses role selection for that call.
 
@@ -113,11 +115,11 @@ bypasses role selection for that call.
 | S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
 | S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
 | S1 extracted-text chunk clarity review and document completeness gate | `gate` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
+| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
 | S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
 | S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` |
 | S2 evidence-grounded answer synthesis, including eval | `synth` | `gpt-6.2-astra@xhigh` |
-| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.3@max,relay-glm-5.3@max` |
+| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.4@max,relay-glm-5.3@max` |
 
 Embedding (BGE-M3), reranking and OCR use their existing local/service paths and
 do not select text LLM roles. The prompt examples calibrate the planner, both

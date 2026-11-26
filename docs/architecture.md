@@ -158,8 +158,9 @@ key auth failures) with a longer cooldown (`PAPERVAULT_LLM_QUOTA_COOLDOWN_S`,
 default `600`s). Partial `finish_reason="length"` outputs return
 `TruncatedResponse`, while single-target Codex roles (`intent`, `synth`) use bounded
 same-model retries without cross-model fallback. `eval_judge` defaults to
-two-tier same-family `glm-5.3@max,relay-glm-5.3@max` (without Tier 3 GPT
-fallback) so evaluation runs preserve a single-family ruler invariant. Search
+two-tier same-family `glm-5.4@max,relay-glm-5.3@max` (without Tier 3 GPT
+fallback; pin `PAPERVAULT_LLM_EVAL_JUDGE=glm-5.4@max` for strict single-version
+arbitration while the relay remains on `glm-5.3`). Search
 intent selects its own handle; the ingest and return gates share the judge
 handle.
 
@@ -169,11 +170,11 @@ handle.
 | S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
 | S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
 | S1 extracted-chunk clarity review and whole-document completeness | `gate` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
+| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
 | S2 query high/low-level keyword extraction when needed | `keyword` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
 | S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` |
 | S2 evidence-grounded synthesis (production/eval) | `synth` | `gpt-6.2-astra@xhigh` |
-| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.3@max,relay-glm-5.3@max` |
+| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.4@max,relay-glm-5.3@max` |
 
 Planner, gate, verification and decomposition prompts include concrete calibration
 examples. Local embedding/reranking and the MinerU OCR service remain outside text

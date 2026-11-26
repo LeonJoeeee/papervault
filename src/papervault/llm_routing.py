@@ -39,14 +39,14 @@ _MIMO_GATEWAY_PREFIXES = ("mimo-v2.6-", "relay-mimo-v2.6-")
 
 _DEFAULT_ROUTES: dict[str, str] = {
     "intent": "gpt-6.1-terra@high",
-    "build": "glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high",
-    "keyword": "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low",
+    "build": "glm-5.4@max,gpt-6.1-terra@high",
+    "keyword": "glm-5.3-flash@low,gpt-6.1-terra@low",
     "synth": "gpt-6.2-astra@xhigh",
-    "gate": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium",
-    "verify": "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low",
-    "judge": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium",
-    "decompose": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high",
-    "eval_judge": "glm-5.4@max,relay-glm-5.3@max",
+    "gate": "glm-5.3-flash@high,gpt-6.1-terra@medium",
+    "verify": "glm-5.3-flash@low,gpt-6.1-terra@low",
+    "judge": "glm-5.3-flash@high,gpt-6.1-terra@medium",
+    "decompose": "glm-5.3-flash@high,gpt-6.1-terra@high",
+    "eval_judge": "glm-5.4@max",
 }
 ROLES = tuple(_DEFAULT_ROUTES)
 

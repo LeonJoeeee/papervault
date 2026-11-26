@@ -23,14 +23,14 @@ from papervault.llm_routing import (
 
 ROLE_DEFAULTS = [
     ("intent", "gpt-6.1-terra@high"),
-    ("build", "glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high"),
-    ("keyword", "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"),
+    ("build", "glm-5.4@max,gpt-6.1-terra@high"),
+    ("keyword", "glm-5.3-flash@low,gpt-6.1-terra@low"),
     ("synth", "gpt-6.2-astra@xhigh"),
-    ("gate", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"),
-    ("verify", "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"),
-    ("judge", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"),
-    ("decompose", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high"),
-    ("eval_judge", "glm-5.4@max,relay-glm-5.3@max"),
+    ("gate", "glm-5.3-flash@high,gpt-6.1-terra@medium"),
+    ("verify", "glm-5.3-flash@low,gpt-6.1-terra@low"),
+    ("judge", "glm-5.3-flash@high,gpt-6.1-terra@medium"),
+    ("decompose", "glm-5.3-flash@high,gpt-6.1-terra@high"),
+    ("eval_judge", "glm-5.4@max"),
 ]
 
 
@@ -81,28 +81,23 @@ def test_role_default_target_objects():
     for role in ("verify", "keyword"):
         assert parse_targets(route(role)) == (
             ModelTarget("glm-5.3-flash", reasoning_effort="low"),
-            ModelTarget("relay-glm-5.3-flash", reasoning_effort="low"),
             ModelTarget("gpt-6.1-terra", reasoning_effort="low"),
         )
     for role in ("gate", "judge"):
         assert parse_targets(route(role)) == (
             ModelTarget("glm-5.3-flash", reasoning_effort="high"),
-            ModelTarget("relay-glm-5.3-flash", reasoning_effort="high"),
             ModelTarget("gpt-6.1-terra", reasoning_effort="medium"),
         )
     assert parse_targets(route("decompose")) == (
         ModelTarget("glm-5.3-flash", reasoning_effort="high"),
-        ModelTarget("relay-glm-5.3-flash", reasoning_effort="high"),
         ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
     )
     assert parse_targets(route("build")) == (
         ModelTarget("glm-5.4", reasoning_effort="max"),
-        ModelTarget("relay-glm-5.3", reasoning_effort="max"),
         ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
     )
     assert parse_targets(route("eval_judge")) == (
         ModelTarget("glm-5.4", reasoning_effort="max"),
-        ModelTarget("relay-glm-5.3", reasoning_effort="max"),
     )
 
 
@@ -412,10 +407,10 @@ def test_retired_legacy_env_vars_ignored(monkeypatch):
         "MIMO_MODEL",
     ):
         monkeypatch.setenv(var, "legacy-ignored-model")
-    assert route("build") == "glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high"
-    assert route("keyword") == "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"
-    assert route("verify") == "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"
-    assert route("eval_judge") == "glm-5.4@max,relay-glm-5.3@max"
+    assert route("build") == "glm-5.4@max,gpt-6.1-terra@high"
+    assert route("keyword") == "glm-5.3-flash@low,gpt-6.1-terra@low"
+    assert route("verify") == "glm-5.3-flash@low,gpt-6.1-terra@low"
+    assert route("eval_judge") == "glm-5.4@max"
 
 
 def test_wire_kwargs_builders():
@@ -549,14 +544,14 @@ def test_doctor_accepts_concrete_route_defaults(tmp_path, monkeypatch, capsys):
     cli._check_config(report)
     assert report.failures == 0
     output = capsys.readouterr().out
-    assert "build=glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high" in output
+    assert "build=glm-5.4@max,gpt-6.1-terra@high" in output
     assert "synth=gpt-6.2-astra@xhigh" in output
-    assert "keyword=glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low" in output
-    assert "judge=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium" in output
-    assert "gate=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium" in output
-    assert "verify=glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low" in output
-    assert "decompose=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high" in output
-    assert "eval_judge=glm-5.4@max,relay-glm-5.3@max" in output
+    assert "keyword=glm-5.3-flash@low,gpt-6.1-terra@low" in output
+    assert "judge=glm-5.3-flash@high,gpt-6.1-terra@medium" in output
+    assert "gate=glm-5.3-flash@high,gpt-6.1-terra@medium" in output
+    assert "verify=glm-5.3-flash@low,gpt-6.1-terra@low" in output
+    assert "decompose=glm-5.3-flash@high,gpt-6.1-terra@high" in output
+    assert "eval_judge=glm-5.4@max" in output
 
 
 def test_doctor_reports_retired_or_invalid_role_override(tmp_path, monkeypatch, capsys):
@@ -643,7 +638,35 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
     )
     monkeypatch.setattr(judge_mimo.JA, "validate_judge_json", lambda d, n_gold_nuggets=None: None)
 
-    # --- A. Default eval_judge='glm-5.4@max,relay-glm-5.3@max': two-tier same-family ruler invariant ---
+    # --- A. Default eval_judge='glm-5.4@max': single-target ruler invariant (no cross-model fallback) ---
+    clear_fallback_cooldowns()
+    jm_single, jm_single_calls = make_client([FakeHTTPError(429), valid_judge_reply])
+    counters_single = {"ok": 0, "skip": 0, "fail": 0}
+    res_single = await judge_mimo._judge_one(
+        jm_single,
+        asyncio.Semaphore(1),
+        "vmq_r1",
+        "q1",
+        {"qid": "q1", "gold_keys": ["K1"], "nuggets": ["n1"]},
+        True,
+        counters_single,
+    )
+    assert res_single == ("vmq_r1", "q1", "ok", "attempt=2")
+    assert [c["model"] for c in jm_single_calls] == ["glm-5.4", "glm-5.4"]
+    assert all(c["reasoning_effort"] == "max" and "extra_body" not in c for c in jm_single_calls)
+    assert not is_model_cooled_down("glm-5.4")
+
+    # Single-target default raises on persistent 429 rather than crossing model families:
+    clear_fallback_cooldowns()
+    srb_single_down, srb_single_calls = make_client([FakeHTTPError(429, "weekly limit"), FakeHTTPError(429, "weekly limit")])
+    with pytest.raises(FakeHTTPError):
+        await srb._judge(
+            srb_single_down, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
+        )
+    assert [c["model"] for c in srb_single_calls] == ["glm-5.4", "glm-5.4"]
+
+    # --- B. Explicit multi-target override: same-family two-tier failover and cooldown ---
+    monkeypatch.setenv("PAPERVAULT_LLM_EVAL_JUDGE", "glm-5.4@max,relay-glm-5.3@max")
     clear_fallback_cooldowns()
     srb_client, srb_calls = make_client(
         [
@@ -726,24 +749,6 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
     assert res == ("vmq_r1", "q1", "ok", "attempt=1")
     assert [c["model"] for c in jm_calls] == ["glm-5.4", "relay-glm-5.3"]
 
-    # --- B. Explicit single-target override stays on glm-5.3 across outer retries ---
-    monkeypatch.setenv("PAPERVAULT_LLM_EVAL_JUDGE", "glm-5.3@max")
-    clear_fallback_cooldowns()
-    jm_single, jm_single_calls = make_client([FakeHTTPError(429), valid_judge_reply])
-    counters_single = {"ok": 0, "skip": 0, "fail": 0}
-    res_single = await judge_mimo._judge_one(
-        jm_single,
-        asyncio.Semaphore(1),
-        "vmq_r1",
-        "q1",
-        {"qid": "q1", "gold_keys": ["K1"], "nuggets": ["n1"]},
-        True,
-        counters_single,
-    )
-    assert res_single == ("vmq_r1", "q1", "ok", "attempt=2")
-    assert [c["model"] for c in jm_single_calls] == ["glm-5.3", "glm-5.3"]
-    assert not is_model_cooled_down("glm-5.3")
-
     # --- C. 3-hop failover: glm -> relay (402 / 403 quota) -> gpt-6.1-terra ---
     monkeypatch.setenv(
         "PAPERVAULT_LLM_EVAL_JUDGE",
@@ -795,7 +800,7 @@ def test_extraction_registration_effective_recipe_records_max_tokens_and_digest(
     default_recipe = effective_recipe("mineru2.5-pro")
     assert (
         default_recipe["gate"]["configured_model"]
-        == "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"
+        == "glm-5.3-flash@high,gpt-6.1-terra@medium"
     )
     assert default_recipe["gate"]["max_tokens"] is None
     canon_default, digest_default = canonical_recipe(default_recipe)

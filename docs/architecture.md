@@ -146,9 +146,9 @@ explicitly configured; see
 [ADR-0012](adr/0012-direct-role-model-routing-and-glm-fallback.md),
 [ADR-0013](adr/0013-effort-tiered-role-routing-and-omitted-max-tokens.md), and
 [ADR-0014](adr/0014-three-tier-glm-relay-codex-routing-and-gpt62.md).
-Three-tier production routes (`build`, `gate`, `verify`, `keyword`, `judge`,
-`decompose`) drain official GLM subscription quota first, step to `relay-glm-*`
-balance, and fall back to Codex `gpt-6.1-terra` — failing over immediately on
+Two-tier production routes (`build`, `gate`, `verify`, `keyword`, `judge`,
+`decompose`) drain official GLM subscription quota first and fall back
+directly to Codex `gpt-6.1-terra` — failing over immediately on
 transient upstream/transport errors (`429`, `408`, `5xx`, timeout, connection
 errors, `StreamTruncated` including empty/thinking-only completions) with a
 process-local cooldown (`PAPERVAULT_LLM_FALLBACK_COOLDOWN_S`, default `120`s), and
@@ -156,25 +156,24 @@ on quota/balance exhaustion (`402`, or quota-indicated `400/403/429`) or
 gateway-wrapped upstream OAuth `token_expired` (`400/401`, excluding client/proxy
 key auth failures) with a longer cooldown (`PAPERVAULT_LLM_QUOTA_COOLDOWN_S`,
 default `600`s). Partial `finish_reason="length"` outputs return
-`TruncatedResponse`, while single-target Codex roles (`intent`, `synth`) use bounded
-same-model retries without cross-model fallback. `eval_judge` defaults to
-two-tier same-family `glm-5.4@max,relay-glm-5.3@max` (without Tier 3 GPT
-fallback; pin `PAPERVAULT_LLM_EVAL_JUDGE=glm-5.4@max` for strict single-version
-arbitration while the relay remains on `glm-5.3`). Search
+`TruncatedResponse`, while single-target roles (`intent`, `synth`, `eval_judge`) use bounded
+same-model retries without cross-model fallback (`eval_judge` defaults to
+single-target `glm-5.4@max` so benchmarks preserve a strict single-version
+ruler invariant). Search
 intent selects its own handle; the ingest and return gates share the judge
 handle.
 
 | Plane / LLM stage | Role | Default |
 | --- | --- | --- |
 | S1 intent parsing (API terms, local KG concepts, filters and ranking hints) | `intent` | `gpt-6.1-terra@high` |
-| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
-| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
-| S2 query high/low-level keyword extraction when needed | `keyword` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
-| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` |
+| S1 ingest/domain and return relevance judgments; fuzzy paper resolution | `judge` | `glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S1 extracted-chunk clarity review and whole-document completeness | `gate` | `glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S2 build entity/relation extraction and merge summaries | `build` | `glm-5.4@max,gpt-6.1-terra@high` |
+| S2 query high/low-level keyword extraction when needed | `keyword` | `glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S2 multiquery decomposition and source-count/fan-out planning (production/eval) | `decompose` | `glm-5.3-flash@high,gpt-6.1-terra@high` |
 | S2 evidence-grounded synthesis (production/eval) | `synth` | `gpt-6.2-astra@xhigh` |
-| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.4@max,relay-glm-5.3@max` |
+| Evaluation answer/refusal scoring | `eval_judge` | `glm-5.4@max` |
 
 Planner, gate, verification and decomposition prompts include concrete calibration
 examples. Local embedding/reranking and the MinerU OCR service remain outside text

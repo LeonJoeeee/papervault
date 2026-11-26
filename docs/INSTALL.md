@@ -101,15 +101,15 @@ from its role (`<model>[@<modifier>][,<fallback>...]`). Defaults are:
 
 | Role | Default route | Override |
 | --- | --- | --- |
-| Graph extraction/merge | `glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
-| Query keyword extraction | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_KEYWORD` |
+| Graph extraction/merge | `glm-5.4@max,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
+| Query keyword extraction | `glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_KEYWORD` |
 | Answer synthesis | `gpt-6.2-astra@xhigh` | `PAPERVAULT_LLM_SYNTH` |
-| Extract clarity/completeness gates | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_GATE` |
-| PDF metadata verification | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_VERIFY` |
+| Extract clarity/completeness gates | `glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_GATE` |
+| PDF metadata verification | `glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_VERIFY` |
 | Library search intent | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_INTENT` |
-| Library judges/resolver/re-rank | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_JUDGE` |
-| Decomposition (production multiquery and eval) | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` | `PAPERVAULT_LLM_DECOMPOSE` |
-| Eval judges | `glm-5.4@max,relay-glm-5.3@max` | `PAPERVAULT_LLM_EVAL_JUDGE` |
+| Library judges/resolver/re-rank | `glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_JUDGE` |
+| Decomposition (production multiquery and eval) | `glm-5.3-flash@high,gpt-6.1-terra@high` | `PAPERVAULT_LLM_DECOMPOSE` |
+| Eval judges | `glm-5.4@max` | `PAPERVAULT_LLM_EVAL_JUDGE` |
 
 Modifiers are validated per family against the transparent LLM Gateway
 catalog (after stripping an optional `openai/` prefix):
@@ -129,7 +129,7 @@ catalog (after stripping an optional `openai/` prefix):
 - Other OpenAI-compatible model IDs (e.g. `PAPERVAULT_LLM_JUDGE=gpt-4.1-mini`):
   bare, `@none..@max`, `@thinking`, or `@nothinking`.
 
-Multi-target routes follow the three-tier GLM subscription → `relay-*` balance →
+Multi-target routes follow the two-tier official GLM subscription →
 Codex subscription hierarchy and fail over immediately from a throttled,
 timed-out, transport-failed, quota-exhausted, or OAuth-expired non-final target:
 transient errors (`429`, `408`, `5xx`, timeout, connection errors,
@@ -139,10 +139,9 @@ seconds (default `120`, `<= 0` disables), while upstream quota/balance exhaustio
 `token_expired` (`400/401`, excluding proxy/API key 401s) cool down that leg for
 `PAPERVAULT_LLM_QUOTA_COOLDOWN_S` seconds (default `600`, `<= 0` disables) before
 probing it again. Genuine non-quota `400/401/403/422` errors fail fast and
-single-target roles (`intent`, `synth`) never cross-model fallback. `eval_judge`
-defaults to two-tier same-family `glm-5.4@max,relay-glm-5.3@max` (without Tier 3
-GPT fallback; pin `PAPERVAULT_LLM_EVAL_JUDGE=glm-5.4@max` when strict
-single-version arbitration is required while the relay remains on `glm-5.3`).
+single-target roles (`intent`, `synth`, `eval_judge`) never cross-model fallback. `eval_judge`
+defaults to single-target `glm-5.4@max` so evaluation runs preserve a strict
+single-version ruler invariant.
 
 The retired symbolic level names (`flash`, `standard`, `pro`, `max`, `ultra` and
 `papervault-*`) are rejected with `ValueError` naming `PAPERVAULT_LLM_<ROLE>`.

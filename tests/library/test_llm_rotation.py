@@ -200,7 +200,7 @@ def test_gateway_on_returns_proxy_llm(monkeypatch):
     monkeypatch.delenv("PAPERVAULT_LLM_JUDGE", raising=False)
     monkeypatch.setattr(L, "_DEFAULT_MAX_TOKENS", None)
     monkeypatch.setattr(L, "_gw_llms", {})
-    got = L.get_llm()                       # default library role → judge (3-tier)
+    got = L.get_llm()                       # default library role → judge (2-tier)
     assert isinstance(got, FakeLLM)         # L.LLM is monkeypatched to FakeLLM by _reset
     assert got.kw == {
         "model": "openai/glm-5.3-flash",
@@ -208,7 +208,7 @@ def test_gateway_on_returns_proxy_llm(monkeypatch):
         "api_key": "sk-test",
         "max_tokens": None,
         "num_retries": 0,
-        "targets": parse_targets("glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"),
+        "targets": parse_targets("glm-5.3-flash@high,gpt-6.1-terra@medium"),
     }
     # An explicit multi-target gate route preserves its output ceiling and parsed target chain.
     gate_spec = "glm-5.3-flash@high,gpt-6.1-terra@medium"

@@ -39,7 +39,7 @@ corpus, so the harness splits into what CI can prove and what only reference har
   above and populate it with the corpus you want scored.
 
 Production `KS_QUERY_VARIANT` defaults to `multiquery`, whose decomposition uses
-`PAPERVAULT_LLM_DECOMPOSE` (default `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high`), as does eval's `--variant multiquery`.
+`PAPERVAULT_LLM_DECOMPOSE` (default `glm-5.3-flash@high,gpt-6.1-terra@high`), as does eval's `--variant multiquery`.
 Eval selects its variant with `--variant` (`baseline` by default, also `multiquery`
 and `standard`); `KS_QUERY_VARIANT` does not override that CLI choice. Specify the
 variant explicitly when comparing production retrieval. Most query settings below
@@ -158,7 +158,7 @@ held constant between arms:
 | `PAPERVAULT_EVAL_DIR` | `/data/paper-vault/eval-results` | Root for raw runs and judge artifacts; never a source directory. |
 | `KS_EVAL_ALLOW_COTENANCY` | unset | Exact `1` bypasses the stopped-service guard; workspace checks still apply. |
 | `PAPERVAULT_LLM_SYNTH` | `gpt-6.2-astra@xhigh` | Evidence-grounded synthesis route, shared by production and eval. |
-| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` / `glm-5.4@max,relay-glm-5.3@max` | Decomposition and eval-judge routes (`eval_judge` defaults to two-tier same-family `glm-5.4@max,relay-glm-5.3@max` without Tier 3 GPT fallback — note that while the third-party relay remains on `relay-glm-5.3`, a quota failover steps down one GLM minor version, so pin `PAPERVAULT_LLM_EVAL_JUDGE=glm-5.4@max` or `glm-5.3@max` when strict single-version arbitration or historical GLM-5.3 baseline reproduction is required; fails over on transient/transport errors with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S=120` and on quota/balance exhaustion or upstream OAuth expiry with `PAPERVAULT_LLM_QUOTA_COOLDOWN_S=600`). |
+| `PAPERVAULT_LLM_DECOMPOSE` / `PAPERVAULT_LLM_EVAL_JUDGE` | `glm-5.3-flash@high,gpt-6.1-terra@high` / `glm-5.4@max` | Decomposition and eval-judge routes (`eval_judge` defaults to single-target `glm-5.4@max` without cross-model fallback so benchmarks preserve a strict single-version ruler invariant; pin `PAPERVAULT_LLM_EVAL_JUDGE=glm-5.3@max` when reproducing a historical GLM-5.3 baseline; multi-target roles fail over on transient/transport errors with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S=120` and on quota/balance exhaustion or upstream OAuth expiry with `PAPERVAULT_LLM_QUOTA_COOLDOWN_S=600`). |
 
 The retained standalone `judge_mimo` utility honors explicit legacy `KS_GATEWAY_URL`
 and `KS_VIRTUAL_KEY` overrides when set, and otherwise falls back cleanly to

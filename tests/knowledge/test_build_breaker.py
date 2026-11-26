@@ -434,8 +434,8 @@ async def test_main_loop_defers_operator_doc_pickup_while_open(breaker, fake_led
 @pytest.mark.parametrize(
     "keyword,want",
     [
-        (False, "glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high"),
-        (True, "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"),
+        (False, "glm-5.4@max,gpt-6.1-terra@high"),
+        (True, "glm-5.3-flash@low,gpt-6.1-terra@low"),
     ],
 )
 async def test_graph_uses_role_route_over_inherited_model(breaker, monkeypatch, keyword, want):

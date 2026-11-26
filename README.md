@@ -95,7 +95,7 @@ OpenAI-compatible model IDs (e.g. `gpt-4.1-mini`) accept bare, `@none..@max`, or
 `@thinking|@nothinking`. `max_tokens` is omitted on the wire by default unless
 an explicit ceiling env (`KS_LLM_MAX_TOKENS`, `PAPERVAULT_LIB_MAX_TOKENS`,
 `KS_SYNTH_MAX_TOKENS`, `JUDGE_MAX_TOKENS`) or caller cap is set. Multi-target
-routes follow the three-tier GLM subscription → `relay-*` balance → Codex
+routes follow the two-tier official GLM subscription → Codex
 subscription order and fail over immediately on transient upstream/transport
 errors (`429`, `408`, `5xx`, timeout, connection errors, `StreamTruncated`)
 with `PAPERVAULT_LLM_FALLBACK_COOLDOWN_S` (default `120`s), as well as upstream
@@ -103,23 +103,22 @@ quota/balance exhaustion (`402`, or quota-indicated `400/403/429`) and
 gateway-wrapped upstream OAuth `token_expired` (`400/401`, excluding client/proxy
 key auth failures) with `PAPERVAULT_LLM_QUOTA_COOLDOWN_S` (default `600`s)
 before re-probing each cooled-down non-final leg; `eval_judge` defaults to
-two-tier same-family `glm-5.4@max,relay-glm-5.3@max` (no cross-family GPT
-fallback; pin `PAPERVAULT_LLM_EVAL_JUDGE=glm-5.4@max` for strict single-version
-arbitration while the relay remains on `glm-5.3`). Retired `flash`..`ultra`
+single-target `glm-5.4@max` (no cross-model fallback) so benchmarks preserve
+the single-ruler invariant. Retired `flash`..`ultra`
 and `papervault-*` aliases raise `ValueError`. A supplied test/client handle
 bypasses role selection for that call.
 
 | Plane and stage | Role | Default |
 | --- | --- | --- |
 | S1 search intent: API terms and local KG concepts in one call | `intent` | `gpt-6.1-terra@high` |
-| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
-| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` |
-| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high` |
-| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` |
-| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` |
+| S1 ingest/domain and return relevance judges; fuzzy `get_paper` resolution | `judge` | `glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S1 downloaded PDF identity verification | `verify` | `glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S1 extracted-text chunk clarity review and document completeness gate | `gate` | `glm-5.3-flash@high,gpt-6.1-terra@medium` |
+| S2 knowledge build: entity/relation extraction and merge summaries | `build` | `glm-5.4@max,gpt-6.1-terra@high` |
+| S2 query high/low-level keyword extraction when not supplied by decomposition | `keyword` | `glm-5.3-flash@low,gpt-6.1-terra@low` |
+| S2 multiquery decomposition and source-count/fan-out planning, including eval | `decompose` | `glm-5.3-flash@high,gpt-6.1-terra@high` |
 | S2 evidence-grounded answer synthesis, including eval | `synth` | `gpt-6.2-astra@xhigh` |
-| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.4@max,relay-glm-5.3@max` |
+| Evaluation answer and refusal judgments | `eval_judge` | `glm-5.4@max` |
 
 Embedding (BGE-M3), reranking and OCR use their existing local/service paths and
 do not select text LLM roles. The prompt examples calibrate the planner, both
@@ -192,8 +191,8 @@ path within those boundaries; they are not six separate services.
    against the domain-pack tiers and paper classification. Source publication types
    take precedence when conclusive; an LLM paper/non-paper judgment fills missing
    metadata. Production search passes a shared judge handle to its gates, defaulting
-   to `PAPERVAULT_LLM_JUDGE=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium`;
-   the separate extraction `gate` role shares that same three-tier default. The stage name does not select a model.
+   to `PAPERVAULT_LLM_JUDGE=glm-5.3-flash@high,gpt-6.1-terra@medium`;
+   the separate extraction `gate` role shares that same two-tier default. The stage name does not select a model.
 4. **Stage 4 — relevance and quality gates.** `registration_rejection` screens the
    external pool for conference/meeting abstracts, non-papers, contentless stubs and
    invalid new-record metadata before preview. Newly allocated records need named

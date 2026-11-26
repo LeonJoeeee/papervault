@@ -101,7 +101,7 @@ from its role (`<model>[@<modifier>][,<fallback>...]`). Defaults are:
 
 | Role | Default route | Override |
 | --- | --- | --- |
-| Graph extraction/merge | `glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
+| Graph extraction/merge | `glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high` | `PAPERVAULT_LLM_BUILD` |
 | Query keyword extraction | `glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low` | `PAPERVAULT_LLM_KEYWORD` |
 | Answer synthesis | `gpt-6.2-astra@xhigh` | `PAPERVAULT_LLM_SYNTH` |
 | Extract clarity/completeness gates | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_GATE` |
@@ -109,11 +109,13 @@ from its role (`<model>[@<modifier>][,<fallback>...]`). Defaults are:
 | Library search intent | `gpt-6.1-terra@high` | `PAPERVAULT_LLM_INTENT` |
 | Library judges/resolver/re-rank | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium` | `PAPERVAULT_LLM_JUDGE` |
 | Decomposition (production multiquery and eval) | `glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high` | `PAPERVAULT_LLM_DECOMPOSE` |
-| Eval judges | `glm-5.3@max,relay-glm-5.3@max` | `PAPERVAULT_LLM_EVAL_JUDGE` |
+| Eval judges | `glm-5.4@max,relay-glm-5.3@max` | `PAPERVAULT_LLM_EVAL_JUDGE` |
 
 Modifiers are validated per family against the transparent LLM Gateway
 catalog (after stripping an optional `openai/` prefix):
-- `glm-*`, `relay-glm-*` (always-on thinking): bare or `@low`, `@high`, `@max`
+- `glm-5.4*` (always-on thinking): bare or `@low`, `@medium`, `@high`, `@max`
+  (`@none`, `@nothinking`, `@thinking`, and `@xhigh` raise `ValueError`).
+- Other `glm-*`, `relay-glm-*` (always-on thinking): bare or `@low`, `@high`, `@max`
   (`@none`, `@nothinking`, `@thinking`, `@medium`, and `@xhigh` raise `ValueError`).
 - `gpt-6.2-astra*`, `gpt-6.2-sol*`, `gpt-6-astra*`, `gpt-6.1-sol*` (always-on Codex):
   bare or `@low`, `@medium`, `@high`, `@xhigh`, `@max` (`@none`, `@thinking`,
@@ -138,9 +140,9 @@ seconds (default `120`, `<= 0` disables), while upstream quota/balance exhaustio
 `PAPERVAULT_LLM_QUOTA_COOLDOWN_S` seconds (default `600`, `<= 0` disables) before
 probing it again. Genuine non-quota `400/401/403/422` errors fail fast and
 single-target roles (`intent`, `synth`) never cross-model fallback. `eval_judge`
-defaults to two-tier same-family `glm-5.3@max,relay-glm-5.3@max` (without Tier 3
-GPT fallback) to preserve a single-family benchmark ruler invariant across Zhipu
-subscription windows.
+defaults to two-tier same-family `glm-5.4@max,relay-glm-5.3@max` (without Tier 3
+GPT fallback; pin `PAPERVAULT_LLM_EVAL_JUDGE=glm-5.4@max` when strict
+single-version arbitration is required while the relay remains on `glm-5.3`).
 
 The retired symbolic level names (`flash`, `standard`, `pro`, `max`, `ultra` and
 `papervault-*`) are rejected with `ValueError` naming `PAPERVAULT_LLM_<ROLE>`.

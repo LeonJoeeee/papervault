@@ -23,14 +23,14 @@ from papervault.llm_routing import (
 
 ROLE_DEFAULTS = [
     ("intent", "gpt-6.1-terra@high"),
-    ("build", "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high"),
+    ("build", "glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high"),
     ("keyword", "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"),
     ("synth", "gpt-6.2-astra@xhigh"),
     ("gate", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"),
     ("verify", "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"),
     ("judge", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium"),
     ("decompose", "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high"),
-    ("eval_judge", "glm-5.3@max,relay-glm-5.3@max"),
+    ("eval_judge", "glm-5.4@max,relay-glm-5.3@max"),
 ]
 
 
@@ -96,12 +96,12 @@ def test_role_default_target_objects():
         ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
     )
     assert parse_targets(route("build")) == (
-        ModelTarget("glm-5.3", reasoning_effort="max"),
+        ModelTarget("glm-5.4", reasoning_effort="max"),
         ModelTarget("relay-glm-5.3", reasoning_effort="max"),
         ModelTarget("gpt-6.1-terra", reasoning_effort="high"),
     )
     assert parse_targets(route("eval_judge")) == (
-        ModelTarget("glm-5.3", reasoning_effort="max"),
+        ModelTarget("glm-5.4", reasoning_effort="max"),
         ModelTarget("relay-glm-5.3", reasoning_effort="max"),
     )
 
@@ -126,11 +126,13 @@ def test_whitespace_and_openai_prefix_normalized(monkeypatch):
 
 
 def test_glm_and_relay_glm_modifier_rules_and_wire_kwargs():
-    for raw_model, want_model in (
-        ("glm-5.3", "glm-5.3"),
-        ("GLM-5.3-Flash", "GLM-5.3-Flash"),
-        ("relay-glm-5.3", "relay-glm-5.3"),
-        ("openai/relay-glm-5.3-flash", "relay-glm-5.3-flash"),
+    for raw_model, want_model, efforts in (
+        ("glm-5.4", "glm-5.4", ("low", "medium", "high", "max")),
+        ("openai/GLM-5.4", "GLM-5.4", ("low", "medium", "high", "max")),
+        ("glm-5.3", "glm-5.3", ("low", "high", "max")),
+        ("GLM-5.3-Flash", "GLM-5.3-Flash", ("low", "high", "max")),
+        ("relay-glm-5.3", "relay-glm-5.3", ("low", "high", "max")),
+        ("openai/relay-glm-5.3-flash", "relay-glm-5.3-flash", ("low", "high", "max")),
     ):
         bare = parse_targets(raw_model)
         assert bare == (ModelTarget(want_model, reasoning_effort=None, thinking=None),)
@@ -138,7 +140,7 @@ def test_glm_and_relay_glm_modifier_rules_and_wire_kwargs():
         assert openai_wire_kwargs(bare[0]) == {"model": want_model}
         assert litellm_wire_kwargs(bare[0]) == {"model": f"openai/{want_model}"}
 
-        for effort in ("low", "high", "max"):
+        for effort in efforts:
             tiered = parse_targets(f"{raw_model}@{effort.upper()}")
             assert tiered == (ModelTarget(want_model, reasoning_effort=effort, thinking=None),)
             assert format_target(tiered[0]) == f"{want_model}@{effort}"
@@ -318,7 +320,12 @@ def test_arbitrary_openai_compatible_modifier_rules_and_canonical_formatting():
         "gpt-6.1-terra@",
         "openai/",
         "openai/@high",
-        # GLM / relay-glm rejections: @none, @nothinking, @thinking, @medium, @xhigh, unknown
+        # GLM / relay-glm rejections: @none, @nothinking, @thinking, @xhigh, unknown (plus @medium on non-5.4)
+        "glm-5.4@none",
+        "glm-5.4@nothinking",
+        "glm-5.4@thinking",
+        "glm-5.4@xhigh",
+        "glm-5.4@bogus",
         "glm-5.3@none",
         "glm-5.3@nothinking",
         "glm-5.3@thinking",
@@ -405,10 +412,10 @@ def test_retired_legacy_env_vars_ignored(monkeypatch):
         "MIMO_MODEL",
     ):
         monkeypatch.setenv(var, "legacy-ignored-model")
-    assert route("build") == "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high"
+    assert route("build") == "glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high"
     assert route("keyword") == "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"
     assert route("verify") == "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low"
-    assert route("eval_judge") == "glm-5.3@max,relay-glm-5.3@max"
+    assert route("eval_judge") == "glm-5.4@max,relay-glm-5.3@max"
 
 
 def test_wire_kwargs_builders():
@@ -542,14 +549,14 @@ def test_doctor_accepts_concrete_route_defaults(tmp_path, monkeypatch, capsys):
     cli._check_config(report)
     assert report.failures == 0
     output = capsys.readouterr().out
-    assert "build=glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high" in output
+    assert "build=glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high" in output
     assert "synth=gpt-6.2-astra@xhigh" in output
     assert "keyword=glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low" in output
     assert "judge=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium" in output
     assert "gate=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium" in output
     assert "verify=glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low" in output
     assert "decompose=glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high" in output
-    assert "eval_judge=glm-5.3@max,relay-glm-5.3@max" in output
+    assert "eval_judge=glm-5.4@max,relay-glm-5.3@max" in output
 
 
 def test_doctor_reports_retired_or_invalid_role_override(tmp_path, monkeypatch, capsys):
@@ -636,7 +643,7 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
     )
     monkeypatch.setattr(judge_mimo.JA, "validate_judge_json", lambda d, n_gold_nuggets=None: None)
 
-    # --- A. Default eval_judge='glm-5.3@max,relay-glm-5.3@max': two-tier same-family ruler invariant ---
+    # --- A. Default eval_judge='glm-5.4@max,relay-glm-5.3@max': two-tier same-family ruler invariant ---
     clear_fallback_cooldowns()
     srb_client, srb_calls = make_client(
         [
@@ -649,14 +656,14 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
         scores_1 = await srb._judge(
             srb_client, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
         )
-        # Second call while glm-5.3 is cooled down skips primary directly to relay-glm-5.3:
+        # Second call while glm-5.4 is cooled down skips primary directly to relay-glm-5.3:
         scores_2 = await srb._judge(
             srb_client, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
         )
     assert scores_1 == [0.9] and scores_2 == [0.8]
-    assert [c["model"] for c in srb_calls] == ["glm-5.3", "relay-glm-5.3", "relay-glm-5.3"]
+    assert [c["model"] for c in srb_calls] == ["glm-5.4", "relay-glm-5.3", "relay-glm-5.3"]
     assert all(c["reasoning_effort"] == "max" and "extra_body" not in c for c in srb_calls)
-    assert any("glm-5.3 -> relay-glm-5.3" in r.getMessage() for r in caplog.records)
+    assert any("glm-5.4 -> relay-glm-5.3" in r.getMessage() for r in caplog.records)
 
     # When both same-family GLM legs are exhausted, eval_judge raises rather than crossing into GPT:
     clear_fallback_cooldowns()
@@ -671,8 +678,8 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
         await srb._judge(
             srb_both_down, "solar wind", [{"title": "Paper A", "year": 2024, "abstract": "abc"}]
         )
-    assert [c["model"] for c in srb_both_calls] == ["glm-5.3", "relay-glm-5.3", "relay-glm-5.3"]
-    assert all(c["model"] in {"glm-5.3", "relay-glm-5.3"} for c in srb_both_calls)
+    assert [c["model"] for c in srb_both_calls] == ["glm-5.4", "relay-glm-5.3", "relay-glm-5.3"]
+    assert all(c["model"] in {"glm-5.4", "relay-glm-5.3"} for c in srb_both_calls)
 
     # Deterministic non-quota 401/403 does NOT fail over:
     for non_quota_err in (FakeHTTPError(401), FakeHTTPError(403, "Forbidden: model access denied")):
@@ -682,15 +689,15 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
         )
         with pytest.raises(FakeHTTPError):
             await srb._judge(auth_client, "solar wind", [{"title": "Paper A", "year": 2024}])
-        assert [c["model"] for c in auth_calls] == ["glm-5.3"]
+        assert [c["model"] for c in auth_calls] == ["glm-5.4"]
 
     # CancelledError propagates immediately without failover:
     cancel_client, cancel_calls = make_client([asyncio.CancelledError()])
     with pytest.raises(asyncio.CancelledError):
         await srb._judge(cancel_client, "solar wind", [{"title": "Paper A", "year": 2024}])
-    assert [c["model"] for c in cancel_calls] == ["glm-5.3"]
+    assert [c["model"] for c in cancel_calls] == ["glm-5.4"]
 
-    # _ab_u1_judge._judge: timeout on glm-5.3 fails over immediately to relay-glm-5.3@max
+    # _ab_u1_judge._judge: timeout on glm-5.4 fails over immediately to relay-glm-5.3@max
     clear_fallback_cooldowns()
     u1_client, u1_calls = make_client(
         [TimeoutError("upstream timeout"), json.dumps({"faithful": True, "reason": "direct"})]
@@ -701,9 +708,9 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
         {"head": "A", "tail": "B", "description": "rel", "source_chunks": ["A causes B"]},
     )
     assert verdict is True
-    assert [c["model"] for c in u1_calls] == ["glm-5.3", "relay-glm-5.3"]
+    assert [c["model"] for c in u1_calls] == ["glm-5.4", "relay-glm-5.3"]
 
-    # judge_mimo._judge_one: 429 on glm-5.3 fails over in attempt 1 without burning attempt
+    # judge_mimo._judge_one: 429 on glm-5.4 fails over in attempt 1 without burning attempt
     clear_fallback_cooldowns()
     jm_client, jm_calls = make_client([FakeHTTPError(429), valid_judge_reply])
     counters = {"ok": 0, "skip": 0, "fail": 0}
@@ -717,7 +724,7 @@ async def test_eval_and_baseline_callers_default_single_target_and_multi_target_
         counters,
     )
     assert res == ("vmq_r1", "q1", "ok", "attempt=1")
-    assert [c["model"] for c in jm_calls] == ["glm-5.3", "relay-glm-5.3"]
+    assert [c["model"] for c in jm_calls] == ["glm-5.4", "relay-glm-5.3"]
 
     # --- B. Explicit single-target override stays on glm-5.3 across outer retries ---
     monkeypatch.setenv("PAPERVAULT_LLM_EVAL_JUDGE", "glm-5.3@max")

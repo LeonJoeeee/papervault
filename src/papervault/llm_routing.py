@@ -25,6 +25,8 @@ EFFORTS = ("none", "low", "medium", "high", "xhigh", "max")
 _RETIRED_LEVELS = frozenset({"flash", "standard", "pro", "max", "ultra"})
 _RETIRED_GATEWAY_ALIASES = frozenset(f"papervault-{lvl}" for lvl in _RETIRED_LEVELS)
 
+_GLM_MEDIUM_CAPABLE_PREFIXES = ("glm-5.4",)
+_GLM_MEDIUM_CAPABLE_EFFORTS = frozenset({"low", "medium", "high", "max"})
 _GLM_PREFIXES = ("glm-", "relay-glm-")
 _GLM_EFFORTS = frozenset({"low", "high", "max"})
 _CODEX_ALWAYS_ON_PREFIXES = ("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-astra", "gpt-6.1-sol")
@@ -37,14 +39,14 @@ _MIMO_GATEWAY_PREFIXES = ("mimo-v2.6-", "relay-mimo-v2.6-")
 
 _DEFAULT_ROUTES: dict[str, str] = {
     "intent": "gpt-6.1-terra@high",
-    "build": "glm-5.3@max,relay-glm-5.3@max,gpt-6.1-terra@high",
+    "build": "glm-5.4@max,relay-glm-5.3@max,gpt-6.1-terra@high",
     "keyword": "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low",
     "synth": "gpt-6.2-astra@xhigh",
     "gate": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium",
     "verify": "glm-5.3-flash@low,relay-glm-5.3-flash@low,gpt-6.1-terra@low",
     "judge": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@medium",
     "decompose": "glm-5.3-flash@high,relay-glm-5.3-flash@high,gpt-6.1-terra@high",
-    "eval_judge": "glm-5.3@max,relay-glm-5.3@max",
+    "eval_judge": "glm-5.4@max,relay-glm-5.3@max",
 }
 ROLES = tuple(_DEFAULT_ROUTES)
 
@@ -106,6 +108,18 @@ def _parse_single_target(token: str, *, spec: str, var_name: str | None) -> Mode
             spec,
             f"{raw_model!r} is a retired level alias; specify a concrete model "
             "(e.g. 'gpt-6.1-terra@high' or 'glm-5.3@max,gpt-6.1-terra@high')",
+            var_name=var_name,
+        )
+
+    if low_model.startswith(_GLM_MEDIUM_CAPABLE_PREFIXES):
+        if mod is None:
+            return ModelTarget(model=model, reasoning_effort=None, thinking=None)
+        if mod in _GLM_MEDIUM_CAPABLE_EFFORTS:
+            return ModelTarget(model=model, reasoning_effort=mod, thinking=None)
+        raise _spec_error(
+            spec,
+            f"invalid modifier @{raw_mod} for GLM model {model!r}; expected bare model "
+            "or one of @low, @medium, @high, @max",
             var_name=var_name,
         )
 
